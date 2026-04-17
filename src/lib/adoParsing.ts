@@ -345,12 +345,15 @@ function scoreAdoLink(href: string, label: string): number {
   if (isAdoNoisyLink(href, label)) return -1;
   const h = href.toLowerCase();
   const l = label.toLowerCase();
-  if (/view comment/i.test(l))                           return 100;
+  // Reject non-ADO URLs — both modern (dev.azure.com) and legacy (.visualstudio.com) are valid.
+  const isAdoDomain = h.includes('dev.azure.com') || h.includes('.visualstudio.com');
+  if (!isAdoDomain) return -1;
+  if (/view comment/i.test(l))                                return 100;
   if (h.includes('pullrequest') && h.includes('discussionid')) return 90;
-  if (h.includes('pullrequest'))                          return 80;
-  if (h.includes('discussionid'))                         return 70;
-  if (/view pull request/i.test(l))                      return 65;
-  if (h.includes('/_git/'))                              return 40;
+  if (h.includes('pullrequest'))                               return 80;
+  if (h.includes('discussionid'))                              return 70;
+  if (/view pull request/i.test(l))                           return 65;
+  if (h.includes('/_git/'))                                   return 40;
   return 10;
 }
 
@@ -383,7 +386,8 @@ function extractAdoPrUrl(bodyText: string): string | undefined {
   if (candidates.length === 0) {
     // Strip the marker lines before scanning so they don't interfere
     const plainText = bodyText.replace(/^##ADO##.*$/gm, '');
-    const urlRe = /https:\/\/dev\.azure\.com\/[^\s"<>)]+/gi;
+    // Match both dev.azure.com and legacy <org>.visualstudio.com URLs.
+    const urlRe = /https:\/\/(?:dev\.azure\.com\/[^\s"<>)]+|[A-Za-z0-9-]+\.visualstudio\.com\/[^\s"<>)]+)/gi;
     let r: RegExpExecArray | null;
     while ((r = urlRe.exec(plainText)) !== null) {
       const href  = r[0].replace(/[.)]+$/, '');

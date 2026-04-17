@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import type { OutlookMessage } from '../types';
 import type { ImportResult, ImportOutcome } from '../context/AppContext';
 import * as tauriApi from '../lib/tauriCommands';
@@ -20,13 +20,35 @@ export default function OutlookImport({ clientId, onClose, onImport, onForceCrea
   const [states, setStates]     = useState<Record<string, MessageState>>({});
   const [results, setResults]   = useState<Record<string, ImportResult>>({});
 
-  async function fetchMessages() {
+  // In-flight guard. Set to true BEFORE the Tauri IPC call is dispatched,
+  // cleared only when the fetch fully completes (or errors).
+  //
+  // Why a ref and NOT reset in useEffect cleanup:
+  // React.StrictMode in development runs: mount → effect → cleanup → remount → effect.
+  // The cleanup fires SYNCHRONOUSLY between the two effect calls, before the first
+  // async Tauri/Graph call has returned. If cleanup cleared this flag, the second
+  // StrictMode effect invocation would immediately pass the guard and dispatch a
+  // second IPC call — which is exactly what we want to prevent.
+  // By NOT resetting in cleanup, the second effect invocation finds inFlight=true
+  // and returns immediately without touching the Rust/Graph layer.
+  // Manual refresh resets the flag explicitly before calling fetchMessages().
+  const inFlightRef = useRef(false);
+
+  async function fetchMessages(trigger: 'mount' | 'refresh' = 'mount') {
+    if (inFlightRef.current) {
+      console.debug(`[outlook-load] skipped trigger=${trigger} reason=in-flight`);
+      return;
+    }
+    inFlightRef.current = true;
+    const requestId = Math.random().toString(36).slice(2, 8);
+    console.debug(`[outlook-load] start requestId=${requestId} trigger=${trigger}`);
     setLoading(true);
     setError(null);
     setStates({});
     setResults({});
     try {
       const result = await tauriApi.getOutlookMessages(clientId);
+      console.debug(`[outlook-load] fetched requestId=${requestId} count=${result.length}`);
       setMessages(result);
       // Auto-import all fetched messages concurrently; duplicates finish immediately.
       const initialStates: Record<string, MessageState> = {};
@@ -34,6 +56,7 @@ export default function OutlookImport({ clientId, onClose, onImport, onForceCrea
       setStates(initialStates);
       await Promise.all(
         result.map(async (m) => {
+          console.debug(`[outlook-import] requestId=${requestId} messageId=${m.id} subject="${m.subject?.slice(0, 60)}"`);
           try {
             const r = await onImport(m);
             setResults((prev) => ({ ...prev, [m.id]: r }));
@@ -43,14 +66,26 @@ export default function OutlookImport({ clientId, onClose, onImport, onForceCrea
           }
         }),
       );
+      console.debug(`[outlook-load] completed requestId=${requestId} count=${result.length}`);
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     } finally {
+      inFlightRef.current = false;
       setLoading(false);
     }
   }
 
-  useEffect(() => { fetchMessages(); }, []);
+  // Auto-load on mount. No cleanup needed — the in-flight guard handles
+  // StrictMode's double-invoke (second call finds inFlight=true and skips).
+  useEffect(() => {
+    fetchMessages('mount');
+  }, []);
+
+  function handleRefresh() {
+    // Explicit user action: release the guard so a fresh load can start.
+    inFlightRef.current = false;
+    fetchMessages('refresh');
+  }
 
   async function handleImport(msg: OutlookMessage) {
     setStates((prev) => ({ ...prev, [msg.id]: 'importing' }));
@@ -79,7 +114,7 @@ export default function OutlookImport({ clientId, onClose, onImport, onForceCrea
           Import from Outlook
         </span>
         <div style={{ display: 'flex', gap: 8 }}>
-          <button className="btn btn-ghost btn-sm" onClick={fetchMessages} disabled={loading}>
+          <button className="btn btn-ghost btn-sm" onClick={handleRefresh} disabled={loading}>
             <Icon name="refresh-cw" size={14} />
           </button>
           <button className="btn btn-ghost btn-sm" onClick={onClose}>

@@ -343,6 +343,16 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
 
       const dedupeKey = input.externalMessageId?.trim();
 
+
+      // --- Per-message trace logs for ADO/PR emails ---
+      if (input.adoContext) {
+        const msgId = input.externalMessageId || '';
+        const subj = input.title || '';
+        const prUrl = input.adoContext.prUrl;
+        console.log(`[ado-link] messageId=${msgId} subject="${subj}"`);
+        if (prUrl) console.log(`[ado-link] selected prUrl=${prUrl}`);
+      }
+
       // --- Force-create path: user explicitly requested task creation ----------
       // Skips prefilter and AI. Upgrades an existing rejected/analyzed record
       // in-place, or creates a new task directly at confidence 80.
@@ -422,8 +432,38 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
           (t) => t.source === input.source && t.externalMessageId === dedupeKey,
         );
         if (existing) {
-          console.log(`[import] dedupe: already imported (${input.source}) "${input.title}" state=${existing.classificationState}`);
-          return { outcome: 'duplicate', reason: 'Already imported', existingState: existing.classificationState };
+          // --- Per-message trace logs for dedupe path ---
+          console.log(`[ado-link] duplicate existingTaskId=${existing.id}`);
+          const existingPrUrl = existing.adoContext?.prUrl;
+          const newPrUrl = input.adoContext?.prUrl;
+          let backfilled = false;
+          // Only backfill if this is a PR or work item, and new adoContext has a prUrl or workItemUrl not present in existing
+          if (input.adoContext &&
+              ((input.adoContext.prUrl && !existing.adoContext?.prUrl) ||
+               (input.adoContext.workItemUrl && !existing.adoContext?.workItemUrl))) {
+            // Backfill missing adoContext fields
+            const mergedAdoContext = { ...existing.adoContext, ...input.adoContext };
+            const upgraded = tasksRef.current.map((t) =>
+              t.id === existing.id ? { ...t, adoContext: mergedAdoContext } : t
+            );
+            tasksRef.current = upgraded;
+            setTasks(upgraded);
+            api.saveTasks(upgraded).catch((e) => console.warn('[ado-link] save backfill failed:', e));
+            backfilled = true;
+            if (!existing.adoContext?.prUrl && input.adoContext?.prUrl) {
+              console.log('[ado-link] existing prUrl missing -> backfilling');
+            }
+            if (!existing.adoContext?.workItemUrl && input.adoContext?.workItemUrl) {
+              console.log('[ado-link] existing workItemUrl missing -> backfilling');
+            }
+          } else {
+            if (!existing.adoContext?.prUrl) {
+              console.log('[ado-link] existing prUrl missing but no new prUrl found');
+            } else {
+              console.log('[ado-link] existing prUrl already present -> no update');
+            }
+          }
+          return { outcome: 'duplicate', reason: 'Already imported', existingState: existing.classificationState, taskId: existing.id };
         }
       }
 

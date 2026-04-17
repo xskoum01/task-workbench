@@ -1,6 +1,6 @@
 use std::fs;
 use std::io;
-use std::io::{BufRead, Write as IoWrite};
+use std::io::BufRead;
 use std::net::TcpListener;
 use std::path::PathBuf;
 use std::collections::HashMap;
@@ -1668,8 +1668,12 @@ fn extract_ado_link_pairs(html: &str) -> Vec<(String, String)> {
             let value_start = href_pos + 6; // after href="
             let Some(value_end) = tag_lower[value_start..].find('"') else { break 'href None };
             let raw_href = &tag_slice[value_start..value_start + value_end];
-            // Only keep Azure DevOps URLs
-            if !raw_href.to_ascii_lowercase().starts_with("https://dev.azure.com/") {
+            // Keep Azure DevOps URLs: both the modern dev.azure.com domain
+            // and the legacy <org>.visualstudio.com domain still used by many orgs.
+            let href_lower = raw_href.to_ascii_lowercase();
+            let is_ado_url = href_lower.starts_with("https://dev.azure.com/")
+                || href_lower.contains(".visualstudio.com/");
+            if !is_ado_url {
                 break 'href None;
             }
             // Decode &amp; → & so the URL is valid when opened
