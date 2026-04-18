@@ -1386,21 +1386,31 @@ async fn get_outlook_messages(
         .into_iter()
         .map(|m| {
             // Strip HTML from the full body for deterministic parsing in the frontend.
-            // IMPORTANT: extract Azure DevOps href URLs *before* stripping tags.
-            // ADO "View comment" / "View pull request" links only exist in <a href="...">
+            // IMPORTANT: extract Azure DevOps href URLs *before* stripping tags —
+            // ADO "View comment" / "View pull request" links only exist in <a href>
             // attributes and are completely lost by strip_html otherwise.
-            let body_html = m["body"]["content"].as_str().unwrap_or("");
-            let ado_pairs = extract_ado_link_pairs(body_html);
+            //
+            // The extraction is gated behind a cheap pre-check so we don't scan
+            // every email body for ADO links.
+            let from_email   = m["from"]["emailAddress"]["address"].as_str().unwrap_or("");
+            let subject_str  = m["subject"].as_str().unwrap_or("");
+            let preview_str  = m["bodyPreview"].as_str().unwrap_or("");
+            let body_html    = m["body"]["content"].as_str().unwrap_or("");
             let mut body_full = strip_html(body_html);
-            if !ado_pairs.is_empty() {
-                // Append structured ADO link markers so TypeScript can rank them.
-                // Format per line: ##ADO## <href> ||| <label>
-                // This carries both the URL and the button text ("View comment", etc.)
-                // so the TypeScript parser can make an informed ranking decision.
-                for (href, label) in &ado_pairs {
-                    body_full.push_str(&format!("\n##ADO## {} ||| {}", href, label));
+            if is_potential_ado_email(from_email, subject_str, preview_str) {
+                let ado_pairs = extract_ado_link_pairs(body_html);
+                if !ado_pairs.is_empty() {
+                    // Append structured ADO link markers so TypeScript can rank them.
+                    // Format per line: ##ADO## <href> ||| <label>
+                    // This carries both the URL and the button text ("View comment", etc.)
+                    // so the TypeScript parser can make an informed ranking decision.
+                    for (href, label) in &ado_pairs {
+                        body_full.push_str(&format!("\n##ADO## {} ||| {}", href, label));
+                    }
+                    eprintln!("[ado-link] appended {} structured ADO link(s) to body_full for subject=\"{}\"", ado_pairs.len(), &subject_str[..subject_str.len().min(60)]);
                 }
-                eprintln!("[ado-link] appended {} structured ADO link(s) to body_full", ado_pairs.len());
+            } else {
+                eprintln!("[ado-link] skip ADO extraction for non-ADO email subject=\"{}\"", &subject_str[..subject_str.len().min(60)]);
             }
             serde_json::json!({
                 "id": m["id"],
@@ -1633,6 +1643,69 @@ async fn get_teams_recent_messages(
         chats_with_errors,
     );
     Ok(serde_json::json!(all_messages))
+}
+
+/// Cheap pre-check: returns true if the email is likely from Azure DevOps.
+///
+/// Examines the sender address, subject line, and body preview using simple
+/// string matching — no HTML parsing involved. This gates the more expensive
+/// `extract_ado_link_pairs` so we don't scan every Outlook email for ADO links.
+///
+/// Broad-enough to catch all real ADO notification types:
+///   - PR review requests / comments / approvals / completions
+///   - Work item creation / updates
+///   - Build notifications
+fn is_potential_ado_email(from_email: &str, subject: &str, body_preview: &str) -> bool {
+    let email_lower   = from_email.to_ascii_lowercase();
+    let subject_lower = subject.to_ascii_lowercase();
+    let preview_lower = body_preview.to_ascii_lowercase();
+
+    // Sender-based: most ADO notifications come from a canonical MS address.
+    if email_lower == "azuredevops@microsoft.com"
+        || email_lower.ends_with("@ado.microsoft.com")
+        || email_lower.contains("vstfs")
+        || (email_lower.contains("azuredevops") && email_lower.ends_with("@microsoft.com"))
+    {
+        return true;
+    }
+
+    // Subject-based: low false-positive patterns that are strongly ADO-specific.
+    let subject_signals: &[&str] = &[
+        "pr - ",           // PR review request: "PR - Fix login - Proj 42 (Reviewer)"
+        "pull request",
+        "has commented on",
+        "commented on",
+        "work item",
+        "build succeeded",
+        "build failed",
+        "build partially succeeded",
+        "pipeline",
+        "release ",
+    ];
+    for signal in subject_signals {
+        if subject_lower.contains(signal) {
+            return true;
+        }
+    }
+
+    // Body-preview-based: used when subject alone is generic.
+    let preview_signals: &[&str] = &[
+        "pull request",
+        "dev.azure.com",
+        "visualstudio.com",
+        "azure devops",
+        "work item",
+        "approved the changes",
+        "completed the pull request",
+        "has commented on",
+    ];
+    for signal in preview_signals {
+        if preview_lower.contains(signal) {
+            return true;
+        }
+    }
+
+    false
 }
 
 /// Extracts (href, anchor_text) pairs for all Azure DevOps links in HTML.

@@ -259,6 +259,19 @@ export type RepositoryTemplateType = 'none' | 'zip' | 'folder';
 /** Validation state after the user picks a template. */
 export type TemplateValidationState = 'not_selected' | 'valid' | 'invalid';
 
+export type AppTemplateType = 'plugin' | 'script';
+export type AppTemplateSourceKind = 'zip' | 'folder';
+
+export interface AppTemplate {
+  id: string;
+  name: string;
+  type: AppTemplateType;
+  sourceKind: AppTemplateSourceKind;
+  sourcePath: string;
+  isDefault: boolean;
+  description?: string;
+}
+
 export interface AppSettings {
   appName: string;
   theme: string;
@@ -324,6 +337,9 @@ export interface AppSettings {
 
   /** Human-readable error message from the last failed sign-in or refresh. */
   lastMicrosoftError?: string;
+
+  /** Plugin and Script templates managed in Settings → Templates. */
+  templates?: AppTemplate[];
 }
 
 /** Which planning time-box a task belongs to. */
