@@ -436,10 +436,9 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
           console.log(`[ado-link] duplicate existingTaskId=${existing.id}`);
           const existingPrUrl = existing.adoContext?.prUrl;
           const newPrUrl = input.adoContext?.prUrl;
-          let backfilled = false;
           // Only backfill if this is a PR or work item, and new adoContext has a prUrl or workItemUrl not present in existing
           if (input.adoContext &&
-              ((input.adoContext.prUrl && !existing.adoContext?.prUrl) ||
+              ((newPrUrl && !existingPrUrl) ||
                (input.adoContext.workItemUrl && !existing.adoContext?.workItemUrl))) {
             // Backfill missing adoContext fields
             const mergedAdoContext = { ...existing.adoContext, ...input.adoContext };
@@ -449,15 +448,14 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
             tasksRef.current = upgraded;
             setTasks(upgraded);
             api.saveTasks(upgraded).catch((e) => console.warn('[ado-link] save backfill failed:', e));
-            backfilled = true;
-            if (!existing.adoContext?.prUrl && input.adoContext?.prUrl) {
+            if (!existingPrUrl && newPrUrl) {
               console.log('[ado-link] existing prUrl missing -> backfilling');
             }
             if (!existing.adoContext?.workItemUrl && input.adoContext?.workItemUrl) {
               console.log('[ado-link] existing workItemUrl missing -> backfilling');
             }
           } else {
-            if (!existing.adoContext?.prUrl) {
+            if (!existingPrUrl) {
               console.log('[ado-link] existing prUrl missing but no new prUrl found');
             } else {
               console.log('[ado-link] existing prUrl already present -> no update');

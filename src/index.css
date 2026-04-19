@@ -3492,5 +3492,269 @@ body {
   text-overflow: ellipsis;
 }
 
+/* --- Script Assistant Panel ------------------------------------- */
+
+.sa-panel {
+  border-top: 1px solid var(--border);
+  padding-top: 8px;
+}
+
+/* Workflow step buttons in a horizontal row */
+.sa-step-row {
+  display: flex;
+  gap: 4px;
+  flex-wrap: wrap;
+  margin-bottom: 4px;
+}
+
+/* Result blocks */
+.sa-result {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  background: var(--bg-base);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 7px 9px;
+  margin-top: 4px;
+}
+
+.sa-result-row {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  min-height: 18px;
+}
+
+.sa-result-label {
+  font-size: 10px;
+  font-weight: 600;
+  color: var(--text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  min-width: 76px;
+  flex-shrink: 0;
+}
+
+.sa-result-value {
+  font-size: 12px;
+  color: var(--text-primary);
+  min-width: 0;
+  word-break: break-word;
+}
+
+.sa-mono {
+  font-family: var(--font-mono);
+  font-size: 11px !important;
+}
+
+.sa-list {
+  color: var(--text-secondary);
+  font-size: 11px !important;
+}
+
+.sa-field-pill {
+  display: inline-block;
+  font-family: var(--font-mono);
+  font-size: 10px !important;
+  padding: 1px 5px;
+  background: color-mix(in srgb, var(--accent) 14%, transparent);
+  color: var(--accent-hover);
+  border-radius: 4px;
+  margin-left: 2px;
+}
+
+.sa-ok {
+  color: var(--color-done, #4caf8f) !important;
+}
+
+.sa-warn {
+  color: var(--color-overdue, #c9883a) !important;
+}
+
+.sa-summary {
+  font-size: 11px;
+  color: var(--text-muted);
+  margin-top: 4px;
+  line-height: 1.4;
+}
+
+.sa-error {
+  margin-top: 4px;
+}
+
+.sa-copy-ok {
+  font-size: 11px;
+  color: var(--color-done, #4caf8f);
+  margin-top: 4px;
+}
+
+/* Skeleton display */
+.sa-skeleton {
+  margin-top: 4px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.sa-skeleton-meta {
+  background: var(--bg-base);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 7px 9px;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.sa-skeleton-code-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-top: 2px;
+}
+
+.sa-skeleton-code-label {
+  font-size: 10px;
+  font-weight: 600;
+  color: var(--text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+}
+
+.sa-patch-hint {
+  margin-top: 4px;
+}
+
+.sa-patch-hint-label {
+  font-size: 10px;
+  font-weight: 600;
+  color: var(--text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  margin-bottom: 2px;
+}
+
+/* Code/pre blocks in skeleton */
+.sa-code-block {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--text-secondary);
+  background: var(--bg-base);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 7px 9px;
+  overflow-x: auto;
+  white-space: pre;
+  line-height: 1.55;
+  max-height: 200px;
+  overflow-y: auto;
+}
+
+.sa-code-block--main {
+  color: var(--text-primary);
+  max-height: 300px;
+}
+
+/* Recommended action callout at top of plan */
+.sa-recommended-action {
+  font-size: 12px;
+  color: var(--text-primary);
+  background: color-mix(in srgb, var(--accent) 10%, transparent);
+  border-left: 3px solid var(--accent);
+  border-radius: 0 var(--radius-sm) var(--radius-sm) 0;
+  padding: 5px 8px;
+  margin-bottom: 4px;
+  line-height: 1.4;
+}
+
+/* Repo/path with overflow ellipsis */
+.sa-ellipsis {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 320px;
+  display: inline-block;
+  vertical-align: bottom;
+}
+
+/* Skeleton file header row */
+.sa-skeleton-file-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11px;
+  color: var(--text-muted);
+  padding: 2px 0;
+}
+
+.sa-skeleton-file-row .sa-mono {
+  color: var(--text-primary);
+}
+
+/* Small badge for operation type */
+.sa-operation-badge {
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  color: var(--text-muted);
+  background: var(--bg-hover);
+  border-radius: 3px;
+  padding: 1px 5px;
+  margin-left: auto;
+}
+
+/* Individual skeleton section */
+.sa-section {
+  background: var(--bg-base);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 7px 9px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.sa-section-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.sa-section-label {
+  font-size: 10px;
+  font-weight: 600;
+  color: var(--text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+}
+
+.sa-section-desc {
+  font-size: 11px;
+  color: var(--text-muted);
+  line-height: 1.4;
+}
+
+/* Restored-from-persistence hint */
+.sa-restored-hint {
+  font-size: 11px;
+  color: var(--text-muted);
+  font-style: italic;
+  padding: 3px 0 1px;
+}
+
+/* Inline warning (low confidence, similar helper found, etc.) */
+.sa-inline-warn {
+  font-size: 11px;
+  color: var(--color-overdue, #c9883a);
+  background: color-mix(in srgb, var(--color-overdue, #c9883a) 8%, transparent);
+  border-left: 3px solid var(--color-overdue, #c9883a);
+  border-radius: 0 var(--radius-sm) var(--radius-sm) 0;
+  padding: 4px 8px;
+  line-height: 1.4;
+}
+
+
+
 
 

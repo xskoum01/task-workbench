@@ -4,6 +4,7 @@ import { useApp } from '../context/AppContext';
 import { TypeBadge, SourceBadge, STATUS_LABELS } from './StatusBadge';
 import ReplyModal from './ReplyModal';
 import SkeletonPreviewModal from './SkeletonPreviewModal';
+import ScriptAssistantPanel from './ScriptAssistantPanel';
 import TaskForm from './TaskForm';
 import Icon from './Icon';
 import * as tauriApi from '../lib/tauriCommands';
@@ -772,6 +773,11 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
               </button>
             </div>
           </div>
+
+          {/* SCRIPT ASSISTANT — shown when customer has a script folder or repo root */}
+          {customer && (customer.scriptFolder || customer.resolvedRepositoryPath || customer.repositoryRoot) && (
+            <ScriptAssistantPanel task={task} customer={customer} />
+          )}
 
           {/* AZURE DEVOPS — shown for ADO PR comment/review tasks with an extracted deep link */}
           {(() => {

@@ -71,6 +71,8 @@ export interface Task {
   analysisResult?: TaskAnalysis;
   /** Persisted AI-generated reply draft. */
   generatedReply?: string;
+  /** Persisted Script Assistant analysis result. */
+  scriptAnalysis?: ScriptAnalysis;
 
   // --- Tracking / delivery metadata ---
   /** Where the work item originates (helpdesk ticket, ADO task, etc.). */
@@ -349,6 +351,86 @@ export type PlanningBucket =
   | 'tomorrow'
   | 'this_week'
   | 'later';
+
+// ── Script Assistant types ────────────────────────────────────────────────────
+
+export type ScriptTriggerType = 'onLoad' | 'onSave' | 'onChange' | 'ribbon' | 'helper_only';
+
+export type ScriptOperationType =
+  | 'helper_plus_hook'
+  | 'new_onchange_handler'
+  | 'extend_existing_helper'
+  | 'new_file_scaffold';
+
+/** Structured result of script analysis (inferred from task text). */
+export interface ScriptAnalysis {
+  artifactType: 'script';
+  entityLogicalName: string;
+  triggerType: ScriptTriggerType;
+  triggerField?: string;
+  /** Preliminary operation type — refined to a definitive value in ScriptPlan. */
+  operationType: ScriptOperationType;
+  candidateFunctionName: string;
+  shouldReuseExistingHandler: boolean;
+  shouldCreateNewHandler: boolean;
+  shouldCreateHelper: boolean;
+  confidence: number;
+  summary: string;
+}
+
+/** Result of inspecting an existing JS file in the customer repo. */
+export interface ScriptFileInspection {
+  filePath: string;
+  fileName: string;
+  exists: boolean;
+  /** All detected function names (handlers + helpers). */
+  handlers: string[];
+  helpers: string[];
+  hasOnLoad: boolean;
+  hasOnSave: boolean;
+  hasOnChange: boolean;
+  /** Fields that already have a dedicated onChange handler. */
+  onChangeFields: string[];
+  /** Exact name of the best existing handler to hook into, if found. */
+  existingHandlerName?: string;
+}
+
+/** Resolved plan: which file, what will be done. */
+export interface ScriptPlan {
+  targetFile: string;
+  targetFileName: string;
+  resolvedBy: 'canonical' | 'activity_shared' | 'content_match' | 'none';
+  fileExists: boolean;
+  entity: string;
+  triggerType: ScriptTriggerType;
+  triggerField?: string;
+  operationType: ScriptOperationType;
+  reuseExistingHandler: boolean;
+  /** Name of the handler to hook into (when reuseExistingHandler is true). */
+  existingHandlerName?: string;
+  createNewHelper: boolean;
+  createNewHandler: boolean;
+  /** True when a helper with a similar name already exists. */
+  similarHelperFound: boolean;
+  /** High-level recommended action in one sentence. */
+  recommendedAction: string;
+  inspection?: ScriptFileInspection;
+}
+
+/** One distinct code section in the skeleton output. */
+export interface SkeletonSection {
+  label: string;
+  description: string;
+  code: string;
+}
+
+/** Generated skeleton proposal — broken into distinct, copyable sections. */
+export interface ScriptSkeleton {
+  targetFile: string;
+  targetFileName: string;
+  operationType: ScriptOperationType;
+  sections: SkeletonSection[];
+}
 
 export type NavPage = 'inbox' | 'tasks' | 'customers' | 'settings';
 

@@ -937,6 +937,47 @@ fn initialize_git_repository(
     }
 }
 
+/// Reads the content of a text file (JS/TS/etc.) for script inspection.
+/// Caps at 500 KB to avoid loading huge build artefacts.
+#[tauri::command]
+fn read_file_content(path: String) -> Result<String, String> {
+    let p = std::path::Path::new(&path);
+    if !p.exists() {
+        return Err(format!("File not found: {path}"));
+    }
+    let content = fs::read_to_string(&path).map_err(|e| format!("Cannot read file: {e}"))?;
+    if content.len() > 500_000 {
+        Ok(content[..500_000].to_string())
+    } else {
+        Ok(content)
+    }
+}
+
+/// Lists files in `dir` that match `extension` (e.g. "js"), non-recursively.
+/// Returns file names only (not full paths). Never fails — returns empty vec on any error.
+#[tauri::command]
+fn list_directory_files(dir: String, extension: String) -> Vec<String> {
+    let path = std::path::Path::new(&dir);
+    if !path.is_dir() {
+        return vec![];
+    }
+    let ext_suffix = format!(".{}", extension.trim_start_matches('.'));
+    let mut files: Vec<String> = fs::read_dir(path)
+        .map(|entries| {
+            entries
+                .filter_map(|e| e.ok())
+                .filter(|e| e.path().is_file())
+                .filter_map(|e| {
+                    let name = e.file_name().to_string_lossy().to_string();
+                    if name.ends_with(&ext_suffix) { Some(name) } else { None }
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    files.sort();
+    files
+}
+
 /// Writes content to the given absolute path, creating directories as needed.
 #[tauri::command]
 fn save_generated_file(path: String, content: String) -> Result<(), String> {
@@ -1866,6 +1907,8 @@ pub fn run() {
             get_teams_chats,
             get_teams_chat_messages,
             get_teams_recent_messages,
+            read_file_content,
+            list_directory_files,
             list_crm_folders,
         ])
         .run(tauri::generate_context!())

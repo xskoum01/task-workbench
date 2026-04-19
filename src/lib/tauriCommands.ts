@@ -175,6 +175,25 @@ export function resetLocalData(): Promise<void> {
   return invoke('reset_local_data');
 }
 
+// --- Script Assistant -------------------------------------------------------
+
+/**
+ * Reads the full content of a file from the customer repository for inspection.
+ * Returns the content as a string, capped at 500 KB.
+ * Rejects if the file does not exist.
+ */
+export function readFileContent(path: string): Promise<string> {
+  return invoke<string>('read_file_content', { path });
+}
+
+/**
+ * Lists file names (not full paths) in the given directory that match
+ * the given extension (e.g. "js"). Returns empty array if dir not found.
+ */
+export function listDirectoryFiles(dir: string, extension: string): Promise<string[]> {
+  return invoke<string[]>('list_directory_files', { dir, extension });
+}
+
 // ---------------------------------------------------------------------------
 // Microsoft 365 — OAuth2 PKCE sign-in and Microsoft Graph API
 //
