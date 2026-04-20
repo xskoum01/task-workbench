@@ -53,7 +53,7 @@
   /* Layout dimensions */
   --sidebar-width:  228px;
   --header-height:   56px;
-  --detail-width:   390px;
+  --detail-width:   560px;
 
   /* Spacing */
   --gap-xs:  4px;
@@ -296,6 +296,7 @@ body {
   flex: 1;
   display: flex;
   overflow: hidden;
+  position: relative;
 }
 
 .page-content {
@@ -305,19 +306,19 @@ body {
   min-width: 0;
 }
 
-/* --- Detail panel ---------------------------------------- */
+/* --- Detail panel (full overlay) ------------------------- */
 .detail-panel {
-  width: var(--detail-width);
-  flex-shrink: 0;
+  position: absolute;
+  inset: 0;
+  z-index: 10;
   background: var(--bg-surface);
-  border-left: 1px solid var(--border);
   display: flex;
   flex-direction: column;
   overflow: hidden;
 }
 
 .detail-panel-header {
-  padding: var(--gap-md) var(--gap-md) 10px;
+  padding: 14px var(--gap-lg) 12px;
   border-bottom: 1px solid var(--border);
   display: flex;
   align-items: flex-start;
@@ -332,12 +333,12 @@ body {
 }
 
 .detail-panel-title {
-  font-size: var(--font-size-base);
+  font-size: 17px;
   font-weight: 700;
   color: var(--text-primary);
-  line-height: 1.35;
+  line-height: 1.4;
   word-break: break-word;
-  letter-spacing: -0.2px;
+  letter-spacing: -0.3px;
 }
 
 .detail-panel-close {
@@ -357,13 +358,21 @@ body {
   background: var(--bg-hover);
 }
 
+/* Two-column inner layout: scrollable content left, actions sidebar right */
+.detail-panel-inner {
+  flex: 1;
+  display: flex;
+  overflow: hidden;
+}
+
 .detail-panel-body {
   flex: 1;
   overflow-y: auto;
-  padding: var(--gap-md);
+  padding: var(--gap-lg) var(--gap-xl);
   display: flex;
   flex-direction: column;
-  gap: 14px;
+  gap: 20px;
+  max-width: 860px;
 }
 
 .detail-section {
@@ -373,36 +382,155 @@ body {
 }
 
 .detail-section-label {
-  font-size: 10px;
+  font-size: 11px;
   font-weight: 700;
   color: var(--text-muted);
   text-transform: uppercase;
-  letter-spacing: 0.08em;
+  letter-spacing: 0.07em;
 }
 
 .detail-section-value {
-  font-size: var(--font-size-sm);
+  font-size: 13px;
   color: var(--text-primary);
+}
+
+/* Notes textarea */
+.detail-notes-textarea {
+  width: 100%;
+  box-sizing: border-box;
+  min-height: 100px;
+  resize: vertical;
+  background: var(--bg-base);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  color: var(--text-primary);
+  font-family: var(--font-sans);
+  font-size: 13px;
+  line-height: 1.6;
+  padding: 8px 10px;
+  outline: none;
+  transition: border-color 0.15s;
+}
+.detail-notes-textarea:focus {
+  border-color: var(--accent);
+}
+.detail-notes-textarea::placeholder {
+  color: var(--text-muted);
 }
 
 .detail-meta-grid {
   display: grid;
-  grid-template-columns: 1fr 1fr;
-  gap: var(--gap-sm) var(--gap-md);
+  grid-template-columns: repeat(4, 1fr);
+  gap: var(--gap-sm) var(--gap-lg);
 }
 
 .detail-message {
-  color: var(--text-secondary);
-  white-space: pre-wrap;
-  line-height: 1.65;
   background: var(--bg-base);
   border: 1px solid var(--border);
   border-radius: var(--radius-md);
+  overflow: hidden;
+}
+
+/* One email thread block */
+.email-segment {
+  padding: var(--gap-md) var(--gap-lg);
+}
+
+.email-segment--dimmed {
+  opacity: 0.6;
+}
+
+/* Header field grid */
+.email-headers {
+  display: grid;
+  grid-template-columns: max-content 1fr;
+  gap: 3px 10px;
+  margin-bottom: var(--gap-sm);
+  padding-bottom: var(--gap-sm);
+  border-bottom: 1px solid var(--border-subtle);
+}
+
+.email-header-row {
+  display: contents;
+}
+
+.email-header-key {
+  font-size: 11px;
+  font-weight: 700;
+  color: var(--text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  padding-top: 1px;
+  white-space: nowrap;
+}
+
+.email-header-val {
+  font-size: 12px;
+  color: var(--text-secondary);
+  line-height: 1.5;
+  word-break: break-word;
+}
+
+/* Body text */
+.email-body {
+  font-size: 13px;
+  color: var(--text-primary);
+  line-height: 1.75;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.detail-message-thread-sep {
+  border: none;
+  border-top: 1px solid var(--border);
+  margin: 0;
+}
+
+/* Email card — structured display for email-sourced tasks */
+.email-card {
+  background: var(--bg-base);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  overflow: hidden;
+}
+
+.email-card-meta {
+  display: grid;
+  grid-template-columns: max-content 1fr;
+  gap: 3px 10px;
   padding: var(--gap-sm) var(--gap-md);
-  max-height: 160px;
-  overflow-y: auto;
-  font-family: var(--font-mono);
-  font-size: var(--font-size-xs);
+  background: var(--bg-hover);
+  border-bottom: 1px solid var(--border-subtle);
+}
+
+.email-card-meta-row {
+  display: contents;
+}
+
+.email-card-meta-key {
+  font-size: 11px;
+  font-weight: 700;
+  color: var(--text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  padding-top: 1px;
+  white-space: nowrap;
+}
+
+.email-card-meta-val {
+  font-size: 12px;
+  color: var(--text-secondary);
+  line-height: 1.5;
+  word-break: break-word;
+}
+
+.email-card-body {
+  padding: var(--gap-md) var(--gap-lg);
+  font-size: 13px;
+  color: var(--text-primary);
+  line-height: 1.75;
+  white-space: pre-wrap;
+  word-break: break-word;
 }
 
 .detail-suggestions {
@@ -2116,14 +2244,16 @@ body {
   text-overflow: ellipsis;
 }
 
-/* Restructured action footer */
+/* Restructured action footer — now a right sidebar */
 .detail-action-groups {
-  padding: var(--gap-sm) var(--gap-md) var(--gap-md);
-  border-top: 1px solid var(--border);
+  width: 340px;
+  flex-shrink: 0;
+  padding: var(--gap-lg) var(--gap-md);
+  border-left: 1px solid var(--border);
   display: flex;
   flex-direction: column;
   gap: 0;
-  flex-shrink: 0;
+  overflow-y: auto;
   background: var(--bg-overlay);
 }
 
@@ -2157,7 +2287,11 @@ body {
 .detail-action-grid {
   display: grid;
   grid-template-columns: 1fr 1fr;
-  gap: 4px;
+  gap: 6px;
+}
+
+.detail-action-grid .btn {
+  width: 100%;
 }
 
 /* Smaller button variant used inside action grids */
@@ -2943,10 +3077,41 @@ body {
   border: 1px solid color-mix(in srgb, var(--color-analyzed) 20%, transparent);
   border-left: 3px solid var(--color-analyzed);
   border-radius: var(--radius-md);
-  padding: var(--gap-sm) var(--gap-sm);
+  padding: var(--gap-md);
   display: flex;
   flex-direction: column;
-  gap: 6px;
+  gap: 8px;
+}
+
+.detail-analysis-lang-row {
+  display: flex;
+  gap: 8px;
+  align-items: flex-start;
+}
+
+.detail-analysis-lang-badge {
+  font-size: 9px;
+  font-weight: 800;
+  letter-spacing: 0.06em;
+  padding: 2px 5px;
+  border-radius: 3px;
+  flex-shrink: 0;
+  margin-top: 2px;
+  background: color-mix(in srgb, var(--color-analyzed) 20%, transparent);
+  color: var(--color-analyzed);
+  border: 1px solid color-mix(in srgb, var(--color-analyzed) 30%, transparent);
+}
+
+.detail-analysis-lang-badge--cz {
+  background: color-mix(in srgb, var(--color-done) 20%, transparent);
+  color: var(--color-done);
+  border-color: color-mix(in srgb, var(--color-done) 30%, transparent);
+}
+
+.detail-analysis-divider {
+  border: none;
+  border-top: 1px solid color-mix(in srgb, var(--color-analyzed) 18%, transparent);
+  margin: 2px 0;
 }
 
 .detail-analysis-summary {
@@ -2954,6 +3119,20 @@ body {
   color: var(--text-secondary);
   line-height: 1.55;
   margin: 0;
+}
+
+.detail-analysis-points {
+  margin: 0;
+  padding-left: 18px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.detail-analysis-points li {
+  font-size: var(--font-size-xs);
+  color: var(--text-secondary);
+  line-height: 1.5;
 }
 
 .detail-analysis-next {
@@ -3018,6 +3197,29 @@ body {
 /* ============================================================
    Tracking metadata — detail panel section + list row pills
    ============================================================ */
+
+/* Back button in the detail panel header */
+.detail-panel-back {
+  background: none;
+  border: 1px solid var(--border);
+  color: var(--text-secondary);
+  cursor: pointer;
+  padding: 3px 10px;
+  border-radius: var(--radius-sm);
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 12px;
+  font-weight: 600;
+  flex-shrink: 0;
+  margin-top: 2px;
+  white-space: nowrap;
+}
+
+.detail-panel-back:hover {
+  background: var(--bg-hover);
+  color: var(--text-primary);
+}
 
 /* Edit (pencil) button in the detail panel header */
 .detail-panel-edit {
@@ -3753,6 +3955,104 @@ body {
   padding: 4px 8px;
   line-height: 1.4;
 }
+
+/* --- Script Assistant V2 ------------------------------------------------- */
+
+/* Preview block */
+.sa-preview {
+  margin-top: 4px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.sa-preview-header {
+  background: var(--bg-base);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 7px 9px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.sa-preview-summary {
+  font-size: 11px;
+  color: var(--text-muted);
+  line-height: 1.4;
+}
+
+.sa-preview-body {
+  background: var(--bg-base);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 7px 9px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.sa-preview-code-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+/* Small badge: create / update */
+.sa-change-badge {
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  border-radius: 3px;
+  padding: 1px 5px;
+  margin-left: auto;
+}
+
+.sa-change-badge--create {
+  background: color-mix(in srgb, var(--color-done, #4caf8f) 14%, transparent);
+  color: var(--color-done, #4caf8f);
+}
+
+.sa-change-badge--update {
+  background: color-mix(in srgb, var(--accent) 14%, transparent);
+  color: var(--accent-hover);
+}
+
+/* No-op / already applied message */
+.sa-noop-message {
+  font-size: 11px;
+  color: var(--text-muted);
+  font-style: italic;
+  background: var(--bg-base);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 6px 9px;
+  line-height: 1.4;
+}
+
+/* Apply success banner */
+.sa-apply-success {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  font-size: 12px;
+  color: var(--color-done, #4caf8f);
+  background: color-mix(in srgb, var(--color-done, #4caf8f) 8%, transparent);
+  border: 1px solid color-mix(in srgb, var(--color-done, #4caf8f) 30%, transparent);
+  border-radius: var(--radius-sm);
+  padding: 6px 9px;
+  margin-top: 4px;
+}
+
+.sa-apply-success-icon {
+  font-weight: 700;
+  flex-shrink: 0;
+}
+
+.sa-apply-success-text {
+  line-height: 1.4;
+}
+
 
 
 

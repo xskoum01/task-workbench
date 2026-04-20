@@ -30,6 +30,7 @@ import type {
   SkeletonSection,
   ScriptTriggerType,
   ScriptOperationType,
+  ScriptPreview,
 } from '../types';
 
 // ---------------------------------------------------------------------------
@@ -1032,4 +1033,319 @@ var ${candidateFunctionName} = function (formContext) {
  */
 export function resolveCustomerScriptFolder(customer: Customer): string | null {
   return customer.scriptFolder ?? customer.resolvedRepositoryPath ?? customer.repositoryRoot ?? null;
+}
+
+// ---------------------------------------------------------------------------
+// V2 — Deterministic patch helpers (no AST, regex/string-based)
+// ---------------------------------------------------------------------------
+
+function escapeRegex(s: string): string {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+/**
+ * Returns the character index of a function declaration for the given name.
+ * Supports:
+ *   var/let/const name = [async] function
+ *   function name(
+ *   Prefix.name = [async] function
+ * Returns -1 if not found.
+ */
+function findFunctionDeclarationIndex(content: string, name: string): number {
+  const esc = escapeRegex(name);
+  const patterns: RegExp[] = [
+    new RegExp(`(?:var|let|const)\\s+${esc}\\s*=\\s*(?:async\\s+)?function`),
+    new RegExp(`(?:^|\\n)function\\s+${esc}\\s*\\(`),
+    new RegExp(`[a-zA-Z_$][a-zA-Z0-9_$.]*\\.${esc}\\s*=\\s*(?:async\\s+)?function`),
+  ];
+  for (const p of patterns) {
+    const m = content.match(p);
+    if (m && m.index !== undefined) return m.index;
+  }
+  return -1;
+}
+
+/**
+ * Finds the brace-delimited body range of a function by name.
+ * Returns { open, close } as character indices of the opening and closing braces,
+ * or null if the function cannot be located or the body is unterminated.
+ */
+function findFunctionBodyRange(content: string, name: string): { open: number; close: number } | null {
+  const declIdx = findFunctionDeclarationIndex(content, name);
+  if (declIdx === -1) return null;
+
+  const braceStart = content.indexOf('{', declIdx);
+  if (braceStart === -1) return null;
+
+  let depth = 0;
+  for (let i = braceStart; i < content.length; i++) {
+    const ch = content[i];
+    if (ch === '{') depth++;
+    else if (ch === '}') {
+      depth--;
+      if (depth === 0) return { open: braceStart, close: i };
+    }
+  }
+  return null; // unterminated — brace mismatch
+}
+
+/** Returns true when a function with the exact name is declared in the content. */
+function functionExists(content: string, name: string): boolean {
+  return findFunctionDeclarationIndex(content, name) !== -1;
+}
+
+/** Returns true when a call site `name(` exists anywhere in the content. */
+function callExists(content: string, name: string): boolean {
+  return new RegExp(`\\b${escapeRegex(name)}\\s*\\(`).test(content);
+}
+
+/** Returns true when the given marker string appears in the content. */
+function markerExists(content: string, marker: string): boolean {
+  return content.includes(marker);
+}
+
+/**
+ * Appends a code block to the file with safe double-newline spacing.
+ * Normalises trailing whitespace before appending.
+ */
+function appendBlock(content: string, code: string): string {
+  const trimmed = content.trimEnd();
+  return `${trimmed}\n\n${code}\n`;
+}
+
+/**
+ * Injects a one-or-multi-line snippet near the top of a named function body.
+ *
+ * Injection position priority:
+ *   1. After `const formContext = executionContext.getFormContext();` if present.
+ *   2. After the first newline inside the body.
+ *   3. Immediately after the opening `{`.
+ *
+ * Throws a clear error if the function body cannot be parsed safely.
+ */
+function injectIntoFunctionBody(content: string, handlerName: string, snippet: string): string {
+  const range = findFunctionBodyRange(content, handlerName);
+  if (!range) {
+    throw new Error(
+      `Could not safely patch handler "${handlerName}". Open in VS Code and apply manually.`,
+    );
+  }
+
+  // Detect the indentation used in the function body (first non-empty line inside)
+  const bodySlice = content.slice(range.open + 1, range.close);
+  const indentMatch = bodySlice.match(/\n([ \t]+)\S/);
+  const indent = indentMatch ? indentMatch[1] : '    ';
+
+  // Try to insert after any formContext extraction:
+  //   const / let / var formContext = executionContext.getFormContext();
+  const formCtxPattern = /\n[ \t]*(?:const|let|var)\s+formContext\s*=\s*executionContext\.getFormContext\(\);/;
+  const formCtxMatch = bodySlice.match(formCtxPattern);
+
+  let insertOffset: number; // offset relative to start of content
+  if (formCtxMatch && formCtxMatch.index !== undefined) {
+    insertOffset = range.open + 1 + formCtxMatch.index + formCtxMatch[0].length;
+  } else {
+    // Insert after the first newline in the body
+    const firstNl = bodySlice.indexOf('\n');
+    insertOffset = firstNl !== -1
+      ? range.open + 1 + firstNl
+      : range.open + 1;
+  }
+
+  // Format snippet with correct indentation
+  const formatted = snippet
+    .split('\n')
+    .map((line) => (line.trim() === '' ? '' : `${indent}${line}`))
+    .join('\n');
+
+  return content.slice(0, insertOffset) + '\n' + formatted + content.slice(insertOffset);
+}
+
+// ---------------------------------------------------------------------------
+// V2 — Preview generation
+// ---------------------------------------------------------------------------
+
+/**
+ * Builds a deterministic ScriptPreview: the exact file change that Apply will write.
+ *
+ * Must be called after buildScriptPlan + generateSkeleton.
+ * Reads the current file content from disk when the target file already exists.
+ * Never calls any AI API.
+ *
+ * Throws a descriptive error when patching is not safe.
+ */
+export async function buildScriptPreview(
+  analysis: ScriptAnalysis,
+  plan: ScriptPlan,
+  skeleton: ScriptSkeleton,
+  getFileContent: (path: string) => Promise<string>,
+): Promise<ScriptPreview> {
+  // Read original content if the file exists
+  const originalContent = plan.fileExists
+    ? await getFileContent(plan.targetFile).catch(() => '')
+    : '';
+
+  switch (plan.operationType) {
+    case 'new_file_scaffold': {
+      const scaffoldSection = skeleton.sections.find((s) => s.label === 'New file scaffold');
+      if (!scaffoldSection) throw new Error('Skeleton missing "New file scaffold" section.');
+      // Edge case: file already exists with identical scaffold content (e.g. applied before)
+      const newContent = scaffoldSection.code;
+      const isNoop = plan.fileExists && newContent === originalContent;
+      return {
+        targetFile: plan.targetFile,
+        targetFileName: plan.targetFileName,
+        fileExists: plan.fileExists,
+        operationType: plan.operationType,
+        originalContent,
+        newContent,
+        changeSummary: isNoop ? 'No changes needed — file already matches scaffold' : 'Create new file',
+        isNoop,
+      };
+    }
+
+    case 'new_onchange_handler': {
+      const handlerSection = skeleton.sections.find((s) => s.label === 'New onChange handler');
+      const helperSection  = skeleton.sections.find((s) => s.label === 'Helper function');
+      if (!handlerSection || !helperSection) {
+        throw new Error('Skeleton missing expected sections for new_onchange_handler.');
+      }
+
+      // Extract function names to detect duplicates
+      const handlerNameMatch = handlerSection.code.match(/(?:var|let|const)\s+([a-zA-Z_$][a-zA-Z0-9_$]*)\s*=/);
+      const helperNameMatch  = helperSection.code.match(/(?:var|let|const)\s+([a-zA-Z_$][a-zA-Z0-9_$]*)\s*=/);
+      const handlerFnName    = handlerNameMatch?.[1];
+      const helperFnName     = helperNameMatch?.[1];
+
+      let content = originalContent;
+
+      if (!handlerFnName || !functionExists(content, handlerFnName)) {
+        content = appendBlock(content, handlerSection.code);
+      }
+      if (!helperFnName || !functionExists(content, helperFnName)) {
+        content = appendBlock(content, helperSection.code);
+      }
+
+      // Final content-equality guard
+      const finalIsNoop = content === originalContent;
+      return {
+        targetFile: plan.targetFile,
+        targetFileName: plan.targetFileName,
+        fileExists: plan.fileExists,
+        operationType: plan.operationType,
+        originalContent,
+        newContent: content,
+        changeSummary: finalIsNoop
+          ? 'No changes needed — handler and helper already present'
+          : 'Append new onChange handler and helper',
+        isNoop: finalIsNoop,
+      };
+    }
+
+    case 'helper_plus_hook': {
+      const helperSection = skeleton.sections.find((s) => s.label === 'New helper function');
+      if (!helperSection) throw new Error('Skeleton missing "New helper function" section.');
+
+      const helperName  = analysis.candidateFunctionName;
+      const handlerName = plan.existingHandlerName;
+      if (!handlerName) {
+        throw new Error(
+          'helper_plus_hook requires an existing handler. ' +
+          'Plan did not resolve a handler — re-run Plan or use new_onchange_handler.',
+        );
+      }
+
+      let content = originalContent;
+
+      // Step 1: add helper if not already present
+      if (!functionExists(content, helperName)) {
+        content = appendBlock(content, helperSection.code);
+      }
+
+      // Step 2: check if handler already calls the helper
+      const handlerRange = findFunctionBodyRange(content, handlerName);
+      if (!handlerRange) {
+        throw new Error(
+          `Could not safely patch handler "${handlerName}". Open in VS Code and apply manually.`,
+        );
+      }
+
+      const handlerBody = content.slice(handlerRange.open, handlerRange.close + 1);
+      const alreadyCalled = callExists(handlerBody, helperName);
+
+      if (!alreadyCalled) {
+        // Match any flavour of formContext extraction: const / let / var
+        const hasFormContext = /(?:const|let|var)\s+formContext\s*=\s*executionContext\.getFormContext\(\)/.test(handlerBody);
+        const injection = hasFormContext
+          ? `${helperName}(formContext);`
+          : `const formContext = executionContext.getFormContext();\n${helperName}(formContext);`;
+
+        content = injectIntoFunctionBody(content, handlerName, injection);
+      }
+
+      // Final content-equality guard: covers cases like helper injected + call
+      // already existed, producing an unchanged file despite partial work.
+      const finalIsNoop = content === originalContent;
+      return {
+        targetFile: plan.targetFile,
+        targetFileName: plan.targetFileName,
+        fileExists: plan.fileExists,
+        operationType: plan.operationType,
+        originalContent,
+        newContent: content,
+        changeSummary: finalIsNoop
+          ? 'No changes needed — helper and hook already present'
+          : 'Insert helper function and patch existing handler',
+        isNoop: finalIsNoop,
+      };
+    }
+
+    case 'extend_existing_helper': {
+      const extSection = skeleton.sections.find((s) => s.label === 'Extension snippet');
+      if (!extSection) throw new Error('Skeleton missing "Extension snippet" section.');
+
+      const handlerName = plan.existingHandlerName;
+      if (!handlerName) {
+        throw new Error('extend_existing_helper requires an existing handler name from the plan.');
+      }
+
+      // Stable marker so re-run is idempotent
+      const markerStart = `// [SA-V2-START] ${handlerName}`;
+      const markerEnd   = `// [SA-V2-END] ${handlerName}`;
+
+      if (markerExists(originalContent, markerStart)) {
+        return {
+          targetFile: plan.targetFile,
+          targetFileName: plan.targetFileName,
+          fileExists: plan.fileExists,
+          operationType: plan.operationType,
+          originalContent,
+          newContent: originalContent,
+          changeSummary: 'No changes needed — extension block already applied',
+          isNoop: true,
+        };
+      }
+
+      // Wrap the snippet in start/end markers so future runs detect it
+      const markedSnippet =
+        `${markerStart}\n` +
+        extSection.code.split('\n').map((l) => `${l}`).join('\n') +
+        `\n${markerEnd}`;
+
+      const content = injectIntoFunctionBody(originalContent, handlerName, markedSnippet);
+      return {
+        targetFile: plan.targetFile,
+        targetFileName: plan.targetFileName,
+        fileExists: plan.fileExists,
+        operationType: plan.operationType,
+        originalContent,
+        newContent: content,
+        changeSummary: 'Extend existing handler with new logic block',
+        isNoop: false,
+      };
+    }
+
+    default:
+      throw new Error(`Unknown operation type: ${(plan as ScriptPlan).operationType}`);
+  }
 }

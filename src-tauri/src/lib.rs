@@ -326,19 +326,26 @@ async fn analyze_task(app: tauri::AppHandle, task: Value, customer: Value) -> Re
     let namespace     = customer["namespace"].as_str().unwrap_or("");
     let repo_name     = customer["repositoryName"].as_str().unwrap_or("");
 
-    let instructions = "You are assisting a Dynamics 365 / Dataverse developer. \
-Analyse work requests and return structured JSON. Respond with ONLY valid JSON — no markdown, no code fences.";
+    let instructions = "Jsi asistent Dynamics 365 / Dataverse vyvojare. \
+Analyzujes pracovni pozadavky a vracis strukturovany JSON v cestine. \
+Odpovedej POUZE validnim JSON — zadny markdown, zadne code fences.";
 
     let prompt = format!(
-        "Analyse this work request.\n\n\
-Task:\n- Title: {title}\n- Type: {task_type}\n- Source: {source}\n- Message: {message}\n\n\
-Customer:\n- Name: {customer_name}\n- Namespace: {namespace}\n- Repository: {repo_name}\n\n\
-Respond with ONLY this JSON (no markdown, no fences):\n\
-{{\"summary\":\"2-3 sentence summary\",\
-\"suggestedActions\":[{{\"id\":\"ai1\",\"label\":\"Actionable step\"}}],\
+        "Analyzuj tento pracovni pozadavek.\n\n\
+Task:\n- Nazev: {title}\n- Typ: {task_type}\n- Zdroj: {source}\n- Zprava: {message}\n\n\
+Zakaznik:\n- Nazev: {customer_name}\n- Namespace: {namespace}\n- Repozitar: {repo_name}\n\n\
+Odpovedej POUZE timto JSON (bez markdownu, bez code fences):\n\
+{{\"summary\":\"Kratke ceske shrnuteni (1-2 vety)\",\
+\"problemPoints\":[\"Co je problem.\",\"Kde se to projevuje.\",\"Co je potreba udelat.\"],\
+\"suggestedActions\":[{{\"id\":\"ai1\",\"label\":\"Konkretni krok cesky\"}}],\
 \"confidence\":85,\
-\"nextStep\":\"The single most important next action\"}}\n\n\
-Provide 3-5 suggestedActions. confidence is 0-100 (clarity and actionability)."
+\"nextStep\":\"Nejdulezitejsi nasledujici krok cesky\"}}\n\n\
+Pravidla:\n\
+- Pis cesky, strucne a srozumitelne. summary: 1-2 vety.\n\
+- problemPoints: 2-4 kratke body (co je problem, kde, co udelat).\n\
+- suggestedActions: 3-5 kroku cesky. confidence: 0-100.\n\
+- Technicke identifikatory (soubory, entity, fieldy) zachovej beze zmeny.\n\
+- Zadny marketingovy ton, zadne dlouhe odstavce."
     );
 
     let text = call_openai(&api_key, &model, instructions, &prompt).await?;

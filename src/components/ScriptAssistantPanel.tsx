@@ -11,7 +11,7 @@
  */
 
 import { useState, useCallback, useRef } from 'react';
-import type { Task, Customer, ScriptAnalysis, ScriptPlan, ScriptSkeleton, SkeletonSection } from '../types';
+import type { Task, Customer, ScriptAnalysis, ScriptPlan, ScriptSkeleton, SkeletonSection, ScriptPreview, ScriptApplyResult } from '../types';
 import Icon from './Icon';
 import { useApp } from '../context/AppContext';
 import * as tauriApi from '../lib/tauriCommands';
@@ -19,6 +19,7 @@ import {
   analyzeScriptTask,
   buildScriptPlan,
   generateSkeleton,
+  buildScriptPreview,
   resolveCustomerScriptFolder,
 } from '../lib/scriptAssistant';
 
@@ -192,6 +193,63 @@ function SkeletonDisplay({ skeleton }: { skeleton: ScriptSkeleton }) {
   );
 }
 
+function PreviewDisplay({ preview }: { preview: ScriptPreview }) {
+  const [copied, setCopied] = useState(false);
+
+  async function handleCopy() {
+    try {
+      await navigator.clipboard.writeText(preview.newContent);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 2000);
+    } catch {
+      // clipboard not available
+    }
+  }
+
+  return (
+    <div className="sa-preview">
+      <div className="sa-preview-header">
+        <div className="sa-skeleton-file-row">
+          <Icon name="file-text" size={11} />
+          <span className="sa-mono">{preview.targetFileName}</span>
+          <span className={`sa-change-badge sa-change-badge--${preview.fileExists ? 'update' : 'create'}`}>
+            {preview.fileExists ? 'update' : 'create'}
+          </span>
+        </div>
+        <div className="sa-preview-summary">{preview.changeSummary}</div>
+      </div>
+      {preview.isNoop ? (
+        <div className="sa-noop-message">
+          No file changes needed — logic already appears to be applied.
+        </div>
+      ) : (
+        <div className="sa-preview-body">
+          <div className="sa-preview-code-header">
+            <span className="sa-section-label">Final file content</span>
+            <button className="btn btn-ghost btn-sm" onClick={handleCopy} title="Copy final content">
+              <Icon name="layers" size={11} /> {copied ? 'Copied' : 'Copy'}
+            </button>
+          </div>
+          <pre className="sa-code-block sa-code-block--main">{preview.newContent}</pre>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function ApplySuccessDisplay({ result }: { result: ScriptApplyResult }) {
+  return (
+    <div className="sa-apply-success">
+      <span className="sa-apply-success-icon">✓</span>
+      <span className="sa-apply-success-text">
+        {result.created ? 'Created' : 'Updated'}{' '}
+        <span className="sa-mono">{result.targetFileName}</span>
+        {' '}({result.bytesWritten} bytes)
+      </span>
+    </div>
+  );
+}
+
 // ---------------------------------------------------------------------------
 // Main panel
 // ---------------------------------------------------------------------------
@@ -206,10 +264,12 @@ export default function ScriptAssistantPanel({ task, customer }: ScriptAssistant
   // True when analysis came from persistence and hasn't been refreshed yet this session.
   // useRef so toggling it to false in handleAnalyze fires before the re-render.
   const analysisIsRestored = useRef<boolean>(!!(task.scriptAnalysis));
-  const [plan, setPlan]         = useState<ScriptPlan | null>(null);
-  const [skeleton, setSkeleton] = useState<ScriptSkeleton | null>(null);
+  const [plan, setPlan]           = useState<ScriptPlan | null>(null);
+  const [skeleton, setSkeleton]   = useState<ScriptSkeleton | null>(null);
+  const [preview, setPreview]     = useState<ScriptPreview | null>(null);
+  const [applyResult, setApplyResult] = useState<ScriptApplyResult | null>(null);
 
-  const [loading, setLoading] = useState<'analyze' | 'plan' | 'skeleton' | null>(null);
+  const [loading, setLoading] = useState<'analyze' | 'plan' | 'skeleton' | 'preview' | 'apply' | null>(null);
   const [error, setError]     = useState<string | null>(null);
 
   const clearError = useCallback(() => setError(null), []);
@@ -225,9 +285,10 @@ export default function ScriptAssistantPanel({ task, customer }: ScriptAssistant
       setAnalysis(result);
       setPlan(null);
       setSkeleton(null);
+      setPreview(null);
+      setApplyResult(null);
       // Persist to task so analysis survives navigation away and back
       updateTask(task.id, { scriptAnalysis: result }).catch(() => {});
-      // (comment about stale state removed — useRef ensures correctness)
     } catch (e) {
       setError(String(e));
     } finally {
@@ -254,6 +315,8 @@ export default function ScriptAssistantPanel({ task, customer }: ScriptAssistant
       );
       setPlan(result);
       setSkeleton(null);
+      setPreview(null);
+      setApplyResult(null);
     } catch (e) {
       setError(String(e));
     } finally {
@@ -270,6 +333,52 @@ export default function ScriptAssistantPanel({ task, customer }: ScriptAssistant
     try {
       const result = generateSkeleton(analysis, plan);
       setSkeleton(result);
+      setPreview(null);
+      setApplyResult(null);
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setLoading(null);
+    }
+  }
+
+  // --- Step 4: Preview ---
+
+  async function handlePreview() {
+    if (!analysis || !plan || !skeleton) return;
+    clearError();
+    setLoading('preview');
+    try {
+      const result = await buildScriptPreview(
+        analysis,
+        plan,
+        skeleton,
+        (path: string) => tauriApi.readFileContent(path),
+      );
+      setPreview(result);
+      setApplyResult(null);
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setLoading(null);
+    }
+  }
+
+  // --- Step 5: Apply ---
+
+  async function handleApply() {
+    if (!preview || preview.isNoop) return;
+    clearError();
+    setLoading('apply');
+    try {
+      await tauriApi.saveGeneratedFile(preview.targetFile, preview.newContent);
+      setApplyResult({
+        targetFile: preview.targetFile,
+        targetFileName: preview.targetFileName,
+        created: !preview.fileExists,
+        updated: preview.fileExists,
+        bytesWritten: new TextEncoder().encode(preview.newContent).length,
+      });
     } catch (e) {
       setError(String(e));
     } finally {
@@ -278,12 +387,15 @@ export default function ScriptAssistantPanel({ task, customer }: ScriptAssistant
   }
 
   // --- Open in VS Code ---
-  // Opens target file if it exists, otherwise opens the script folder as fallback.
+  // Opens the applied/existing target file, or falls back to the script folder.
 
   async function handleOpenVscode() {
-    // Use target file only if it actually exists
+    // After apply, the file definitely exists — use it directly.
+    // Before apply, use target file only when known to exist.
     const targetPath =
-      (plan?.fileExists ? plan.targetFile : null) ?? scriptFolder;
+      applyResult?.targetFile ??
+      (plan?.fileExists ? plan.targetFile : null) ??
+      scriptFolder;
 
     if (!targetPath) {
       setError('No script folder configured. Set it in Customers → Edit.');
@@ -298,11 +410,13 @@ export default function ScriptAssistantPanel({ task, customer }: ScriptAssistant
 
   // ---------------------------------------------------------------------------
 
-  const vsCodeLabel = plan?.fileExists
-    ? `Open ${plan.targetFileName}`
-    : plan
-      ? 'Open script folder'
-      : 'Open in VS Code';
+  const vsCodeLabel = applyResult?.targetFileName
+    ? `Open ${applyResult.targetFileName}`
+    : plan?.fileExists
+      ? `Open ${plan.targetFileName}`
+      : plan
+        ? 'Open script folder'
+        : 'Open in VS Code';
 
   return (
     <div className="detail-action-group sa-panel">
@@ -340,6 +454,24 @@ export default function ScriptAssistantPanel({ task, customer }: ScriptAssistant
         </button>
 
         <button
+          className={`btn btn-sm ${preview ? 'btn-secondary' : skeleton ? 'btn-primary' : 'btn-ghost'}`}
+          onClick={handlePreview}
+          disabled={!skeleton || loading === 'preview'}
+          title="Preview the exact file change that will be written"
+        >
+          {loading === 'preview' ? <><span className="btn-spinner" /> Previewing…</> : 'Preview'}
+        </button>
+
+        <button
+          className={`btn btn-sm ${applyResult ? 'btn-secondary' : preview && !preview.isNoop ? 'btn-primary' : 'btn-ghost'}`}
+          onClick={handleApply}
+          disabled={!preview || preview.isNoop || !!applyResult || loading === 'apply'}
+          title={preview?.isNoop ? 'No changes to apply' : 'Write the generated change to the repository'}
+        >
+          {loading === 'apply' ? <><span className="btn-spinner" /> Applying…</> : 'Apply'}
+        </button>
+
+        <button
           className="btn btn-sm btn-ghost"
           onClick={handleOpenVscode}
           disabled={!scriptFolder}
@@ -372,6 +504,16 @@ export default function ScriptAssistantPanel({ task, customer }: ScriptAssistant
       {/* Skeleton — each section is individually copyable */}
       {skeleton && (
         <SkeletonDisplay skeleton={skeleton} />
+      )}
+
+      {/* Preview — shows exact file content that will be written */}
+      {preview && (
+        <PreviewDisplay preview={preview} />
+      )}
+
+      {/* Apply success message */}
+      {applyResult && (
+        <ApplySuccessDisplay result={applyResult} />
       )}
     </div>
   );

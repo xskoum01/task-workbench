@@ -25,6 +25,7 @@ export type WorkItemSource = 'none' | 'helpdesk' | 'azure_devops' | 'other';
 
 export interface TaskAnalysis {
   summary: string;
+  problemPoints?: string[];
   suggestedActions: SuggestedAction[];
   confidence: number;
   nextStep?: string;
@@ -115,6 +116,9 @@ export interface Task {
    * When undefined the item is treated as a regular task (legacy compat).
    */
   classificationState?: ClassificationState;
+
+  /** Free-text notes the user can write on this task. */
+  notes?: string;
 }
 
 export type ClassificationState = 'pending' | 'analyzed' | 'rejected' | 'created';
@@ -430,6 +434,40 @@ export interface ScriptSkeleton {
   targetFileName: string;
   operationType: ScriptOperationType;
   sections: SkeletonSection[];
+}
+
+// ── Script Assistant V2 types ─────────────────────────────────────────────────
+
+/**
+ * Deterministic preview of the exact file change that will be written.
+ * Generated from analysis + plan + skeleton without any AI call.
+ */
+export interface ScriptPreview {
+  targetFile: string;
+  targetFileName: string;
+  /** True when the target file already exists on disk. */
+  fileExists: boolean;
+  operationType: ScriptOperationType;
+  /** Current file content, or empty string for a new file. */
+  originalContent: string;
+  /** Full content that will be written to disk on Apply. */
+  newContent: string;
+  /** Short human-readable description of the change. */
+  changeSummary: string;
+  /** True when newContent equals originalContent — no write needed. */
+  isNoop: boolean;
+}
+
+/** Result returned after successfully applying a preview to the repository. */
+export interface ScriptApplyResult {
+  targetFile: string;
+  targetFileName: string;
+  /** True when the file was newly created (did not exist before). */
+  created: boolean;
+  /** True when an existing file was updated. */
+  updated: boolean;
+  /** Number of bytes written. */
+  bytesWritten: number;
 }
 
 export type NavPage = 'inbox' | 'tasks' | 'customers' | 'settings';

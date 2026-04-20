@@ -51,8 +51,156 @@ function formatEffort(hours: number): string {
 }
 
 // ---------------------------------------------------------------------------
-// PlanningSection — displayed in the detail body for non-done tasks
+// Email message rendering helpers
 // ---------------------------------------------------------------------------
+
+/** Known email header field names we extract and display distinctly. */
+const EMAIL_HEADER_FIELDS = ['From', 'To', 'Cc', 'Bcc', 'Date', 'Sent', 'Subject'] as const;
+type EmailHeaderField = typeof EMAIL_HEADER_FIELDS[number];
+
+interface ParsedEmailSegment {
+  headers: Partial<Record<EmailHeaderField, string>>;
+  body: string;
+}
+
+/**
+ * Parses one email block into structured header fields + plain body text.
+ * Handles two common layouts:
+ *   1. "From: X\nTo: Y\nSubject: Z\n\nbody"   (newline-separated headers)
+ *   2. "From: X Date: ... To: ... Subject: ... body"  (all on one line, no separating newlines)
+ */
+function parseEmailSegment(raw: string): ParsedEmailSegment {
+  const headers: Partial<Record<EmailHeaderField, string>> = {};
+  let remaining = raw.trim();
+
+  // Build a combined header-field pattern: "(?:From|To|Cc|...):\s*"
+  const fieldPattern = EMAIL_HEADER_FIELDS.join('|');
+  // Greedy extraction: for each known field, capture value up to the NEXT known field or end
+  const fullPattern = new RegExp(
+    `(${fieldPattern}):\\s*((?:(?!(?:${fieldPattern}):)[\\s\\S])*?)(?=(?:${fieldPattern}):|$)`,
+    'gi',
+  );
+
+  const matches = [...remaining.matchAll(fullPattern)];
+  if (matches.length === 0) {
+    return { headers, body: remaining };
+  }
+
+  for (const m of matches) {
+    const key = m[1] as EmailHeaderField;
+    const val = m[2].replace(/\s+/g, ' ').trim();
+    if (val) headers[key] = val;
+  }
+
+  // Body = everything after the last matched header region
+  const lastMatch = matches[matches.length - 1];
+  const lastEnd = (lastMatch.index ?? 0) + lastMatch[0].length;
+  const body = remaining.slice(lastEnd).trim();
+
+  return { headers, body };
+}
+
+// Matches lines that are clearly email header metadata, e.g. "From: John Smith"
+// Anchored to start of line so "From what I can see..." is NOT matched.
+const HEADER_LINE_RE = /^(?:From|To|Cc|Bcc|Date|Sent|Subject):\s*.+/i;
+
+// If stripped body is shorter than this we fall back to the full original.
+const MIN_BODY_LENGTH = 20;
+
+/**
+ * Conservatively strips an embedded email header block from the start of a message.
+ * Only removes leading lines that clearly match "FieldName: value" — stops as soon as
+ * a blank separator line or non-header content is reached.
+ * Falls back to the full originalMessage if stripping would hide too much content.
+ */
+function getDisplayMessageBody(raw: string): string {
+  const trimmed = raw.trim();
+  if (!trimmed) return '';
+
+  const lines = trimmed.split('\n');
+  let i = 0;
+
+  // Walk through leading header lines
+  while (i < lines.length) {
+    const line = lines[i];
+    if (HEADER_LINE_RE.test(line.trim())) {
+      // Recognised header line — skip it
+      i++;
+    } else if (line.trim() === '') {
+      // Blank separator between headers and body — skip it and stop
+      i++;
+      break;
+    } else {
+      // Real content reached — stop stripping immediately
+      break;
+    }
+  }
+
+  const body = lines.slice(i).join('\n').trim();
+
+  // Safety fallback: if we stripped too much, return the full original
+  if (body.length < MIN_BODY_LENGTH && trimmed.length > MIN_BODY_LENGTH) {
+    return trimmed;
+  }
+
+  return body || trimmed;
+}
+
+/** Renders a clean email card using task metadata + stripped body. */
+function EmailCard({ task }: { task: Task }) {
+  const body = getDisplayMessageBody(task.originalMessage);
+  const hasMeta = task.senderName || task.senderEmail || task.receivedAt;
+
+  return (
+    <div className="email-card">
+      {hasMeta && (
+        <div className="email-card-meta">
+          {task.senderName && (
+            <div className="email-card-meta-row">
+              <span className="email-card-meta-key">Od</span>
+              <span className="email-card-meta-val">{task.senderName}</span>
+            </div>
+          )}
+          {task.senderEmail && (
+            <div className="email-card-meta-row">
+              <span className="email-card-meta-key">Email</span>
+              <span className="email-card-meta-val">{task.senderEmail}</span>
+            </div>
+          )}
+          {task.receivedAt && (
+            <div className="email-card-meta-row">
+              <span className="email-card-meta-key">Prijato</span>
+              <span className="email-card-meta-val">{formatDate(task.receivedAt)}</span>
+            </div>
+          )}
+        </div>
+      )}
+      {body && <div className="email-card-body">{body}</div>}
+    </div>
+  );
+}
+
+/** Renders a single email thread block with structured header + body. */
+function EmailSegment({ raw, dimmed }: { raw: string; dimmed?: boolean }) {
+  const { headers, body } = parseEmailSegment(raw);
+  const hasHeaders = Object.keys(headers).length > 0;
+
+  return (
+    <div className={`email-segment${dimmed ? ' email-segment--dimmed' : ''}`}>
+      {hasHeaders && (
+        <div className="email-headers">
+          {EMAIL_HEADER_FIELDS.filter((f) => headers[f]).map((f) => (
+            <div key={f} className="email-header-row">
+              <span className="email-header-key">{f}</span>
+              <span className="email-header-val">{headers[f]}</span>
+            </div>
+          ))}
+        </div>
+      )}
+      {body && <div className="email-body">{body}</div>}
+    </div>
+  );
+}
 
 interface PlanningSectionProps {
   task: Task;
@@ -170,10 +318,20 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
   const [showEditForm, setShowEditForm] = useState(false);
   // Delete confirmation step
   const [confirmDelete, setConfirmDelete] = useState(false);
+  // Notes — local state, saved on blur
+  const [notes, setNotes] = useState(task.notes ?? '');
+  // Keep notes in sync when task changes (e.g. different task selected)
+  useEffect(() => { setNotes(task.notes ?? ''); }, [task.id, task.notes]);
 
   async function handleDelete() {
     await deleteTask(task.id);
     onClose();
+  }
+
+  async function handleNotesSave() {
+    if (notes !== (task.notes ?? '')) {
+      await updateTask(task.id, { notes });
+    }
   }
 
   // Auto-clear feedback / error messages after a delay
@@ -369,6 +527,14 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
           </div>
 
           <button
+            className="detail-panel-back"
+            onClick={onClose}
+            title="Back to list"
+          >
+            <Icon name="arrow-left" size={14} /> Back
+          </button>
+
+          <button
             className="detail-panel-edit"
             onClick={() => setShowEditForm(true)}
             title="Edit task"
@@ -401,8 +567,10 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
               <Icon name="trash-2" size={14} />
             </button>
           )}
-          <button className="detail-panel-close" onClick={onClose} title="Close">×</button>
         </div>
+
+        {/* ---- Two-column inner layout ---- */}
+        <div className="detail-panel-inner">
 
         {/* ---- Body ---- */}
         <div className="detail-panel-body">
@@ -523,10 +691,36 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
           <div className="detail-section">
             <span className="detail-section-label">Original Message</span>
             {task.originalMessage ? (
-              <div className="detail-message">{task.originalMessage}</div>
+              task.source === 'email' ? (
+                <EmailCard task={task} />
+              ) : (
+                <div className="detail-message">
+                  {task.originalMessage
+                    .split(/(?=\bFrom:\s)/g)
+                    .filter(Boolean)
+                    .map((segment, i) => (
+                      <div key={i}>
+                        {i > 0 && <div className="detail-message-thread-sep" />}
+                        <EmailSegment raw={segment} dimmed={i > 0} />
+                      </div>
+                    ))}
+                </div>
+              )
             ) : (
               <span className="detail-empty-inline">No message provided</span>
             )}
+          </div>
+
+          {/* Notes */}
+          <div className="detail-section">
+            <span className="detail-section-label">Notes</span>
+            <textarea
+              className="detail-notes-textarea"
+              value={notes}
+              placeholder="Write notes, context, or reminders…"
+              onChange={(e) => setNotes(e.target.value)}
+              onBlur={handleNotesSave}
+            />
           </div>
 
           {/* Azure DevOps context — shown for ADO-sourced tasks with parsed metadata */}
@@ -627,15 +821,22 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
             </div>
           )}
 
-          {/* AI Analysis result */}
+          {/* AI Analysis result — Czech */}
           {task.analysisResult && (
             <div className="detail-section">
-              <span className="detail-section-label detail-ai-label">AI Analysis</span>
+              <span className="detail-section-label detail-ai-label">AI analýza</span>
               <div className="detail-analysis-block">
                 <p className="detail-analysis-summary">{task.analysisResult.summary}</p>
+                {task.analysisResult.problemPoints && task.analysisResult.problemPoints.length > 0 && (
+                  <ul className="detail-analysis-points">
+                    {task.analysisResult.problemPoints.map((point, i) => (
+                      <li key={i}>{point}</li>
+                    ))}
+                  </ul>
+                )}
                 {task.analysisResult.nextStep && (
                   <div className="detail-analysis-next">
-                    <span className="detail-analysis-next-label">Next:</span>
+                    <span className="detail-analysis-next-label">Další krok:</span>
                     {task.analysisResult.nextStep}
                   </div>
                 )}
@@ -647,7 +848,7 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
           {(task.analysisResult?.suggestedActions ?? task.suggestedActions).length > 0 && (
             <div className="detail-section">
               <span className="detail-section-label">
-                {task.analysisResult ? 'AI Suggested Steps' : 'Suggested Steps'}
+                {task.analysisResult ? 'Navrhované kroky' : 'Suggested Steps'}
               </span>
               <div className="detail-suggestions">
                 {(task.analysisResult?.suggestedActions ?? task.suggestedActions).map((sa, i) => (
@@ -915,6 +1116,7 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
           )}
 
         </div>
+        </div>{/* end detail-panel-inner */}
       </aside>
 
       {/* Reply modal */}
