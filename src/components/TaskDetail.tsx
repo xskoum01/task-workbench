@@ -222,6 +222,67 @@ function EmailSegment({ raw, dimmed }: { raw: string; dimmed?: boolean }) {
   );
 }
 
+// ---------------------------------------------------------------------------
+// Bilingual analysis block
+// ---------------------------------------------------------------------------
+
+interface AnalysisLangBlockProps {
+  lang: 'CZ' | 'EN';
+  summary?: string;
+  problems?: string[];
+  actions?: string[];
+  nextStep?: string;
+  labelProblem: string;
+  labelAction: string;
+  labelNext: string;
+}
+
+function AnalysisLangBlock({
+  lang, summary, problems, actions, nextStep,
+  labelProblem, labelAction, labelNext,
+}: AnalysisLangBlockProps) {
+  const isCz       = lang === 'CZ';
+  const hasProblems = problems && problems.length > 0;
+  const hasActions  = actions  && actions.length  > 0;
+  if (!summary && !hasProblems && !hasActions && !nextStep) return null;
+
+  return (
+    <div className="analysis-lang-block">
+      <div className="analysis-lang-header">
+        <span className={`detail-analysis-lang-badge${isCz ? ' detail-analysis-lang-badge--cz' : ''}`}>
+          {lang}
+        </span>
+        {summary && <p className="detail-analysis-summary">{summary}</p>}
+      </div>
+
+      {hasProblems && (
+        <div className="analysis-subsection">
+          <span className="analysis-subsection-label">{labelProblem}</span>
+          <ul className="detail-analysis-points">
+            {problems!.map((p, i) => <li key={i}>{p}</li>)}
+          </ul>
+        </div>
+      )}
+
+      {hasActions && (
+        <div className="analysis-subsection">
+          <span className="analysis-subsection-label">{labelAction}</span>
+          <ul className="detail-analysis-points">
+            {actions!.map((a, i) => <li key={i}>{a}</li>)}
+          </ul>
+        </div>
+      )}
+
+      {nextStep && (
+        <div className="detail-analysis-next">
+          <span className="detail-analysis-next-label">{labelNext}:</span>
+          {nextStep}
+        </div>
+      )}
+    </div>
+  );
+}
+
 interface PlanningSectionProps {
   task: Task;
 }
@@ -841,31 +902,50 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
             </div>
           )}
 
-          {/* AI Analysis result — Czech */}
+          {/* AI Analysis result — bilingual CZ / EN */}
           {task.analysisResult && (
             <div className="detail-section">
-              <span className="detail-section-label detail-ai-label">AI analýza</span>
+              <span className="detail-section-label detail-ai-label">AI analýza / analysis</span>
               <div className="detail-analysis-block">
-                <p className="detail-analysis-summary">{task.analysisResult.summary}</p>
-                {task.analysisResult.problemPoints && task.analysisResult.problemPoints.length > 0 && (
-                  <ul className="detail-analysis-points">
-                    {task.analysisResult.problemPoints.map((point, i) => (
-                      <li key={i}>{point}</li>
-                    ))}
-                  </ul>
+
+                {/* Czech block — uses bilingual fields, falls back to legacy */}
+                <AnalysisLangBlock
+                  lang="CZ"
+                  summary={task.analysisResult.summaryCz ?? task.analysisResult.summary}
+                  problems={task.analysisResult.problemPointsCz ?? task.analysisResult.problemPoints}
+                  actions={task.analysisResult.actionPointsCz}
+                  nextStep={task.analysisResult.nextStepCz ?? task.analysisResult.nextStep}
+                  labelProblem="Problém"
+                  labelAction="Co udělat"
+                  labelNext="Další krok"
+                />
+
+                {/* English block — shown only when EN fields are present */}
+                {(task.analysisResult.summaryEn ||
+                  task.analysisResult.problemPointsEn ||
+                  task.analysisResult.actionPointsEn) && (
+                  <>
+                    <div className="detail-analysis-divider" />
+                    <AnalysisLangBlock
+                      lang="EN"
+                      summary={task.analysisResult.summaryEn}
+                      problems={task.analysisResult.problemPointsEn}
+                      actions={task.analysisResult.actionPointsEn}
+                      nextStep={task.analysisResult.nextStepEn}
+                      labelProblem="Problem"
+                      labelAction="What to do"
+                      labelNext="Next step"
+                    />
+                  </>
                 )}
-                {task.analysisResult.nextStep && (
-                  <div className="detail-analysis-next">
-                    <span className="detail-analysis-next-label">Další krok:</span>
-                    {task.analysisResult.nextStep}
-                  </div>
-                )}
+
               </div>
             </div>
           )}
 
-          {/* Suggested steps — AI steps take precedence when available */}
-          {(task.analysisResult?.suggestedActions ?? task.suggestedActions).length > 0 && (
+          {/* Suggested steps — hidden when new action bullets are present to avoid duplication */}
+          {!task.analysisResult?.actionPointsCz && !task.analysisResult?.actionPointsEn &&
+           (task.analysisResult?.suggestedActions ?? task.suggestedActions).length > 0 && (
             <div className="detail-section">
               <span className="detail-section-label">
                 {task.analysisResult ? 'Navrhované kroky' : 'Suggested Steps'}

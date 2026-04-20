@@ -326,26 +326,38 @@ async fn analyze_task(app: tauri::AppHandle, task: Value, customer: Value) -> Re
     let namespace     = customer["namespace"].as_str().unwrap_or("");
     let repo_name     = customer["repositoryName"].as_str().unwrap_or("");
 
-    let instructions = "Jsi asistent Dynamics 365 / Dataverse vyvojare. \
-Analyzujes pracovni pozadavky a vracis strukturovany JSON v cestine. \
-Odpovedej POUZE validnim JSON — zadny markdown, zadne code fences.";
+    let instructions = "You are a Dynamics 365 / Dataverse developer assistant. \
+Analyse work requests and return a bilingual (Czech + English) structured JSON analysis. \
+Respond with ONLY valid JSON — no markdown, no code fences.";
 
     let prompt = format!(
-        "Analyzuj tento pracovni pozadavek.\n\n\
-Task:\n- Nazev: {title}\n- Typ: {task_type}\n- Zdroj: {source}\n- Zprava: {message}\n\n\
-Zakaznik:\n- Nazev: {customer_name}\n- Namespace: {namespace}\n- Repozitar: {repo_name}\n\n\
-Odpovedej POUZE timto JSON (bez markdownu, bez code fences):\n\
-{{\"summary\":\"Kratke ceske shrnuteni (1-2 vety)\",\
-\"problemPoints\":[\"Co je problem.\",\"Kde se to projevuje.\",\"Co je potreba udelat.\"],\
-\"suggestedActions\":[{{\"id\":\"ai1\",\"label\":\"Konkretni krok cesky\"}}],\
+        "Analyse this work request and return a bilingual structured analysis.\n\n\
+Task:\n- Title: {title}\n- Type: {task_type}\n- Source: {source}\n- Message: {message}\n\n\
+Customer:\n- Name: {customer_name}\n- Namespace: {namespace}\n- Repository: {repo_name}\n\n\
+Return ONLY this JSON (no markdown, no fences):\n\
+{{\"summary\":\"1-2 sentence English summary (legacy field)\",\
+\"problemPoints\":[\"English problem bullet (legacy)\"],\
+\"suggestedActions\":[{{\"id\":\"ai1\",\"label\":\"Actionable English step\"}}],\
 \"confidence\":85,\
-\"nextStep\":\"Nejdulezitejsi nasledujici krok cesky\"}}\n\n\
-Pravidla:\n\
-- Pis cesky, strucne a srozumitelne. summary: 1-2 vety.\n\
-- problemPoints: 2-4 kratke body (co je problem, kde, co udelat).\n\
-- suggestedActions: 3-5 kroku cesky. confidence: 0-100.\n\
-- Technicke identifikatory (soubory, entity, fieldy) zachovej beze zmeny.\n\
-- Zadny marketingovy ton, zadne dlouhe odstavce."
+\"nextStep\":\"Most important next action in English (legacy)\",\
+\"summaryCz\":\"1-2 věty česky\",\
+\"summaryEn\":\"1-2 sentences in English\",\
+\"problemPointsCz\":[\"Český bod o problému.\",\"Kde se projevuje.\"],\
+\"problemPointsEn\":[\"English bullet about the problem.\",\"Where it occurs.\"],\
+\"actionPointsCz\":[\"Akční krok česky.\",\"Další krok česky.\"],\
+\"actionPointsEn\":[\"Action step in English.\",\"Next concrete step.\"],\
+\"nextStepCz\":\"Jeden jasný další krok česky.\",\
+\"nextStepEn\":\"One clear next step in English.\"}}\n\n\
+Rules:\n\
+- summaryCz / summaryEn: 1-2 sentences, capture the core problem\n\
+- problemPointsCz / problemPointsEn: 2-4 short bullets — what is wrong, where, who is affected\n\
+- actionPointsCz / actionPointsEn: 2-4 short bullets — concrete steps to resolve\n\
+- nextStepCz / nextStepEn: single most important immediate action\n\
+- suggestedActions: 3-5 English steps (kept for legacy compat)\n\
+- confidence: 0-100 reflecting how clear and actionable the request is\n\
+- Preserve technical identifiers exactly: file names, entity names, field names\n\
+- Czech: natural, practical, not corporate, no long sentences\n\
+- English: clear, actionable, concise"
     );
 
     let text = call_openai(&api_key, &model, instructions, &prompt).await?;

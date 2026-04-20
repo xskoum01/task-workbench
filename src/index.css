@@ -3151,6 +3151,34 @@ body {
   flex-shrink: 0;
 }
 
+/* --- Bilingual analysis language block ------------------- */
+.analysis-lang-block {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.analysis-lang-header {
+  display: flex;
+  gap: 8px;
+  align-items: flex-start;
+}
+
+.analysis-subsection {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  padding-left: 4px;
+}
+
+.analysis-subsection-label {
+  font-size: 10px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--text-muted);
+}
+
 /* --- Skeleton preview modal ------------------------------ */
 .skeleton-path-row {
   display: flex;

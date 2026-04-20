@@ -24,11 +24,22 @@ export interface SuggestedAction {
 export type WorkItemSource = 'none' | 'helpdesk' | 'azure_devops' | 'other';
 
 export interface TaskAnalysis {
+  // Legacy fields — always populated for backward compat with stored tasks
   summary: string;
   problemPoints?: string[];
   suggestedActions: SuggestedAction[];
   confidence: number;
   nextStep?: string;
+
+  // Bilingual structured fields — populated by the current prompt, absent on old tasks
+  summaryCz?: string;
+  summaryEn?: string;
+  problemPointsCz?: string[];
+  problemPointsEn?: string[];
+  actionPointsCz?: string[];
+  actionPointsEn?: string[];
+  nextStepCz?: string;
+  nextStepEn?: string;
 }
 
 export interface SkeletonPreview {
