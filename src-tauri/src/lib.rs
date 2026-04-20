@@ -313,6 +313,36 @@ fn strip_fences(text: &str) -> &str {
 
 // --- AI commands -----------------------------------------------------------
 
+/// Ensures the JSON returned by the AI has the minimum required shape.
+/// Fixes null / missing scalar fields; does NOT copy legacy English into bilingual fields.
+fn normalize_task_analysis(mut v: Value) -> Value {
+    // Legacy scalar fields that must always be present
+    if !v["confidence"].is_number() {
+        v["confidence"] = serde_json::json!(50);
+    }
+    if !v["summary"].is_string() {
+        v["summary"] = serde_json::json!("");
+    }
+    // suggestedActions must be an array
+    if !v["suggestedActions"].is_array() {
+        v["suggestedActions"] = serde_json::json!([]);
+    }
+    // Fix null bilingual array fields — only touch keys that already exist in the response
+    let array_fields = [
+        "problemPoints",
+        "problemPointsCz", "problemPointsEn",
+        "actionPointsCz",  "actionPointsEn",
+    ];
+    for key in &array_fields {
+        if v.get(*key).is_some() && !v[key].is_array() {
+            v[key] = serde_json::json!([]);
+        }
+    }
+    // Do NOT synthesise missing bilingual fields from legacy English values —
+    // the frontend uses absence to detect "legacy-only" mode.
+    v
+}
+
 /// Analyses a task using OpenAI and returns a TaskAnalysis JSON object.
 #[tauri::command]
 async fn analyze_task(app: tauri::AppHandle, task: Value, customer: Value) -> Result<Value, String> {
@@ -327,45 +357,52 @@ async fn analyze_task(app: tauri::AppHandle, task: Value, customer: Value) -> Re
     let repo_name     = customer["repositoryName"].as_str().unwrap_or("");
 
     let instructions = "You are a Dynamics 365 / Dataverse developer assistant. \
-Analyse work requests and return a bilingual (Czech + English) structured JSON analysis. \
-Respond with ONLY valid JSON — no markdown, no code fences.";
+Return ONLY valid JSON — no markdown, no prose, no code fences. \
+All bilingual fields (summaryCz, summaryEn, problemPointsCz, problemPointsEn, \
+actionPointsCz, actionPointsEn, nextStepCz, nextStepEn) are MANDATORY. \
+Czech fields must be real Czech. English fields must be real English.";
 
     let prompt = format!(
-        "Analyse this work request and return a bilingual structured analysis.\n\n\
+        "Analyse this work request. Return ALL fields — bilingual fields are required.\n\n\
 Task:\n- Title: {title}\n- Type: {task_type}\n- Source: {source}\n- Message: {message}\n\n\
 Customer:\n- Name: {customer_name}\n- Namespace: {namespace}\n- Repository: {repo_name}\n\n\
-Return ONLY this JSON (no markdown, no fences):\n\
-{{\"summary\":\"1-2 sentence English summary (legacy field)\",\
-\"problemPoints\":[\"English problem bullet (legacy)\"],\
-\"suggestedActions\":[{{\"id\":\"ai1\",\"label\":\"Actionable English step\"}}],\
+Return ONLY this exact JSON shape (fill every field with real content):\n\
+{{\
+\"summary\":\"1-2 sentence English summary\",\
+\"problemPoints\":[\"English problem bullet\"],\
+\"suggestedActions\":[{{\"id\":\"ai1\",\"label\":\"Concrete English action step\"}}],\
 \"confidence\":85,\
-\"nextStep\":\"Most important next action in English (legacy)\",\
-\"summaryCz\":\"1-2 věty česky\",\
-\"summaryEn\":\"1-2 sentences in English\",\
-\"problemPointsCz\":[\"Český bod o problému.\",\"Kde se projevuje.\"],\
-\"problemPointsEn\":[\"English bullet about the problem.\",\"Where it occurs.\"],\
-\"actionPointsCz\":[\"Akční krok česky.\",\"Další krok česky.\"],\
-\"actionPointsEn\":[\"Action step in English.\",\"Next concrete step.\"],\
-\"nextStepCz\":\"Jeden jasný další krok česky.\",\
-\"nextStepEn\":\"One clear next step in English.\"}}\n\n\
-Rules:\n\
-- summaryCz / summaryEn: 1-2 sentences, capture the core problem\n\
-- problemPointsCz / problemPointsEn: 2-4 short bullets — what is wrong, where, who is affected\n\
-- actionPointsCz / actionPointsEn: 2-4 short bullets — concrete steps to resolve\n\
-- nextStepCz / nextStepEn: single most important immediate action\n\
-- suggestedActions: 3-5 English steps (kept for legacy compat)\n\
-- confidence: 0-100 reflecting how clear and actionable the request is\n\
-- Preserve technical identifiers exactly: file names, entity names, field names\n\
-- Czech: natural, practical, not corporate, no long sentences\n\
-- English: clear, actionable, concise"
+\"nextStep\":\"Most important next action in English\",\
+\"summaryCz\":\"1-2 věty česky popisující problém\",\
+\"summaryEn\":\"1-2 sentences in English describing the problem\",\
+\"problemPointsCz\":[\"Krátký český bod o problému.\",\"Kde se projevuje nebo kdo je ovlivněn.\"],\
+\"problemPointsEn\":[\"Short English bullet about the problem.\",\"Where it occurs or who is affected.\"],\
+\"actionPointsCz\":[\"Konkrétní akční krok česky.\",\"Druhý krok česky.\"],\
+\"actionPointsEn\":[\"Concrete action step in English.\",\"Second step in English.\"],\
+\"nextStepCz\":\"Jeden jasný bezprostřední krok česky.\",\
+\"nextStepEn\":\"One clear immediate next step in English.\"\
+}}\n\n\
+Rules — follow strictly:\n\
+- ALL 13 fields above are mandatory. Do not omit any.\n\
+- summaryCz and all *Cz fields: must be natural Czech — not translated literally, not English.\n\
+- summaryEn and all *En fields: must be natural English — not Czech.\n\
+- problemPointsCz / problemPointsEn: 2-4 bullets — what is wrong, where, who is affected.\n\
+- actionPointsCz / actionPointsEn: 2-4 bullets — concrete steps to fix the issue.\n\
+- nextStepCz / nextStepEn: the single most important immediate action.\n\
+- suggestedActions: 3-5 English steps (legacy field, keep it).\n\
+- confidence: integer 0-100 reflecting how clear and actionable the request is.\n\
+- Preserve technical identifiers exactly as given: file names, entity names, field names, script names.\n\
+- No long sentences. No corporate language. No markdown inside string values."
     );
 
     let text = call_openai(&api_key, &model, instructions, &prompt).await?;
 
-    serde_json::from_str(strip_fences(&text)).map_err(|e| {
+    let parsed: Value = serde_json::from_str(strip_fences(&text)).map_err(|e| {
         let snippet = &text[..text.len().min(300)];
         format!("Failed to parse AI response: {e}. Response: {snippet}")
-    })
+    })?;
+
+    Ok(normalize_task_analysis(parsed))
 }
 
 /// Generates a professional reply draft. Returns plain text.
@@ -1456,7 +1493,9 @@ async fn get_outlook_messages(
             let subject_str  = m["subject"].as_str().unwrap_or("");
             let preview_str  = m["bodyPreview"].as_str().unwrap_or("");
             let body_html    = m["body"]["content"].as_str().unwrap_or("");
-            let mut body_full = strip_html(body_html);
+            // strip_html_email preserves block-level line breaks so the frontend
+            // thread splitter can detect quoted-reply boundaries.
+            let mut body_full = strip_html_email(body_html);
             if is_potential_ado_email(from_email, subject_str, preview_str) {
                 let ado_pairs = extract_ado_link_pairs(body_html);
                 if !ado_pairs.is_empty() {
@@ -1830,6 +1869,100 @@ fn extract_ado_link_pairs(html: &str) -> Vec<(String, String)> {
         search_pos = tag_end;
     }
     pairs
+}
+
+/// Returns true for HTML tags that represent block-level breaks.
+/// `tag` must be the raw tag name+attributes, lowercased (without < >).
+fn is_block_tag(tag: &str) -> bool {
+    // Extract just the tag name (first word, strip leading slash for closing tags)
+    let name = tag.trim_start_matches('/').split_ascii_whitespace().next().unwrap_or("");
+    matches!(
+        name,
+        "p" | "div" | "br" | "hr" | "tr" | "td" | "th" | "li" | "dt" | "dd"
+            | "h1" | "h2" | "h3" | "h4" | "h5" | "h6"
+            | "blockquote" | "pre" | "article" | "section"
+            | "table" | "thead" | "tbody" | "tfoot"
+    )
+}
+
+/// Email-aware HTML stripper: preserves paragraph / line-break structure.
+/// Block-level tags (p, div, br, tr, …) become newlines so that email thread
+/// boundaries remain detectable for the frontend thread splitter.
+/// Use this for Outlook full-body content; use `strip_html` for short previews.
+fn strip_html_email(html: &str) -> String {
+    let mut out = String::with_capacity(html.len());
+    let mut in_tag = false;
+    let mut tag_buf = String::new();
+
+    for ch in html.chars() {
+        match ch {
+            '<' => {
+                in_tag = true;
+                tag_buf.clear();
+            }
+            '>' => {
+                if in_tag {
+                    let tag_lower = tag_buf.to_ascii_lowercase();
+                    if is_block_tag(tag_lower.trim()) {
+                        out.push('\n');
+                    } else {
+                        out.push(' ');
+                    }
+                    tag_buf.clear();
+                } else {
+                    // Stray > in content — pass through
+                    out.push(ch);
+                }
+                in_tag = false;
+            }
+            c if in_tag => tag_buf.push(c),
+            c => out.push(c),
+        }
+    }
+
+    // Decode common HTML entities
+    let decoded = out
+        .replace("&nbsp;",  " ")
+        .replace("&amp;",   "&")
+        .replace("&lt;",    "<")
+        .replace("&gt;",    ">")
+        .replace("&quot;",  "\"")
+        .replace("&apos;",  "'")
+        .replace("&#39;",   "'")
+        .replace("&mdash;", "\u{2014}")
+        .replace("&ndash;", "\u{2013}")
+        .replace("&ldquo;", "\u{201c}")
+        .replace("&rdquo;", "\u{201d}")
+        .replace("&lsquo;", "\u{2018}")
+        .replace("&rsquo;", "\u{2019}")
+        .replace("&hellip;","\u{2026}")
+        .replace("&bull;",  "\u{2022}")
+        .replace("&#8211;", "\u{2013}")
+        .replace("&#8212;", "\u{2014}")
+        .replace("&#8216;", "\u{2018}")
+        .replace("&#8217;", "\u{2019}")
+        .replace("&#8220;", "\u{201c}")
+        .replace("&#8221;", "\u{201d}")
+        .replace("&#8230;", "\u{2026}");
+
+    // Normalise: trim each line, collapse runs of 3+ blank lines to 2
+    let mut result = String::new();
+    let mut blank_run = 0usize;
+    for line in decoded.lines() {
+        let t = line.trim_end();
+        if t.is_empty() {
+            blank_run += 1;
+            if blank_run <= 2 {
+                result.push('\n');
+            }
+        } else {
+            blank_run = 0;
+            result.push_str(t);
+            result.push('\n');
+        }
+    }
+
+    result.trim().to_string()
 }
 
 /// HTML tag stripper with basic entity decoding for Teams / Outlook message bodies.

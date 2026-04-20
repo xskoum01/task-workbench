@@ -54,71 +54,218 @@ function formatEffort(hours: number): string {
 // Email message rendering helpers
 // ---------------------------------------------------------------------------
 
-/** Known email header field names we extract and display distinctly. */
-const EMAIL_HEADER_FIELDS = ['From', 'To', 'Cc', 'Bcc', 'Date', 'Sent', 'Subject'] as const;
+const EMAIL_HEADER_FIELDS = ['From', 'Sent', 'Date', 'To', 'Cc', 'Bcc', 'Subject'] as const;
 type EmailHeaderField = typeof EMAIL_HEADER_FIELDS[number];
 
-interface ParsedEmailSegment {
+// Gmail safety trust banner — appears inline when HTML is stripped.
+const GMAIL_TRUST_BANNER_RE = /You don['']t often get email from\s+\S+\.?\s*Learn why this is important\.?\s*/gi;
+
+// A header line at the start of a line — requires colon so "From what I know" is safe.
+const HEADER_LINE_RE = /^(?:From|To|Cc|Bcc|Date|Sent|Subject):\s*.+/i;
+
+const MIN_BODY_LENGTH = 20;
+
+// ---------------------------------------------------------------------------
+// Single-segment parser (line-by-line — accurate for multiline, regex for single-line)
+// ---------------------------------------------------------------------------
+
+interface ParsedSegment {
   headers: Partial<Record<EmailHeaderField, string>>;
   body: string;
 }
 
 /**
- * Parses one email block into structured header fields + plain body text.
- * Handles two common layouts:
- *   1. "From: X\nTo: Y\nSubject: Z\n\nbody"   (newline-separated headers)
- *   2. "From: X Date: ... To: ... Subject: ... body"  (all on one line, no separating newlines)
+ * Parses a quoted email segment using a line-by-line approach.
+ * Stops reading headers as soon as it hits a blank line or a non-header line.
+ * This is accurate and never consumes body text as a header value.
  */
-function parseEmailSegment(raw: string): ParsedEmailSegment {
+function parseSegmentLines(raw: string): ParsedSegment {
   const headers: Partial<Record<EmailHeaderField, string>> = {};
-  let remaining = raw.trim();
+  const lines = raw.split('\n');
+  let i = 0;
 
-  // Build a combined header-field pattern: "(?:From|To|Cc|...):\s*"
+  while (i < lines.length) {
+    const line = lines[i].trim();
+    if (line === '') { i++; break; }
+    const m = line.match(/^(From|Sent|Date|To|Cc|Bcc|Subject):\s*(.+)/i);
+    if (m) {
+      headers[m[1] as EmailHeaderField] = m[2].trim();
+      i++;
+    } else {
+      break;
+    }
+  }
+
+  return { headers, body: lines.slice(i).join('\n').trim() };
+}
+
+/**
+ * In single-line email parsing the last header value absorbs body text because
+ * there is no structural line separator. This function splits them apart.
+ *
+ * Heuristics (applied in order):
+ *   1. Subject / generic: first sentence-end (.!?) followed by whitespace + any word
+ *      that is NOT another "Word:" header pattern → body starts there.
+ *      Covers: "Subject: RE: portal komentar 7. aha ok" → Subject="RE: portal komentar 7."
+ *   2. From field: leading CamelCase name words, then first lowercase word = body.
+ *      Covers: "From: Jaroslav Barták ok, super" → From="Jaroslav Barták", body="ok, super"
+ *
+ * Applied ALWAYS to the last parsed header (not only when trailing body is empty).
+ * When uncertain, leaves value intact and returns empty body — never wrongly trims.
+ */
+function splitLastHeaderFromBody(
+  field: EmailHeaderField,
+  value: string,
+): { headerVal: string; body: string } {
+  // Heuristic 1: sentence-end followed by whitespace + text that does NOT look
+  // like a new "Word: " header continuation (e.g. "RE: foo"). This is safe for
+  // Subject lines like "RE: portal komentar 7. aha ok to ma nenapadlo".
+  // We require the post-sentence text to NOT match "^\s*[A-Za-z]+:\s" (header start).
+  const sentenceMatch = value.match(/^(.*?[.!?])\s+(?![A-Za-z]+:\s)(.+)$/s);
+  if (sentenceMatch) {
+    return { headerVal: sentenceMatch[1].trim(), body: sentenceMatch[2].trim() };
+  }
+  // Heuristic 2 (From field): capitalised name words, then first lowercase word = body.
+  if (field === 'From') {
+    const nameBodyMatch = value.match(/^((?:[A-Z]\S*(?:\s+|$))+)([a-z].*)$/);
+    if (nameBodyMatch) {
+      return { headerVal: nameBodyMatch[1].trim(), body: nameBodyMatch[2].trim() };
+    }
+  }
+  return { headerVal: value, body: '' };
+}
+
+/**
+ * Parses a quoted segment that may be on a single line (old stored data).
+ * Uses a greedy lookahead regex — only call this when there are no newlines.
+ */
+function parseSegmentInline(raw: string): ParsedSegment {
+  const headers: Partial<Record<EmailHeaderField, string>> = {};
   const fieldPattern = EMAIL_HEADER_FIELDS.join('|');
-  // Greedy extraction: for each known field, capture value up to the NEXT known field or end
   const fullPattern = new RegExp(
     `(${fieldPattern}):\\s*((?:(?!(?:${fieldPattern}):)[\\s\\S])*?)(?=(?:${fieldPattern}):|$)`,
     'gi',
   );
-
-  const matches = [...remaining.matchAll(fullPattern)];
-  if (matches.length === 0) {
-    return { headers, body: remaining };
-  }
+  const matches = [...raw.matchAll(fullPattern)];
+  if (matches.length === 0) return { headers, body: raw.trim() };
 
   for (const m of matches) {
-    const key = m[1] as EmailHeaderField;
     const val = m[2].replace(/\s+/g, ' ').trim();
-    if (val) headers[key] = val;
+    if (val) headers[m[1] as EmailHeaderField] = val;
   }
+  const last = matches[matches.length - 1];
+  let body = raw.slice((last.index ?? 0) + last[0].length).trim();
 
-  // Body = everything after the last matched header region
-  const lastMatch = matches[matches.length - 1];
-  const lastEnd = (lastMatch.index ?? 0) + lastMatch[0].length;
-  const body = remaining.slice(lastEnd).trim();
+  // Always attempt to split body out of the last header value.
+  // The last field's regex group greedily absorbs body text when there is no
+  // following header to stop it — so we must split regardless of whether there
+  // is trailing text after the match.
+  const lastKey = last[1] as EmailHeaderField;
+  const lastVal = headers[lastKey] ?? '';
+  const split = splitLastHeaderFromBody(lastKey, lastVal);
+  if (split.body) {
+    headers[lastKey] = split.headerVal;
+    // Prepend any newly found body to whatever (if anything) followed the matches.
+    body = body ? `${split.body} ${body}` : split.body;
+  }
 
   return { headers, body };
 }
 
-// Gmail adds a trust banner in plain-text extracts: "You don't often get email from <addr>. Learn why this is important"
-// Both ASCII apostrophe (') and Unicode curly apostrophe (') are handled.
-const GMAIL_TRUST_BANNER_RE = /You don['']t often get email from\s+\S+\.?\s*Learn why this is important\.?\s*/gi;
+function parseSegment(raw: string): ParsedSegment {
+  return raw.includes('\n') ? parseSegmentLines(raw) : parseSegmentInline(raw);
+}
 
-// Email header line anchored to start of a line (requires colon — never matches "From what I know").
-const HEADER_LINE_RE = /^(?:From|To|Cc|Bcc|Date|Sent|Subject):\s*.+/i;
-
-// Minimum chars a cleaned body must have to be considered valid.
-const MIN_BODY_LENGTH = 20;
+// ---------------------------------------------------------------------------
+// Thread splitter
+// ---------------------------------------------------------------------------
 
 /**
- * Produces a clean body string for display.
- *
- * Stripping order:
- *   1. Gmail trust banner — removed globally (appears inline in HTML-stripped text)
- *   2. Leading "From: <senderName>" prefix — removed when sender is known (single-line format)
- *   3. Leading header-line block — removed for multiline messages
- *
- * Falls back to the original message if the result is too short.
+ * Returns true when `line` looks like the start of a quoted-reply header block
+ * (i.e. "From: <something>") AND at least one companion field appears within
+ * the next 4 lines. This avoids splitting on "From:" inside normal sentences.
+ */
+function isReplyHeaderStart(line: string, lines: string[], idx: number): boolean {
+  if (!/^From:\s+.+/i.test(line)) return false;
+  const COMPANION = /^(?:Sent|Date|To|Cc|Subject):\s+/i;
+  for (let j = idx + 1; j < Math.min(idx + 5, lines.length); j++) {
+    const t = lines[j].trim();
+    if (COMPANION.test(t)) return true;
+    if (t === '' && j > idx + 1) break; // blank line gap without companion — stop
+  }
+  return false;
+}
+
+/**
+ * Splits a multiline email body into thread segments.
+ * [0] is the newest message body; subsequent entries are older quoted replies.
+ */
+function splitMultilineThread(text: string): string[] {
+  const lines = text.split('\n');
+  const segments: string[] = [];
+  let current: string[] = [];
+
+  for (let i = 0; i < lines.length; i++) {
+    if (isReplyHeaderStart(lines[i].trim(), lines, i)) {
+      const seg = current.join('\n').trim();
+      if (seg) segments.push(seg);
+      current = [lines[i]];
+    } else {
+      current.push(lines[i]);
+    }
+  }
+  const last = current.join('\n').trim();
+  if (last) segments.push(last);
+
+  return segments.length > 0 ? segments : [text];
+}
+
+/**
+ * Splits a single-line (legacy stored) email body into thread segments.
+ * Only splits on "From: " that has a companion header field within 200 chars.
+ */
+function splitInlineThread(text: string): string[] {
+  const FROM_RE = /\bFrom:\s+/gi;
+  const COMPANION = /(?:Date|Sent|To|Cc|Subject):/i;
+  const splitPoints: number[] = [];
+  let m: RegExpExecArray | null;
+
+  while ((m = FROM_RE.exec(text)) !== null) {
+    const window = text.slice(m.index + m[0].length, m.index + m[0].length + 200);
+    if (COMPANION.test(window)) splitPoints.push(m.index);
+  }
+
+  if (splitPoints.length === 0) return [text];
+
+  const segments: string[] = [];
+  let last = 0;
+  for (const pos of splitPoints) {
+    if (pos > last) segments.push(text.slice(last, pos).trim());
+    last = pos;
+  }
+  segments.push(text.slice(last).trim());
+  return segments.filter(Boolean);
+}
+
+/** Splits an email body into thread segments; handles both multiline and flat formats. */
+function splitEmailThread(raw: string): string[] {
+  const trimmed = raw.trim();
+  if (!trimmed) return [''];
+  return trimmed.includes('\n')
+    ? splitMultilineThread(trimmed)
+    : splitInlineThread(trimmed);
+}
+
+// ---------------------------------------------------------------------------
+// Body cleaning for the newest message
+// ---------------------------------------------------------------------------
+
+/**
+ * Cleans the newest message segment for display:
+ *   1. Strips Gmail trust banner
+ *   2. Strips leading "From: <sender>" prefix when sender is known
+ *   3. Strips leading header-line block (multiline format)
+ * Falls back to original if stripping removes too much.
  */
 function getDisplayMessageBody(raw: string, senderName?: string, senderEmail?: string): string {
   const trimmed = raw.trim();
@@ -126,31 +273,25 @@ function getDisplayMessageBody(raw: string, senderName?: string, senderEmail?: s
 
   let result = trimmed;
 
-  // Step 1: strip Gmail trust banner wherever it appears in the string
+  // Step 1: strip Gmail trust banner wherever it appears
   result = result.replace(GMAIL_TRUST_BANNER_RE, ' ').replace(/[ \t]{2,}/g, ' ').trim();
 
-  // Step 2: strip leading "From: <sender>" prefix (single-line / inline format)
-  // Use the known display name or email to strip exactly the right amount of text.
+  // Step 2: strip leading "From: <sender>" prefix (single-line format)
   const knownSender = senderName ?? senderEmail;
   if (knownSender) {
     const escaped = knownSender.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
     result = result.replace(new RegExp(`^From:\\s+${escaped}\\s*`, 'i'), '').trim();
   }
 
-  // Step 3: strip remaining leading header lines for multiline messages
+  // Step 3: strip leading header-line block (multiline format)
   if (result.includes('\n')) {
     const lines = result.split('\n');
     let i = 0;
     while (i < lines.length) {
       const line = lines[i].trim();
-      if (HEADER_LINE_RE.test(line)) {
-        i++;
-      } else if (line === '') {
-        i++;
-        break;
-      } else {
-        break;
-      }
+      if (HEADER_LINE_RE.test(line)) { i++; }
+      else if (line === '') { i++; break; }
+      else break;
     }
     if (i > 0) {
       const stripped = lines.slice(i).join('\n').trim();
@@ -158,17 +299,41 @@ function getDisplayMessageBody(raw: string, senderName?: string, senderEmail?: s
     }
   }
 
-  // Fallback: if stripping removed too much, return original
-  if (result.length < MIN_BODY_LENGTH && trimmed.length > MIN_BODY_LENGTH) {
-    return trimmed;
-  }
-
+  if (result.length < MIN_BODY_LENGTH && trimmed.length > MIN_BODY_LENGTH) return trimmed;
   return result || trimmed;
 }
 
-/** Renders a clean email card using task metadata + stripped body. */
+// ---------------------------------------------------------------------------
+// Rendering components
+// ---------------------------------------------------------------------------
+
+/** One dimmed quoted-reply block with its own parsed header. */
+function QuotedSegment({ raw }: { raw: string }) {
+  const { headers, body } = parseSegment(raw);
+  const hasHeaders = Object.keys(headers).length > 0;
+
+  return (
+    <div className="email-segment email-segment--dimmed">
+      {hasHeaders && (
+        <div className="email-headers">
+          {EMAIL_HEADER_FIELDS.filter((f) => headers[f]).map((f) => (
+            <div key={f} className="email-header-row">
+              <span className="email-header-key">{f}</span>
+              <span className="email-header-val">{headers[f]}</span>
+            </div>
+          ))}
+        </div>
+      )}
+      {body && <div className="email-body">{body}</div>}
+    </div>
+  );
+}
+
+/** Email card: top metadata + newest body + dimmed quoted replies. */
 function EmailCard({ task }: { task: Task }) {
-  const body = getDisplayMessageBody(task.originalMessage, task.senderName, task.senderEmail);
+  const segments = splitEmailThread(task.originalMessage);
+  const newestBody = getDisplayMessageBody(segments[0], task.senderName, task.senderEmail);
+  const quotedSegments = segments.slice(1);
   const hasMeta = task.senderName || task.senderEmail || task.receivedAt;
 
   return (
@@ -189,35 +354,25 @@ function EmailCard({ task }: { task: Task }) {
           )}
           {task.receivedAt && (
             <div className="email-card-meta-row">
-              <span className="email-card-meta-key">Prijato</span>
+              <span className="email-card-meta-key">Přijato</span>
               <span className="email-card-meta-val">{formatDate(task.receivedAt)}</span>
             </div>
           )}
         </div>
       )}
-      {body && <div className="email-card-body">{body}</div>}
-    </div>
-  );
-}
 
-/** Renders a single email thread block with structured header + body. */
-function EmailSegment({ raw, dimmed }: { raw: string; dimmed?: boolean }) {
-  const { headers, body } = parseEmailSegment(raw);
-  const hasHeaders = Object.keys(headers).length > 0;
+      {newestBody && <div className="email-card-body">{newestBody}</div>}
 
-  return (
-    <div className={`email-segment${dimmed ? ' email-segment--dimmed' : ''}`}>
-      {hasHeaders && (
-        <div className="email-headers">
-          {EMAIL_HEADER_FIELDS.filter((f) => headers[f]).map((f) => (
-            <div key={f} className="email-header-row">
-              <span className="email-header-key">{f}</span>
-              <span className="email-header-val">{headers[f]}</span>
+      {quotedSegments.length > 0 && (
+        <div className="email-thread-older">
+          {quotedSegments.map((seg, i) => (
+            <div key={i}>
+              <div className="email-thread-sep" />
+              <QuotedSegment raw={seg} />
             </div>
           ))}
         </div>
       )}
-      {body && <div className="email-body">{body}</div>}
     </div>
   );
 }
@@ -279,6 +434,96 @@ function AnalysisLangBlock({
           {nextStep}
         </div>
       )}
+    </div>
+  );
+}
+
+/** Detects whether a TaskAnalysis has real Czech bilingual data (not just legacy English). */
+function hasCzBilingualData(ar: NonNullable<Task['analysisResult']>): boolean {
+  return !!(
+    ar.summaryCz ||
+    (ar.problemPointsCz && ar.problemPointsCz.length > 0) ||
+    (ar.actionPointsCz  && ar.actionPointsCz.length  > 0) ||
+    ar.nextStepCz
+  );
+}
+
+/** Detects whether a TaskAnalysis has real English bilingual data. */
+function hasEnBilingualData(ar: NonNullable<Task['analysisResult']>): boolean {
+  return !!(
+    ar.summaryEn ||
+    (ar.problemPointsEn && ar.problemPointsEn.length > 0) ||
+    (ar.actionPointsEn  && ar.actionPointsEn.length  > 0) ||
+    ar.nextStepEn
+  );
+}
+
+/**
+ * Renders the AI analysis block in one of three modes:
+ *   - Bilingual: CZ block + EN block (when fresh analysis is present)
+ *   - Partial:   only the language block that has data
+ *   - Legacy:    one English-only block + re-run hint (old stored tasks)
+ */
+function AnalysisBlock({ result }: { result: NonNullable<Task['analysisResult']> }) {
+  const hasCz = hasCzBilingualData(result);
+  const hasEn = hasEnBilingualData(result);
+  const hasBilingual = hasCz || hasEn;
+
+  if (hasBilingual) {
+    return (
+      <div className="detail-analysis-block">
+        {hasCz && (
+          <AnalysisLangBlock
+            lang="CZ"
+            summary={result.summaryCz}
+            problems={result.problemPointsCz}
+            actions={result.actionPointsCz}
+            nextStep={result.nextStepCz}
+            labelProblem="Problém"
+            labelAction="Co udělat"
+            labelNext="Další krok"
+          />
+        )}
+        {hasCz && hasEn && <div className="detail-analysis-divider" />}
+        {hasEn && (
+          <AnalysisLangBlock
+            lang="EN"
+            summary={result.summaryEn}
+            problems={result.problemPointsEn}
+            actions={result.actionPointsEn}
+            nextStep={result.nextStepEn}
+            labelProblem="Problem"
+            labelAction="What to do"
+            labelNext="Next step"
+          />
+        )}
+      </div>
+    );
+  }
+
+  // Legacy mode — old task with English-only analysis
+  return (
+    <div className="detail-analysis-block">
+      <div className="analysis-legacy-block">
+        {result.summary && <p className="detail-analysis-summary">{result.summary}</p>}
+        {result.problemPoints && result.problemPoints.length > 0 && (
+          <div className="analysis-subsection">
+            <span className="analysis-subsection-label">Problem</span>
+            <ul className="detail-analysis-points">
+              {result.problemPoints.map((p, i) => <li key={i}>{p}</li>)}
+            </ul>
+          </div>
+        )}
+        {result.nextStep && (
+          <div className="detail-analysis-next">
+            <span className="detail-analysis-next-label">Next step:</span>
+            {result.nextStep}
+          </div>
+        )}
+      </div>
+      <p className="analysis-rerun-hint">
+        Click Analyze to generate a new analysis.
+      </p>
     </div>
   );
 }
@@ -776,15 +1021,9 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
                 <EmailCard task={task} />
               ) : (
                 <div className="detail-message">
-                  {task.originalMessage
-                    .split(/(?=\bFrom:\s)/g)
-                    .filter(Boolean)
-                    .map((segment, i) => (
-                      <div key={i}>
-                        {i > 0 && <div className="detail-message-thread-sep" />}
-                        <EmailSegment raw={segment} dimmed={i > 0} />
-                      </div>
-                    ))}
+                  <div className="email-body" style={{ padding: 'var(--gap-md) var(--gap-lg)' }}>
+                    {task.originalMessage}
+                  </div>
                 </div>
               )
             ) : (
@@ -902,49 +1141,16 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
             </div>
           )}
 
-          {/* AI Analysis result — bilingual CZ / EN */}
+          {/* AI Analysis result */}
           {task.analysisResult && (
             <div className="detail-section">
               <span className="detail-section-label detail-ai-label">AI analýza / analysis</span>
-              <div className="detail-analysis-block">
-
-                {/* Czech block — uses bilingual fields, falls back to legacy */}
-                <AnalysisLangBlock
-                  lang="CZ"
-                  summary={task.analysisResult.summaryCz ?? task.analysisResult.summary}
-                  problems={task.analysisResult.problemPointsCz ?? task.analysisResult.problemPoints}
-                  actions={task.analysisResult.actionPointsCz}
-                  nextStep={task.analysisResult.nextStepCz ?? task.analysisResult.nextStep}
-                  labelProblem="Problém"
-                  labelAction="Co udělat"
-                  labelNext="Další krok"
-                />
-
-                {/* English block — shown only when EN fields are present */}
-                {(task.analysisResult.summaryEn ||
-                  task.analysisResult.problemPointsEn ||
-                  task.analysisResult.actionPointsEn) && (
-                  <>
-                    <div className="detail-analysis-divider" />
-                    <AnalysisLangBlock
-                      lang="EN"
-                      summary={task.analysisResult.summaryEn}
-                      problems={task.analysisResult.problemPointsEn}
-                      actions={task.analysisResult.actionPointsEn}
-                      nextStep={task.analysisResult.nextStepEn}
-                      labelProblem="Problem"
-                      labelAction="What to do"
-                      labelNext="Next step"
-                    />
-                  </>
-                )}
-
-              </div>
+              <AnalysisBlock result={task.analysisResult} />
             </div>
           )}
 
-          {/* Suggested steps — hidden when new action bullets are present to avoid duplication */}
-          {!task.analysisResult?.actionPointsCz && !task.analysisResult?.actionPointsEn &&
+          {/* Legacy suggested steps — hidden when bilingual action bullets cover them */}
+          {!(task.analysisResult?.actionPointsCz?.length) && !(task.analysisResult?.actionPointsEn?.length) &&
            (task.analysisResult?.suggestedActions ?? task.suggestedActions).length > 0 && (
             <div className="detail-section">
               <span className="detail-section-label">
