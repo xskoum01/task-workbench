@@ -100,55 +100,75 @@ function parseEmailSegment(raw: string): ParsedEmailSegment {
   return { headers, body };
 }
 
-// Matches lines that are clearly email header metadata, e.g. "From: John Smith"
-// Anchored to start of line so "From what I can see..." is NOT matched.
+// Gmail adds a trust banner in plain-text extracts: "You don't often get email from <addr>. Learn why this is important"
+// Both ASCII apostrophe (') and Unicode curly apostrophe (') are handled.
+const GMAIL_TRUST_BANNER_RE = /You don['']t often get email from\s+\S+\.?\s*Learn why this is important\.?\s*/gi;
+
+// Email header line anchored to start of a line (requires colon — never matches "From what I know").
 const HEADER_LINE_RE = /^(?:From|To|Cc|Bcc|Date|Sent|Subject):\s*.+/i;
 
-// If stripped body is shorter than this we fall back to the full original.
+// Minimum chars a cleaned body must have to be considered valid.
 const MIN_BODY_LENGTH = 20;
 
 /**
- * Conservatively strips an embedded email header block from the start of a message.
- * Only removes leading lines that clearly match "FieldName: value" — stops as soon as
- * a blank separator line or non-header content is reached.
- * Falls back to the full originalMessage if stripping would hide too much content.
+ * Produces a clean body string for display.
+ *
+ * Stripping order:
+ *   1. Gmail trust banner — removed globally (appears inline in HTML-stripped text)
+ *   2. Leading "From: <senderName>" prefix — removed when sender is known (single-line format)
+ *   3. Leading header-line block — removed for multiline messages
+ *
+ * Falls back to the original message if the result is too short.
  */
-function getDisplayMessageBody(raw: string): string {
+function getDisplayMessageBody(raw: string, senderName?: string, senderEmail?: string): string {
   const trimmed = raw.trim();
   if (!trimmed) return '';
 
-  const lines = trimmed.split('\n');
-  let i = 0;
+  let result = trimmed;
 
-  // Walk through leading header lines
-  while (i < lines.length) {
-    const line = lines[i];
-    if (HEADER_LINE_RE.test(line.trim())) {
-      // Recognised header line — skip it
-      i++;
-    } else if (line.trim() === '') {
-      // Blank separator between headers and body — skip it and stop
-      i++;
-      break;
-    } else {
-      // Real content reached — stop stripping immediately
-      break;
+  // Step 1: strip Gmail trust banner wherever it appears in the string
+  result = result.replace(GMAIL_TRUST_BANNER_RE, ' ').replace(/[ \t]{2,}/g, ' ').trim();
+
+  // Step 2: strip leading "From: <sender>" prefix (single-line / inline format)
+  // Use the known display name or email to strip exactly the right amount of text.
+  const knownSender = senderName ?? senderEmail;
+  if (knownSender) {
+    const escaped = knownSender.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    result = result.replace(new RegExp(`^From:\\s+${escaped}\\s*`, 'i'), '').trim();
+  }
+
+  // Step 3: strip remaining leading header lines for multiline messages
+  if (result.includes('\n')) {
+    const lines = result.split('\n');
+    let i = 0;
+    while (i < lines.length) {
+      const line = lines[i].trim();
+      if (HEADER_LINE_RE.test(line)) {
+        i++;
+      } else if (line === '') {
+        i++;
+        break;
+      } else {
+        break;
+      }
+    }
+    if (i > 0) {
+      const stripped = lines.slice(i).join('\n').trim();
+      if (stripped) result = stripped;
     }
   }
 
-  const body = lines.slice(i).join('\n').trim();
-
-  // Safety fallback: if we stripped too much, return the full original
-  if (body.length < MIN_BODY_LENGTH && trimmed.length > MIN_BODY_LENGTH) {
+  // Fallback: if stripping removed too much, return original
+  if (result.length < MIN_BODY_LENGTH && trimmed.length > MIN_BODY_LENGTH) {
     return trimmed;
   }
 
-  return body || trimmed;
+  return result || trimmed;
 }
 
 /** Renders a clean email card using task metadata + stripped body. */
 function EmailCard({ task }: { task: Task }) {
-  const body = getDisplayMessageBody(task.originalMessage);
+  const body = getDisplayMessageBody(task.originalMessage, task.senderName, task.senderEmail);
   const hasMeta = task.senderName || task.senderEmail || task.receivedAt;
 
   return (
