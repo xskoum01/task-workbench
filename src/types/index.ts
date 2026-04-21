@@ -542,6 +542,11 @@ export interface TeamsChatMessage {
   originalSenderEmail?: string;
   originalSentAt?: string;
   originalContent?: string;
+  // Teams message link metadata.
+  hasLinkedTeamsMessage?: boolean;
+  linkedMessageUrl?: string;
+  linkedMessageType?: 'chat' | 'channel' | 'unknown';
+  linkedMessageResolved?: boolean;
 }
 
 /**
@@ -569,4 +574,9 @@ export interface TeamsFlatMessage {
   originalSenderEmail?: string;
   originalSentAt?: string;
   originalContent?: string;
+  // Teams message link metadata.
+  hasLinkedTeamsMessage?: boolean;
+  linkedMessageUrl?: string;
+  linkedMessageType?: 'chat' | 'channel' | 'unknown';
+  linkedMessageResolved?: boolean;
 }

@@ -1870,6 +1870,44 @@ async fn get_teams_intake_messages(
             eprintln!("[Teams-intake] forwarded card detected in message {}",
                 m["id"].as_str().unwrap_or("?"));
         }
+
+        // ── Teams message link resolution ────────────────────────────────────
+        // If the intake message body contains a "Copy link to message" URL,
+        // resolve and prefer the original linked message over forwarded heuristics.
+        let link = parse_teams_message_link(&content);
+        let mut linked_type   = "";         // "chat" | "channel" | ""
+        let mut linked_url    = String::new();
+        let mut link_resolved = false;
+        let mut linked_meta: Option<ForwardedMeta> = None;
+
+        if let Some(ref lnk) = link {
+            linked_url = lnk.raw_url.clone();
+            if lnk.is_channel {
+                linked_type = "channel";       // not supported — surface in UI
+                eprintln!("[Teams-link] channel link detected (unsupported): {}", &lnk.raw_url[..lnk.raw_url.len().min(80)]);
+            } else {
+                linked_type = "chat";
+                eprintln!("[Teams-link] chat link detected, resolving: chat={} msg={}",
+                    &lnk.chat_id[..lnk.chat_id.len().min(20)],
+                    &lnk.message_id[..lnk.message_id.len().min(20)]);
+                match try_fetch_linked_chat_message(&token, &lnk.chat_id, &lnk.message_id).await {
+                    Ok(Some(meta)) => {
+                        eprintln!("[Teams-link] resolved: sender=\"{}\"", meta.sender_name);
+                        link_resolved = true;
+                        linked_meta   = Some(meta);
+                    }
+                    Ok(None) => {
+                        eprintln!("[Teams-link] could not resolve (no data / permission)");
+                    }
+                    Err(e) => {
+                        eprintln!("[Teams-link] resolution error: {e}");
+                    }
+                }
+            }
+        }
+
+        // Priority: linked message > forwarded card > normal intake message.
+        let effective = linked_meta.as_ref().or(fwd.as_ref());
         messages.push(serde_json::json!({
             "id":                 m["id"],
             "senderName":         m["from"]["user"]["displayName"].as_str().unwrap_or(""),
@@ -1880,12 +1918,17 @@ async fn get_teams_intake_messages(
             "chatTopic":          "Teams intake",
             "chatType":           "oneOnOne",
             "chatMembersSummary": "Intake chat",
-            // Forwarded-message metadata — empty strings when not a forward.
-            "isForwarded":         fwd.is_some(),
-            "originalSenderName":  fwd.as_ref().map(|f| f.sender_name.as_str()).unwrap_or(""),
-            "originalSenderEmail": fwd.as_ref().and_then(|f| f.sender_email.as_deref()).unwrap_or(""),
-            "originalSentAt":      fwd.as_ref().and_then(|f| f.sent_at.as_deref()).unwrap_or(""),
-            "originalContent":     fwd.as_ref().map(|f| f.content.as_str()).unwrap_or(""),
+            // Forwarded-message metadata — empty when not a forward.
+            "isForwarded":         effective.is_some(),
+            "originalSenderName":  effective.as_ref().map(|f| f.sender_name.as_str()).unwrap_or(""),
+            "originalSenderEmail": effective.as_ref().and_then(|f| f.sender_email.as_deref()).unwrap_or(""),
+            "originalSentAt":      effective.as_ref().and_then(|f| f.sent_at.as_deref()).unwrap_or(""),
+            "originalContent":     effective.as_ref().map(|f| f.content.as_str()).unwrap_or(""),
+            // Teams link metadata — non-empty when a "Copy link to message" URL was found.
+            "hasLinkedTeamsMessage": link.is_some(),
+            "linkedMessageUrl":      linked_url,
+            "linkedMessageType":     linked_type,
+            "linkedMessageResolved": link_resolved,
         }));
     }
     eprintln!("[Teams-intake] {} messages kept today, {} filtered out", messages.len(), filtered_out);
@@ -2402,6 +2445,103 @@ fn chrono_now_iso() -> String {
     // Very simple date arithmetic (no leap-year handling needed for sync timestamps)
     let year = 1970 + days_since_epoch / 365;
     format!("{year:04}-01-01T{h:02}:{m:02}:{s:02}Z")
+}
+
+// --- Teams message link detection and resolution --------------------------
+
+/// Structured data extracted from a Teams message URL.
+struct ParsedTeamsLink {
+    raw_url:    String,
+    chat_id:    String,
+    message_id: String,
+    /// True when the URL contains a non-empty `groupId` query parameter,
+    /// which signals a channel (team) message rather than a plain chat message.
+    is_channel: bool,
+}
+
+/// Scan plain text for the first `teams.microsoft.com/l/message/` URL and
+/// decode the chat-id and message-id embedded in its path.
+///
+/// Teams deep-link format:
+///   `https://teams.microsoft.com/l/message/<encoded-chat-id>/<message-id>?<query>`
+///
+/// Returns `None` when no recognised Teams message URL is found.
+fn parse_teams_message_link(plain_text: &str) -> Option<ParsedTeamsLink> {
+    const PREFIX: &str = "https://teams.microsoft.com/l/message/";
+    let start = plain_text.find(PREFIX)?;
+    let after_prefix = &plain_text[start + PREFIX.len()..];
+
+    // Grab the URL up to the first whitespace/newline
+    let url_len = after_prefix
+        .find(|c: char| c.is_whitespace())
+        .unwrap_or(after_prefix.len());
+    let url_part = &after_prefix[..url_len];
+    let raw_url  = format!("{PREFIX}{url_part}");
+
+    // Split path: <encoded-chat-id>/<message-id>[?query]
+    let slash = url_part.find('/')?;
+    let encoded_chat_id = &url_part[..slash];
+    let after_slash = &url_part[slash + 1..];
+
+    let q_pos = after_slash.find('?').unwrap_or(after_slash.len());
+    let encoded_message_id = &after_slash[..q_pos];
+    let query = if q_pos < after_slash.len() { &after_slash[q_pos + 1..] } else { "" };
+
+    let chat_id    = percent_decode(encoded_chat_id);
+    let message_id = percent_decode(encoded_message_id);
+    if chat_id.is_empty() || message_id.is_empty() {
+        return None;
+    }
+
+    // A non-empty groupId signals a channel (team) message.
+    let is_channel = query.split('&').any(|kv| {
+        let mut parts = kv.splitn(2, '=');
+        let key = parts.next().unwrap_or("");
+        let val = parts.next().unwrap_or("");
+        key == "groupId" && !val.is_empty()
+    });
+
+    Some(ParsedTeamsLink { raw_url, chat_id, message_id, is_channel })
+}
+
+/// Attempt to fetch the linked Teams chat message directly from Graph.
+/// Returns `Ok(Some(meta))` on success, `Ok(None)` on not-found / permission
+/// error (caller should surface "unresolved"), `Err(())` on unexpected failure.
+async fn try_fetch_linked_chat_message(
+    token:      &str,
+    chat_id:    &str,
+    message_id: &str,
+) -> Result<Option<ForwardedMeta>, String> {
+    let url = format!("{MS_GRAPH_BASE}/me/chats/{chat_id}/messages/{message_id}");
+    match graph_get(&url, token).await {
+        Ok(data) => {
+            let sender_name = data["from"]["user"]["displayName"]
+                .as_str()
+                .unwrap_or("")
+                .to_string();
+            let sender_email = data["from"]["user"]["userPrincipalName"]
+                .as_str()
+                .filter(|s| !s.is_empty())
+                .map(|s| s.to_string());
+            let sent_at  = data["createdDateTime"].as_str().map(|s| s.to_string());
+            let body_html = data["body"]["content"].as_str().unwrap_or("");
+            let content   = strip_html(body_html).trim().to_string();
+
+            if sender_name.is_empty() && content.is_empty() {
+                return Ok(None);
+            }
+            Ok(Some(ForwardedMeta {
+                sender_name: if sender_name.is_empty() { "[unknown]".to_string() } else { sender_name },
+                sender_email,
+                sent_at,
+                content,
+            }))
+        }
+        Err(e) => {
+            eprintln!("[Teams-link] fetch failed for chat={chat_id} msg={message_id}: {e}");
+            Ok(None)
+        }
+    }
 }
 
 // --- Forwarded Teams message detection ------------------------------------

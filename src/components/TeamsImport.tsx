@@ -56,11 +56,16 @@ function toImportArgs(item: TeamsFlatMessage): [TeamsChat, TeamsChatMessage] {
     sentAt:              item.sentAt,
     content:             item.content,
     // Forward forwarded-message metadata so handleTeamsImport can prefer original sender.
-    isForwarded:         item.isForwarded,
-    originalSenderName:  item.originalSenderName,
-    originalSenderEmail: item.originalSenderEmail,
-    originalSentAt:      item.originalSentAt,
-    originalContent:     item.originalContent,
+    isForwarded:            item.isForwarded,
+    originalSenderName:     item.originalSenderName,
+    originalSenderEmail:    item.originalSenderEmail,
+    originalSentAt:         item.originalSentAt,
+    originalContent:        item.originalContent,
+    // Pass link-resolution metadata through.
+    hasLinkedTeamsMessage:  item.hasLinkedTeamsMessage,
+    linkedMessageUrl:       item.linkedMessageUrl,
+    linkedMessageType:      item.linkedMessageType,
+    linkedMessageResolved:  item.linkedMessageResolved,
   };
   return [chat, msg];
 }
@@ -183,7 +188,10 @@ export default function TeamsImport({ clientId, intakeChatId, onClose, onImport,
                 {/* Sender · Chat · Timestamp */}
                 <div className="ms-import-item-meta">
                   <strong>{(item.isForwarded && item.originalSenderName) ? item.originalSenderName : (item.senderName || '(unknown)')}</strong>
-                  {item.isForwarded && (
+                  {item.linkedMessageResolved && (
+                    <span className="ms-import-badge-linked" title={item.linkedMessageUrl}>linked message</span>
+                  )}
+                  {!item.linkedMessageResolved && item.isForwarded && (
                     <span className="ms-import-badge-fwd" title={`Forwarded by ${item.senderName}`}>fwd</span>
                   )}
                   <span className="ms-import-meta-sep"> {'\u00b7'} </span>
@@ -191,6 +199,14 @@ export default function TeamsImport({ clientId, intakeChatId, onClose, onImport,
                   <span className="ms-import-meta-sep"> {'\u00b7'} </span>
                   <span>{new Date((item.isForwarded && item.originalSentAt) ? item.originalSentAt : item.sentAt).toLocaleString()}</span>
                 </div>
+                {/* Unresolvable link warning */}
+                {item.hasLinkedTeamsMessage && !item.linkedMessageResolved && (
+                  <div className="ms-import-link-note">
+                    {item.linkedMessageType === 'channel'
+                      ? 'Channel message links are not supported — the import uses the intake message instead.'
+                      : 'Linked message could not be resolved — the import uses the intake message instead.'}
+                  </div>
+                )}
                 {/* Message body preview — prefer original forwarded body when available */}
                 <div className="ms-import-item-preview">
                   {(item.isForwarded && item.originalContent) ? item.originalContent : item.content}

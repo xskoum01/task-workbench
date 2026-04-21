@@ -195,13 +195,25 @@ export default function InboxPage() {
   }
 
   async function handleTeamsImport(chat: TeamsChat, msg: TeamsChatMessage, forceCreate = false): Promise<ImportResult> {
-    // Prefer structured forwarded-message metadata parsed by Rust from the raw HTML
-    // (populated on `msg` before strip_html destroys forwarded-card structure).
-    // Fall back to the frontend heuristic parser only when Rust did not detect a forward.
-    const rustFwd = msg.isForwarded && msg.originalSenderName
-      ? { senderName: msg.originalSenderName, senderEmail: msg.originalSenderEmail, sentAt: msg.originalSentAt, content: msg.originalContent }
+    // Priority order for effective sender/body:
+    //  1. Linked original message (resolved from a pasted "Copy link" URL — most reliable)
+    //  2. Forwarded-card metadata (parsed from HTML/attachments by Rust)
+    //  3. Frontend heuristic parser fallback
+    //  4. Normal intake message fields
+    //
+    // Rust already merges 1 and 2 into isForwarded/original* fields, giving linked
+    // messages priority. We only need the frontend heuristic as a last resort.
+    const rustFwd = msg.isForwarded && (msg.originalSenderName || msg.originalContent)
+      ? {
+          senderName:  msg.originalSenderName ?? '',
+          senderEmail: msg.originalSenderEmail,
+          sentAt:      msg.originalSentAt,
+          content:     msg.originalContent ?? '',
+        }
       : null;
-    const fwdFallback = !rustFwd ? parseForwardedTeamsMessage(msg.content, msg.senderName, msg.senderEmail, msg.sentAt) : null;
+    const fwdFallback = !rustFwd
+      ? parseForwardedTeamsMessage(msg.content, msg.senderName, msg.senderEmail, msg.sentAt)
+      : null;
     const fwd = rustFwd ?? fwdFallback;
 
     const effectiveSenderName  = fwd?.senderName  || msg.senderName;
@@ -210,8 +222,9 @@ export default function InboxPage() {
     const effectiveBody        = fwd?.content     || msg.content;
 
     if (fwd) {
+      const source = msg.linkedMessageResolved ? 'linked-message' : rustFwd ? 'rust-fwd' : 'frontend';
       console.log(
-        `[teams-fwd] forwarded message detected (source: ${rustFwd ? 'rust' : 'frontend'})`,
+        `[teams-fwd] resolved (source: ${source})`,
         `originalSender="${effectiveSenderName}" bodyLen=${effectiveBody.length}`,
       );
     }

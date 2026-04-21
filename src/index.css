@@ -3734,6 +3734,28 @@ body {
   vertical-align: middle;
 }
 
+.ms-import-badge-linked {
+  display: inline-block;
+  font-size: 9px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--accent, #4ea5d9);
+  border: 1px solid var(--accent, #4ea5d9);
+  border-radius: 3px;
+  padding: 0 4px;
+  line-height: 14px;
+  margin-left: 5px;
+  vertical-align: middle;
+}
+
+.ms-import-link-note {
+  font-size: 11px;
+  color: var(--text-muted);
+  font-style: italic;
+  margin-bottom: 3px;
+}
+
 .ms-import-item-preview {
   font-size: 12px;
   color: var(--text-secondary);
