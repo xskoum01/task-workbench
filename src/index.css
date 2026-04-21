@@ -3719,6 +3719,21 @@ body {
   color: var(--text-muted);
 }
 
+.ms-import-badge-fwd {
+  display: inline-block;
+  font-size: 9px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--text-muted);
+  border: 1px solid var(--border-subtle, #444);
+  border-radius: 3px;
+  padding: 0 4px;
+  line-height: 14px;
+  margin-left: 5px;
+  vertical-align: middle;
+}
+
 .ms-import-item-preview {
   font-size: 12px;
   color: var(--text-secondary);

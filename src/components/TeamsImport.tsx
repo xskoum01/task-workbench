@@ -182,14 +182,19 @@ export default function TeamsImport({ clientId, intakeChatId, onClose, onImport,
               <li key={item.id} className="ms-import-item">
                 {/* Sender · Chat · Timestamp */}
                 <div className="ms-import-item-meta">
-                  <strong>{item.senderName || '(unknown)'}</strong>
+                  <strong>{(item.isForwarded && item.originalSenderName) ? item.originalSenderName : (item.senderName || '(unknown)')}</strong>
+                  {item.isForwarded && (
+                    <span className="ms-import-badge-fwd" title={`Forwarded by ${item.senderName}`}>fwd</span>
+                  )}
                   <span className="ms-import-meta-sep"> {'\u00b7'} </span>
                   <span className="ms-import-chat-source">{chatLabel(item)}</span>
                   <span className="ms-import-meta-sep"> {'\u00b7'} </span>
-                  <span>{new Date(item.sentAt).toLocaleString()}</span>
+                  <span>{new Date((item.isForwarded && item.originalSentAt) ? item.originalSentAt : item.sentAt).toLocaleString()}</span>
                 </div>
-                {/* Message body preview */}
-                <div className="ms-import-item-preview">{item.content}</div>
+                {/* Message body preview — prefer original forwarded body when available */}
+                <div className="ms-import-item-preview">
+                  {(item.isForwarded && item.originalContent) ? item.originalContent : item.content}
+                </div>
                 {/* Import action */}
                 <div className="ms-import-actions">
                   {state === 'idle' && (

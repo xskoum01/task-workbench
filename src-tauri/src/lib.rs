@@ -1831,11 +1831,39 @@ async fn get_teams_intake_messages(
             continue;
         }
         let raw_content = m["body"]["content"].as_str().unwrap_or("");
+        let body_content_type = m["body"]["contentType"].as_str().unwrap_or("unknown");
         let content = strip_html(raw_content);
         if content.trim().len() < 3 {
             filtered_out += 1;
             continue;
         }
+
+        // ── Targeted diagnostic logging for forwarded-message diagnosis ────────
+        // Log attachment metadata and a body snippet for messages that look like
+        // forwards (contains "from" keyword or has attachments). Safe and bounded.
+        let atts = m["attachments"].as_array();
+        let att_count = atts.map(|a| a.len()).unwrap_or(0);
+        let plain_lower = content.to_ascii_lowercase();
+        let looks_forwarded = att_count > 0
+            || plain_lower.contains("forwarded")
+            || plain_lower.contains("from:")
+            || plain_lower.contains("original message");
+        if looks_forwarded {
+            let msg_id  = m["id"].as_str().unwrap_or("?");
+            let snippet = &raw_content[..raw_content.len().min(300)];
+            eprintln!("[Teams-fwd-diag] id={msg_id} bodyType={body_content_type} atts={att_count}");
+            eprintln!("[Teams-fwd-diag] html_snippet={snippet:?}");
+            if let Some(atts_arr) = atts {
+                for (ai, att) in atts_arr.iter().enumerate() {
+                    let ct      = att["contentType"].as_str().unwrap_or("?");
+                    let att_id  = att["id"].as_str().unwrap_or("?");
+                    let c_snip  = att["content"].as_str().unwrap_or("");
+                    let c_snip  = &c_snip[..c_snip.len().min(200)];
+                    eprintln!("[Teams-fwd-diag]   att[{ai}] contentType={ct:?} id={att_id} content={c_snip:?}");
+                }
+            }
+        }
+
         // Parse forwarded-message metadata from the raw HTML *before* it is lost.
         let fwd = parse_teams_forwarded_card(&m, raw_content);
         if fwd.is_some() {
@@ -2404,10 +2432,13 @@ struct ForwardedMeta {
 /// Returns `None` for normal (non-forwarded) messages so the caller falls back
 /// cleanly to the existing behaviour.
 fn parse_teams_forwarded_card(msg: &Value, body_html: &str) -> Option<ForwardedMeta> {
-    // ── Strategy 1: messageReference attachment ──────────────────────────────
+    // ── Strategy 1 & 3: attachment-based detection ───────────────────────────
+    // Strategy 1: contentType == "messageReference"  (explicit Teams forward button)
+    // Strategy 3: contentType == "reference"         (some group-chat / channel variants)
     if let Some(atts) = msg["attachments"].as_array() {
         for att in atts {
-            if att["contentType"].as_str() != Some("messageReference") {
+            let ct = att["contentType"].as_str().unwrap_or("");
+            if ct != "messageReference" && ct != "reference" {
                 continue;
             }
             let content_str = att["content"].as_str().unwrap_or("{}");
@@ -2440,9 +2471,62 @@ fn parse_teams_forwarded_card(msg: &Value, body_html: &str) -> Option<ForwardedM
         }
     }
 
+    // ── Strategy 4: blockquote / Teams indent-forward ────────────────────────
+    // When a user pastes a forwarded block, Teams sometimes wraps it in a
+    // <blockquote> or a <div> with the forwarded content inside.  We look for
+    // a <blockquote> that contains recognisable attribution text.
+    let lower_html = body_html.to_ascii_lowercase();
+    if lower_html.contains("<blockquote") {
+        // Extract everything between the first <blockquote ...> and </blockquote>.
+        if let (Some(open_end), Some(close_start)) =
+            (lower_html.find('>'), lower_html.find("</blockquote"))
+        {
+            // Find the > that closes the opening <blockquote tag.
+            let tag_close = body_html[..close_start]
+                .find('>')
+                .map(|p| p + 1)
+                .unwrap_or(open_end + 1);
+            let inner_html = &body_html[tag_close..close_start];
+            let inner_text = strip_html(inner_html).trim().to_string();
+            // Treat the outer message sender as the forwarder; the blockquote
+            // body is the original message content.
+            if !inner_text.is_empty() {
+                // Try to pull a "From:" or "Name wrote:" attribution from the
+                // first line of the blockquote; fall back to the full block.
+                let lines: Vec<&str> = inner_text.lines().collect();
+                let first = lines.first().copied().unwrap_or("");
+                let (sender_name, content) = if let Some(rest) = first.strip_prefix("From:") {
+                    let raw = rest.trim();
+                    let name = if let Some(a) = raw.find('<') { raw[..a].trim().to_string() }
+                               else { raw.to_string() };
+                    (name, lines[1..].join("\n").trim().to_string())
+                } else if first.contains(" wrote:") || first.contains(" says:") {
+                    let name = first.split_once(" wrote:").or_else(|| first.split_once(" says:"))
+                        .map(|(n, _)| n.trim().to_string())
+                        .unwrap_or_default();
+                    (name, lines[1..].join("\n").trim().to_string())
+                } else {
+                    (String::new(), inner_text.clone())
+                };
+                if !content.is_empty() {
+                    return Some(ForwardedMeta {
+                        sender_name: if sender_name.is_empty() {
+                            // Fall back: mark as forwarded but attribute sender unknown
+                            "[forwarded]".to_string()
+                        } else {
+                            sender_name
+                        },
+                        sender_email: None,
+                        sent_at: None,
+                        content,
+                    });
+                }
+            }
+        }
+    }
+
     // ── Strategy 2: HTML <b>From:</b> / <strong>From:</strong> pattern ────────
     // Parse this in the raw HTML *before* strip_html destroys the structure.
-    let lower_html = body_html.to_ascii_lowercase();
     if lower_html.contains("<b>from:</b>") || lower_html.contains("<strong>from:</strong>") {
         let plain = strip_html(body_html);
         let lines: Vec<&str> = plain.lines().collect();
