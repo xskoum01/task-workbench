@@ -269,13 +269,10 @@ function parsePrComment(
   const fileMatch  = /([A-Za-z0-9_\-.]+\.[a-z]{1,6})\b/i.exec(commentTarget);
   const commentedFile = fileMatch ? fileMatch[1] : undefined;
 
-  // Build a concise action-oriented title — always starts with "PR comment:"
-  // so it is visually distinct from other task types in the task list.
-  const title = commentedFile
-    ? `PR comment: address feedback in ${commentedFile}`
-    : prNumber
-      ? `PR comment: resolve review feedback (PR ${prNumber})`
-      : `PR comment: resolve review feedback from ${reviewerName}`;
+  // Title: use the original email subject directly — it already contains the meaningful
+  // heading (e.g. "Jan Svestka has commented on nvr_accountContact_Ribbon.js").
+  // Normalise whitespace/length but do not replace with a generic prefix.
+  const title = normalizeTextTitle(subject);
 
   const prUrl = extractAdoPrUrl(bodyText);
   if (prUrl) {
@@ -419,7 +416,7 @@ function extractReviewComment(bodyText: string): string | undefined {
     .map((l) => l.trim())
     .filter(Boolean);
 
-  // Skip header / metadata lines
+  // Lines to skip at any position — header/metadata/infrastructure lines
   const skipPatterns = [
     /^From:/i,
     /^Subject:/i,
@@ -431,21 +428,45 @@ function extractReviewComment(bodyText: string): string | undefined {
     /^Area Path:/i,
     /^Iteration/i,
     /^https?:/i,
+    /^##ADO##/,           // structured link markers added by Rust HTML parser
     /^Pull Request/i,
     /\bhas commented on\b/i,
     /\bcommented on\b/i,
     /View the full\b/i,
+    /View comment\b/i,
+    /View pull request\b/i,
     /Reply to this\b/i,
     /You can view the\b/i,
   ];
 
+  // Lines that mark the start of footer boilerplate — stop collecting here
+  const footerPatterns = [
+    /Microsoft\s+respects\s+your\s+privacy/i,
+    /To\s+unsubscribe\b/i,
+    /Manage\s+(your\s+)?notification/i,
+    /This\s+email\s+was\s+sent\s+(from|by)\b/i,
+    /©\s*Microsoft/i,
+    /^Microsoft\s+Corporation/i,
+    /Privacy\s+statement/i,
+    /You('re| are) receiving this/i,
+  ];
+
+  const commentLines: string[] = [];
+
   for (const line of lines) {
-    const skip = skipPatterns.some((p) => p.test(line));
-    if (!skip && line.length > 15) {
-      return line.slice(0, 600);
-    }
+    // Stop at known footer markers
+    if (footerPatterns.some((p) => p.test(line))) break;
+    // Skip infrastructure / metadata lines
+    if (skipPatterns.some((p) => p.test(line))) continue;
+    // Skip very short fragments (e.g. single words or punctuation)
+    if (line.length < 4) continue;
+    commentLines.push(line);
   }
-  return undefined;
+
+  if (commentLines.length === 0) return undefined;
+
+  // Join collected lines and cap total length to avoid storing huge payloads
+  return commentLines.join('\n').slice(0, 1200);
 }
 
 // ---------------------------------------------------------------------------

@@ -829,6 +829,14 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
 
         {/* ---- Header ---- */}
         <div className="detail-panel-header">
+          <button
+            className="detail-panel-back"
+            onClick={onClose}
+            title="Back to list"
+          >
+            <Icon name="arrow-left" size={14} /> Back
+          </button>
+
           <div className="detail-panel-header-content">
             <div className="detail-panel-title">{task.title}</div>
 
@@ -851,14 +859,6 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
               )}
             </div>
           </div>
-
-          <button
-            className="detail-panel-back"
-            onClick={onClose}
-            title="Back to list"
-          >
-            <Icon name="arrow-left" size={14} /> Back
-          </button>
 
           <button
             className="detail-panel-edit"

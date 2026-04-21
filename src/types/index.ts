@@ -495,6 +495,13 @@ export interface OutlookMessage {
   /** Full message body stripped of HTML tags. Available when Graph fetches body field. */
   bodyFull?: string;
   webLink: string;
+  /**
+   * True when the email has been flagged by the user in Outlook.
+   * Populated from the Graph API `flag.flagStatus === 'flagged'` field.
+   * Future: update `get_outlook_messages` Rust command to filter
+   *   ?$filter=flag/flagStatus eq 'flagged' and return this field.
+   */
+  isFlagged?: boolean;
 }
 
 export interface TeamsChat {

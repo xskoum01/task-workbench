@@ -120,6 +120,22 @@ const NOISE_PATTERNS: RegExp[] = [
 ];
 
 // ---------------------------------------------------------------------------
+// EXPLICIT-CAPTURE hard rejects:
+// Items that should be rejected even when the user explicitly selected/imported them.
+// Keep this list very narrow — only deterministic, zero-actionability signals.
+// Calendar response emails (accepted/declined/tentative/cancelled) are the canonical case:
+// the calendar handles them; importing them as tasks adds no value regardless of intent.
+// ---------------------------------------------------------------------------
+const EXPLICIT_CAPTURE_HARD_REJECTS: RegExp[] = [
+  /^accepted:\s/i,         // calendar acceptance response
+  /^declined:\s/i,         // calendar decline
+  /^tentative:\s/i,        // tentative acceptance
+  /^cancelled:\s/i,        // meeting cancellation
+  /^automatic\s+reply:/i,  // out-of-office auto-replies
+  /^out\s+of\s+office\b/i, // OOO subject line variant
+];
+
+// ---------------------------------------------------------------------------
 // Sender-address patterns that reliably indicate automated senders.
 // Keep this list tight: only match addresses that are never used by humans.
 // ---------------------------------------------------------------------------
@@ -179,20 +195,43 @@ export function prefilter(item: {
   title: string;
   content: string;
   senderEmail?: string;
+  /** When 'explicit', apply conservative filtering: only hard-known noise is rejected. */
+  captureMode?: 'explicit';
 }): PrefilterResult {
   const subject     = item.title.toLowerCase();
   const content     = item.content.toLowerCase();
   const combined    = `${subject} ${content}`;
   const senderEmail = (item.senderEmail ?? '').toLowerCase();
 
-  // Hard reject: known automated sender address
+  // ---------------------------------------------------------------------------
+  // EXPLICIT-CAPTURE conservative path:
+  // The user explicitly selected/imported this item — trust their intent.
+  // Sender-based and short-content checks are skipped entirely.
+  // Only truly-empty content and deterministic non-actionable subjects are rejected.
+  // ---------------------------------------------------------------------------
+  if (item.captureMode === 'explicit') {
+    // Reject only truly empty content (whitespace-only). Short messages are fine.
+    if (content.trim().length === 0) {
+      return { pass: false, reason: 'Content is empty' };
+    }
+    // Reject deterministic non-actionable subjects (calendar responses, OOO).
+    for (const pattern of EXPLICIT_CAPTURE_HARD_REJECTS) {
+      if (pattern.test(subject)) {
+        return { pass: false, reason: `Explicit-capture hard reject (calendar/OOO noise): ${subject.slice(0, 60)}` };
+      }
+    }
+    // All other explicit-capture items pass — AI enriches from here.
+    return { pass: true, reason: 'Explicit capture — passed conservative prefilter' };
+  }
+
+  // Hard reject: known automated sender address (non-explicit only)
   for (const pattern of AUTOMATED_SENDER_PATTERNS) {
     if (pattern.test(senderEmail)) {
       return { pass: false, reason: `Automated sender: ${senderEmail}` };
     }
   }
 
-  // Hard reject: trivially empty body
+  // Hard reject: trivially short body (non-explicit only)
   if (content.trim().length < 15) {
     return { pass: false, reason: 'Content too short to be actionable' };
   }

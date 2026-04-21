@@ -42,6 +42,18 @@ export interface ImportMessageInput {
    *   - if already 'created', returns duplicate to prevent doubling
    */
   forceCreate?: boolean;
+  /**
+   * Signals that this import was triggered by an explicit user intent signal
+   * (e.g. Outlook panel import, manual Teams message selection).
+   *
+   * Effect: AI enriches the task (summary, type, customer, effort, due date) but
+   * no longer acts as a gatekeeper. The item always surfaces as at minimum
+   * 'analyzed' (inbox review), regardless of AI confidence or isTask verdict.
+   * High-confidence AI results (>= CONFIDENCE_AUTO_CREATE) still auto-create.
+   *
+   * The ADO deterministic path never sets this — it has its own confidence values.
+   */
+  captureMode?: 'explicit';
 }
 
 export type ImportOutcome = 'duplicate' | 'rejected' | 'analyzed' | 'created';
@@ -167,13 +179,23 @@ const VALID_TASK_TYPES = new Set(['bug-fix', 'feature', 'review', 'question', 'd
 
 /** Strip HTML tags and decode basic entities — used before sending content to AI. */
 function stripHtmlTags(html: string): string {
-  // Use the full text normalizer which handles HTML tags, entities, and mojibake.
-  return normalizeText(
-    html
-      .replace(/<[^>]+>/g, ' ')
-      .replace(/\s{2,}/g, ' ')
-      .trim()
-  );
+  // 1. <br> variants → newline
+  // 2. Block-level open/close tags → newline (preserves paragraph/list structure)
+  // 3. Remaining inline tags → space
+  // 4. Collapse horizontal whitespace only; normalize excessive blank lines (max 2)
+  const BLOCK_RE = /<\/?(p|div|li|tr|td|th|h[1-6]|blockquote|pre|ul|ol|table|section|article|header|footer|hr)\b[^>]*>/gi;
+  const text = html
+    .replace(/<br\s*\/?>/gi, '\n')
+    .replace(BLOCK_RE, '\n')
+    .replace(/<[^>]+>/g, ' ')
+    .replace(/[ \t]+/g, ' ')
+    .replace(/\n[ \t]+/g, '\n')
+    .replace(/[ \t]+\n/g, '\n')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
+  // Run through full normalizer for mojibake + entity decoding.
+  // normalizeText's whitespace step only collapses [ \t]+, so newlines survive.
+  return normalizeText(text);
 }
 
 /** Detect a short human-readable hint for what kind of message this is. */
@@ -473,11 +495,14 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
       // Derive a hint label early — used for both prefilter-rejected and AI-classified items.
       const classificationLabel = detectClassificationLabel(cleanTitle, cleanContent, input.senderEmail);
 
-      // 2. Rule-based prefilter — reject obvious noise before calling AI
+      // 2. Rule-based prefilter — reject obvious noise before calling AI.
+      // For explicit captures: conservative mode — only hard-known zero-actionability
+      // items (calendar responses, OOO) are rejected; everything else passes.
       const filterResult = prefilter({
         title:       cleanTitle,
         content:     cleanContent,
         senderEmail: input.senderEmail,
+        captureMode: input.captureMode,
       });
 
       if (!filterResult.pass) {
@@ -588,13 +613,14 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
         console.warn(`[import] AI classification failed for "${input.title}":`, errMsg);
 
         // When AI call fails, fall back to heuristic priority.
-        // Heuristic confidence only gates whether the item becomes review (≥ MIN_CONFIDENCE_ANALYZE)
-        // or task (≥ CONFIDENCE_AUTO_CREATE). We treat fallback items as isTask=true implicitly
-        // since the prefilter already passed and we have no better signal.
+        // Explicit-capture: always surface in inbox — AI failure never silently rejects.
+        // Auto-import: heuristic confidence gates the outcome as before.
         const fallbackConfidence = input.heuristicPriority ?? 30;
         const fallbackState: ClassificationState =
-          fallbackConfidence >= IMPORT_CONFIG.CONFIDENCE_AUTO_CREATE ? 'created' :
-          fallbackConfidence >= IMPORT_CONFIG.MIN_CONFIDENCE_ANALYZE  ? 'analyzed' : 'rejected';
+          input.captureMode === 'explicit'
+            ? (fallbackConfidence >= IMPORT_CONFIG.CONFIDENCE_AUTO_CREATE ? 'created' : 'analyzed')
+            : fallbackConfidence >= IMPORT_CONFIG.CONFIDENCE_AUTO_CREATE ? 'created'
+            : fallbackConfidence >= IMPORT_CONFIG.MIN_CONFIDENCE_ANALYZE  ? 'analyzed' : 'rejected';
 
         const fallbackSummary = errMsg.includes('API key not configured')
           ? 'No OpenAI API key configured — review manually or add key in Settings.'
@@ -629,17 +655,19 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
 
       // 6. Apply classification result
       //
-      // Decision order (must follow this exactly):
-      //   isTask=false               → skip (reject internally for dedupe)
-      //   isTask=true, conf < REVIEW → skip
-      //   isTask=true, conf >= AUTO  → real Task
-      //   isTask=true, conf >= REVIEW → Review item in Inbox
+      // Auto-import (captureMode unset):
+      //   isTask=false               → reject
+      //   isTask=true, conf < REVIEW → reject
+      //   isTask=true, conf >= AUTO  → created
+      //   isTask=true, conf >= REVIEW → analyzed
       //
-      // Confidence alone NEVER creates a task — isTask must be true first.
+      // Explicit-capture (captureMode === 'explicit'):
+      //   AI enriches only — never rejects.
+      //   conf >= AUTO → created; otherwise → analyzed
       const { isTask, confidence, title, summary, customerName, taskType, estimatedEffort, dueAt } =
         classification;
 
-      if (!isTask || confidence < IMPORT_CONFIG.MIN_CONFIDENCE_ANALYZE) {
+      if ((!isTask || confidence < IMPORT_CONFIG.MIN_CONFIDENCE_ANALYZE) && input.captureMode !== 'explicit') {
         const skipReason = !isTask
           ? `AI: isTask=false (conf=${confidence})`
           : `AI: low confidence (conf=${confidence})`;
@@ -652,6 +680,9 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
         setTasks(withRejected);
         api.saveTasks(withRejected).catch((e) => console.warn('[import] save rejected failed:', e));
         return { outcome: 'rejected', reason: skipReason, taskId: pendingId };
+      }
+      if (input.captureMode === 'explicit' && (!isTask || confidence < IMPORT_CONFIG.MIN_CONFIDENCE_ANALYZE)) {
+        console.log(`[import] explicit-capture override "${input.title}": AI weak (isTask=${isTask} conf=${confidence}) → surfaces as analyzed`);
       }
 
       // Refine customer match using AI-derived name if deterministic match failed
@@ -679,19 +710,17 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
       // always preferred. OpenAI's freely-generated title is used only for generic emails, where
       // it adds real value by extracting a clean action-oriented summary from messy bodies.
       const isPrComment = input.adoContext?.type === 'pr-comment';
-      const rawResolvedTitle = isPrComment
-        ? input.title                // preserve deterministic "PR comment: address feedback in ..."
-        : title || input.title;      // AI title for everything else
-      // Final guardrail: if this is a PR comment, the title must start with "PR comment:".
-      // This protects against edge cases where input.title was somehow overwritten upstream.
-      const guardrailFired = isPrComment && !!rawResolvedTitle && !rawResolvedTitle.startsWith('PR comment:');
-      const resolvedTitle = guardrailFired
-        ? `PR comment: ${rawResolvedTitle}`
-        : rawResolvedTitle;
+      const isEmail     = input.source === 'email';
+      // Title policy:
+      //   ADO PR comment  → input.title is the normalized email subject (the natural heading)
+      //   Generic email   → input.title is the original email subject
+      //   Teams / other   → AI-generated title preferred, subject as fallback
+      const resolvedTitle = (isPrComment || isEmail)
+        ? input.title
+        : title || input.title;
       console.log(
         `[title-route] finalTitle="${resolvedTitle?.slice(0, 70)}"`,
-        `source=${isPrComment ? 'deterministic_pr' : 'ai'}`,
-        `guardrailFired=${guardrailFired}`,
+        `source=${isPrComment ? 'deterministic_pr' : isEmail ? 'email_subject' : 'ai'}`,
         `customer=${finalCustomer?.name ?? 'NONE'}`,
       );
       const aiFields: Partial<Task> = {

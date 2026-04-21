@@ -186,6 +186,10 @@ export default function InboxPage() {
       heuristicBucket:    h.bucket,
       heuristicPriority:  h.confidence,
       heuristicReason:    h.reason,
+      // Explicit user intent: user opened the Outlook panel and triggered this import.
+      // AI enriches metadata but no longer gatekeeps task candidacy.
+      // Future: when isFlagged is available from Graph, only flagged emails reach here.
+      captureMode:        'explicit',
       forceCreate,
     });
   }
@@ -212,12 +216,12 @@ export default function InboxPage() {
       senderEmail:        msg.senderEmail,
       content:            fullContent,
       receivedAt:         msg.sentAt,
-      // Bucket from urgency detector (more granular than heuristic).
-      // Priority from heuristicClassify — Teams base=20, so no-signal messages
-      // score 20 and are silently skipped (< MIN_CONFIDENCE_ANALYZE=50).
+      // Bucket/priority still used for planning hints and auto-create threshold.
       heuristicBucket:    h.bucket !== 'this_week' ? h.bucket : urgency.bucket,
       heuristicPriority:  h.confidence,
       heuristicReason:    h.reason,
+      // Explicit user intent: user manually selected this Teams message to import.
+      captureMode:        'explicit',
       forceCreate,
     });
   }

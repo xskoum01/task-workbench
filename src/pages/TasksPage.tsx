@@ -2,6 +2,7 @@ import { useState } from 'react';
 import type { TaskStatus } from '../types';
 import { useApp } from '../context/AppContext';
 import { StatusBadge, TypeBadge, SourceBadge } from '../components/StatusBadge';
+import Icon from '../components/Icon';
 import TaskDetail from '../components/TaskDetail';
 import TaskForm from '../components/TaskForm';
 import PlanningView, { type PlanningFilter } from '../components/PlanningView';
@@ -38,13 +39,15 @@ const STATUS_FILTERS: { value: TaskStatus | 'all'; label: string }[] = [
 // ---------------------------------------------------------------------------
 
 export default function TasksPage() {
-  const { tasks, getCustomerById } = useApp();
+  const { tasks, getCustomerById, updateTask, deleteTask } = useApp();
 
   const [viewMode, setViewMode]           = useState<ViewMode>('planning');
   const [filter, setFilter]               = useState<TaskStatus | 'all'>('all');
   const [planningFilter, setPlanningFilter] = useState<PlanningFilter>(null);
+  const [showCompleted, setShowCompleted] = useState(false);
   const [selectedId, setSelectedId]       = useState<string | null>(null);
   const [showTaskForm, setShowTaskForm]   = useState(false);
+  const [confirmDeleteId, setConfirmDeleteId] = useState<string | null>(null);
 
   function handleSelect(id: string) {
     setSelectedId((prev) => (prev === id ? null : id));
@@ -142,6 +145,18 @@ export default function TasksPage() {
                     </button>
                   );
                 })}
+                <button
+                  className={`planning-filter-chip${showCompleted ? ' active' : ''}`}
+                  onClick={() => setShowCompleted((v) => !v)}
+                  title="Show completed tasks"
+                >
+                  Completed
+                  {realTasks.filter((t) => t.status === 'done').length > 0 && (
+                    <span className="planning-filter-chip-count">
+                      {realTasks.filter((t) => t.status === 'done').length}
+                    </span>
+                  )}
+                </button>
               </div>
             )}
 
@@ -187,11 +202,15 @@ export default function TasksPage() {
             <div className="task-list">
               {filtered.map((task) => {
                 const customer = getCustomerById(task.customerId);
+                const isConfirmingDelete = confirmDeleteId === task.id;
                 return (
-                  <button
+                  <div
                     key={task.id}
+                    role="button"
+                    tabIndex={0}
                     className={`task-list-item${selectedId === task.id ? ' selected' : ''}${task.dueAt && isOverdue(task.dueAt, task.status) ? ' overdue' : ''}`}
                     onClick={() => handleSelect(task.id)}
+                    onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') handleSelect(task.id); }}
                   >
                     <div className="task-list-item-main">
                       <div className="task-list-item-title">{task.title}</div>
@@ -238,8 +257,48 @@ export default function TasksPage() {
                       <span className="task-list-item-confidence">
                         {task.confidence}%
                       </span>
+                      <div
+                        className="task-list-item-actions"
+                        onClick={(e) => e.stopPropagation()}
+                      >
+                        {task.status !== 'done' && (
+                          <button
+                            className="tli-action-btn tli-action-btn--done"
+                            title="Mark as done"
+                            onClick={() => updateTask(task.id, { status: 'done' })}
+                          >
+                            <Icon name="check" size={12} />
+                          </button>
+                        )}
+                        {isConfirmingDelete ? (
+                          <>
+                            <button
+                              className="tli-action-btn tli-action-btn--confirm"
+                              title="Confirm delete"
+                              onClick={() => { deleteTask(task.id); setConfirmDeleteId(null); }}
+                            >
+                              del?
+                            </button>
+                            <button
+                              className="tli-action-btn tli-action-btn--cancel"
+                              title="Cancel"
+                              onClick={() => setConfirmDeleteId(null)}
+                            >
+                              <Icon name="x" size={12} />
+                            </button>
+                          </>
+                        ) : (
+                          <button
+                            className="tli-action-btn tli-action-btn--delete"
+                            title="Delete task"
+                            onClick={() => setConfirmDeleteId(task.id)}
+                          >
+                            <Icon name="trash-2" size={12} />
+                          </button>
+                        )}
+                      </div>
                     </div>
-                  </button>
+                  </div>
                 );
               })}
             </div>
@@ -253,6 +312,7 @@ export default function TasksPage() {
             selectedId={selectedId}
             onSelect={handleSelect}
             filter={planningFilter}
+            showCompleted={showCompleted}
           />
         )}
       </div>

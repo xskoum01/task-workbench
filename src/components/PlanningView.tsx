@@ -284,9 +284,11 @@ interface PlanningViewProps {
   onSelect: (id: string) => void;
   /** Active focus filter; null means no filter. */
   filter: PlanningFilter;
+  /** When true, a Done section is shown below the active buckets. */
+  showCompleted?: boolean;
 }
 
-export default function PlanningView({ tasks, selectedId, onSelect, filter }: PlanningViewProps) {
+export default function PlanningView({ tasks, selectedId, onSelect, filter, showCompleted }: PlanningViewProps) {
   const isFiltered = filter !== null;
 
   // Apply filter before grouping (done tasks are excluded inside groupByBucket)
@@ -296,6 +298,8 @@ export default function PlanningView({ tasks, selectedId, onSelect, filter }: Pl
 
   const groups = groupByBucket(visibleTasks);
   const totalVisible = Object.values(groups).reduce((s, g) => s + g.length, 0);
+
+  const doneTasks = showCompleted ? tasks.filter((t) => t.status === 'done') : [];
 
   return (
     <div className="planning-view">
@@ -326,6 +330,30 @@ export default function PlanningView({ tasks, selectedId, onSelect, filter }: Pl
           <div className="empty-state-icon">—</div>
           <div className="empty-state-text">No tasks match this filter</div>
         </div>
+      )}
+
+      {showCompleted && (
+        <section className="planning-bucket planning-bucket--done">
+          <div className="planning-bucket-header">
+            <Icon name="check" size={12} className="planning-bucket-icon" />
+            <span className="planning-bucket-label">Completed</span>
+            <span className="planning-bucket-count">{doneTasks.length}</span>
+          </div>
+          {doneTasks.length === 0 ? (
+            <div className="planning-bucket-empty">No completed tasks</div>
+          ) : (
+            <div className="planning-task-list">
+              {doneTasks.map((task) => (
+                <PlanningTaskRow
+                  key={task.id}
+                  task={task}
+                  selected={selectedId === task.id}
+                  onSelect={onSelect}
+                />
+              ))}
+            </div>
+          )}
+        </section>
       )}
     </div>
   );
