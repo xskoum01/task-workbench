@@ -497,9 +497,9 @@ export interface OutlookMessage {
   webLink: string;
   /**
    * True when the email has been flagged by the user in Outlook.
-   * Populated from the Graph API `flag.flagStatus === 'flagged'` field.
-   * Future: update `get_outlook_messages` Rust command to filter
-   *   ?$filter=flag/flagStatus eq 'flagged' and return this field.
+   * Populated from the Graph API `flag.flagStatus` field.
+   * The backend filters server-side with `$filter=flag/flagStatus eq 'flagged'`,
+   * so this will always be true for messages returned by `get_outlook_messages`.
    */
   isFlagged?: boolean;
 }

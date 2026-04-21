@@ -1469,11 +1469,15 @@ async fn get_outlook_messages(
     client_id: String,
 ) -> Result<Value, String> {
     let token = ensure_valid_token(&app, &client_id).await?;
+    // Server-side filter: only return messages the user has flagged in Outlook.
+    // Graph supports `flag/flagStatus eq 'flagged'` as an OData filter on /me/messages.
+    // `flag` is included in $select so we can confirm the status and populate isFlagged.
     let url = format!(
         "{MS_GRAPH_BASE}/me/messages\
-         ?$top=25\
+         ?$top=50\
+         &$filter=flag%2FflagStatus%20eq%20'flagged'\
          &$orderby=receivedDateTime%20desc\
-         &$select=id,subject,from,receivedDateTime,bodyPreview,webLink,body"
+         &$select=id,subject,from,receivedDateTime,bodyPreview,webLink,body,flag"
     );
     let data = graph_get(&url, &token).await?;
     let messages: Vec<Value> = data["value"]
@@ -1511,6 +1515,9 @@ async fn get_outlook_messages(
             } else {
                 eprintln!("[ado-link] skip ADO extraction for non-ADO email subject=\"{}\"", &subject_str[..subject_str.len().min(60)]);
             }
+            // isFlagged: we filtered server-side so this will always be true,
+            // but we confirm from the field so the contract is explicit.
+            let is_flagged = m["flag"]["flagStatus"].as_str() == Some("flagged");
             serde_json::json!({
                 "id": m["id"],
                 "subject": m["subject"].as_str().unwrap_or("(no subject)"),
@@ -1520,6 +1527,7 @@ async fn get_outlook_messages(
                 "bodyPreview": m["bodyPreview"],
                 "bodyFull": body_full,
                 "webLink": m["webLink"],
+                "isFlagged": is_flagged,
             })
         })
         .collect();

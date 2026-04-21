@@ -49,23 +49,9 @@ export default function OutlookImport({ clientId, onClose, onImport, onForceCrea
     try {
       const result = await tauriApi.getOutlookMessages(clientId);
       console.debug(`[outlook-load] fetched requestId=${requestId} count=${result.length}`);
+      // Show flagged emails for manual import — do NOT auto-import.
+      // Each item stays at 'idle' until the user clicks Import.
       setMessages(result);
-      // Auto-import all fetched messages concurrently; duplicates finish immediately.
-      const initialStates: Record<string, MessageState> = {};
-      result.forEach((m) => { initialStates[m.id] = 'importing'; });
-      setStates(initialStates);
-      await Promise.all(
-        result.map(async (m) => {
-          console.debug(`[outlook-import] requestId=${requestId} messageId=${m.id} subject="${m.subject?.slice(0, 60)}"`);
-          try {
-            const r = await onImport(m);
-            setResults((prev) => ({ ...prev, [m.id]: r }));
-            setStates((prev) => ({ ...prev, [m.id]: r.outcome }));
-          } catch {
-            setStates((prev) => ({ ...prev, [m.id]: 'idle' }));
-          }
-        }),
-      );
       console.debug(`[outlook-load] completed requestId=${requestId} count=${result.length}`);
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
@@ -137,8 +123,13 @@ export default function OutlookImport({ clientId, onClose, onImport, onForceCrea
         </div>
       )}
 
+      {/* Scope note: source is flagged emails only */}
+      <div className="ms-import-scope-note">
+        {'Flagged emails only — flag an email in Outlook first, then refresh here to import it as a task.'}
+      </div>
+
       {!loading && !error && messages.length === 0 && (
-        <div className="ms-import-empty">No recent messages.</div>
+        <div className="ms-import-empty">No flagged emails. Flag an email in Outlook to import it.</div>
       )}
 
       {!loading && !error && messages.length > 0 && (
