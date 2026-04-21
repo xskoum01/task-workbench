@@ -111,6 +111,16 @@ export default function InlineTaskPanel({ task, onOpenDetail }: Props) {
                     <span className="tip-nextstep-text">{enNext}</span>
                   </div>
                 )}
+                <div>
+                  <button
+                    className="btn btn-ghost btn-sm"
+                    disabled={analyzing}
+                    onClick={handleAnalyze}
+                  >
+                    <Icon name="search" size={12} />
+                    {analyzing ? 'Analyzing…' : 'Re-analyze'}
+                  </button>
+                </div>
               </div>
             ) : (
               <div className="tip-empty-state">

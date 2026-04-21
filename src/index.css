@@ -3601,6 +3601,7 @@ body {
 .tip-col-main {
   display: flex;
   flex-direction: column;
+  background: var(--bg-base);
   border-right: 1px solid var(--border);
 }
 
@@ -3638,9 +3639,10 @@ body {
 
 /* ── Section label ─────────────────────────────────────────── */
 
+/* Section label — matches detail-section-label exactly */
 .tip-sec-label {
-  font-size: 10px;
-  font-weight: 600;
+  font-size: 11px;
+  font-weight: 700;
   letter-spacing: 0.07em;
   text-transform: uppercase;
   color: var(--text-muted);
@@ -3655,12 +3657,12 @@ body {
   gap: 10px;
 }
 
-/* Primary content — bright, easy to read */
+/* Primary content — matches detail-section-value and email-body exactly */
 .tip-content-text {
   margin: 0;
-  font-size: 13.5px;
+  font-size: 13px;
   color: var(--text-primary);
-  line-height: 1.65;
+  line-height: 1.75;
 }
 
 .tip-content-text--secondary {
@@ -3749,7 +3751,7 @@ body {
 
 /* ── Notes textarea ────────────────────────────────────────── */
 
-/* Notes fills the right column — matches detail-notes-textarea style exactly */
+/* Notes fills the right column — identical token set to detail-notes-textarea */
 .tip-notes {
   flex: 1;
   width: 100%;
@@ -3760,9 +3762,9 @@ body {
   color: var(--text-primary);
   font-size: 13px;
   font-family: inherit;
-  padding: 10px 12px;
+  padding: 8px 10px;
   resize: none;
-  line-height: 1.65;
+  line-height: 1.6;
   min-height: 240px;
   outline: none;
   transition: border-color 0.15s;
