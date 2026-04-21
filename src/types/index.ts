@@ -536,6 +536,12 @@ export interface TeamsChatMessage {
   sentAt: string;
   /** HTML stripped to plain text. */
   content: string;
+  // Forwarded-message metadata — mirrored from TeamsFlatMessage.
+  isForwarded?: boolean;
+  originalSenderName?: string;
+  originalSenderEmail?: string;
+  originalSentAt?: string;
+  originalContent?: string;
 }
 
 /**
@@ -556,4 +562,11 @@ export interface TeamsFlatMessage {
   chatTopic: string;
   chatType: string;
   chatMembersSummary: string;
+  // Forwarded-message metadata (populated by Rust before strip_html).
+  // Present only when the Teams message is a forwarded card.
+  isForwarded?: boolean;
+  originalSenderName?: string;
+  originalSenderEmail?: string;
+  originalSentAt?: string;
+  originalContent?: string;
 }

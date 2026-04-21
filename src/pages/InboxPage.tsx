@@ -195,20 +195,24 @@ export default function InboxPage() {
   }
 
   async function handleTeamsImport(chat: TeamsChat, msg: TeamsChatMessage, forceCreate = false): Promise<ImportResult> {
-    // Detect forwarded message structure before building the import payload.
-    // When the intake message contains a forwarded block, import the original
-    // message (sender + content), not the outer wrapper.
-    const fwd = parseForwardedTeamsMessage(msg.content, msg.senderName, msg.senderEmail, msg.sentAt);
+    // Prefer structured forwarded-message metadata parsed by Rust from the raw HTML
+    // (populated on `msg` before strip_html destroys forwarded-card structure).
+    // Fall back to the frontend heuristic parser only when Rust did not detect a forward.
+    const rustFwd = msg.isForwarded && msg.originalSenderName
+      ? { senderName: msg.originalSenderName, senderEmail: msg.originalSenderEmail, sentAt: msg.originalSentAt, content: msg.originalContent }
+      : null;
+    const fwdFallback = !rustFwd ? parseForwardedTeamsMessage(msg.content, msg.senderName, msg.senderEmail, msg.sentAt) : null;
+    const fwd = rustFwd ?? fwdFallback;
 
-    const effectiveSenderName  = fwd ? fwd.senderName  : msg.senderName;
-    const effectiveSenderEmail = fwd ? (fwd.senderEmail ?? msg.senderEmail) : msg.senderEmail;
-    const effectiveSentAt      = fwd ? (fwd.sentAt     ?? msg.sentAt)      : msg.sentAt;
-    const effectiveBody        = fwd ? fwd.content                          : msg.content;
+    const effectiveSenderName  = fwd?.senderName  || msg.senderName;
+    const effectiveSenderEmail = fwd?.senderEmail || msg.senderEmail;
+    const effectiveSentAt      = fwd?.sentAt      || msg.sentAt;
+    const effectiveBody        = fwd?.content     || msg.content;
 
     if (fwd) {
       console.log(
-        `[teams-fwd] forwarded message detected in intake chat`,
-        `originalSender="${fwd.senderName}" bodyLen=${fwd.content.length}`,
+        `[teams-fwd] forwarded message detected (source: ${rustFwd ? 'rust' : 'frontend'})`,
+        `originalSender="${effectiveSenderName}" bodyLen=${effectiveBody.length}`,
       );
     }
 

@@ -1836,6 +1836,12 @@ async fn get_teams_intake_messages(
             filtered_out += 1;
             continue;
         }
+        // Parse forwarded-message metadata from the raw HTML *before* it is lost.
+        let fwd = parse_teams_forwarded_card(&m, raw_content);
+        if fwd.is_some() {
+            eprintln!("[Teams-intake] forwarded card detected in message {}",
+                m["id"].as_str().unwrap_or("?"));
+        }
         messages.push(serde_json::json!({
             "id":                 m["id"],
             "senderName":         m["from"]["user"]["displayName"].as_str().unwrap_or(""),
@@ -1846,6 +1852,12 @@ async fn get_teams_intake_messages(
             "chatTopic":          "Teams intake",
             "chatType":           "oneOnOne",
             "chatMembersSummary": "Intake chat",
+            // Forwarded-message metadata — empty strings when not a forward.
+            "isForwarded":         fwd.is_some(),
+            "originalSenderName":  fwd.as_ref().map(|f| f.sender_name.as_str()).unwrap_or(""),
+            "originalSenderEmail": fwd.as_ref().and_then(|f| f.sender_email.as_deref()).unwrap_or(""),
+            "originalSentAt":      fwd.as_ref().and_then(|f| f.sent_at.as_deref()).unwrap_or(""),
+            "originalContent":     fwd.as_ref().map(|f| f.content.as_str()).unwrap_or(""),
         }));
     }
     eprintln!("[Teams-intake] {} messages kept today, {} filtered out", messages.len(), filtered_out);
@@ -2362,6 +2374,119 @@ fn chrono_now_iso() -> String {
     // Very simple date arithmetic (no leap-year handling needed for sync timestamps)
     let year = 1970 + days_since_epoch / 365;
     format!("{year:04}-01-01T{h:02}:{m:02}:{s:02}Z")
+}
+
+// --- Forwarded Teams message detection ------------------------------------
+
+/// Metadata extracted from a forwarded Teams intake message.
+struct ForwardedMeta {
+    sender_name:  String,
+    sender_email: Option<String>,
+    sent_at:      Option<String>,
+    content:      String,
+}
+
+/// Attempt to extract original-message metadata from a forwarded Teams intake message.
+///
+/// Two strategies (tried in order):
+///
+/// 1. **messageReference attachment** — when a user explicitly shares/references
+///    another message via the Teams UI, the Graph API populates
+///    `attachments[].contentType == "messageReference"` with a JSON `content`
+///    string that contains `messageSender.user.{displayName,userPrincipalName}`
+///    and `messagePreview`. This is the most reliable signal.
+///
+/// 2. **HTML `<b>From:</b>` pattern** — when a message is forwarded by copying
+///    and pasting, the body HTML often contains an email-style header block
+///    (`<b>From:</b> Name ...`) that is destroyed when `strip_html` is called.
+///    We parse this *before* stripping.
+///
+/// Returns `None` for normal (non-forwarded) messages so the caller falls back
+/// cleanly to the existing behaviour.
+fn parse_teams_forwarded_card(msg: &Value, body_html: &str) -> Option<ForwardedMeta> {
+    // ── Strategy 1: messageReference attachment ──────────────────────────────
+    if let Some(atts) = msg["attachments"].as_array() {
+        for att in atts {
+            if att["contentType"].as_str() != Some("messageReference") {
+                continue;
+            }
+            let content_str = att["content"].as_str().unwrap_or("{}");
+            if let Ok(c) = serde_json::from_str::<Value>(content_str) {
+                let sender_name = c["messageSender"]["user"]["displayName"]
+                    .as_str()
+                    .unwrap_or("")
+                    .to_string();
+                let sender_email = c["messageSender"]["user"]["userPrincipalName"]
+                    .as_str()
+                    .filter(|s| !s.is_empty())
+                    .map(|s| s.to_string());
+                let preview = c["messagePreview"].as_str().unwrap_or("").trim().to_string();
+                if !sender_name.is_empty() {
+                    // Prefer the structured preview; fall back to the full stripped body.
+                    let full_stripped = strip_html(body_html);
+                    let content = if !preview.is_empty() {
+                        preview
+                    } else {
+                        full_stripped.trim().to_string()
+                    };
+                    return Some(ForwardedMeta {
+                        sender_name,
+                        sender_email,
+                        sent_at: None,
+                        content,
+                    });
+                }
+            }
+        }
+    }
+
+    // ── Strategy 2: HTML <b>From:</b> / <strong>From:</strong> pattern ────────
+    // Parse this in the raw HTML *before* strip_html destroys the structure.
+    let lower_html = body_html.to_ascii_lowercase();
+    if lower_html.contains("<b>from:</b>") || lower_html.contains("<strong>from:</strong>") {
+        let plain = strip_html(body_html);
+        let lines: Vec<&str> = plain.lines().collect();
+        let mut sender_name:  String          = String::new();
+        let mut sender_email: Option<String>  = None;
+        let mut sent_at:      Option<String>  = None;
+        let mut body_start:   usize           = lines.len(); // default: no body found
+
+        for (i, line) in lines.iter().enumerate() {
+            let t = line.trim();
+            if let Some(rest) = t.strip_prefix("From:") {
+                let raw = rest.trim();
+                if let (Some(a), Some(b)) = (raw.find('<'), raw.find('>')) {
+                    // "Display Name <user@domain>"
+                    sender_name  = raw[..a].trim().to_string();
+                    sender_email = Some(raw[a + 1..b].trim().to_string());
+                } else if raw.contains('@') {
+                    sender_email = Some(raw.to_string());
+                    sender_name  = raw.split('@').next().unwrap_or(raw).to_string();
+                } else {
+                    sender_name = raw.to_string();
+                }
+            } else if let Some(rest) = t.strip_prefix("Sent:") {
+                sent_at = Some(rest.trim().to_string());
+            } else if !sender_name.is_empty()
+                && !t.is_empty()
+                && !t.starts_with("To:")
+                && !t.starts_with("Cc:")
+                && !t.starts_with("Subject:")
+            {
+                body_start = i;
+                break;
+            }
+        }
+
+        if !sender_name.is_empty() && body_start < lines.len() {
+            let content = lines[body_start..].join("\n").trim().to_string();
+            if !content.is_empty() {
+                return Some(ForwardedMeta { sender_name, sender_email, sent_at, content });
+            }
+        }
+    }
+
+    None
 }
 
 // --- Entry point -----------------------------------------------------------

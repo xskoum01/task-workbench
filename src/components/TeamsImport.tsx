@@ -50,11 +50,17 @@ function toImportArgs(item: TeamsFlatMessage): [TeamsChat, TeamsChatMessage] {
     lastUpdatedAt:      item.sentAt,
   };
   const msg: TeamsChatMessage = {
-    id:          item.id,
-    senderName:  item.senderName,
-    senderEmail: item.senderEmail,
-    sentAt:      item.sentAt,
-    content:     item.content,
+    id:                  item.id,
+    senderName:          item.senderName,
+    senderEmail:         item.senderEmail,
+    sentAt:              item.sentAt,
+    content:             item.content,
+    // Forward forwarded-message metadata so handleTeamsImport can prefer original sender.
+    isForwarded:         item.isForwarded,
+    originalSenderName:  item.originalSenderName,
+    originalSenderEmail: item.originalSenderEmail,
+    originalSentAt:      item.originalSentAt,
+    originalContent:     item.originalContent,
   };
   return [chat, msg];
 }
