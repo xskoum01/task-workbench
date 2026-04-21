@@ -70,6 +70,10 @@ export default function TeamsImport({ clientId, onClose, onImport, onForceCreate
     setStates({});
     setResults({});
     try {
+      // Fetches recent chat messages — NOT saved/bookmarked messages.
+      // Microsoft Graph has no stable saved-messages endpoint for Teams as of 2025.
+      // Future extension: if Graph exposes a saved-messages API, swap the call below
+      // with a dedicated `getTeamsSavedMessages(clientId)` command and update the UI scope note.
       const items = await tauriApi.getTeamsRecentMessages(clientId);
       setMessages(items);
       // All messages start as idle — the user imports each one manually.
@@ -126,9 +130,9 @@ export default function TeamsImport({ clientId, onClose, onImport, onForceCreate
         </div>
       </div>
 
-      {/* Scope disclaimer — always visible so users know what this covers */}
+      {/* Scope note: honest about source and limitation */}
       <div className="ms-import-scope-note">
-        {'Recent chat messages — select which ones to import as tasks. Channel messages are not supported.'}
+        {'Recent chat messages — select which ones to import as tasks. Channel messages and saved/bookmarked messages are not available via the current Microsoft Graph API.'}
       </div>
 
       {errorInfo && (

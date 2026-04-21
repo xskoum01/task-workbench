@@ -263,6 +263,12 @@ export function getTeamsChatMessages(clientId: string, chatId: string): Promise<
  * Fetch the latest 10 Teams messages across the user's recent chats.
  * Each item embeds its parent chat context (chatId, chatTopic, chatMembersSummary).
  * This is the message-centric view used by the Teams import panel.
+ *
+ * NOTE: This uses recent chat messages, NOT saved/bookmarked messages.
+ * Microsoft Graph does not expose a stable user-level "saved for later" endpoint
+ * for Teams chats as of 2025 (the Teams in-app Save feature has no Graph API surface).
+ * If Graph ever exposes GET /me/teams/savedMessages or similar, replace this call
+ * and the Rust `get_teams_recent_messages` command with a saved-messages fetch.
  */
 export function getTeamsRecentMessages(clientId: string): Promise<TeamsFlatMessage[]> {
   return invoke('get_teams_recent_messages', { clientId });
