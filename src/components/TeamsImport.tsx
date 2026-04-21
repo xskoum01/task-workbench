@@ -6,6 +6,8 @@ import Icon from './Icon';
 
 interface Props {
   clientId: string;
+  /** Configured Teams intake chat ID from Settings. If absent the panel shows a setup prompt. */
+  intakeChatId?: string;
   onClose: () => void;
   /** Called with reconstructed chat + message objects so InboxPage.handleTeamsImport stays unchanged. */
   onImport: (chat: TeamsChat, msg: TeamsChatMessage) => Promise<ImportResult>;
@@ -57,7 +59,7 @@ function toImportArgs(item: TeamsFlatMessage): [TeamsChat, TeamsChatMessage] {
   return [chat, msg];
 }
 
-export default function TeamsImport({ clientId, onClose, onImport, onForceCreate }: Props) {
+export default function TeamsImport({ clientId, intakeChatId, onClose, onImport, onForceCreate }: Props) {
   const [messages, setMessages] = useState<TeamsFlatMessage[]>([]);
   const [loading, setLoading]   = useState(true);
   const [error, setError]       = useState<string | null>(null);
@@ -65,14 +67,14 @@ export default function TeamsImport({ clientId, onClose, onImport, onForceCreate
   const [results, setResults]   = useState<Record<string, ImportResult>>({});
 
   async function fetchMessages() {
+    if (!intakeChatId) return;
     setLoading(true);
     setError(null);
     setStates({});
     setResults({});
     try {
-      // Source: self-chat intake inbox, today only.
-      // Send or forward a message to yourself in Teams to queue it here.
-      const items = await tauriApi.getTeamsSelfChatMessages(clientId);
+      // Source: configured intake chat (set in Settings → Teams Intake), today only.
+      const items = await tauriApi.getTeamsIntakeMessages(clientId, intakeChatId);
       setMessages(items);
       // All messages start as idle — the user imports each one manually.
       const initialStates: Record<string, MessageState> = {};
@@ -85,7 +87,7 @@ export default function TeamsImport({ clientId, onClose, onImport, onForceCreate
     }
   }
 
-  useEffect(() => { fetchMessages(); }, []);
+  useEffect(() => { if (intakeChatId) { fetchMessages(); } }, [intakeChatId]);
 
   const errorInfo = error ? classifyError(error) : null;
 
@@ -128,8 +130,20 @@ export default function TeamsImport({ clientId, onClose, onImport, onForceCreate
 
       {/* Scope note */}
       <div className="ms-import-scope-note">
-        {'Self-chat intake — today’s messages only. Forward or send a message to yourself in Teams to queue it as a task candidate.'}
+        {intakeChatId
+          ? 'Today’s messages from your configured intake chat — send or forward a message into that chat to queue it as a task candidate.'
+          : 'No intake chat configured yet.'}
       </div>
+
+      {/* Setup prompt if no chat is configured */}
+      {!intakeChatId && (
+        <div className="ms-import-empty">
+          <div>Teams intake chat not configured.</div>
+          <div className="ms-import-empty-sub">
+            Go to <strong>Settings → Teams Intake</strong>, paste the chat link or ID, and save.
+          </div>
+        </div>
+      )}
 
       {errorInfo && (
         <div className="ms-import-error">
@@ -138,18 +152,18 @@ export default function TeamsImport({ clientId, onClose, onImport, onForceCreate
         </div>
       )}
 
-      {loading && (
+      {intakeChatId && loading && (
         <div className="ms-import-loading">
           <Icon name="loader" size={18} />
-          {'Loading self-chat messages\u2026'}
+          {'Loading intake messages\u2026'}
         </div>
       )}
 
-      {!loading && messages.length === 0 && !error && (
+      {intakeChatId && !loading && messages.length === 0 && !error && (
         <div className="ms-import-empty">
-          <div>No messages today in your self-chat.</div>
+          <div>No messages today in your intake chat.</div>
           <div className="ms-import-empty-sub">
-            Send or forward a message to yourself in Teams to queue it as a task candidate.
+            Send or forward a message into the configured chat to queue it as a task candidate.
           </div>
         </div>
       )}

@@ -57,6 +57,34 @@ function SettingsField({
 }
 
 // ---------------------------------------------------------------------------
+// Teams chat URL parser
+// ---------------------------------------------------------------------------
+
+/**
+ * Extract a chatId from a pasted Teams chat link or return the raw input if
+ * it already looks like a chatId.
+ *
+ * Teams deep links look like:
+ *   https://teams.microsoft.com/l/chat/19%3Axxx%40thread.v2/0?context=...
+ * The chatId is the path segment after /l/chat/ decoded from percent-encoding.
+ */
+function parseTeamsChatId(raw: string): string {
+  const input = raw.trim();
+  if (!input) return '';
+  try {
+    const url = new URL(input);
+    const parts = url.pathname.split('/');
+    const chatIdx = parts.indexOf('chat');
+    if (chatIdx !== -1 && parts[chatIdx + 1]) {
+      return decodeURIComponent(parts[chatIdx + 1]);
+    }
+  } catch {
+    // Not a URL — treat as a raw chat ID
+  }
+  return input;
+}
+
+// ---------------------------------------------------------------------------
 // M365 status helpers
 // ---------------------------------------------------------------------------
 
@@ -834,6 +862,37 @@ export default function SettingsPage() {
               );
             })()}
           </SettingsBlock>
+
+          {/* Teams Intake — shown only when Teams is connected */}
+          {draft.teamsStatus === 'connected' && (
+            <SettingsBlock
+              icon="message-square"
+              title="Teams Intake"
+              description="Configure which Teams chat is used as the task intake inbox."
+            >
+              <SettingsField label="Intake chat">
+                <input
+                  className="form-input"
+                  type="text"
+                  placeholder="Paste a Teams chat link or a raw chat ID"
+                  value={draft.teamsIntakeChatId ?? ''}
+                  onChange={(e) => {
+                    const normalized = parseTeamsChatId(e.target.value);
+                    set('teamsIntakeChatId', normalized || undefined);
+                  }}
+                  style={{ maxWidth: 420 }}
+                />
+              </SettingsField>
+              <p className="settings-hint">
+                Open the chat in Teams, copy the link from
+                {' '}<strong>More options → Copy link to chat</strong>, and paste it here.
+                Today’s messages from this chat will appear in the Teams import panel.
+                {draft.teamsIntakeChatId && (
+                  <><br /><span style={{ opacity: 0.7 }}>Stored ID: {draft.teamsIntakeChatId}</span></>
+                )}
+              </p>
+            </SettingsBlock>
+          )}
 
           {/* Data management */}
           <SettingsBlock icon="folder" title="Data Management" description="Reset local persisted data. Settings and Microsoft tokens are preserved.">

@@ -185,3 +185,136 @@ export function generateTeamsTitle(senderName: string, content: string): string 
   const prefix = senderName?.trim() ? `${senderName.trim()}: ` : '';
   return `${prefix}${capped}`;
 }
+
+// ---------------------------------------------------------------------------
+// Forwarded message detection
+// ---------------------------------------------------------------------------
+
+export interface ForwardedTeamsMessage {
+  isForwarded: true;
+  senderName: string;
+  senderEmail?: string;
+  sentAt?: string;
+  content: string;
+}
+
+/**
+ * Extracts sender name, email, and sent-at from a "From: ..." / "Sent: ..." header block.
+ * Returns partial fields — all may be absent if not found.
+ */
+function extractFromOrSentHeader(lines: string[]): Pick<ForwardedTeamsMessage, 'senderName' | 'senderEmail' | 'sentAt'> {
+  let senderName = '';
+  let senderEmail: string | undefined;
+  let sentAt: string | undefined;
+
+  for (const line of lines) {
+    const fromMatch = line.match(/^From:\s*(.+)/i);
+    if (fromMatch) {
+      const raw = fromMatch[1].trim();
+      // "Name <email>" or "email" or just "Name"
+      const angleMatch = raw.match(/^(.+?)\s*<([^>]+)>$/);
+      if (angleMatch) {
+        senderName = angleMatch[1].trim();
+        senderEmail = angleMatch[2].trim();
+      } else if (raw.includes('@')) {
+        senderEmail = raw;
+        senderName = raw.split('@')[0];
+      } else {
+        senderName = raw;
+      }
+    }
+    const sentMatch = line.match(/^Sent:\s*(.+)/i);
+    if (sentMatch) sentAt = sentMatch[1].trim();
+  }
+
+  return { senderName, senderEmail, sentAt };
+}
+
+/**
+ * Detects whether `content` contains a forwarded message and, if so, returns
+ * structured data about the original message.
+ *
+ * Patterns detected:
+ *  A: First few lines contain "From: ..." header (email-style forward)
+ *  B: "---Forwarded message---" or "---------- Forwarded message ---------"
+ *  C: Teams card header "Name  HH:MM AM/PM" pattern
+ *  D: Majority of lines start with ">"
+ *
+ * Returns null if no forwarded structure is detected.
+ */
+export function parseForwardedTeamsMessage(
+  content: string,
+  fallbackSenderName: string,
+  fallbackSenderEmail?: string,
+  fallbackSentAt?: string,
+): ForwardedTeamsMessage | null {
+  if (!content?.trim()) return null;
+
+  const lines = content.split('\n');
+
+  // Pattern B — explicit forwarded separator
+  const fwdSepIdx = lines.findIndex((l) =>
+    /^-{3,}\s*forwarded message\s*-{3,}/i.test(l.trim()),
+  );
+  if (fwdSepIdx !== -1) {
+    const headerLines = lines.slice(fwdSepIdx + 1, fwdSepIdx + 8);
+    const meta = extractFromOrSentHeader(headerLines);
+    const bodyStart = headerLines.findIndex((l) => l.trim() === '') + fwdSepIdx + 2;
+    const body = lines.slice(bodyStart).join('\n').trim();
+    return {
+      isForwarded: true,
+      senderName: meta.senderName || fallbackSenderName,
+      senderEmail: meta.senderEmail ?? fallbackSenderEmail,
+      sentAt: meta.sentAt ?? fallbackSentAt,
+      content: body || content,
+    };
+  }
+
+  // Pattern A — "From:" within first 6 lines
+  const first6 = lines.slice(0, 6);
+  const hasFromHeader = first6.some((l) => /^From:\s+\S+/i.test(l.trim()));
+  if (hasFromHeader) {
+    const meta = extractFromOrSentHeader(first6);
+    // Body starts after the header block (first blank line)
+    const blankIdx = first6.findIndex((l) => l.trim() === '');
+    const bodyStart = blankIdx !== -1 ? blankIdx + 1 : 4;
+    const body = lines.slice(bodyStart).join('\n').trim();
+    return {
+      isForwarded: true,
+      senderName: meta.senderName || fallbackSenderName,
+      senderEmail: meta.senderEmail ?? fallbackSenderEmail,
+      sentAt: meta.sentAt ?? fallbackSentAt,
+      content: body || content,
+    };
+  }
+
+  // Pattern C — Teams card header: "Name  HH:MM AM/PM" on the first non-empty line
+  const firstNonEmpty = lines.find((l) => l.trim().length > 0) ?? '';
+  const teamsCardMatch = firstNonEmpty.match(/^(.+?)\s{2,}(\d{1,2}:\d{2}\s*[AP]M)/i);
+  if (teamsCardMatch) {
+    const body = lines.slice(1).join('\n').trim();
+    return {
+      isForwarded: true,
+      senderName: teamsCardMatch[1].trim(),
+      senderEmail: fallbackSenderEmail,
+      sentAt: teamsCardMatch[2].trim(),
+      content: body || content,
+    };
+  }
+
+  // Pattern D — quote-style forward (majority of lines start with ">")
+  const nonEmpty = lines.filter((l) => l.trim().length > 0);
+  const quoted = nonEmpty.filter((l) => l.trim().startsWith('>'));
+  if (nonEmpty.length >= 3 && quoted.length / nonEmpty.length >= 0.6) {
+    const body = nonEmpty.map((l) => l.replace(/^>\s?/, '')).join('\n').trim();
+    return {
+      isForwarded: true,
+      senderName: fallbackSenderName,
+      senderEmail: fallbackSenderEmail,
+      sentAt: fallbackSentAt,
+      content: body,
+    };
+  }
+
+  return null;
+}

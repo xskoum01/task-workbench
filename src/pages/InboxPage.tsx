@@ -2,7 +2,7 @@
 import type { Task, Customer, OutlookMessage, TeamsChat, TeamsChatMessage } from '../types';
 import { useApp } from '../context/AppContext';
 import type { ImportResult } from '../context/AppContext';
-import { generateTeamsTitle, detectTeamsUrgency } from '../lib/teamsHeuristics';
+import { generateTeamsTitle, detectTeamsUrgency, parseForwardedTeamsMessage } from '../lib/teamsHeuristics';
 import { heuristicClassify } from '../lib/heuristicClassify';
 import { parseAdoEmail, resolveCustomerFromCrmCode } from '../lib/adoParsing';
 import { SourceBadge, ClassificationBadge } from '../components/StatusBadge';
@@ -195,32 +195,47 @@ export default function InboxPage() {
   }
 
   async function handleTeamsImport(chat: TeamsChat, msg: TeamsChatMessage, forceCreate = false): Promise<ImportResult> {
+    // Detect forwarded message structure before building the import payload.
+    // When the intake message contains a forwarded block, import the original
+    // message (sender + content), not the outer wrapper.
+    const fwd = parseForwardedTeamsMessage(msg.content, msg.senderName, msg.senderEmail, msg.sentAt);
+
+    const effectiveSenderName  = fwd ? fwd.senderName  : msg.senderName;
+    const effectiveSenderEmail = fwd ? (fwd.senderEmail ?? msg.senderEmail) : msg.senderEmail;
+    const effectiveSentAt      = fwd ? (fwd.sentAt     ?? msg.sentAt)      : msg.sentAt;
+    const effectiveBody        = fwd ? fwd.content                          : msg.content;
+
+    if (fwd) {
+      console.log(
+        `[teams-fwd] forwarded message detected in intake chat`,
+        `originalSender="${fwd.senderName}" bodyLen=${fwd.content.length}`,
+      );
+    }
+
     // Build the full content block first so heuristics can read the message body
-    const fullContent = `From: ${msg.senderName} <${msg.senderEmail}>\nChat: ${chat.topic || chat.membersSummary}\n\n${msg.content}`;
+    const fullContent = `From: ${effectiveSenderName} <${effectiveSenderEmail}>\nChat: ${chat.topic || chat.membersSummary}${
+      fwd ? '\n[Forwarded via intake chat]' : ''
+    }\n\n${effectiveBody}`;
 
     // Generate a meaningful title instead of using raw participant names
-    const title = generateTeamsTitle(msg.senderName, fullContent);
+    const title = generateTeamsTitle(effectiveSenderName, fullContent);
 
     // heuristicClassify drives the confidence/priority score.
-    // detectTeamsUrgency is used only for the planning bucket when the message
-    // is already considered actionable, so casual messages stay skipped.
     const h = heuristicClassify(title, fullContent, 'teams');
-    const urgency = detectTeamsUrgency(msg.content);
+    const urgency = detectTeamsUrgency(effectiveBody);
 
     return importMessage({
       externalMessageId:  msg.id,
       sourceThreadId:     chat.id,
       source:             'teams',
       title,
-      senderName:         msg.senderName,
-      senderEmail:        msg.senderEmail,
+      senderName:         effectiveSenderName,
+      senderEmail:        effectiveSenderEmail,
       content:            fullContent,
-      receivedAt:         msg.sentAt,
-      // Bucket/priority still used for planning hints and auto-create threshold.
+      receivedAt:         effectiveSentAt,
       heuristicBucket:    h.bucket !== 'this_week' ? h.bucket : urgency.bucket,
       heuristicPriority:  h.confidence,
       heuristicReason:    h.reason,
-      // Explicit user intent: user manually selected this Teams message to import.
       captureMode:        'explicit',
       forceCreate,
     });
@@ -285,6 +300,7 @@ export default function InboxPage() {
         {showTeams && (
           <TeamsImport
             clientId={clientId}
+            intakeChatId={settings?.teamsIntakeChatId}
             onClose={() => setShowTeams(false)}
             onImport={handleTeamsImport}
             onForceCreate={(chat, msg) => handleTeamsImport(chat, msg, true)}

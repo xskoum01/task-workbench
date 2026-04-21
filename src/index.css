@@ -3596,6 +3596,21 @@ body {
   color: var(--text-primary);
 }
 
+/* Compact recency filter dropdown in the Outlook import panel header */
+.ms-import-recency-select {
+  font-size: 11px;
+  padding: 2px 4px;
+  background: var(--bg-base);
+  border: 1px solid var(--border-subtle);
+  border-radius: 3px;
+  color: var(--text-muted);
+  cursor: pointer;
+}
+.ms-import-recency-select:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+
 .ms-import-loading,
 .ms-import-empty,
 .ms-import-error {
@@ -3622,6 +3637,13 @@ body {
 .ms-import-error {
   color: var(--color-danger, #e74c3c);
   align-items: flex-start;
+}
+
+/* Inline per-item error (e.g. full-body fetch failed on import) */
+.ms-import-item-error {
+  font-size: 11px;
+  color: var(--color-danger, #e74c3c);
+  margin-bottom: 4px;
 }
 
 /* Compact disclaimer bar below the panel header */

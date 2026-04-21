@@ -1281,7 +1281,12 @@ async fn refresh_access_token(
 
 async fn graph_get(url: &str, access_token: &str) -> Result<Value, String> {
     eprintln!("[Graph] GET {url}");
-    let resp = Client::new()
+    // 20-second timeout so the UI never hangs indefinitely if Graph is slow.
+    let client = reqwest::ClientBuilder::new()
+        .timeout(std::time::Duration::from_secs(20))
+        .build()
+        .map_err(|e| format!("Failed to build HTTP client: {e}"))?;
+    let resp = client
         .get(url)
         .bearer_auth(access_token)
         .send()
@@ -1298,18 +1303,18 @@ async fn graph_get(url: &str, access_token: &str) -> Result<Value, String> {
         let msg  = err_obj["message"].as_str().unwrap_or("no detail");
         let friendly = match code {
             "Authorization_RequestDenied" | "Unauthorized" | "AccessDenied" =>
-                format!("Missing Teams permissions ({code}): {msg}"),
+                format!("Missing Microsoft permissions ({code}): {msg}"),
             "InvalidAuthenticationToken" | "AuthenticationError" =>
                 format!("Microsoft connection expired — please reconnect ({code})"),
             _ =>
-                format!("Teams API error [{status}] {code}: {msg}"),
+                format!("Microsoft Graph API error [{status}] {code}: {msg}"),
         };
         eprintln!("[Graph] Error response: {friendly}");
         return Err(friendly);
     }
 
     if !status.is_success() {
-        let err = format!("Teams request failed with HTTP {status}");
+        let err = format!("Microsoft Graph request failed with HTTP {status}");
         eprintln!("[Graph] {err}");
         return Err(err);
     }
@@ -1541,6 +1546,136 @@ async fn get_outlook_messages(
     Ok(serde_json::json!(messages))
 }
 
+/// Lightweight flagged-email list for the Outlook import panel.
+/// Paginates through flagged messages via @odata.nextLink up to MAX_FETCH total,
+/// then sorts locally by receivedDateTime desc and returns the newest SHOW_LIMIT.
+///
+/// `days_back` restricts results to emails received within the last N days (server-side).
+/// Pass 0 to fetch all flagged emails regardless of age.
+#[tauri::command]
+async fn get_outlook_flagged_list(
+    app: tauri::AppHandle,
+    client_id: String,
+    days_back: u32,
+) -> Result<Value, String> {
+    const MAX_FETCH: usize = 300;
+    const SHOW_LIMIT: usize = 50;
+
+    let token = ensure_valid_token(&app, &client_id).await?;
+
+    // Build the OData $filter expression.
+    // Combining flag/flagStatus with receivedDateTime ge <date> is safe — InefficientFilter
+    // only fires when $orderby is mixed with the flag filter, not for AND-filter clauses.
+    let filter = if days_back > 0 {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let now_secs = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+        let cutoff_secs = now_secs.saturating_sub((days_back as u64) * 86400);
+        let cutoff_date = unix_secs_to_date_str(cutoff_secs);
+        // Percent-encode spaces and '/' in the filter string.
+        format!(
+            "flag%2FflagStatus%20eq%20'flagged'%20and%20receivedDateTime%20ge%20{}T00%3A00%3A00Z",
+            cutoff_date
+        )
+    } else {
+        "flag%2FflagStatus%20eq%20'flagged'".to_string()
+    };
+
+    let initial_url = format!(
+        "{MS_GRAPH_BASE}/me/messages\
+         ?$top=50\
+         &$filter={filter}\
+         &$select=id,subject,from,receivedDateTime,bodyPreview,webLink,flag"
+    );
+
+    let mut next_url: Option<String> = Some(initial_url);
+    let mut raw_items: Vec<Value> = Vec::new();
+
+    while let Some(url) = next_url.take() {
+        let data = graph_get(&url, &token).await?;
+        let page = data["value"].as_array().cloned().unwrap_or_default();
+        raw_items.extend(page);
+        if raw_items.len() >= MAX_FETCH {
+            break;
+        }
+        next_url = data["@odata.nextLink"].as_str().map(|s| s.to_string());
+    }
+
+    let fetched_count = raw_items.len();
+    let mut messages: Vec<Value> = raw_items
+        .into_iter()
+        .map(|m| {
+            let is_flagged = m["flag"]["flagStatus"].as_str() == Some("flagged");
+            serde_json::json!({
+                "id":          m["id"],
+                "subject":     m["subject"].as_str().unwrap_or("(no subject)"),
+                "fromName":    m["from"]["emailAddress"]["name"].as_str().unwrap_or(""),
+                "fromEmail":   m["from"]["emailAddress"]["address"].as_str().unwrap_or(""),
+                "receivedAt":  m["receivedDateTime"],
+                "bodyPreview": m["bodyPreview"],
+                "webLink":     m["webLink"],
+                "isFlagged":   is_flagged,
+            })
+        })
+        .collect();
+
+    messages.sort_by(|a, b| {
+        let ta = a["receivedAt"].as_str().unwrap_or("");
+        let tb = b["receivedAt"].as_str().unwrap_or("");
+        tb.cmp(ta)
+    });
+    messages.truncate(SHOW_LIMIT);
+
+    eprintln!(
+        "[Outlook] get_outlook_flagged_list: days_back={} fetched={} shown={}",
+        days_back, fetched_count, messages.len()
+    );
+    Ok(serde_json::json!({ "messages": messages, "fetchedCount": fetched_count }))
+}
+
+/// Fetch one Outlook message by id with full body, HTML stripping, and ADO link extraction.
+/// Called lazily when the user clicks Import for a specific email — not during panel load.
+#[tauri::command]
+async fn get_outlook_message_full(
+    app: tauri::AppHandle,
+    client_id: String,
+    message_id: String,
+) -> Result<Value, String> {
+    let token = ensure_valid_token(&app, &client_id).await?;
+    let url = format!(
+        "{MS_GRAPH_BASE}/me/messages/{message_id}\
+         ?$select=id,subject,from,receivedDateTime,bodyPreview,webLink,body,flag"
+    );
+    let m = graph_get(&url, &token).await?;
+    let from_email  = m["from"]["emailAddress"]["address"].as_str().unwrap_or("").to_string();
+    let subject_str = m["subject"].as_str().unwrap_or("");
+    let preview_str = m["bodyPreview"].as_str().unwrap_or("");
+    let body_html   = m["body"]["content"].as_str().unwrap_or("").to_string();
+    // strip_html_email preserves block-level line breaks for quoted-reply detection.
+    let mut body_full = strip_html_email(&body_html);
+    if is_potential_ado_email(&from_email, subject_str, preview_str) {
+        let ado_pairs = extract_ado_link_pairs(&body_html);
+        if !ado_pairs.is_empty() {
+            for (href, label) in &ado_pairs {
+                body_full.push_str(&format!("\n##ADO## {} ||| {}", href, label));
+            }
+            eprintln!("[ado-link] {} ADO link(s) for messageId={}", ado_pairs.len(), &message_id[..message_id.len().min(12)]);
+        }
+    }
+    let is_flagged = m["flag"]["flagStatus"].as_str() == Some("flagged");
+    eprintln!("[Outlook] get_outlook_message_full: messageId={}", &message_id[..message_id.len().min(12)]);
+    Ok(serde_json::json!({
+        "id":         m["id"],
+        "subject":    m["subject"].as_str().unwrap_or("(no subject)"),
+        "fromName":   m["from"]["emailAddress"]["name"].as_str().unwrap_or(""),
+        "fromEmail":  from_email,
+        "receivedAt": m["receivedDateTime"],
+        "bodyPreview": m["bodyPreview"],
+        "bodyFull":   body_full,
+        "webLink":    m["webLink"],
+        "isFlagged":  is_flagged,
+    }))
+}
+
 /// Fetch recent Teams chats (top 20, personal/group chats only).
 /// Note: $orderby is NOT supported on /me/chats — it causes a 400 when combined
 /// with $expand. Results are sorted in Rust after fetching.
@@ -1646,6 +1781,74 @@ async fn get_teams_chat_messages(
         messages.len(),
         filtered_out
     );
+    Ok(serde_json::json!(messages))
+}
+
+/// Fetch today's messages from a configured Teams intake chat.
+///
+/// Takes the chatId directly (configured in Settings) rather than auto-detecting
+/// the self-chat.  Returns TeamsFlatMessage items so TeamsImport can display and
+/// import them without any additional wiring.
+/// Today-only filter keeps the intake clean: only messages whose createdDateTime
+/// starts with the current UTC date ("YYYY-MM-DD") are returned.
+#[tauri::command]
+async fn get_teams_intake_messages(
+    app: tauri::AppHandle,
+    client_id: String,
+    chat_id: String,
+) -> Result<Value, String> {
+    if chat_id.trim().is_empty() {
+        return Err("Teams intake chat ID is not configured. Set it in Settings → Teams Intake.".to_string());
+    }
+    let token = ensure_valid_token(&app, &client_id).await?;
+
+    // Fetch latest 50 messages from the configured chat (newest first).
+    let url = format!(
+        "{MS_GRAPH_BASE}/me/chats/{chat_id}/messages\
+         ?$top=50\
+         &$orderby=createdDateTime%20desc"
+    );
+    let data = graph_get(&url, &token).await?;
+    let raw = data["value"].as_array().cloned().unwrap_or_default();
+
+    // Today-only filter: keep messages whose createdDateTime starts with today's UTC date.
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let now_secs = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+    let today_str = unix_secs_to_date_str(now_secs);
+    eprintln!("[Teams-intake] chatId prefix={} today_utc={} raw_count={}",
+        &chat_id[..chat_id.len().min(12)], today_str, raw.len());
+
+    let mut messages: Vec<Value> = Vec::new();
+    let mut filtered_out = 0usize;
+    for m in raw {
+        if m["messageType"].as_str() != Some("message") {
+            filtered_out += 1;
+            continue;
+        }
+        let sent_at = m["createdDateTime"].as_str().unwrap_or("");
+        if !sent_at.starts_with(today_str.as_str()) {
+            filtered_out += 1;
+            continue;
+        }
+        let raw_content = m["body"]["content"].as_str().unwrap_or("");
+        let content = strip_html(raw_content);
+        if content.trim().len() < 3 {
+            filtered_out += 1;
+            continue;
+        }
+        messages.push(serde_json::json!({
+            "id":                 m["id"],
+            "senderName":         m["from"]["user"]["displayName"].as_str().unwrap_or(""),
+            "senderEmail":        m["from"]["user"]["userPrincipalName"].as_str().unwrap_or(""),
+            "sentAt":             sent_at,
+            "content":            content,
+            "chatId":             &chat_id,
+            "chatTopic":          "Teams intake",
+            "chatType":           "oneOnOne",
+            "chatMembersSummary": "Intake chat",
+        }));
+    }
+    eprintln!("[Teams-intake] {} messages kept today, {} filtered out", messages.len(), filtered_out);
     Ok(serde_json::json!(messages))
 }
 
@@ -2195,8 +2398,11 @@ pub fn run() {
             disconnect_microsoft_account,
             get_microsoft_connection_state,
             get_outlook_messages,
+            get_outlook_flagged_list,
+            get_outlook_message_full,
             get_teams_chats,
             get_teams_chat_messages,
+            get_teams_intake_messages,
             get_teams_recent_messages,
             get_teams_self_chat_messages,
             read_file_content,

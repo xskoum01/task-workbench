@@ -166,7 +166,7 @@ function detectPrNonActionable(
  */
 function parsePrReviewRequest(
   subject: string,
-  _bodyText: string,   // used for URL extraction further down
+  bodyText: string,
   crmProjectCode: string | undefined,
 ): AdoParseResult | null {
   if (!/^PR\s*-\s*/i.test(subject)) return null;
@@ -205,28 +205,41 @@ function parsePrReviewRequest(
         ? `PR comment: review ${titleExcerpt}`
         : `PR comment: review Pull Request`;
 
-  const prUrl = extractAdoPrUrl(_bodyText);
+  const prUrl = extractAdoPrUrl(bodyText);  // used for URL extraction further down
   if (prUrl) {
     console.log(`[ado-link] found PR review-request link: ${prUrl}`);
   } else {
     console.log('[ado-link] no usable devops link found in PR review-request email');
   }
 
-  const description = normalizeText(
-    `PR review request${reviewerName ? ` (${reviewerName})` : ''}:\n\n${afterPr}`,
-  );
+  // Try to extract an actual review comment from the body.
+  // ADO sometimes sends comment notifications with a "PR - ..." subject.
+  // If the body contains substantive comment text, prefer it over the generic
+  // subject-derived description.
+  const reviewComment = extractReviewComment(bodyText);
+  const hasSubstantiveComment =
+    reviewComment != null &&
+    (reviewComment.split('\n').some((l) => l.trim().length > 40) ||
+      reviewComment.split('\n').filter((l) => l.trim()).length > 2);
+
+  const description = hasSubstantiveComment && reviewComment
+    ? normalizeText(`PR comment by ${reviewerName ?? 'reviewer'}:\n\n${reviewComment}`)
+    : normalizeText(
+        `PR review request${reviewerName ? ` (${reviewerName})` : ''}:\n\n${afterPr}`,
+      );
 
   return {
     isAdoEmail:          true,
     title,
     description,
-    classificationLabel: 'PR review',
+    classificationLabel: hasSubstantiveComment ? 'PR feedback' : 'PR review',
     adoContext: {
       type:             'pr-comment',
       prNumber,
       reviewerName,
       crmProjectCode:   project ?? crmProjectCode,
       prUrl,
+      reviewComment:    hasSubstantiveComment ? reviewComment ?? undefined : undefined,
     },
   };
 }
@@ -416,7 +429,7 @@ function extractReviewComment(bodyText: string): string | undefined {
     .map((l) => l.trim())
     .filter(Boolean);
 
-  // Lines to skip at any position — header/metadata/infrastructure lines
+  // Lines to skip (continue) at any position — header/metadata/notification chrome
   const skipPatterns = [
     /^From:/i,
     /^Subject:/i,
@@ -432,14 +445,20 @@ function extractReviewComment(bodyText: string): string | undefined {
     /^Pull Request/i,
     /\bhas commented on\b/i,
     /\bcommented on\b/i,
+    /\bedited a comment\b/i,
     /View the full\b/i,
-    /View comment\b/i,
-    /View pull request\b/i,
     /Reply to this\b/i,
     /You can view the\b/i,
+    // Generic ADO notification wrapper lines that precede the actual comment block
+    /is requesting your review/i,
+    /^Reviewer:/i,
+    /^Repository:/i,
+    /^Branch:/i,
   ];
 
-  // Lines that mark the start of footer boilerplate — stop collecting here
+  // Lines that STOP collection — footer boilerplate OR end-of-comment CTA buttons.
+  // "View comment" / "View pull request" appear directly AFTER the comment block;
+  // treating them as stop markers prevents picking up any footer noise that follows.
   const footerPatterns = [
     /Microsoft\s+respects\s+your\s+privacy/i,
     /To\s+unsubscribe\b/i,
@@ -449,6 +468,9 @@ function extractReviewComment(bodyText: string): string | undefined {
     /^Microsoft\s+Corporation/i,
     /Privacy\s+statement/i,
     /You('re| are) receiving this/i,
+    // CTA buttons that appear directly after the comment block
+    /\bView comment\b/i,
+    /\bView pull request\b/i,
   ];
 
   const commentLines: string[] = [];

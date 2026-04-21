@@ -4,7 +4,7 @@
  */
 import { invoke } from '@tauri-apps/api/core';
 import { openUrl as openerOpen } from '@tauri-apps/plugin-opener';
-import type { Task, Customer, AppSettings, TaskAnalysis, SkeletonPreview, GitInitStatus, OutlookMessage, TeamsChat, TeamsChatMessage, TeamsFlatMessage, ClassificationResult } from '../types';
+import type { Task, Customer, AppSettings, TaskAnalysis, SkeletonPreview, GitInitStatus, OutlookMessage, OutlookFlaggedListResult, TeamsChat, TeamsChatMessage, TeamsFlatMessage, ClassificationResult } from '../types';
 
 export type { ClassificationResult };
 
@@ -244,9 +244,30 @@ export function getMicrosoftConnectionState(): Promise<string> {
   return invoke('get_microsoft_connection_state');
 }
 
-/** Fetch the 25 most recent Outlook messages. */
+/** @deprecated Use getOutlookFlaggedList + getOutlookMessageFull instead. */
 export function getOutlookMessages(clientId: string): Promise<OutlookMessage[]> {
   return invoke('get_outlook_messages', { clientId });
+}
+
+/**
+ * Lightweight flagged-email list for the Outlook import panel.
+ * Returns only display fields (no body) so the panel loads quickly.
+ * Paginates up to 300 flagged emails, sorts newest-first locally, returns top 50.
+ * Full body is fetched lazily via getOutlookMessageFull when the user clicks Import.
+ *
+ * @param daysBack  Only return emails from the last N days (server-side cutoff).
+ *                  Pass 0 to fetch all flagged emails regardless of age.
+ */
+export function getOutlookFlaggedList(clientId: string, daysBack: number): Promise<OutlookFlaggedListResult> {
+  return invoke('get_outlook_flagged_list', { clientId, daysBack });
+}
+
+/**
+ * Fetch one Outlook message by id with full body, HTML stripping, and ADO link extraction.
+ * Call this lazily when the user clicks Import — not during panel load.
+ */
+export function getOutlookMessageFull(clientId: string, messageId: string): Promise<OutlookMessage> {
+  return invoke('get_outlook_message_full', { clientId, messageId });
 }
 
 /** Fetch the 20 most recent Teams chats. */
@@ -272,6 +293,11 @@ export function getTeamsChatMessages(clientId: string, chatId: string): Promise<
  */
 export function getTeamsRecentMessages(clientId: string): Promise<TeamsFlatMessage[]> {
   return invoke('get_teams_recent_messages', { clientId });
+}
+
+/** Fetch today's messages from the user's configured Teams intake chat. */
+export function getTeamsIntakeMessages(clientId: string, chatId: string): Promise<TeamsFlatMessage[]> {
+  return invoke('get_teams_intake_messages', { clientId, chatId });
 }
 
 /**

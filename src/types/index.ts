@@ -357,6 +357,14 @@ export interface AppSettings {
 
   /** Plugin and Script templates managed in Settings → Templates. */
   templates?: AppTemplate[];
+
+  /**
+   * Teams chat used as the task intake inbox.
+   * Populated by the Teams Intake setting in Settings.
+   * The Teams import panel reads only from this chat (today's messages).
+   * Configure by pasting a Teams chat link or a raw chat ID.
+   */
+  teamsIntakeChatId?: string;
 }
 
 /** Which planning time-box a task belongs to. */
@@ -502,6 +510,14 @@ export interface OutlookMessage {
    * so this will always be true for messages returned by `get_outlook_messages`.
    */
   isFlagged?: boolean;
+}
+
+/** Result shape returned by getOutlookFlaggedList. */
+export interface OutlookFlaggedListResult {
+  /** Newest SHOW_LIMIT (50) flagged emails, sorted by receivedAt desc. */
+  messages: OutlookMessage[];
+  /** Total flagged emails fetched via pagination before trimming. */
+  fetchedCount: number;
 }
 
 export interface TeamsChat {

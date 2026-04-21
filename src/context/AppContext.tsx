@@ -748,6 +748,18 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
         );
         setTasks(withCreated);
         api.saveTasks(withCreated).catch((e) => console.warn('[import] save created failed:', e));
+        // Non-blocking: generate a reply draft for explicit captures.
+        if (input.captureMode === 'explicit') {
+          api.generateReply(
+            { id: pendingId, title: resolvedTitle ?? pendingTask.title, taskType: resolvedTaskType, status: 'new', originalMessage: pendingTask.originalMessage } as Task,
+            finalCustomer,
+          ).then((replyDraft) => {
+            const withReply = tasksRef.current.map((t) => t.id === pendingId ? { ...t, generatedReply: replyDraft } : t);
+            setTasks(withReply);
+            api.saveTasks(withReply).catch(() => {});
+            console.log('[import] reply draft generated for', pendingId);
+          }).catch((e) => console.warn('[import] reply draft failed (non-blocking):', e));
+        }
         return { outcome: 'created', taskId: pendingId };
       }
 
@@ -762,6 +774,18 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
       );
       setTasks(withAnalyzed);
       api.saveTasks(withAnalyzed).catch((e) => console.warn('[import] save analyzed failed:', e));
+      // Non-blocking: generate a reply draft for explicit captures.
+      if (input.captureMode === 'explicit') {
+        api.generateReply(
+          { id: pendingId, title: resolvedTitle ?? pendingTask.title, taskType: resolvedTaskType, status: 'new', originalMessage: pendingTask.originalMessage } as Task,
+          finalCustomer,
+        ).then((replyDraft) => {
+          const withReply = tasksRef.current.map((t) => t.id === pendingId ? { ...t, generatedReply: replyDraft } : t);
+          setTasks(withReply);
+          api.saveTasks(withReply).catch(() => {});
+          console.log('[import] reply draft generated for', pendingId);
+        }).catch((e) => console.warn('[import] reply draft failed (non-blocking):', e));
+      }
       return { outcome: 'analyzed', taskId: pendingId };
     },
     [customers], // reads tasks via tasksRef — no stale capture on concurrent imports
