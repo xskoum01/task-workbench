@@ -9,6 +9,7 @@ import type { Task, PlanningBucket } from '../types';
 import { useApp } from '../context/AppContext';
 import { StatusBadge, SourceBadge, TypeBadge } from './StatusBadge';
 import Icon from './Icon';
+import InlineTaskPanel from './InlineTaskPanel';
 import {
   BUCKET_META,
   BUCKET_ORDER,
@@ -114,10 +115,11 @@ interface BucketSectionProps {
   tasks: Task[];
   selectedId: string | null;
   onSelect: (id: string) => void;
+  onOpenDetail: (id: string) => void;
   isFiltered: boolean;
 }
 
-function BucketSection({ bucket, tasks, selectedId, onSelect, isFiltered }: BucketSectionProps) {
+function BucketSection({ bucket, tasks, selectedId, onSelect, onOpenDetail, isFiltered }: BucketSectionProps) {
   const meta = BUCKET_META[bucket];
 
   // When a filter is active, skip empty buckets entirely for a cleaner view
@@ -136,12 +138,19 @@ function BucketSection({ bucket, tasks, selectedId, onSelect, isFiltered }: Buck
       ) : (
         <div className="planning-task-list">
           {tasks.map((task) => (
-            <PlanningTaskRow
-              key={task.id}
-              task={task}
-              selected={selectedId === task.id}
-              onSelect={onSelect}
-            />
+            <div key={task.id} className="planning-task-row-wrap">
+              <PlanningTaskRow
+                task={task}
+                selected={selectedId === task.id}
+                onSelect={onSelect}
+              />
+              {selectedId === task.id && (
+                <InlineTaskPanel
+                  task={task}
+                  onOpenDetail={() => onOpenDetail(task.id)}
+                />
+              )}
+            </div>
           ))}
         </div>
       )}
@@ -282,13 +291,14 @@ interface PlanningViewProps {
   tasks: Task[];
   selectedId: string | null;
   onSelect: (id: string) => void;
+  onOpenDetail: (id: string) => void;
   /** Active focus filter; null means no filter. */
   filter: PlanningFilter;
   /** When true, a Done section is shown below the active buckets. */
   showCompleted?: boolean;
 }
 
-export default function PlanningView({ tasks, selectedId, onSelect, filter, showCompleted }: PlanningViewProps) {
+export default function PlanningView({ tasks, selectedId, onSelect, onOpenDetail, filter, showCompleted }: PlanningViewProps) {
   const isFiltered = filter !== null;
 
   // Apply filter before grouping (done tasks are excluded inside groupByBucket)
@@ -320,6 +330,7 @@ export default function PlanningView({ tasks, selectedId, onSelect, filter, show
             tasks={groups[bucket]}
             selectedId={selectedId}
             onSelect={onSelect}
+            onOpenDetail={onOpenDetail}
             isFiltered={isFiltered}
           />
         ))}
@@ -344,12 +355,19 @@ export default function PlanningView({ tasks, selectedId, onSelect, filter, show
           ) : (
             <div className="planning-task-list">
               {doneTasks.map((task) => (
-                <PlanningTaskRow
-                  key={task.id}
-                  task={task}
-                  selected={selectedId === task.id}
-                  onSelect={onSelect}
-                />
+                <div key={task.id} className="planning-task-row-wrap">
+                  <PlanningTaskRow
+                    task={task}
+                    selected={selectedId === task.id}
+                    onSelect={onSelect}
+                  />
+                  {selectedId === task.id && (
+                    <InlineTaskPanel
+                      task={task}
+                      onOpenDetail={() => onOpenDetail(task.id)}
+                    />
+                  )}
+                </div>
               ))}
             </div>
           )}

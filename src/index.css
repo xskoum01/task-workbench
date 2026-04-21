@@ -714,6 +714,8 @@ body {
 .task-list-item.selected {
   background: color-mix(in srgb, var(--accent) 10%, var(--bg-surface));
   border-left-color: var(--accent);
+  flex-wrap: wrap;        /* lets InlineTaskPanel flow to a second row */
+  align-items: flex-start;
 }
 
 .task-list-item-main {
@@ -3562,6 +3564,168 @@ body {
   color: var(--text-muted);
   background: var(--bg-overlay);
   border-color: var(--border-subtle);
+}
+
+/* ============================================================
+   Inline Task Panel — compact workbench panel (InlineTaskPanel.tsx)
+   ============================================================ */
+
+/* Wrapper for planning-view row + inline panel */
+.planning-task-row-wrap {
+  display: flex;
+  flex-direction: column;
+}
+
+.task-inline-panel {
+  /* Spans full row width in both list and planning views */
+  flex-basis: 100%;
+  width: 100%;
+  box-sizing: border-box;
+  padding: var(--gap-md) var(--gap-lg) var(--gap-lg);
+  background: color-mix(in srgb, var(--accent) 5%, var(--bg-surface));
+  border-top: 1px solid color-mix(in srgb, var(--accent) 20%, var(--border-subtle));
+  display: flex;
+  flex-direction: column;
+  gap: var(--gap-md);
+}
+
+.tip-section {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+
+.tip-label {
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--text-muted);
+}
+
+/* Analysis */
+.tip-analysis {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+
+.tip-analysis-summary {
+  margin: 0;
+  font-size: 12px;
+  color: var(--text-secondary);
+  line-height: 1.5;
+}
+
+.tip-analysis-summary--en {
+  color: var(--text-muted);
+  border-top: 1px solid var(--border-subtle);
+  padding-top: 4px;
+  margin-top: 2px;
+}
+
+.tip-analysis-next {
+  font-size: 12px;
+  color: var(--text-secondary);
+  line-height: 1.45;
+  display: flex;
+  gap: 6px;
+}
+
+.tip-next-label {
+  font-size: 10px;
+  font-weight: 700;
+  text-transform: uppercase;
+  color: var(--accent);
+  white-space: nowrap;
+  margin-top: 1px;
+}
+
+.tip-empty {
+  font-size: 11px;
+  color: var(--text-muted);
+  font-style: italic;
+}
+
+/* Notes textarea */
+.tip-notes {
+  width: 100%;
+  box-sizing: border-box;
+  background: var(--bg-input, var(--bg-surface));
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-sm);
+  color: var(--text-primary);
+  font-size: 12px;
+  font-family: inherit;
+  padding: 6px 8px;
+  resize: vertical;
+  line-height: 1.5;
+  min-height: 56px;
+}
+
+.tip-notes:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+
+/* Original message */
+.tip-message {
+  background: var(--bg-surface);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-sm);
+  overflow: hidden;
+}
+
+.tip-message-body {
+  margin: 0;
+  padding: 8px var(--gap-md);
+  font-size: 11px;
+  font-family: inherit;
+  color: var(--text-muted);
+  white-space: pre-wrap;
+  word-break: break-word;
+  line-height: 1.5;
+}
+
+.tip-expand-btn {
+  display: block;
+  width: 100%;
+  padding: 4px var(--gap-md);
+  background: var(--bg-hover);
+  border: none;
+  border-top: 1px solid var(--border-subtle);
+  color: var(--accent);
+  font-size: 11px;
+  cursor: pointer;
+  text-align: left;
+}
+
+.tip-expand-btn:hover {
+  color: var(--accent-hover, var(--accent));
+  background: var(--bg-hover);
+}
+
+/* Bottom action row */
+.tip-action-row {
+  display: flex;
+  align-items: center;
+  gap: var(--gap-sm);
+  justify-content: space-between;
+  flex-wrap: wrap;
+}
+
+.tip-links {
+  display: flex;
+  align-items: center;
+  gap: var(--gap-xs);
+  flex-wrap: wrap;
+}
+
+.tip-primary-actions {
+  display: flex;
+  align-items: center;
+  gap: var(--gap-xs);
+  margin-left: auto;
 }
 
 /* ============================================================

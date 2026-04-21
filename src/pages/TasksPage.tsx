@@ -4,6 +4,7 @@ import { useApp } from '../context/AppContext';
 import { StatusBadge, TypeBadge, SourceBadge } from '../components/StatusBadge';
 import Icon from '../components/Icon';
 import TaskDetail from '../components/TaskDetail';
+import InlineTaskPanel from '../components/InlineTaskPanel';
 import TaskForm from '../components/TaskForm';
 import PlanningView, { type PlanningFilter } from '../components/PlanningView';
 import { isOverdue, formatRelativeDate } from '../lib/dates';
@@ -46,11 +47,14 @@ export default function TasksPage() {
   const [planningFilter, setPlanningFilter] = useState<PlanningFilter>(null);
   const [showCompleted, setShowCompleted] = useState(false);
   const [selectedId, setSelectedId]       = useState<string | null>(null);
+  const [detailOpenId, setDetailOpenId]   = useState<string | null>(null);
   const [showTaskForm, setShowTaskForm]   = useState(false);
   const [confirmDeleteId, setConfirmDeleteId] = useState<string | null>(null);
 
   function handleSelect(id: string) {
     setSelectedId((prev) => (prev === id ? null : id));
+    // Opening a different task collapses any open detail panel
+    setDetailOpenId((prev) => (prev && prev !== id ? null : prev));
   }
 
   // When switching view modes, clear irrelevant filter state
@@ -71,8 +75,6 @@ export default function TasksPage() {
   const filtered = filter === 'all'
     ? realTasks
     : realTasks.filter((t) => t.status === filter);
-
-  const selectedTask = realTasks.find((t) => t.id === selectedId) ?? null;
 
   // Quick counts for planning filter badges
   const activeTasks = realTasks.filter((t) => t.status !== 'done');
@@ -298,6 +300,13 @@ export default function TasksPage() {
                         )}
                       </div>
                     </div>
+                    {/* Inline workbench — expands below the task header when selected */}
+                    {selectedId === task.id && (
+                      <InlineTaskPanel
+                        task={task}
+                        onOpenDetail={() => setDetailOpenId(task.id)}
+                      />
+                    )}
                   </div>
                 );
               })}
@@ -311,15 +320,18 @@ export default function TasksPage() {
             tasks={realTasks}
             selectedId={selectedId}
             onSelect={handleSelect}
+            onOpenDetail={(id) => setDetailOpenId(id)}
             filter={planningFilter}
             showCompleted={showCompleted}
           />
         )}
       </div>
 
-      {selectedTask && (
-        <TaskDetail task={selectedTask} onClose={() => setSelectedId(null)} />
-      )}
+      {/* Full TaskDetail — opened only via the Detail button in InlineTaskPanel */}
+      {detailOpenId && (() => {
+        const t = realTasks.find((x) => x.id === detailOpenId);
+        return t ? <TaskDetail task={t} onClose={() => setDetailOpenId(null)} /> : null;
+      })()}
 
       {showTaskForm && (
         <TaskForm onClose={() => setShowTaskForm(false)} />
