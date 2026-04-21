@@ -23,16 +23,18 @@ interface Props {
 const MSG_PREVIEW_LINES = 8;
 
 export default function InlineTaskPanel({ task, onOpenDetail }: Props) {
-  const { updateTask, getCustomerById } = useApp();
+  const { updateTask, getCustomerById, deleteTask } = useApp();
   const customer = getCustomerById(task.customerId);
 
   const [notes, setNotes]             = useState(task.notes ?? '');
   const [msgExpanded, setMsgExpanded] = useState(false);
   const [analyzing, setAnalyzing]     = useState(false);
+  const [confirmDelete, setConfirmDelete] = useState(false);
 
   useEffect(() => {
     setNotes(task.notes ?? '');
     setMsgExpanded(false);
+    setConfirmDelete(false);
   }, [task.id]);
 
   useEffect(() => {
@@ -190,6 +192,31 @@ export default function InlineTaskPanel({ task, onOpenDetail }: Props) {
                 <button className="btn btn-secondary btn-sm" onClick={onOpenDetail}>
                   Detail →
                 </button>
+                {confirmDelete ? (
+                  <span className="tip-delete-confirm" onClick={(e) => e.stopPropagation()}>
+                    <span className="tip-delete-confirm-label">Delete?</span>
+                    <button
+                      className="btn btn-danger btn-sm"
+                      onClick={(e) => { e.stopPropagation(); deleteTask(task.id); }}
+                    >
+                      Yes
+                    </button>
+                    <button
+                      className="btn btn-ghost btn-sm"
+                      onClick={(e) => { e.stopPropagation(); setConfirmDelete(false); }}
+                    >
+                      No
+                    </button>
+                  </span>
+                ) : (
+                  <button
+                    className="btn btn-ghost btn-sm tip-delete-btn"
+                    onClick={(e) => { e.stopPropagation(); setConfirmDelete(true); }}
+                    title="Delete this task"
+                  >
+                    Delete
+                  </button>
+                )}
               </div>
             </div>
           </div>

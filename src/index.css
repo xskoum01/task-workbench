@@ -3576,20 +3576,20 @@ body {
   flex-direction: column;
 }
 
-/* Outer panel */
+/* Outer panel — bg-base (true black) overrides the blue selection tint from the parent row */
 .tip-panel {
   flex-basis: 100%;
   width: 100%;
   box-sizing: border-box;
-  background: var(--bg-surface);
-  border-top: 2px solid color-mix(in srgb, var(--accent) 35%, var(--border-subtle));
+  background: var(--bg-base);
+  border-top: 1px solid var(--border);
 }
 
-/* 2-column grid: left (analysis + message) | right (notes + actions) */
+/* 2-column layout: left (analysis + message) | right (notes + actions) */
 .tip-columns {
   display: grid;
-  grid-template-columns: 2fr 1fr;
-  min-height: 180px;
+  grid-template-columns: 1.6fr 1fr;
+  min-height: 240px;
 }
 
 @media (max-width: 860px) {
@@ -3601,85 +3601,92 @@ body {
 .tip-col-main {
   display: flex;
   flex-direction: column;
-  border-right: 1px solid var(--border-subtle);
+  border-right: 1px solid var(--border);
 }
 
+/* Right column uses bg-surface — slightly lighter than base, same as DetailPanel content blocks */
 .tip-col-side {
   display: flex;
   flex-direction: column;
+  background: var(--bg-surface);
 }
 
-/* ── Section block ────────────────────────────────────────────────────── */
+/* ── Section block ─────────────────────────────────────────── */
 
 .tip-section {
-  padding: 12px 16px;
+  padding: 16px 20px;
   display: flex;
   flex-direction: column;
-  gap: 7px;
+  gap: 10px;
 }
 
+/* Separator — same weight as TaskDetail section dividers */
 .tip-section + .tip-section {
   border-top: 1px solid var(--border-subtle);
 }
 
 .tip-section--notes {
   flex: 1;
+  gap: 8px;
 }
 
+/* Actions section: less top padding, blends as continuation */
 .tip-section--actions {
-  border-top: 1px solid var(--border-subtle);
+  padding-top: 12px;
+  padding-bottom: 16px;
 }
 
-/* ── Section label ────────────────────────────────────────────────────── */
+/* ── Section label ─────────────────────────────────────────── */
 
 .tip-sec-label {
-  font-size: 9px;
-  font-weight: 700;
-  letter-spacing: 0.09em;
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.07em;
   text-transform: uppercase;
   color: var(--text-muted);
   line-height: 1;
 }
 
-/* ── Analysis content ─────────────────────────────────────────────────── */
+/* ── Analysis content ──────────────────────────────────────── */
 
 .tip-analysis-body {
   display: flex;
   flex-direction: column;
-  gap: 7px;
+  gap: 10px;
 }
 
-/* Primary content text — close to white for readability */
+/* Primary content — bright, easy to read */
 .tip-content-text {
   margin: 0;
-  font-size: 13px;
+  font-size: 13.5px;
   color: var(--text-primary);
-  line-height: 1.6;
+  line-height: 1.65;
 }
 
 .tip-content-text--secondary {
-  font-size: 12px;
+  margin: 0;
+  font-size: 12.5px;
   color: var(--text-secondary);
-  margin-top: 2px;
+  line-height: 1.6;
 }
 
+/* Next step — card block matching detail-message style */
 .tip-nextstep {
   display: flex;
-  align-items: baseline;
-  gap: 8px;
-  padding: 6px 10px;
-  background: color-mix(in srgb, var(--accent) 10%, transparent);
-  border-left: 2px solid var(--accent);
+  flex-direction: column;
+  gap: 4px;
+  padding: 9px 12px;
+  background: var(--bg-base);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
 }
 
 .tip-nextstep-label {
-  font-size: 9px;
+  font-size: 9.5px;
   font-weight: 700;
   text-transform: uppercase;
   letter-spacing: 0.07em;
   color: var(--accent);
-  white-space: nowrap;
-  flex-shrink: 0;
 }
 
 .tip-nextstep-label--en {
@@ -3687,39 +3694,42 @@ body {
 }
 
 .tip-nextstep-text {
-  font-size: 12.5px;
+  font-size: 13px;
   color: var(--text-primary);
-  line-height: 1.5;
+  line-height: 1.55;
 }
 
-/* ── Empty / no-analysis state ─────────────────────────────────────────── */
+/* ── Empty / no-analysis state ─────────────────────────────── */
 
 .tip-empty-state {
   display: flex;
   flex-direction: column;
-  gap: 10px;
-  padding: 4px 0;
+  gap: 12px;
+  padding: 4px 0 2px;
 }
 
 .tip-empty-text {
   margin: 0;
-  font-size: 12px;
+  font-size: 12.5px;
   color: var(--text-secondary);
-  line-height: 1.55;
+  line-height: 1.6;
 }
 
-/* ── Message ──────────────────────────────────────────────────────────── */
-
+/* Message body — matches detail-message card style */
 .tip-message-body {
   margin: 0;
-  font-size: 12px;
+  font-size: 13px;
   font-family: inherit;
-  color: var(--text-secondary);
+  color: var(--text-primary);
   white-space: pre-wrap;
   word-break: break-word;
-  line-height: 1.6;
-  max-height: 220px;
+  line-height: 1.75;
+  max-height: 240px;
   overflow-y: auto;
+  background: var(--bg-base);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  padding: 10px 14px;
 }
 
 .tip-expand-btn {
@@ -3727,7 +3737,7 @@ body {
   border: none;
   padding: 2px 0;
   color: var(--accent);
-  font-size: 11px;
+  font-size: 11.5px;
   cursor: pointer;
   text-align: left;
   width: fit-content;
@@ -3737,56 +3747,58 @@ body {
   text-decoration: underline;
 }
 
-/* ── Notes textarea ───────────────────────────────────────────────────── */
+/* ── Notes textarea ────────────────────────────────────────── */
 
+/* Notes fills the right column — matches detail-notes-textarea style exactly */
 .tip-notes {
   flex: 1;
   width: 100%;
   box-sizing: border-box;
-  background: color-mix(in srgb, var(--bg-overlay) 60%, transparent);
-  border: 1px solid var(--border-subtle);
-  border-radius: var(--radius-sm);
+  background: var(--bg-base);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
   color: var(--text-primary);
   font-size: 13px;
   font-family: inherit;
-  padding: 8px 10px;
-  resize: vertical;
-  line-height: 1.55;
-  min-height: 100px;
+  padding: 10px 12px;
+  resize: none;
+  line-height: 1.65;
+  min-height: 240px;
+  outline: none;
+  transition: border-color 0.15s;
 }
 
 .tip-notes:focus {
-  outline: none;
   border-color: var(--accent);
-  background: color-mix(in srgb, var(--accent) 4%, var(--bg-overlay));
 }
 
 .tip-notes::placeholder {
   color: var(--text-muted);
+  font-style: italic;
 }
 
-/* ── Action list ──────────────────────────────────────────────────────── */
+/* ── Action list ───────────────────────────────────────────── */
 
 .tip-action-list {
   display: flex;
   flex-direction: column;
-  gap: 3px;
+  gap: 2px;
 }
 
 .tip-action-btn {
   display: flex;
   align-items: center;
-  gap: 6px;
+  gap: 7px;
   background: none;
   border: none;
-  padding: 4px 6px;
+  padding: 5px 6px;
   color: var(--text-secondary);
-  font-size: 12px;
+  font-size: 12.5px;
   font-family: inherit;
   cursor: pointer;
   border-radius: var(--radius-sm);
   text-align: left;
-  transition: color 0.1s, background 0.1s;
+  transition: color 0.12s, background 0.12s;
   width: 100%;
 }
 
@@ -3795,17 +3807,52 @@ body {
   background: var(--bg-hover);
 }
 
-/* Primary buttons row at the bottom of actions */
+/* Primary buttons — Done and Detail, at the bottom */
 .tip-primary-btns {
   display: flex;
   align-items: center;
-  gap: 6px;
-  margin-top: 6px;
-  padding-top: 8px;
-  border-top: 1px solid var(--border-subtle);
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 10px;
 }
 
-/* ── btn-accent variant (Done) ────────────────────────────────────────── */
+.tip-delete-btn {
+  margin-left: auto;
+  color: var(--color-danger, #e05555);
+  opacity: 0.7;
+}
+
+.tip-delete-btn:hover {
+  opacity: 1;
+  background: color-mix(in srgb, var(--color-danger, #e05555) 12%, transparent);
+  color: var(--color-danger, #e05555);
+}
+
+.tip-delete-confirm {
+  margin-left: auto;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.tip-delete-confirm-label {
+  font-size: 12px;
+  color: var(--color-danger, #e05555);
+}
+
+/* ── btn-danger variant ─────────────────────────────────────── */
+
+.btn-danger {
+  background: var(--color-danger, #e05555);
+  color: #fff;
+  border: none;
+}
+
+.btn-danger:hover {
+  background: color-mix(in srgb, var(--color-danger, #e05555) 80%, #000);
+}
+
+/* ── btn-accent variant (Done) ─────────────────────────────── */
 
 .btn-accent {
   background: var(--accent);
@@ -3815,10 +3862,6 @@ body {
 
 .btn-accent:hover {
   background: color-mix(in srgb, var(--accent) 80%, #fff);
-}
-
-.tip-expand-btn:hover {
-  text-decoration: underline;
 }
 
 /* ============================================================
