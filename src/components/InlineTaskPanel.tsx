@@ -23,7 +23,7 @@ interface Props {
 const MSG_PREVIEW_LINES = 8;
 
 export default function InlineTaskPanel({ task, onOpenDetail }: Props) {
-  const { updateTask, getCustomerById, deleteTask } = useApp();
+  const { updateTask, getCustomerById, deleteTask, settings } = useApp();
   const customer = getCustomerById(task.customerId);
 
   const [notes, setNotes]             = useState(task.notes ?? '');
@@ -80,10 +80,14 @@ export default function InlineTaskPanel({ task, onOpenDetail }: Props) {
     : msg;
 
   // ── Action links ────────────────────────────────────────────────────────────
-  const adoUrl      = task.adoContext?.workItemUrl || task.adoContext?.prUrl;
-  const repoRoot    = customer?.repositoryRoot;
+  const adoUrl   = task.adoContext?.workItemUrl || task.adoContext?.prUrl;
+  const repoRoot = customer?.repositoryRoot;
+  // Mirror TaskDetail: effectiveVscodePath = pluginFolder ?? repositoryRoot ?? crmFolderPath
+  const crmFolderPath = (settings?.crmBaseDirectory && customer?.folderName)
+    ? `${settings.crmBaseDirectory}/${customer.folderName}`
+    : undefined;
+  const effectiveVscodePath = customer?.pluginFolder ?? customer?.repositoryRoot ?? crmFolderPath;
   // Show Open Repository when customer has a repo root and the task is script-related
-  // (same condition as TaskDetail uses to show ScriptAssistantPanel)
   const isScriptTask = !!(task.scriptAnalysis || customer?.scriptFolder);
   const showOpenRepo = !!(repoRoot && isScriptTask);
 
@@ -91,8 +95,21 @@ export default function InlineTaskPanel({ task, onOpenDetail }: Props) {
     <div className="tip-panel" onClick={(e) => e.stopPropagation()}>
       <div className="tip-columns">
 
-        {/* ────── Left column: Analysis + Message ────── */}
+        {/* ────── Left column: Message + Analysis ────── */}
         <div className="tip-col-main">
+
+          {/* Message */}
+          {msg && (
+            <div className="tip-section">
+              <div className="tip-sec-label">Message</div>
+              <pre className="tip-message-body">{msgPreview}</pre>
+              {needsExpand && (
+                <button className="tip-expand-btn" onClick={() => setMsgExpanded((v) => !v)}>
+                  {msgExpanded ? '↑ Show less' : `↓ ${msgLines.length - MSG_PREVIEW_LINES} more lines…`}
+                </button>
+              )}
+            </div>
+          )}
 
           {/* Analysis */}
           <div className="tip-section">
@@ -140,19 +157,6 @@ export default function InlineTaskPanel({ task, onOpenDetail }: Props) {
               </div>
             )}
           </div>
-
-          {/* Message */}
-          {msg && (
-            <div className="tip-section">
-              <div className="tip-sec-label">Message</div>
-              <pre className="tip-message-body">{msgPreview}</pre>
-              {needsExpand && (
-                <button className="tip-expand-btn" onClick={() => setMsgExpanded((v) => !v)}>
-                  {msgExpanded ? '↑ Show less' : `↓ ${msgLines.length - MSG_PREVIEW_LINES} more lines…`}
-                </button>
-              )}
-            </div>
-          )}
         </div>
 
         {/* ────── Right column: Notes + Actions ────── */}
@@ -189,8 +193,8 @@ export default function InlineTaskPanel({ task, onOpenDetail }: Props) {
                   <Icon name="external-link" size={11} /> Ticket
                 </button>
               )}
-              {repoRoot && (
-                <button className="tip-action-btn" onClick={() => tauriApi.openInVscode(repoRoot).catch(() => {})} title={repoRoot}>
+              {effectiveVscodePath && (
+                <button className="tip-action-btn" onClick={() => tauriApi.openInVscode(effectiveVscodePath).catch(() => {})} title={effectiveVscodePath}>
                   <Icon name="terminal" size={11} /> Open in VS Code
                 </button>
               )}
