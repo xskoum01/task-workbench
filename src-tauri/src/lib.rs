@@ -1885,6 +1885,11 @@ async fn get_teams_intake_messages(
             if lnk.is_channel {
                 linked_type = "channel";       // not supported — surface in UI
                 eprintln!("[Teams-link] channel link detected (unsupported): {}", &lnk.raw_url[..lnk.raw_url.len().min(80)]);
+                // Still try to parse the preview card text for the original sender/body.
+                if let Some(pc) = parse_teams_preview_card(&content) {
+                    eprintln!("[Teams-link] preview card parsed from channel link: sender=\"{}\"", pc.sender_name);
+                    linked_meta = Some(pc);
+                }
             } else {
                 linked_type = "chat";
                 eprintln!("[Teams-link] chat link detected, resolving: chat={} msg={}",
@@ -1897,10 +1902,18 @@ async fn get_teams_intake_messages(
                         linked_meta   = Some(meta);
                     }
                     Ok(None) => {
-                        eprintln!("[Teams-link] could not resolve (no data / permission)");
+                        eprintln!("[Teams-link] could not resolve (no data / permission); trying preview-card fallback");
+                        if let Some(pc) = parse_teams_preview_card(&content) {
+                            eprintln!("[Teams-link] preview card fallback: sender=\"{}\"", pc.sender_name);
+                            linked_meta = Some(pc);
+                        }
                     }
                     Err(e) => {
-                        eprintln!("[Teams-link] resolution error: {e}");
+                        eprintln!("[Teams-link] resolution error: {e}; trying preview-card fallback");
+                        if let Some(pc) = parse_teams_preview_card(&content) {
+                            eprintln!("[Teams-link] preview card fallback: sender=\"{}\"", pc.sender_name);
+                            linked_meta = Some(pc);
+                        }
                     }
                 }
             }
@@ -2545,6 +2558,81 @@ async fn try_fetch_linked_chat_message(
 }
 
 // --- Forwarded Teams message detection ------------------------------------
+
+/// Strip trailing Teams UI chrome from a plain-text string.
+/// Removes `| Chat | Microsoft Teams`, `| Microsoft Teams`, and bare `| Chat`
+/// suffixes that Teams injects into link-preview card text.
+fn strip_teams_chrome(s: &str) -> &str {
+    let mut result = s.trim();
+    let patterns = [
+        "| Chat | Microsoft Teams",
+        "| Microsoft Teams",
+        "| General | Microsoft Teams",
+        "| Channel | Microsoft Teams",
+        "| Chat",
+    ];
+    for pat in &patterns {
+        if let Some(idx) = result.rfind(pat) {
+            result = result[..idx].trim();
+        }
+    }
+    result
+}
+
+/// Parse a Teams link-preview card from plain intake text.
+///
+/// When a user pastes a Teams message link into a chat, Teams renders it as a
+/// "rich preview" card.  After HTML stripping the body looks like:
+///
+///   `Jan Kvicala: V těch 16:00 spustíme ten release na PROD | Chat | Microsoft Teams`
+///   `https://teams.microsoft.com/l/message/...`
+///
+/// This function detects that pattern and extracts the original sender name
+/// and message body, stripping all Teams UI chrome.
+///
+/// Returns `None` when the text does not match the preview-card pattern.
+fn parse_teams_preview_card(content: &str) -> Option<ForwardedMeta> {
+    // Remove the URL itself so we're left with just the preview text.
+    let without_url = if let Some(idx) = content.find("https://teams.microsoft.com") {
+        content[..idx].trim()
+    } else {
+        content.trim()
+    };
+
+    // Strip trailing Teams chrome ("| Chat | Microsoft Teams" etc.)
+    let clean = strip_teams_chrome(without_url);
+    if clean.is_empty() { return None; }
+
+    // Expect first non-empty line to be "<SenderName>: <body text>"
+    let first_line = clean.lines().next()?.trim();
+    let colon_idx = first_line.find(':')?;
+    let name = first_line[..colon_idx].trim();
+
+    // Validate sender name: non-empty, not a URL fragment, reasonable length.
+    if name.is_empty() || name.len() > 80 || name.contains('/') || name.contains('@') {
+        return None;
+    }
+
+    let body_first = first_line[colon_idx + 1..].trim();
+    let rest_lines: Vec<&str> = clean.lines().skip(1)
+        .map(|l| l.trim())
+        .filter(|l| !l.is_empty())
+        .collect();
+    let body = if rest_lines.is_empty() {
+        body_first.to_string()
+    } else {
+        format!("{body_first}\n{}", rest_lines.join("\n"))
+    };
+    let body = body.trim().to_string();
+    if body.is_empty() { return None; }
+
+    Some(ForwardedMeta {
+        sender_name:  name.to_string(),
+        sender_email: None,
+        sent_at:      None,
+        content:      body,
+    })
+}
 
 /// Metadata extracted from a forwarded Teams intake message.
 struct ForwardedMeta {

@@ -187,6 +187,26 @@ export function generateTeamsTitle(senderName: string, content: string): string 
 }
 
 // ---------------------------------------------------------------------------
+// Body cleaning
+// ---------------------------------------------------------------------------
+
+/**
+ * Strip Teams UI chrome from a raw intake message body.
+ * Removes trailing `| Chat | Microsoft Teams` noise and any `teams.microsoft.com`
+ * deep-link URLs that Teams auto-appends to link-preview cards.
+ */
+export function cleanTeamsBody(body: string): string {
+  return body
+    .replace(/https:\/\/teams\.microsoft\.com\/l\/message\/\S*/g, '')
+    .replace(/\|\s*Chat\s*\|\s*Microsoft Teams\s*$/im, '')
+    .replace(/\|\s*Microsoft Teams\s*$/im, '')
+    .replace(/\|\s*General\s*\|\s*Microsoft Teams\s*$/im, '')
+    .replace(/\|\s*Channel\s*\|\s*Microsoft Teams\s*$/im, '')
+    .replace(/\|\s*Chat\s*$/im, '')
+    .trim();
+}
+
+// ---------------------------------------------------------------------------
 // Forwarded message detection
 // ---------------------------------------------------------------------------
 
@@ -314,6 +334,34 @@ export function parseForwardedTeamsMessage(
       sentAt: fallbackSentAt,
       content: body,
     };
+  }
+
+  // Pattern E — Teams link preview card: "Name: body text | Chat | Microsoft Teams"
+  // Rust parses this server-side too, but include here as a safe JS-side fallback.
+  {
+    const withoutUrl = content.replace(/https:\/\/teams\.microsoft\.com\/l\/message\/\S*/g, '').trim();
+    const clean = withoutUrl.replace(/\|\s*Chat\s*\|\s*Microsoft Teams\s*$/im, '')
+      .replace(/\|\s*Microsoft Teams\s*$/im, '')
+      .replace(/\|\s*Chat\s*$/im, '')
+      .trim();
+    const firstLine = clean.split('\n')[0]?.trim() ?? '';
+    const colonIdx = firstLine.indexOf(':');
+    if (colonIdx > 0 && colonIdx < 60) {
+      const candidateName = firstLine.slice(0, colonIdx).trim();
+      // Reject if name looks like a URL or protocol fragment
+      if (candidateName && !candidateName.includes('/') && !candidateName.includes('@')) {
+        const bodyText = clean.slice(colonIdx + 1).trim();
+        if (bodyText.length > 3) {
+          return {
+            isForwarded: true,
+            senderName: candidateName,
+            senderEmail: fallbackSenderEmail,
+            sentAt: fallbackSentAt,
+            content: bodyText,
+          };
+        }
+      }
+    }
   }
 
   return null;

@@ -2,7 +2,7 @@
 import type { Task, Customer, OutlookMessage, TeamsChat, TeamsChatMessage } from '../types';
 import { useApp } from '../context/AppContext';
 import type { ImportResult } from '../context/AppContext';
-import { generateTeamsTitle, detectTeamsUrgency, parseForwardedTeamsMessage } from '../lib/teamsHeuristics';
+import { generateTeamsTitle, detectTeamsUrgency, parseForwardedTeamsMessage, cleanTeamsBody } from '../lib/teamsHeuristics';
 import { heuristicClassify } from '../lib/heuristicClassify';
 import { parseAdoEmail, resolveCustomerFromCrmCode } from '../lib/adoParsing';
 import { SourceBadge, ClassificationBadge } from '../components/StatusBadge';
@@ -229,10 +229,14 @@ export default function InboxPage() {
       );
     }
 
-    // Build the full content block first so heuristics can read the message body
-    const fullContent = `From: ${effectiveSenderName} <${effectiveSenderEmail}>\nChat: ${chat.topic || chat.membersSummary}${
-      fwd ? '\n[Forwarded via intake chat]' : ''
-    }\n\n${effectiveBody}`;
+    // Build the full content block first so heuristics can read the message body.
+    // For resolved original messages (linked or forwarded) use a clean format that
+    // does NOT include the intake-chat wrapper noise (sender = forwarder, Chat = intake).
+    const hasOriginal = !!fwd;
+    const cleanBody = hasOriginal ? cleanTeamsBody(effectiveBody) : effectiveBody;
+    const fullContent = hasOriginal
+      ? `From: ${effectiveSenderName}\n\n${cleanBody}`
+      : `From: ${effectiveSenderName} <${effectiveSenderEmail}>\nChat: ${chat.topic || chat.membersSummary}\n\n${effectiveBody}`;
 
     // Generate a meaningful title instead of using raw participant names
     const title = generateTeamsTitle(effectiveSenderName, fullContent);
