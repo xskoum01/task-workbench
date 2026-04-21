@@ -1,14 +1,12 @@
 /**
- * InlineTaskPanel — compact task workbench that expands inline when a task is selected.
+ * InlineTaskPanel — compact 2-column workbench that expands inline when a task is selected.
  *
  * Layout:
  *   ┌──────────────────────────────┬──────────────────┐
- *   │  Analysis (or Analyze button)│  Notes           │
- *   ├──────────────────────────────┴──────────────────┤
- *   │  Links …                        Done   Detail → │
- *   ├─────────────────────────────────────────────────┤
- *   │  Message (collapsible, optional)                │
- *   └─────────────────────────────────────────────────┘
+ *   │  Analysis                    │  Notes (tall)    │
+ *   ├──────────────────────────────┤──────────────────┤
+ *   │  Message (collapsible)        │  Actions/Links   │
+ *   └──────────────────────────────┴──────────────────┘
  */
 
 import { useState, useEffect } from 'react';
@@ -85,112 +83,118 @@ export default function InlineTaskPanel({ task, onOpenDetail }: Props) {
 
   return (
     <div className="tip-panel" onClick={(e) => e.stopPropagation()}>
+      <div className="tip-columns">
 
-      {/* ── Top row: Analysis | Notes ─────────────────────────────────────── */}
-      <div className="tip-row">
+        {/* ────── Left column: Analysis + Message ────── */}
+        <div className="tip-col-main">
 
-        {/* Analysis */}
-        <div className="tip-analysis-col">
-          <div className="tip-sec-label">Analysis</div>
-          {hasAnalysis ? (
-            <>
-              {czSummary && <p className="tip-analysis-text">{czSummary}</p>}
-              {czNext && (
-                <div className="tip-nextstep">
-                  <span className="tip-nextstep-label">Další krok</span>
-                  <span className="tip-nextstep-text">{czNext}</span>
-                </div>
+          {/* Analysis */}
+          <div className="tip-section">
+            <div className="tip-sec-label">Analysis</div>
+            {hasAnalysis ? (
+              <div className="tip-analysis-body">
+                {czSummary && <p className="tip-content-text">{czSummary}</p>}
+                {czNext && (
+                  <div className="tip-nextstep">
+                    <span className="tip-nextstep-label">Další krok</span>
+                    <span className="tip-nextstep-text">{czNext}</span>
+                  </div>
+                )}
+                {enSummary && enSummary !== czSummary && (
+                  <p className="tip-content-text tip-content-text--secondary">{enSummary}</p>
+                )}
+                {enNext && enNext !== czNext && (
+                  <div className="tip-nextstep">
+                    <span className="tip-nextstep-label tip-nextstep-label--en">Next step</span>
+                    <span className="tip-nextstep-text">{enNext}</span>
+                  </div>
+                )}
+              </div>
+            ) : (
+              <div className="tip-empty-state">
+                <p className="tip-empty-text">No analysis yet. Run AI analysis to get a summary and suggested next step.</p>
+                <button
+                  className="btn btn-secondary btn-sm"
+                  disabled={analyzing}
+                  onClick={handleAnalyze}
+                >
+                  <Icon name="search" size={12} />
+                  {analyzing ? 'Analyzing…' : 'Analyze'}
+                </button>
+              </div>
+            )}
+          </div>
+
+          {/* Message */}
+          {msg && (
+            <div className="tip-section">
+              <div className="tip-sec-label">Message</div>
+              <pre className="tip-message-body">{msgPreview}</pre>
+              {needsExpand && (
+                <button className="tip-expand-btn" onClick={() => setMsgExpanded((v) => !v)}>
+                  {msgExpanded ? '↑ Show less' : `↓ ${msgLines.length - MSG_PREVIEW_LINES} more lines…`}
+                </button>
               )}
-              {enSummary && enSummary !== czSummary && (
-                <p className="tip-analysis-text tip-analysis-en">{enSummary}</p>
-              )}
-              {enNext && enNext !== czNext && (
-                <div className="tip-nextstep">
-                  <span className="tip-nextstep-label tip-nextstep-label--en">Next step</span>
-                  <span className="tip-nextstep-text">{enNext}</span>
-                </div>
-              )}
-            </>
-          ) : (
-            <div className="tip-no-analysis">
-              <span className="tip-no-analysis-note">No analysis yet</span>
-              <button
-                className="btn btn-secondary btn-sm"
-                disabled={analyzing}
-                onClick={handleAnalyze}
-              >
-                <Icon name="search" size={12} />
-                {analyzing ? 'Analyzing…' : 'Analyze'}
-              </button>
             </div>
           )}
         </div>
 
-        {/* Notes */}
-        <div className="tip-notes-col">
-          <div className="tip-sec-label">Notes</div>
-          <textarea
-            className="tip-notes"
-            value={notes}
-            placeholder="Notes or context…"
-            rows={3}
-            onChange={(e) => setNotes(e.target.value)}
-            onBlur={handleNotesSave}
-          />
+        {/* ────── Right column: Notes + Actions ────── */}
+        <div className="tip-col-side">
+
+          {/* Notes */}
+          <div className="tip-section tip-section--notes">
+            <div className="tip-sec-label">Notes</div>
+            <textarea
+              className="tip-notes"
+              value={notes}
+              placeholder="Notes, context, reminders…"
+              onChange={(e) => setNotes(e.target.value)}
+              onBlur={handleNotesSave}
+            />
+          </div>
+
+          {/* Actions */}
+          <div className="tip-section tip-section--actions">
+            <div className="tip-sec-label">Actions</div>
+            <div className="tip-action-list">
+              {adoUrl && (
+                <button className="tip-action-btn" onClick={() => openUrl(adoUrl)} title={adoUrl}>
+                  <Icon name="external-link" size={11} /> Open in DevOps
+                </button>
+              )}
+              {task.devopsTaskUrl && (
+                <button className="tip-action-btn" onClick={() => openUrl(task.devopsTaskUrl)} title={task.devopsTaskUrl}>
+                  <Icon name="external-link" size={11} /> DevOps task
+                </button>
+              )}
+              {task.ticketUrl && (
+                <button className="tip-action-btn" onClick={() => openUrl(task.ticketUrl)} title={task.ticketUrl}>
+                  <Icon name="external-link" size={11} /> Ticket
+                </button>
+              )}
+              {repoRoot && (
+                <button className="tip-action-btn" onClick={() => tauriApi.openInVscode(repoRoot).catch(() => {})} title={repoRoot}>
+                  <Icon name="terminal" size={11} /> Open in VS Code
+                </button>
+              )}
+              <div className="tip-primary-btns">
+                {task.status !== 'done' && (
+                  <button
+                    className="btn btn-accent btn-sm"
+                    onClick={() => updateTask(task.id, { status: 'done' })}
+                  >
+                    <Icon name="check" size={12} /> Done
+                  </button>
+                )}
+                <button className="btn btn-secondary btn-sm" onClick={onOpenDetail}>
+                  Detail →
+                </button>
+              </div>
+            </div>
+          </div>
         </div>
       </div>
-
-      {/* ── Footer: links + primary actions ─────────────────────────────── */}
-      <div className="tip-footer">
-        <div className="tip-footer-links">
-          {adoUrl && (
-            <button className="tip-footer-link" onClick={() => openUrl(adoUrl)} title={adoUrl}>
-              <Icon name="external-link" size={11} /> Open in DevOps
-            </button>
-          )}
-          {task.devopsTaskUrl && (
-            <button className="tip-footer-link" onClick={() => openUrl(task.devopsTaskUrl)} title={task.devopsTaskUrl}>
-              <Icon name="external-link" size={11} /> DevOps task
-            </button>
-          )}
-          {task.ticketUrl && (
-            <button className="tip-footer-link" onClick={() => openUrl(task.ticketUrl)} title={task.ticketUrl}>
-              <Icon name="external-link" size={11} /> Ticket
-            </button>
-          )}
-          {repoRoot && (
-            <button className="tip-footer-link" onClick={() => tauriApi.openInVscode(repoRoot).catch(() => {})} title={repoRoot}>
-              <Icon name="terminal" size={11} /> VS Code
-            </button>
-          )}
-        </div>
-        <div className="tip-footer-actions">
-          {task.status !== 'done' && (
-            <button
-              className="btn btn-ghost btn-sm"
-              onClick={() => updateTask(task.id, { status: 'done' })}
-            >
-              <Icon name="check" size={12} /> Done
-            </button>
-          )}
-          <button className="btn btn-secondary btn-sm" onClick={onOpenDetail}>
-            Detail →
-          </button>
-        </div>
-      </div>
-
-      {/* ── Original message (collapsible) ──────────────────────────────── */}
-      {msg && (
-        <div className="tip-message-wrap">
-          <div className="tip-sec-label">Message</div>
-          <pre className="tip-message-body">{msgPreview}</pre>
-          {needsExpand && (
-            <button className="tip-expand-btn" onClick={() => setMsgExpanded((v) => !v)}>
-              {msgExpanded ? '↑ Show less' : `↓ ${msgLines.length - MSG_PREVIEW_LINES} more lines`}
-            </button>
-          )}
-        </div>
-      )}
     </div>
   );
 }
