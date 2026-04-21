@@ -80,8 +80,12 @@ export default function InlineTaskPanel({ task, onOpenDetail }: Props) {
     : msg;
 
   // ── Action links ────────────────────────────────────────────────────────────
-  const adoUrl   = task.adoContext?.workItemUrl || task.adoContext?.prUrl;
-  const repoRoot = customer?.repositoryRoot;
+  const adoUrl      = task.adoContext?.workItemUrl || task.adoContext?.prUrl;
+  const repoRoot    = customer?.repositoryRoot;
+  // Show Open Repository when customer has a repo root and the task is script-related
+  // (same condition as TaskDetail uses to show ScriptAssistantPanel)
+  const isScriptTask = !!(task.scriptAnalysis || customer?.scriptFolder);
+  const showOpenRepo = !!(repoRoot && isScriptTask);
 
   return (
     <div className="tip-panel" onClick={(e) => e.stopPropagation()}>
@@ -188,6 +192,11 @@ export default function InlineTaskPanel({ task, onOpenDetail }: Props) {
               {repoRoot && (
                 <button className="tip-action-btn" onClick={() => tauriApi.openInVscode(repoRoot).catch(() => {})} title={repoRoot}>
                   <Icon name="terminal" size={11} /> Open in VS Code
+                </button>
+              )}
+              {showOpenRepo && (
+                <button className="tip-action-btn" onClick={() => tauriApi.openPath(repoRoot!).catch(() => {})} title={repoRoot}>
+                  <Icon name="folder" size={11} /> Open Repository
                 </button>
               )}
               <div className="tip-primary-btns">
