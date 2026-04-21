@@ -72,22 +72,12 @@ export default function TeamsImport({ clientId, onClose, onImport, onForceCreate
     try {
       const items = await tauriApi.getTeamsRecentMessages(clientId);
       setMessages(items);
-      // Auto-import all fetched messages concurrently; duplicates finish immediately.
+      // All messages start as idle — the user imports each one manually.
+      // TODO: when Graph API saved-messages endpoint becomes available,
+      //       consider showing saved messages here as a higher-signal source.
       const initialStates: Record<string, MessageState> = {};
-      items.forEach((m) => { initialStates[m.id] = 'importing'; });
+      items.forEach((m) => { initialStates[m.id] = 'idle'; });
       setStates(initialStates);
-      await Promise.all(
-        items.map(async (item) => {
-          try {
-            const [chat, msg] = toImportArgs(item);
-            const r = await onImport(chat, msg);
-            setResults((prev) => ({ ...prev, [item.id]: r }));
-            setStates((prev) => ({ ...prev, [item.id]: r.outcome }));
-          } catch {
-            setStates((prev) => ({ ...prev, [item.id]: 'idle' }));
-          }
-        }),
-      );
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     } finally {
@@ -138,7 +128,7 @@ export default function TeamsImport({ clientId, onClose, onImport, onForceCreate
 
       {/* Scope disclaimer — always visible so users know what this covers */}
       <div className="ms-import-scope-note">
-        {'Latest messages from recent chats \u2014 channel messages are not supported.'}
+        {'Recent chat messages — select which ones to import as tasks. Channel messages are not supported.'}
       </div>
 
       {errorInfo && (
