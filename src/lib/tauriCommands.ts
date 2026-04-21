@@ -273,3 +273,16 @@ export function getTeamsChatMessages(clientId: string, chatId: string): Promise<
 export function getTeamsRecentMessages(clientId: string): Promise<TeamsFlatMessage[]> {
   return invoke('get_teams_recent_messages', { clientId });
 }
+
+/**
+ * Fetch today's messages from the signed-in user's self-chat (Teams intake inbox).
+ *
+ * Self-chat = the oneOnOne chat where the user is the only participant.
+ * Today filter = messages sent on the current UTC date.
+ *
+ * Send or forward a message to yourself in Teams to queue it as a task candidate.
+ * This is the Teams equivalent of flagging an email in Outlook.
+ */
+export function getTeamsSelfChatMessages(clientId: string): Promise<TeamsFlatMessage[]> {
+  return invoke('get_teams_self_chat_messages', { clientId });
+}

@@ -1469,14 +1469,14 @@ async fn get_outlook_messages(
     client_id: String,
 ) -> Result<Value, String> {
     let token = ensure_valid_token(&app, &client_id).await?;
-    // Server-side filter: only return messages the user has flagged in Outlook.
-    // Graph supports `flag/flagStatus eq 'flagged'` as an OData filter on /me/messages.
-    // `flag` is included in $select so we can confirm the status and populate isFlagged.
+    // Server-side filter: only flagged emails.
+    // NOTE: $orderby is intentionally omitted — Graph rejects the combination of
+    // $filter on flag/flagStatus with $orderby on a different field (InefficientFilter).
+    // Messages are sorted locally after fetch.
     let url = format!(
         "{MS_GRAPH_BASE}/me/messages\
          ?$top=50\
          &$filter=flag%2FflagStatus%20eq%20'flagged'\
-         &$orderby=receivedDateTime%20desc\
          &$select=id,subject,from,receivedDateTime,bodyPreview,webLink,body,flag"
     );
     let data = graph_get(&url, &token).await?;
@@ -1531,6 +1531,13 @@ async fn get_outlook_messages(
             })
         })
         .collect();
+    // Sort by receivedAt descending ($orderby omitted from request — see above).
+    let mut messages = messages;
+    messages.sort_by(|a, b| {
+        let ta = a["receivedAt"].as_str().unwrap_or("");
+        let tb = b["receivedAt"].as_str().unwrap_or("");
+        tb.cmp(ta)
+    });
     Ok(serde_json::json!(messages))
 }
 
@@ -1750,6 +1757,130 @@ async fn get_teams_recent_messages(
         chats_with_errors,
     );
     Ok(serde_json::json!(all_messages))
+}
+
+/// Convert a Unix timestamp (seconds since epoch) to a UTC date string "YYYY-MM-DD".
+/// Uses Howard Hinnant's civil-from-days algorithm — no external crate required.
+fn unix_secs_to_date_str(secs: u64) -> String {
+    let z   = (secs / 86400) as i64 + 719468;
+    let era = if z >= 0 { z } else { z - 146096 } / 146097;
+    let doe = z - era * 146097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp  = (5 * doy + 2) / 153;
+    let d   = doy - (153 * mp + 2) / 5 + 1;
+    let m   = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y   = yoe + era * 400 + if m <= 2 { 1 } else { 0 };
+    format!("{:04}-{:02}-{:02}", y, m, d)
+}
+
+/// Fetch today's messages from the signed-in user's self-chat (Teams intake inbox).
+///
+/// Self-chat identification: look for a `oneOnOne` chat where every member's
+/// `userId` equals the signed-in user's own ID.  This is the Graph-standard marker
+/// for the "Chat with yourself" entry that Teams creates automatically.
+///
+/// Today-only filter is applied locally: Graph `createdDateTime` strings start with
+/// "YYYY-MM-DD", so prefix-matching against the current UTC date is sufficient.
+#[tauri::command]
+async fn get_teams_self_chat_messages(
+    app: tauri::AppHandle,
+    client_id: String,
+) -> Result<Value, String> {
+    let token = ensure_valid_token(&app, &client_id).await?;
+
+    // Step 1: resolve the signed-in user's Graph userId.
+    let me_data = graph_get(&format!("{MS_GRAPH_BASE}/me?$select=id"), &token).await?;
+    let my_id = me_data["id"].as_str().unwrap_or("").to_string();
+    if my_id.is_empty() {
+        return Err("Could not determine signed-in user ID from Microsoft Graph.".to_string());
+    }
+    eprintln!("[Teams-selfchat] signed-in userId prefix={}", &my_id[..my_id.len().min(8)]);
+
+    // Step 2: fetch chats with members expanded so we can identify the self-chat.
+    let chats_url = format!(
+        "{MS_GRAPH_BASE}/me/chats\
+         ?$top=50\
+         &$expand=members\
+         &$select=id,topic,chatType,members"
+    );
+    let chats_data = graph_get(&chats_url, &token).await?;
+    let raw_chats = chats_data["value"].as_array().cloned().unwrap_or_default();
+    eprintln!("[Teams-selfchat] {} chats fetched", raw_chats.len());
+
+    // Step 3: find the self-chat — a oneOnOne chat where ALL members share my userId.
+    let self_chat_id = raw_chats.iter().find_map(|c| {
+        if c["chatType"].as_str() != Some("oneOnOne") {
+            return None;
+        }
+        let members = c["members"].as_array()?;
+        if members.is_empty() {
+            return None;
+        }
+        let all_self = members.iter().all(|m| {
+            m["userId"].as_str().map(|id| id == my_id.as_str()).unwrap_or(false)
+        });
+        if all_self { Some(c["id"].as_str()?.to_string()) } else { None }
+    });
+    let chat_id = match self_chat_id {
+        Some(id) => id,
+        None => return Err(
+            "Self-chat not found. Open Teams, go to Chat, and send a message to yourself to create the intake chat.".to_string()
+        ),
+    };
+    eprintln!("[Teams-selfchat] self-chat found chatId prefix={}", &chat_id[..chat_id.len().min(12)]);
+
+    // Step 4: fetch latest 50 messages from the self-chat (newest first).
+    let msgs_url = format!(
+        "{MS_GRAPH_BASE}/me/chats/{chat_id}/messages\
+         ?$top=50\
+         &$orderby=createdDateTime%20desc"
+    );
+    let msgs_data = graph_get(&msgs_url, &token).await?;
+    let raw_msgs = msgs_data["value"].as_array().cloned().unwrap_or_default();
+
+    // Step 5: compute today's UTC date string for the today-only filter.
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let now_secs = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+    let today_str = unix_secs_to_date_str(now_secs);
+    eprintln!("[Teams-selfchat] today_utc={}", today_str);
+
+    let mut messages: Vec<Value> = Vec::new();
+    let mut filtered_out = 0usize;
+    for m in raw_msgs {
+        if m["messageType"].as_str() != Some("message") {
+            filtered_out += 1;
+            continue;
+        }
+        let sent_at = m["createdDateTime"].as_str().unwrap_or("");
+        // Keep only messages sent today (UTC).
+        if !sent_at.starts_with(today_str.as_str()) {
+            filtered_out += 1;
+            continue;
+        }
+        let raw_content = m["body"]["content"].as_str().unwrap_or("");
+        let content = strip_html(raw_content);
+        if content.trim().len() < 3 {
+            filtered_out += 1;
+            continue;
+        }
+        messages.push(serde_json::json!({
+            "id":                 m["id"],
+            "senderName":         m["from"]["user"]["displayName"].as_str().unwrap_or(""),
+            "senderEmail":        m["from"]["user"]["userPrincipalName"].as_str().unwrap_or(""),
+            "sentAt":             sent_at,
+            "content":            content,
+            "chatId":             &chat_id,
+            "chatTopic":          "Self-chat",
+            "chatType":           "oneOnOne",
+            "chatMembersSummary": "Self-chat intake",
+        }));
+    }
+    eprintln!(
+        "[Teams-selfchat] {} messages kept today, {} filtered out",
+        messages.len(), filtered_out
+    );
+    Ok(serde_json::json!(messages))
 }
 
 /// Cheap pre-check: returns true if the email is likely from Azure DevOps.
@@ -2067,6 +2198,7 @@ pub fn run() {
             get_teams_chats,
             get_teams_chat_messages,
             get_teams_recent_messages,
+            get_teams_self_chat_messages,
             read_file_content,
             list_directory_files,
             list_crm_folders,

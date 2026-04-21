@@ -70,15 +70,11 @@ export default function TeamsImport({ clientId, onClose, onImport, onForceCreate
     setStates({});
     setResults({});
     try {
-      // Fetches recent chat messages — NOT saved/bookmarked messages.
-      // Microsoft Graph has no stable saved-messages endpoint for Teams as of 2025.
-      // Future extension: if Graph exposes a saved-messages API, swap the call below
-      // with a dedicated `getTeamsSavedMessages(clientId)` command and update the UI scope note.
-      const items = await tauriApi.getTeamsRecentMessages(clientId);
+      // Source: self-chat intake inbox, today only.
+      // Send or forward a message to yourself in Teams to queue it here.
+      const items = await tauriApi.getTeamsSelfChatMessages(clientId);
       setMessages(items);
       // All messages start as idle — the user imports each one manually.
-      // TODO: when Graph API saved-messages endpoint becomes available,
-      //       consider showing saved messages here as a higher-signal source.
       const initialStates: Record<string, MessageState> = {};
       items.forEach((m) => { initialStates[m.id] = 'idle'; });
       setStates(initialStates);
@@ -130,9 +126,9 @@ export default function TeamsImport({ clientId, onClose, onImport, onForceCreate
         </div>
       </div>
 
-      {/* Scope note: honest about source and limitation */}
+      {/* Scope note */}
       <div className="ms-import-scope-note">
-        {'Recent chat messages — select which ones to import as tasks. Channel messages and saved/bookmarked messages are not available via the current Microsoft Graph API.'}
+        {'Self-chat intake — today’s messages only. Forward or send a message to yourself in Teams to queue it as a task candidate.'}
       </div>
 
       {errorInfo && (
@@ -145,15 +141,15 @@ export default function TeamsImport({ clientId, onClose, onImport, onForceCreate
       {loading && (
         <div className="ms-import-loading">
           <Icon name="loader" size={18} />
-          {'Loading recent messages\u2026'}
+          {'Loading self-chat messages\u2026'}
         </div>
       )}
 
       {!loading && messages.length === 0 && !error && (
         <div className="ms-import-empty">
-          <div>No recent messages found.</div>
+          <div>No messages today in your self-chat.</div>
           <div className="ms-import-empty-sub">
-            Searched the latest messages from your recent personal and group chats.
+            Send or forward a message to yourself in Teams to queue it as a task candidate.
           </div>
         </div>
       )}
