@@ -248,11 +248,17 @@ const FIELD_EXCLUSION_WORDS = new Set([
 export function extractEntityFromText(text: string): string {
   const lower = text.toLowerCase();
 
+  // Trigger/event words that must never form part of an entity logical name.
+  // e.g. "nvr_solution_onchange" → entity is "nvr_solution", not "nvr_solution_onchange".
+  const TRIGGER_SUFFIXES = /[_](onchange|onload|onsave|handler|events)$/i;
+
   // 1. nvr_ prefixed tokens — skip excluded field names; limit segment count
   for (const m of lower.matchAll(/\bnvr_([a-z][a-z0-9]*(?:_[a-z0-9]+)*)\b/g)) {
-    const full = `nvr_${m[1]}`;
+    // Strip trailing trigger/event suffix before treating as entity name.
+    const bare = m[1].replace(TRIGGER_SUFFIXES, '');
+    const full = `nvr_${bare}`;
     if (NVR_FIELD_EXCLUSIONS.has(full)) continue;
-    const segmentCount = m[1].split('_').length;
+    const segmentCount = bare.split('_').length;
     if (segmentCount > 3) continue; // likely a compound field, not an entity
     return full;
   }
@@ -825,8 +831,13 @@ const TRIGGER_HANDLER_SUFFIX: Record<string, string> = {
 function skeletonHelperPlusHook(analysis: ScriptAnalysis, plan: ScriptPlan): ScriptSkeleton {
   const { triggerField, candidateFunctionName } = analysis;
   const triggerSuffix = TRIGGER_HANDLER_SUFFIX[analysis.triggerType] ?? analysis.triggerType;
-  // Keep full entity name (nvr_ prefix included) — convention: nvr_<entity>_OnLoad etc.
-  const handler = plan.existingHandlerName ?? `${plan.entity}_${triggerSuffix}`;
+  // Convention:
+  //   OnLoad / OnSave: nvr_<entity>_OnLoad / nvr_<entity>_OnSave
+  //   OnChange: nvr_<fieldName>_OnChange  (field-based, not entity-based)
+  const defaultHandler = (analysis.triggerType === 'onChange' && triggerField)
+    ? `${triggerField}_${triggerSuffix}`
+    : `${plan.entity}_${triggerSuffix}`;
+  const handler = plan.existingHandlerName ?? defaultHandler;
 
   const helperCode = triggerField
     ? `// Helper: ${candidateFunctionName}
