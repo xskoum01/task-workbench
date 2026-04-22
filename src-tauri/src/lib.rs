@@ -224,6 +224,77 @@ fn open_in_vscode(path: String) -> Result<(), String> {
     })
 }
 
+// --- Git helpers -----------------------------------------------------------
+
+/// Helper: run a git command in repo_path; return trimmed stdout or an error string.
+fn git_run(repo_path: &str, args: &[&str]) -> Result<String, String> {
+    let p = std::path::Path::new(repo_path);
+    if !p.exists() {
+        return Err(format!("Repository path not found: {repo_path}"));
+    }
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(repo_path)
+        .args(args)
+        .output()
+        .map_err(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                "git is not installed or not on PATH.".to_string()
+            } else {
+                format!("Failed to run git: {e}")
+            }
+        })?;
+    if output.status.success() {
+        Ok(String::from_utf8_lossy(&output.stdout)
+            .trim()
+            .to_string())
+    } else {
+        Err(String::from_utf8_lossy(&output.stderr)
+            .trim()
+            .to_string())
+    }
+}
+
+/// Returns the name of the currently checked-out branch.
+/// Fails when the path is not a git repository or git is not available.
+#[tauri::command]
+fn get_git_branch(repo_path: String) -> Result<String, String> {
+    let branch = git_run(&repo_path, &["rev-parse", "--abbrev-ref", "HEAD"])?;
+    if branch.is_empty() {
+        Err("Could not determine current branch.".to_string())
+    } else {
+        Ok(branch)
+    }
+}
+
+/// Returns a sorted list of local branch names (the `*` marker is stripped).
+#[tauri::command]
+fn list_git_branches(repo_path: String) -> Result<Vec<String>, String> {
+    let raw = git_run(&repo_path, &["branch", "--list"])?;
+    let mut branches: Vec<String> = raw
+        .lines()
+        .map(|l| l.trim_start_matches('*').trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    branches.sort();
+    Ok(branches)
+}
+
+/// Returns true when the working tree has uncommitted changes.
+/// Untracked files are included (same as `git status --short`).
+#[tauri::command]
+fn git_has_uncommitted(repo_path: String) -> Result<bool, String> {
+    let out = git_run(&repo_path, &["status", "--short"])?;
+    Ok(!out.is_empty())
+}
+
+/// Checks out the given branch in the repository.
+/// Returns an error when the branch does not exist or there are conflicts.
+#[tauri::command]
+fn git_checkout_branch(repo_path: String, branch: String) -> Result<(), String> {
+    git_run(&repo_path, &["checkout", &branch]).map(|_| ())
+}
+
 // --- AI helpers ------------------------------------------------------------
 
 /// Reads aiApiKey and aiModel from settings.json.
@@ -2909,6 +2980,10 @@ pub fn run() {
             read_file_content,
             list_directory_files,
             list_crm_folders,
+            get_git_branch,
+            list_git_branches,
+            git_has_uncommitted,
+            git_checkout_branch,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

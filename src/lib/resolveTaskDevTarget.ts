@@ -217,3 +217,59 @@ export async function resolveBestPluginPath(
   console.log(tag, 'chosen: pluginFolder (no .sln/.csproj found)', pluginFolder);
   return pluginFolder;
 }
+
+// ---------------------------------------------------------------------------
+// Helpers for the manual dev-mode switcher (used by TaskDetail)
+// ---------------------------------------------------------------------------
+
+/**
+ * Returns the directory that contains plugin project subfolders.
+ *
+ * Priority:
+ *   1. customer.pluginFolder  (assumed to be the Plugins container)
+ *   2. customer.repositoryRoot + "/Plugins"
+ *   3. crmFolderFallback + "/Plugins"
+ */
+export function getPluginsDir(
+  customer: Customer | undefined,
+  crmFolderFallback?: string,
+): string | undefined {
+  if (customer?.pluginFolder) return customer.pluginFolder.replace(/\\/g, '/');
+  const root = customer?.repositoryRoot ?? crmFolderFallback;
+  if (root) return `${root.replace(/\\/g, '/')}/Plugins`;
+  return undefined;
+}
+
+/**
+ * Guesses the plugin project folder name from the task's ADO context.
+ *
+ * Looks at commentedFile and the `path` param of prUrl, both in the form
+ *   /Plugins/<ProjectFolder>/Something.cs
+ * Returns the <ProjectFolder> segment, or undefined when nothing can be inferred.
+ */
+export function hintedPluginProject(task: Task): string | undefined {
+  function extractProject(rawPath: string): string | undefined {
+    const segments = rawPath.replace(/\\/g, '/').replace(/^\//, '').split('/');
+    if (segments[0]?.toLowerCase() === 'plugins' && segments[1]) return segments[1];
+    return undefined;
+  }
+
+  const commented = task.adoContext?.commentedFile;
+  if (commented) {
+    const p = extractProject(commented);
+    if (p) return p;
+  }
+
+  const prUrl = task.adoContext?.prUrl;
+  if (prUrl) {
+    try {
+      const raw = new URL(prUrl).searchParams.get('path');
+      if (raw) {
+        const p = extractProject(decodeURIComponent(raw));
+        if (p) return p;
+      }
+    } catch { /* invalid URL */ }
+  }
+
+  return undefined;
+}

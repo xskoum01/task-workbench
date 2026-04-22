@@ -194,6 +194,39 @@ export function listDirectoryFiles(dir: string, extension: string): Promise<stri
   return invoke<string[]>('list_directory_files', { dir, extension });
 }
 
+/**
+ * Lists immediate subfolder names under `dir` (hidden folders excluded, sorted).
+ * Reuses the same Rust command as listCrmFolders.
+ * Returns empty array if dir not found or not a directory.
+ */
+export function listSubfolders(dir: string): Promise<string[]> {
+  return invoke<string[]>('list_crm_folders', { baseDir: dir });
+}
+
+// ---------------------------------------------------------------------------
+// Git helpers
+// ---------------------------------------------------------------------------
+
+/** Returns the name of the currently checked-out branch. */
+export function getGitBranch(repoPath: string): Promise<string> {
+  return invoke<string>('get_git_branch', { repoPath });
+}
+
+/** Returns sorted list of local branch names. */
+export function listGitBranches(repoPath: string): Promise<string[]> {
+  return invoke<string[]>('list_git_branches', { repoPath });
+}
+
+/** Returns true when the repo has uncommitted changes (including untracked files). */
+export function gitHasUncommitted(repoPath: string): Promise<boolean> {
+  return invoke<boolean>('git_has_uncommitted', { repoPath });
+}
+
+/** Checks out the given branch. Rejects with an error message on failure. */
+export function gitCheckoutBranch(repoPath: string, branch: string): Promise<void> {
+  return invoke('git_checkout_branch', { repoPath, branch });
+}
+
 // ---------------------------------------------------------------------------
 // Microsoft 365 — OAuth2 PKCE sign-in and Microsoft Graph API
 //

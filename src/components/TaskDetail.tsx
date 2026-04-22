@@ -9,7 +9,7 @@ import ScriptAssistantPanel from './ScriptAssistantPanel';
 import TaskForm from './TaskForm';
 import Icon from './Icon';
 import * as tauriApi from '../lib/tauriCommands';
-import { resolveTaskDevTarget, resolveBestPluginPath } from '../lib/resolveTaskDevTarget';
+import { resolveTaskDevTarget, resolveBestPluginPath, getPluginsDir, hintedPluginProject } from '../lib/resolveTaskDevTarget';
 import { BUCKET_META, BUCKET_ORDER, computePlanning, effectiveBucket } from '../lib/planning';
 import { isOverdue, formatRelativeDate } from '../lib/dates';
 
@@ -646,6 +646,9 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
   const devTarget = resolveTaskDevTarget(task, customer, crmFolderPath);
   const effectiveVscodePath = devTarget.path;
 
+  // Container directory for plugin project subfolders.
+  const pluginsDir = getPluginsDir(customer, crmFolderPath);
+
   // Inline feedback message (e.g. "Analysis recorded")
   const [feedback, setFeedback] = useState<string | null>(null);
   // Filesystem error message
@@ -668,6 +671,43 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
   const [notes, setNotes] = useState(task.notes ?? '');
   // Keep notes in sync when task changes (e.g. different task selected)
   useEffect(() => { setNotes(task.notes ?? ''); }, [task.id, task.notes]);
+
+  // --- Dev mode switcher state ---
+  // Initialized from heuristic; user can override via Script/Plugin toggle.
+  const [devMode, setDevMode] = useState<'script' | 'plugin'>(
+    devTarget.kind === 'plugin' ? 'plugin' : 'script',
+  );
+  const [pluginProjects, setPluginProjects]               = useState<string[]>([]);
+  const [pluginProjectsLoaded, setPluginProjectsLoaded]   = useState(false);
+  const [pluginProjectsLoading, setPluginProjectsLoading] = useState(false);
+  const [selectedPlugin, setSelectedPlugin]               = useState<string>('');
+  const [pluginOpenHint, setPluginOpenHint]               = useState<string | null>(null);
+
+  // --- Branch awareness state (V2) ---
+  const repoRootForGit = customer?.resolvedRepositoryPath ?? customer?.repositoryRoot;
+  const [currentBranch, setCurrentBranch]       = useState<string | null>(null);
+  const [branches, setBranches]                 = useState<string[]>([]);
+  const [selectedBranch, setSelectedBranch]     = useState<string>('');
+  const [branchDirty, setBranchDirty]           = useState(false);
+  const [branchLoading, setBranchLoading]       = useState(false);
+  const [branchSwitching, setBranchSwitching]   = useState(false);
+  const [branchError, setBranchError]           = useState<string | null>(null);
+
+  // Reset all plugin + branch state when the viewed task changes.
+  useEffect(() => {
+    const initialMode = devTarget.kind === 'plugin' ? 'plugin' : 'script';
+    setDevMode(initialMode);
+    setSelectedPlugin('');
+    setPluginProjects([]);
+    setPluginProjectsLoaded(false);
+    setPluginOpenHint(null);
+    setCurrentBranch(null);
+    setBranches([]);
+    setSelectedBranch('');
+    setBranchDirty(false);
+    setBranchError(null);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [task.id]);
 
   async function handleDelete() {
     await deleteTask(task.id);
@@ -698,6 +738,104 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
     const t = setTimeout(() => setAiError(null), 8000);
     return () => clearTimeout(t);
   }, [aiError]);
+
+  // Load plugin project subfolders when dev mode switches to 'plugin'.
+  useEffect(() => {
+    if (devMode !== 'plugin' || !pluginsDir || pluginProjectsLoaded) return;
+    setPluginProjectsLoading(true);
+    tauriApi.listSubfolders(pluginsDir)
+      .then((folders) => {
+        setPluginProjects(folders);
+        // Try to preselect from ADO task hint
+        const hint = hintedPluginProject(task);
+        if (hint && folders.includes(hint)) {
+          setSelectedPlugin(hint);
+        } else if (folders.length === 1) {
+          setSelectedPlugin(folders[0]);
+        }
+        setPluginProjectsLoaded(true);
+      })
+      .catch(() => {
+        setPluginProjects([]);
+        setPluginProjectsLoaded(true);
+      })
+      .finally(() => setPluginProjectsLoading(false));
+  }, [devMode, pluginsDir, pluginProjectsLoaded, task]);
+
+  // Load branch info when plugin mode is first activated.
+  useEffect(() => {
+    if (devMode !== 'plugin' || !repoRootForGit || currentBranch !== null) return;
+    setBranchLoading(true);
+    setBranchError(null);
+    Promise.all([
+      tauriApi.getGitBranch(repoRootForGit),
+      tauriApi.listGitBranches(repoRootForGit),
+      tauriApi.gitHasUncommitted(repoRootForGit),
+    ])
+      .then(([branch, branchList, dirty]) => {
+        setCurrentBranch(branch);
+        setSelectedBranch(branch);
+        setBranches(branchList);
+        setBranchDirty(dirty);
+      })
+      .catch((err) => {
+        setBranchError(String(err));
+      })
+      .finally(() => setBranchLoading(false));
+  }, [devMode, repoRootForGit, currentBranch]);
+
+  // Scan selected plugin folder for .sln / .csproj to populate the hint.
+  useEffect(() => {
+    if (!selectedPlugin || !pluginsDir) {
+      setPluginOpenHint(null);
+      return;
+    }
+    const pluginPath = `${pluginsDir}/${selectedPlugin}`;
+    tauriApi.listDirectoryFiles(pluginPath, 'sln')
+      .then((slns) => {
+        if (slns.length > 0) {
+          setPluginOpenHint(`.sln found: ${slns[0]}`);
+          return;
+        }
+        return tauriApi.listDirectoryFiles(pluginPath, 'csproj').then((csprojs) => {
+          setPluginOpenHint(
+            csprojs.length > 0
+              ? `.csproj found: ${csprojs[0]}`
+              : 'No .sln or .csproj found in this plugin folder.',
+          );
+        });
+      })
+      .catch(() => setPluginOpenHint(null));
+  }, [selectedPlugin, pluginsDir]);
+
+  // Handler: switch to selected branch, then refresh plugin folder and hint.
+  async function handleSwitchBranch() {
+    if (!repoRootForGit || !selectedBranch || selectedBranch === currentBranch) return;
+    setBranchError(null);
+    setBranchSwitching(true);
+    try {
+      const dirty = await tauriApi.gitHasUncommitted(repoRootForGit);
+      if (dirty) {
+        setBranchDirty(true);
+        setBranchError(
+          'Cannot switch branch because the repository has uncommitted changes.',
+        );
+        return;
+      }
+      await tauriApi.gitCheckoutBranch(repoRootForGit, selectedBranch);
+      const newBranch = await tauriApi.getGitBranch(repoRootForGit);
+      setCurrentBranch(newBranch);
+      setBranchDirty(false);
+      // Reload plugin projects on the new branch
+      setPluginProjectsLoaded(false);
+      setSelectedPlugin('');
+      setPluginOpenHint(null);
+    } catch (err) {
+      setBranchError(String(err));
+    } finally {
+      setBranchSwitching(false);
+    }
+  }
 
   // --- Status change ---
 
@@ -840,6 +978,40 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
     }
     try {
       await tauriApi.openInVscode(resolvedPath);
+    } catch (e) {
+      setFsError(String(e));
+    }
+  }
+
+  // Opens the selected plugin project in VS Code (.sln > .csproj > folder).
+  async function handleOpenPluginVscode() {
+    if (!pluginsDir || !selectedPlugin) {
+      setFsError('Select a plugin project first.');
+      return;
+    }
+    const pluginPath = `${pluginsDir}/${selectedPlugin}`;
+    try {
+      const slns = await tauriApi.listDirectoryFiles(pluginPath, 'sln');
+      if (slns.length > 0) {
+        const target = `${pluginPath}/${slns[0]}`;
+        console.log('[devTarget] final path=', target, '(from .sln)');
+        await tauriApi.openInVscode(target);
+        return;
+      }
+      const csprojs = await tauriApi.listDirectoryFiles(pluginPath, 'csproj');
+      if (csprojs.length > 0) {
+        const target = `${pluginPath}/${csprojs[0]}`;
+        console.log('[devTarget] final path=', target, '(from .csproj)');
+        await tauriApi.openInVscode(target);
+        return;
+      }
+      const exists = await tauriApi.checkPathExists(pluginPath);
+      if (!exists) {
+        setFsError('Plugin not found on the current branch or path.');
+        return;
+      }
+      console.log('[devTarget] final path=', pluginPath, '(folder — no .sln/.csproj)');
+      await tauriApi.openInVscode(pluginPath);
     } catch (e) {
       setFsError(String(e));
     }
@@ -1379,12 +1551,119 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
               )}
 
               {(hasRepo || hasVscodePath) && (
-                <button
-                  className="btn btn-secondary btn-sm btn-full"
-                  onClick={() => handleOpenVscode(effectiveVscodePath)}
-                >
-                  <Icon name="terminal" size={13} /> {devTarget.label}
-                </button>
+                <div className="detail-devmode-block">
+                  {/* Script / Plugin mode toggle */}
+                  <div className="detail-devmode-toggle">
+                    <button
+                      className={`btn btn-sm ${devMode === 'script' ? 'btn-primary' : 'btn-secondary'}`}
+                      onClick={() => setDevMode('script')}
+                    >
+                      Script
+                    </button>
+                    <button
+                      className={`btn btn-sm ${devMode === 'plugin' ? 'btn-primary' : 'btn-secondary'}`}
+                      onClick={() => setDevMode('plugin')}
+                    >
+                      Plugin
+                    </button>
+                  </div>
+
+                  {devMode === 'plugin' ? (
+                    <>
+                      {/* Branch awareness */}
+                      {repoRootForGit && (
+                        <div className="detail-devmode-branch">
+                          <div className="detail-devmode-branch-current">
+                            Branch:{' '}
+                            <span className="detail-devmode-branch-name">
+                              {branchLoading ? '…' : (currentBranch ?? 'unknown')}
+                            </span>
+                            {branchDirty && (
+                              <span className="detail-devmode-branch-dirty" title="Uncommitted changes present">
+                                {' '}(dirty)
+                              </span>
+                            )}
+                          </div>
+
+                          {branches.length > 1 && (
+                            <div className="detail-devmode-branch-row">
+                              <select
+                                className="form-select detail-devmode-branch-select"
+                                value={selectedBranch}
+                                onChange={(e) => setSelectedBranch(e.target.value)}
+                                disabled={branchSwitching}
+                              >
+                                {branches.map((b) => (
+                                  <option key={b} value={b}>{b}</option>
+                                ))}
+                              </select>
+                              <button
+                                className="btn btn-secondary btn-sm"
+                                onClick={handleSwitchBranch}
+                                disabled={
+                                  branchSwitching ||
+                                  !selectedBranch ||
+                                  selectedBranch === currentBranch
+                                }
+                                title="Switch to selected branch"
+                              >
+                                {branchSwitching ? <><span className="btn-spinner" /> Switching…</> : 'Switch'}
+                              </button>
+                            </div>
+                          )}
+
+                          {branchError && (
+                            <div className="detail-fs-error">{branchError}</div>
+                          )}
+                        </div>
+                      )}
+
+                      {pluginProjectsLoading && (
+                        <div className="detail-devmode-hint">Loading plugin projects…</div>
+                      )}
+
+                      {!pluginProjectsLoading && pluginProjectsLoaded && pluginProjects.length === 0 && (
+                        <div className="detail-devmode-hint">
+                          No plugin project folders found{pluginsDir ? ` in ${pluginsDir}` : ''}.
+                        </div>
+                      )}
+
+                      {!pluginProjectsLoading && pluginProjects.length > 0 && (
+                        <select
+                          className="form-select"
+                          value={selectedPlugin}
+                          onChange={(e) => setSelectedPlugin(e.target.value)}
+                        >
+                          <option value="">— select plugin project —</option>
+                          {pluginProjects.map((p) => (
+                            <option key={p} value={p}>{p}</option>
+                          ))}
+                        </select>
+                      )}
+
+                      {pluginOpenHint && (
+                        <div className="detail-devmode-hint">{pluginOpenHint}</div>
+                      )}
+
+                      <button
+                        className="btn btn-secondary btn-sm btn-full"
+                        onClick={handleOpenPluginVscode}
+                        disabled={!selectedPlugin}
+                      >
+                        <Icon name="terminal" size={13} /> Open Plugin in VS Code
+                      </button>
+                    </>
+                  ) : (
+                    <button
+                      className="btn btn-secondary btn-sm btn-full"
+                      onClick={() => handleOpenVscode(
+                        customer?.scriptFolder ?? effectiveVscodePath,
+                      )}
+                    >
+                      <Icon name="terminal" size={13} /> Open Script in VS Code
+                    </button>
+                  )}
+                </div>
               )}
 
               {/* Filesystem error strip */}
