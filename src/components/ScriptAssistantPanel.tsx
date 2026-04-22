@@ -625,22 +625,21 @@ function ScriptAssistantPanel({ task, customer, onDraftChange, scriptFolderOverr
   }
 
   // --- Open in VS Code ---
-  // Opens the applied/existing target file, or falls back to the script folder.
+  // Opens the customer's repository in VS Code (not the individual JS file).
+  // Falls back to the script folder if no repo root is configured.
 
   async function handleOpenVscode() {
-    // After apply, the file definitely exists — use it directly.
-    // Before apply, use target file only when known to exist.
-    const targetPath =
-      applyResult?.targetFile ??
-      (plan?.fileExists ? plan.targetFile : null) ??
+    const repoPath =
+      customer.resolvedRepositoryPath ??
+      customer.repositoryRoot ??
       scriptFolder;
 
-    if (!targetPath) {
-      setError('No script folder configured. Set it in Customers → Edit.');
+    if (!repoPath) {
+      setError('No repository configured. Set it in Customers → Edit.');
       return;
     }
     try {
-      await tauriApi.openInVscode(targetPath);
+      await tauriApi.openInVscode(repoPath);
     } catch (e) {
       setError(String(e));
     }
@@ -648,13 +647,7 @@ function ScriptAssistantPanel({ task, customer, onDraftChange, scriptFolderOverr
 
   // ---------------------------------------------------------------------------
 
-  const vsCodeLabel = applyResult?.targetFileName
-    ? `Open ${applyResult.targetFileName}`
-    : plan?.fileExists
-      ? `Open ${plan.targetFileName}`
-      : plan
-        ? 'Open script folder'
-        : 'Open in VS Code';
+  const vsCodeLabel = 'Open Repository in VS Code';
 
   return (
     <div className="detail-action-group sa-panel">
@@ -712,7 +705,7 @@ function ScriptAssistantPanel({ task, customer, onDraftChange, scriptFolderOverr
         <button
           className="btn btn-sm btn-ghost"
           onClick={handleOpenVscode}
-          disabled={!scriptFolder}
+          disabled={!customer.resolvedRepositoryPath && !customer.repositoryRoot && !scriptFolder}
           title={vsCodeLabel}
         >
           <Icon name="terminal" size={12} /> VS Code
