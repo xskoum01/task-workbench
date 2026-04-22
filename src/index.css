@@ -1965,7 +1965,6 @@ body {
 }
 
 .form-input,
-.form-select,
 .form-textarea {
   background: var(--bg-base);
   border: 1px solid var(--border);
@@ -1980,6 +1979,23 @@ body {
   /* Reset browser defaults */
   -webkit-appearance: none;
   appearance: none;
+}
+
+/* .form-select uses native appearance so the OS popup is not clipped by
+   overflow:hidden ancestors (modals, panels). All visual styling is kept
+   but appearance:none is intentionally omitted. */
+.form-select {
+  background: var(--bg-base);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  color: var(--text-primary);
+  font-family: var(--font-sans);
+  font-size: var(--font-size-md);
+  padding: 7px 10px;
+  width: 100%;
+  outline: none;
+  transition: border-color 0.15s;
+  cursor: pointer;
 }
 
 .form-input:focus,
@@ -2000,14 +2016,7 @@ body {
   cursor: not-allowed;
 }
 
-/* Native select arrow (keeps custom bg) */
-.form-select {
-  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='8' viewBox='0 0 12 8'%3E%3Cpath d='M1 1l5 5 5-5' stroke='%238b949e' stroke-width='1.5' fill='none' stroke-linecap='round'/%3E%3C/svg%3E");
-  background-repeat: no-repeat;
-  background-position: right 10px center;
-  padding-right: 30px;
-  cursor: pointer;
-}
+/* (native select arrow is used — no custom SVG needed) */
 
 .form-textarea {
   resize: vertical;
