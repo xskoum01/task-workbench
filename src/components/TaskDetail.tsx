@@ -1,4 +1,4 @@
-﻿import { useState, useEffect } from 'react';
+﻿import { useState, useEffect, useRef } from 'react';
 import type { Task, TaskStatus, PlanningBucket, SkeletonPreview, AiReviewResult } from '../types';
 import TaskEmailContent from './TaskEmailContent';
 import TaskDevModePanel from './TaskDevModePanel';
@@ -6,7 +6,7 @@ import { useApp } from '../context/AppContext';
 import { TypeBadge, SourceBadge, STATUS_LABELS } from './StatusBadge';
 import ReplyModal from './ReplyModal';
 import SkeletonPreviewModal from './SkeletonPreviewModal';
-import ScriptAssistantPanel from './ScriptAssistantPanel';
+import ScriptAssistantPanel, { type ScriptAssistantPanelHandle } from './ScriptAssistantPanel';
 import TaskForm from './TaskForm';
 import CreatePluginProjectModal from './CreatePluginProjectModal';
 import Icon from './Icon';
@@ -318,6 +318,9 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
   const [showCreatePlugin, setShowCreatePlugin] = useState(false);
   // AI Review result
   const [aiReview, setAiReview] = useState<AiReviewResult | null>(null);
+  // Script Assistant imperative ref + draft-ready flag
+  const scriptPanelRef = useRef<ScriptAssistantPanelHandle>(null);
+  const [scriptHasDraft, setScriptHasDraft] = useState(false);
   // Edit task form
   const [showEditForm, setShowEditForm] = useState(false);
   // Delete confirmation step
@@ -326,6 +329,8 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
   const [notes, setNotes] = useState(task.notes ?? '');
   // Keep notes in sync when task changes (e.g. different task selected)
   useEffect(() => { setNotes(task.notes ?? ''); }, [task.id, task.notes]);
+  // Reset script draft flag when switching tasks
+  useEffect(() => { setScriptHasDraft(false); }, [task.id]);
 
 
   // --- Status change ---
@@ -409,45 +414,72 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
   }
 
   async function handleGenerateDraft() {
-    // Plugin tasks: generate a C# skeleton preview using AI.
-    // Script tasks: the ScriptAssistantPanel manages draft generation — inform user.
-    if (devTarget.kind !== 'plugin') {
-      setFeedback('Use the Script Assistant below to generate a draft for script tasks.');
-      return;
-    }
-    setAiLoading('draft');
-    setAiError(null);
-    try {
-      const preview = await tauriApi.generateSkeletonPreview(task, customer ?? null);
-      setSkeletonPreview(preview);
-      setShowSkeleton(true);
-    } catch (e) {
-      setAiError(String(e));
-    } finally {
-      setAiLoading(null);
+    if (devTarget.kind === 'plugin') {
+      // Plugin: call AI to generate a C# skeleton, then open preview modal.
+      setAiLoading('draft');
+      setAiError(null);
+      try {
+        const preview = await tauriApi.generateSkeletonPreview(task, customer ?? null);
+        setSkeletonPreview(preview);
+        setShowSkeleton(true);
+      } catch (e) {
+        setAiError(String(e));
+      } finally {
+        setAiLoading(null);
+      }
+    } else {
+      // Script: delegate to the Script Assistant panel (runs full Analyze→Plan→Skeleton→Preview chain).
+      if (!scriptPanelRef.current) {
+        setAiError('Script Assistant panel is not available for this task.');
+        return;
+      }
+      setAiLoading('draft');
+      setAiError(null);
+      try {
+        await scriptPanelRef.current.generateDraft();
+        // setScriptHasDraft is driven by onDraftChange callback from the panel.
+      } catch (e) {
+        setAiError(String(e));
+      } finally {
+        setAiLoading(null);
+      }
     }
   }
 
   async function handleApplyDraft() {
-    // For plugin drafts: write the skeleton preview to disk.
-    // Requires the draft to have been generated first.
-    if (!skeletonPreview) {
-      setFeedback('Generate a draft first before applying.');
-      return;
-    }
-    if (!pluginsDir) {
-      setFsError('No plugin folder configured for this customer.');
-      return;
-    }
-    const subPath = skeletonPreview.targetPath
-      ? `${pluginsDir}/${skeletonPreview.targetPath}/${skeletonPreview.fileName}`
-      : `${pluginsDir}/${skeletonPreview.fileName}`;
-    try {
-      await tauriApi.saveGeneratedFile(subPath, skeletonPreview.content);
-      setFeedback(`Draft written: ${skeletonPreview.fileName}`);
-      setSkeletonPreview(null);
-    } catch (e) {
-      setFsError(String(e));
+    if (devTarget.kind === 'plugin') {
+      // Plugin: write the skeleton preview to disk.
+      if (!skeletonPreview) {
+        setFeedback('Generate a draft first before applying.');
+        return;
+      }
+      if (!pluginsDir) {
+        setFsError('No plugin folder configured for this customer.');
+        return;
+      }
+      const subPath = skeletonPreview.targetPath
+        ? `${pluginsDir}/${skeletonPreview.targetPath}/${skeletonPreview.fileName}`
+        : `${pluginsDir}/${skeletonPreview.fileName}`;
+      try {
+        await tauriApi.saveGeneratedFile(subPath, skeletonPreview.content);
+        setFeedback(`Draft written: ${skeletonPreview.fileName}`);
+        setSkeletonPreview(null);
+      } catch (e) {
+        setFsError(String(e));
+      }
+    } else {
+      // Script: delegate to the Script Assistant panel apply step.
+      if (!scriptPanelRef.current) return;
+      setAiLoading('draft');
+      setAiError(null);
+      try {
+        await scriptPanelRef.current.applyDraft();
+        setFeedback('Script draft applied.');
+      } catch (e) {
+        setAiError(String(e));
+      } finally {
+        setAiLoading(null);
+      }
     }
   }
 
@@ -995,12 +1027,17 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
                   ? <><span className="btn-spinner" /> Generating…</>
                   : <><Icon name="layers" size={13} /> Generate Draft</>}
               </button>
-              {skeletonPreview && (
+              {/* Apply Draft — shown for plugin (skeletonPreview ready) or script (scriptHasDraft) */}
+              {(skeletonPreview || scriptHasDraft) && (
                 <button
                   className="btn btn-secondary btn-sm"
                   onClick={handleApplyDraft}
                   disabled={!!aiLoading}
-                  title={`Write draft to disk: ${skeletonPreview.fileName}`}
+                  title={
+                    devTarget.kind === 'plugin' && skeletonPreview
+                      ? `Write draft to disk: ${skeletonPreview.fileName}`
+                      : 'Apply script draft to repository'
+                  }
                 >
                   <Icon name="check" size={13} /> Apply Draft
                 </button>
@@ -1066,7 +1103,12 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
 
           {/* SCRIPT ASSISTANT — shown when customer has a script folder or repo root */}
           {customer && (customer.scriptFolder || customer.resolvedRepositoryPath || customer.repositoryRoot) && (
-            <ScriptAssistantPanel task={task} customer={customer} />
+            <ScriptAssistantPanel
+              ref={scriptPanelRef}
+              task={task}
+              customer={customer}
+              onDraftChange={setScriptHasDraft}
+            />
           )}
 
           {/* AZURE DEVOPS — shown for ADO PR comment/review tasks with an extracted deep link */}

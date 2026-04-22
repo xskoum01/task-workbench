@@ -10,7 +10,7 @@
  * - Plan shows customer name, repo path, and concrete recommended action
  */
 
-import { useState, useCallback, useRef } from 'react';
+import { useState, useCallback, useRef, forwardRef, useImperativeHandle } from 'react';
 import type { Task, Customer, ScriptAnalysis, ScriptPlan, ScriptSkeleton, SkeletonSection, ScriptPreview, ScriptApplyResult } from '../types';
 import Icon from './Icon';
 import { useApp } from '../context/AppContext';
@@ -23,9 +23,22 @@ import {
   resolveCustomerScriptFolder,
 } from '../lib/scriptAssistant';
 
+export interface ScriptAssistantPanelHandle {
+  /** Run the full Analyze → Plan → Skeleton → Preview pipeline. Throws on failure. */
+  generateDraft(): Promise<void>;
+  /** Write the current preview to disk. Throws if no preview is available. */
+  applyDraft(): Promise<void>;
+}
+
 interface ScriptAssistantPanelProps {
   task: Task;
   customer: Customer;
+  /**
+   * Called whenever the draft-ready state changes.
+   * `true`  = a preview is loaded and ready to apply.
+   * `false` = no preview (or just applied).
+   */
+  onDraftChange?: (hasDraft: boolean) => void;
 }
 
 // ---------------------------------------------------------------------------
@@ -254,7 +267,8 @@ function ApplySuccessDisplay({ result }: { result: ScriptApplyResult }) {
 // Main panel
 // ---------------------------------------------------------------------------
 
-export default function ScriptAssistantPanel({ task, customer }: ScriptAssistantPanelProps) {
+export default forwardRef<ScriptAssistantPanelHandle, ScriptAssistantPanelProps>(
+function ScriptAssistantPanel({ task, customer, onDraftChange }, ref) {
   const { updateTask } = useApp();
   const scriptFolder = resolveCustomerScriptFolder(customer);
 
@@ -269,10 +283,123 @@ export default function ScriptAssistantPanel({ task, customer }: ScriptAssistant
   const [preview, setPreview]     = useState<ScriptPreview | null>(null);
   const [applyResult, setApplyResult] = useState<ScriptApplyResult | null>(null);
 
+  // Shadow ref so imperative applyDraft() can read the current preview synchronously.
+  const previewRef = useRef<ScriptPreview | null>(null);
+  function updatePreview(p: ScriptPreview | null) {
+    previewRef.current = p;
+    setPreview(p);
+    onDraftChange?.(!!p && !p.isNoop);
+  }
+
   const [loading, setLoading] = useState<'analyze' | 'plan' | 'skeleton' | 'preview' | 'apply' | null>(null);
   const [error, setError]     = useState<string | null>(null);
 
   const clearError = useCallback(() => setError(null), []);
+
+  // ---------------------------------------------------------------------------
+  // Imperative API (exposed via forwardRef to TaskDetail)
+  // ---------------------------------------------------------------------------
+
+  useImperativeHandle(ref, () => ({
+    /** Chain all 4 steps using local variables so we don’t rely on async state between steps. */
+    async generateDraft() {
+      if (!scriptFolder) throw new Error('No script folder configured for this customer.');
+      clearError();
+
+      // Step 1: Analyze (synchronous)
+      setLoading('analyze');
+      let localAnalysis: ScriptAnalysis;
+      try {
+        localAnalysis = analyzeScriptTask(task, customer);
+        analysisIsRestored.current = false;
+        setAnalysis(localAnalysis);
+        setPlan(null); setSkeleton(null);
+        updatePreview(null);
+        setApplyResult(null);
+        updateTask(task.id, { scriptAnalysis: localAnalysis }).catch(() => {});
+      } catch (e) {
+        setLoading(null);
+        setError(String(e));
+        throw e;
+      }
+
+      // Step 2: Plan (async — reads files from disk)
+      setLoading('plan');
+      let localPlan: ScriptPlan;
+      try {
+        localPlan = await buildScriptPlan(
+          localAnalysis,
+          scriptFolder,
+          () => tauriApi.listDirectoryFiles(scriptFolder, 'js'),
+          (path: string) => tauriApi.readFileContent(path),
+        );
+        setPlan(localPlan);
+        setSkeleton(null);
+        updatePreview(null);
+        setApplyResult(null);
+      } catch (e) {
+        setLoading(null);
+        setError(String(e));
+        throw e;
+      }
+
+      // Step 3: Skeleton (synchronous)
+      setLoading('skeleton');
+      let localSkeleton: ScriptSkeleton;
+      try {
+        localSkeleton = generateSkeleton(localAnalysis, localPlan);
+        setSkeleton(localSkeleton);
+        updatePreview(null);
+        setApplyResult(null);
+      } catch (e) {
+        setLoading(null);
+        setError(String(e));
+        throw e;
+      }
+
+      // Step 4: Preview (async — reads current file content)
+      setLoading('preview');
+      try {
+        const localPreview = await buildScriptPreview(
+          localAnalysis,
+          localPlan,
+          localSkeleton,
+          (path: string) => tauriApi.readFileContent(path),
+        );
+        updatePreview(localPreview);
+        setApplyResult(null);
+      } catch (e) {
+        setLoading(null);
+        setError(String(e));
+        throw e;
+      }
+      setLoading(null);
+    },
+
+    async applyDraft() {
+      const currentPreview = previewRef.current;
+      if (!currentPreview) throw new Error('No preview available. Run Generate Draft first.');
+      if (currentPreview.isNoop) throw new Error('No file changes to apply — logic already present.');
+      clearError();
+      setLoading('apply');
+      try {
+        await tauriApi.saveGeneratedFile(currentPreview.targetFile, currentPreview.newContent);
+        setApplyResult({
+          targetFile: currentPreview.targetFile,
+          targetFileName: currentPreview.targetFileName,
+          created: !currentPreview.fileExists,
+          updated: currentPreview.fileExists,
+          bytesWritten: new TextEncoder().encode(currentPreview.newContent).length,
+        });
+        onDraftChange?.(false); // draft consumed
+      } catch (e) {
+        setLoading(null);
+        setError(String(e));
+        throw e;
+      }
+      setLoading(null);
+    },
+  }), [task, customer, scriptFolder, clearError, updateTask, onDraftChange]);
 
   // --- Step 1: Analyze ---
 
@@ -285,7 +412,7 @@ export default function ScriptAssistantPanel({ task, customer }: ScriptAssistant
       setAnalysis(result);
       setPlan(null);
       setSkeleton(null);
-      setPreview(null);
+      updatePreview(null);
       setApplyResult(null);
       // Persist to task so analysis survives navigation away and back
       updateTask(task.id, { scriptAnalysis: result }).catch(() => {});
@@ -315,7 +442,7 @@ export default function ScriptAssistantPanel({ task, customer }: ScriptAssistant
       );
       setPlan(result);
       setSkeleton(null);
-      setPreview(null);
+      updatePreview(null);
       setApplyResult(null);
     } catch (e) {
       setError(String(e));
@@ -333,7 +460,7 @@ export default function ScriptAssistantPanel({ task, customer }: ScriptAssistant
     try {
       const result = generateSkeleton(analysis, plan);
       setSkeleton(result);
-      setPreview(null);
+      updatePreview(null);
       setApplyResult(null);
     } catch (e) {
       setError(String(e));
@@ -355,7 +482,7 @@ export default function ScriptAssistantPanel({ task, customer }: ScriptAssistant
         skeleton,
         (path: string) => tauriApi.readFileContent(path),
       );
-      setPreview(result);
+      updatePreview(result);
       setApplyResult(null);
     } catch (e) {
       setError(String(e));
@@ -379,6 +506,7 @@ export default function ScriptAssistantPanel({ task, customer }: ScriptAssistant
         updated: preview.fileExists,
         bytesWritten: new TextEncoder().encode(preview.newContent).length,
       });
+      onDraftChange?.(false);
     } catch (e) {
       setError(String(e));
     } finally {
@@ -517,4 +645,4 @@ export default function ScriptAssistantPanel({ task, customer }: ScriptAssistant
       )}
     </div>
   );
-}
+});
