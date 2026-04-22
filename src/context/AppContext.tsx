@@ -2,6 +2,7 @@ import { createContext, useContext, useEffect, useState, useRef, useCallback } f
 import type { Task, Customer, AppSettings, CreateRepoResult, CreateRepoOptions, TaskType, ClassificationState, PlanningBucket, AdoEmailContext } from '../types';
 import * as api from '../lib/tauriCommands';
 import { defaultSettings } from '../data/mockData';
+import { OTHER_CUSTOMER, OTHER_CUSTOMER_ID } from '../data/mockData';
 import { prefilter } from '../lib/prefilter';
 import { matchCustomer } from '../lib/customerMatch';
 import { normalizeText, normalizeTitle } from '../lib/textNormalize';
@@ -290,7 +291,11 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
         }
 
         setTasks(loadedTasks);
-        setCustomers(finalCustomers);
+        // Always ensure the Other sentinel customer is present.
+        const withOther = finalCustomers.some((c) => c.id === OTHER_CUSTOMER_ID)
+          ? finalCustomers
+          : [OTHER_CUSTOMER, ...finalCustomers];
+        setCustomers(withOther);
         setSettings(loadedSettings);
       } catch (err) {
         // Tauri runtime not available (e.g. plain Vite dev server in browser).
@@ -426,13 +431,13 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
         const cleanTitle   = normalizeTitle(input.title);
         const matchedCustomer = input.preResolvedCustomerId
           ? customers.find((c) => c.id === input.preResolvedCustomerId) ?? null
-          : matchCustomer(customers, { senderEmail: input.senderEmail, senderName: input.senderName, title: cleanTitle, content: cleanContent });
+          : matchCustomer(customers.filter((c) => c.id !== OTHER_CUSTOMER_ID), { senderEmail: input.senderEmail, senderName: input.senderName, title: cleanTitle, content: cleanContent });
         const forcedId   = generateId();
         const forcedTask: Task = {
           id:                      forcedId,
           title:                   cleanTitle,
           source:                  input.source,
-          customerId:              matchedCustomer?.id ?? '',
+          customerId:              matchedCustomer?.id ?? OTHER_CUSTOMER_ID,
           taskType:                'other',
           status:                  'new',
           confidence:              80,
@@ -576,7 +581,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
       // b. Otherwise run the heuristic matchCustomer algorithm
       const matchedCustomer = input.preResolvedCustomerId
         ? customers.find((c) => c.id === input.preResolvedCustomerId) ?? null
-        : matchCustomer(customers, {
+        : matchCustomer(customers.filter((c) => c.id !== OTHER_CUSTOMER_ID), {
             senderEmail: input.senderEmail,
             senderName:  input.senderName,
             title:       cleanTitle,
@@ -595,7 +600,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
         id:                  pendingId,
         title:               cleanTitle,
         source:              input.source,
-        customerId:          matchedCustomer?.id ?? '',
+        customerId:          matchedCustomer?.id ?? OTHER_CUSTOMER_ID,
         taskType:            'other',
         status:              'new',
         confidence:          0,
@@ -699,7 +704,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
       // Explicit-capture (captureMode === 'explicit'):
       //   AI enriches only — never rejects.
       //   conf >= AUTO → created; otherwise → analyzed
-      const { isTask, confidence, title, summary, customerName, taskType, estimatedEffort, dueAt } =
+      const { isTask, confidence, title, summary, summaryCz, nextStepCz, customerName, taskType, estimatedEffort, dueAt } =
         classification;
 
       if ((!isTask || confidence < IMPORT_CONFIG.MIN_CONFIDENCE_ANALYZE) && input.captureMode !== 'explicit') {
@@ -720,14 +725,16 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
         console.log(`[import] explicit-capture override "${input.title}": AI weak (isTask=${isTask} conf=${confidence}) → surfaces as analyzed`);
       }
 
-      // Refine customer match using AI-derived name if deterministic match failed
-      const finalCustomer = matchedCustomer ?? matchCustomer(customers, {
+      // Refine customer match using AI-derived name if deterministic match failed.
+      // Exclude the Other sentinel from matching — it must only be used as a fallback.
+      const finalCustomer = matchedCustomer ?? matchCustomer(customers.filter((c) => c.id !== OTHER_CUSTOMER_ID), {
         senderEmail:    input.senderEmail,
         senderName:     input.senderName,
         title:          input.title,
         content:        cleanContent,
         aiCustomerName: customerName ?? undefined,
       });
+      const finalCustomerId = finalCustomer?.id ?? OTHER_CUSTOMER_ID;
       if (!matchedCustomer && finalCustomer) {
         console.log(`[import] post-AI customer: ${finalCustomer.name} (via AI name "${customerName}")`);
       } else if (!finalCustomer) {
@@ -756,16 +763,22 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
       console.log(
         `[title-route] finalTitle="${resolvedTitle?.slice(0, 70)}"`,
         `source=${isPrComment ? 'deterministic_pr' : isEmail ? 'email_subject' : 'ai'}`,
-        `customer=${finalCustomer?.name ?? 'NONE'}`,
+        `customer=${finalCustomer?.name ?? 'Other'}`,
       );
       const aiFields: Partial<Task> = {
         title:                  resolvedTitle,
-        customerId:             finalCustomer?.id ?? '',
+        customerId:             finalCustomerId,
         taskType:               resolvedTaskType,
         confidence,
         dueAt:                  dueAt ?? undefined,
         estimatedEffort:        estimatedEffort ?? undefined,
-        analysisResult:         { summary, suggestedActions: [], confidence },
+        analysisResult:         {
+          summary,
+          summaryCz:        summaryCz ?? undefined,
+          nextStepCz:       nextStepCz ?? undefined,
+          suggestedActions: [],
+          confidence,
+        },
         // Preserve heuristic planning when AI doesn't set a bucket (AI doesn't return bucket yet)
         suggestedPlanningBucket: input.heuristicBucket,
         priorityScore:           input.heuristicPriority,
@@ -998,7 +1011,12 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
   // --- Convenience ---
 
   const getCustomerById = useCallback(
-    (id: string) => customers.find((c) => c.id === id),
+    (id: string) => {
+      // Treat empty string as equivalent to __other__ for backward compat
+      // with tasks imported before the Other sentinel existed.
+      if (!id || id === OTHER_CUSTOMER_ID) return OTHER_CUSTOMER;
+      return customers.find((c) => c.id === id);
+    },
     [customers],
   );
 

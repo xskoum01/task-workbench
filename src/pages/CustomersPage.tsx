@@ -4,6 +4,7 @@ import { useApp } from '../context/AppContext';
 import CustomerForm from '../components/CustomerForm';
 import CreateRepoWizard from '../components/CreateRepoWizard';
 import { openPath, openInVscode } from '../lib/tauriCommands';
+import { OTHER_CUSTOMER_ID } from '../data/mockData';
 
 const REPO_STATUS_LABEL: Record<RepositoryStatus, string> = {
   linked:      'Linked',
@@ -57,6 +58,9 @@ export default function CustomersPage() {
     customers.map((c) => [c.id, tasks.filter((t) => t.customerId === c.id).length]),
   );
 
+  // Hide the built-in Other sentinel from the customer management UI.
+  const managedCustomers = customers.filter((c) => c.id !== OTHER_CUSTOMER_ID);
+
   const hasTemplate =
     (settings.repositoryTemplateType ?? 'none') !== 'none' &&
     !!settings.repositoryTemplatePath &&
@@ -92,8 +96,8 @@ export default function CustomersPage() {
     setConfirmDeleteId(null);
   }
 
-  const linkedCount  = customers.filter((c) => c.repositoryStatus === 'linked').length;
-  const missingCount = customers.filter((c) => c.repositoryStatus === 'missing').length;
+  const linkedCount  = managedCustomers.filter((c) => c.repositoryStatus === 'linked').length;
+  const missingCount = managedCustomers.filter((c) => c.repositoryStatus === 'missing').length;
 
   return (
     <div className="page-content">
@@ -101,11 +105,11 @@ export default function CustomersPage() {
         <div>
           <div className="page-title">Workspaces</div>
           <div className="page-subtitle">
-            {customers.length === 0
+            {managedCustomers.length === 0
               ? crmBaseDir
-                ? 'No workspaces found \u2014 click Sync to discover folders'
+                ? 'No workspaces found — click Sync to discover folders'
                 : 'Configure a CRM base directory in Settings to auto-discover workspaces'
-              : `${customers.length} workspace${customers.length !== 1 ? 's' : ''}\u2003${linkedCount} linked${missingCount > 0 ? `, ${missingCount} not cloned` : ''}`}
+              : `${managedCustomers.length} workspace${managedCustomers.length !== 1 ? 's' : ''} ${linkedCount} linked${missingCount > 0 ? `, ${missingCount} not cloned` : ''}`}
           </div>
         </div>
         <div style={{ display: 'flex', gap: 8 }}>
@@ -134,7 +138,7 @@ export default function CustomersPage() {
       </div>
 
       {/* Empty state */}
-      {customers.length === 0 && (
+      {managedCustomers.length === 0 && (
         <div className="empty-state">
           {crmBaseDir ? (
             <>
@@ -156,9 +160,9 @@ export default function CustomersPage() {
       )}
 
       {/* Workspace list */}
-      {customers.length > 0 && (
+      {managedCustomers.length > 0 && (
         <div className="customer-list">
-          {customers.map((customer) => {
+          {managedCustomers.map((customer) => {
             const outcome  = outcomes[customer.id];
             const repoPath = customer.resolvedRepositoryPath ?? customer.repositoryRoot;
             const crmPath  =

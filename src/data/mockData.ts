@@ -2,7 +2,19 @@
  * Default AppSettings shape used as the initial state before Tauri loads.
  * No mock tasks or customers — the app starts empty with real local data only.
  */
-import type { AppSettings } from '../types';
+import type { AppSettings, Customer } from '../types';
+
+/**
+ * Built-in sentinel customer for tasks that don't belong to any CRM project.
+ * Always present in memory (injected by AppContext after load).
+ * Has no repository, plugin, or script paths — dev tools collapse automatically.
+ */
+export const OTHER_CUSTOMER_ID = '__other__';
+export const OTHER_CUSTOMER: Customer = {
+  id:        OTHER_CUSTOMER_ID,
+  name:      'Other',
+  shortCode: 'OTHER',
+};
 
 export const defaultSettings: AppSettings = {
   appName: 'Task Workbench',

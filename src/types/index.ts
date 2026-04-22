@@ -175,6 +175,8 @@ export interface ClassificationResult {
   isTask: boolean;
   title: string;
   summary: string;
+  summaryCz?: string | null;
+  nextStepCz?: string | null;
   customerName?: string | null;
   taskType: TaskType;
   estimatedEffort?: number | null;

@@ -320,7 +320,10 @@ export default function TaskDevModePanel({
           <button
             className="btn btn-secondary btn-sm btn-full"
             onClick={handleOpenPlugin}
-            disabled={!selectedPlugin}
+            disabled={
+              !selectedPlugin ||
+              pluginOpenHint === 'No .sln or .csproj found in this plugin folder.'
+            }
           >
             <Icon name="terminal" size={13} />{' '}
             {pluginOpenHint?.startsWith('.sln') ? 'Open Plugin in Visual Studio' : 'Open Plugin in VS Code'}
