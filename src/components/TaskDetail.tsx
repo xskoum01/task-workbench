@@ -295,6 +295,14 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
   const devTarget = resolveTaskDevTarget(task, customer, crmFolderPath);
   const effectiveVscodePath = devTarget.path;
 
+  // Resolved script folder: customer fields first, then the same fallback used by Open Work.
+  // This ensures ScriptAssistantPanel is mounted whenever a script path is available.
+  const effectiveScriptFolder =
+    customer?.scriptFolder ??
+    customer?.resolvedRepositoryPath ??
+    customer?.repositoryRoot ??
+    (devTarget.kind !== 'plugin' ? effectiveVscodePath : undefined);
+
   // Container directory for plugin project subfolders.
   const pluginsDir = getPluginsDir(customer, crmFolderPath);
   // Root used for git operations (branch switching).
@@ -1101,13 +1109,14 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
             )}
           </div>
 
-          {/* SCRIPT ASSISTANT — shown when customer has a script folder or repo root */}
-          {customer && (customer.scriptFolder || customer.resolvedRepositoryPath || customer.repositoryRoot) && (
+          {/* SCRIPT ASSISTANT — shown when any script-capable path exists (customer fields or fallback repo path) */}
+          {customer && effectiveScriptFolder && (
             <ScriptAssistantPanel
               ref={scriptPanelRef}
               task={task}
               customer={customer}
               onDraftChange={setScriptHasDraft}
+              scriptFolderOverride={effectiveScriptFolder}
             />
           )}
 

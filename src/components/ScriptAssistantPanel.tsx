@@ -39,6 +39,11 @@ interface ScriptAssistantPanelProps {
    * `false` = no preview (or just applied).
    */
   onDraftChange?: (hasDraft: boolean) => void;
+  /**
+   * Explicit script folder path to use when customer fields alone cannot resolve one.
+   * Covers the fallback path (crmBaseDirectory + folderName) used by Open Work.
+   */
+  scriptFolderOverride?: string;
 }
 
 // ---------------------------------------------------------------------------
@@ -268,9 +273,9 @@ function ApplySuccessDisplay({ result }: { result: ScriptApplyResult }) {
 // ---------------------------------------------------------------------------
 
 export default forwardRef<ScriptAssistantPanelHandle, ScriptAssistantPanelProps>(
-function ScriptAssistantPanel({ task, customer, onDraftChange }, ref) {
+function ScriptAssistantPanel({ task, customer, onDraftChange, scriptFolderOverride }, ref) {
   const { updateTask } = useApp();
-  const scriptFolder = resolveCustomerScriptFolder(customer);
+  const scriptFolder = resolveCustomerScriptFolder(customer) ?? scriptFolderOverride ?? null;
 
   // Restore persisted analysis from task (survives task switching).
   // Track whether we loaded from persistence so the UI can show a subtle indicator.
