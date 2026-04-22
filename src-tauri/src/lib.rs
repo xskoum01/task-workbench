@@ -635,7 +635,15 @@ Examples:\n\
 - 'PR - VSM 113862 needs your review' → isTask=true conf=88 (explicit review request)\n\n\
 Respond with ONLY this JSON:\n\
 {{\"isTask\":true,\"confidence\":85,\"title\":\"Short imperative action title (max 80 chars)\",\
-\"summary\":\"1-2 sentences: what needs to be done and why\",\
+\"summary\":\"1-2 sentences in English: what needs to be done and why\",\
+\"summaryCz\":\"1-2 věty česky: co je třeba udělat a proč\",\
+\"summaryEn\":\"1-2 sentences in English describing the problem\",\
+\"problemPointsCz\":[\"Krátký český bod o problému.\"],\
+\"problemPointsEn\":[\"Short English bullet about the problem.\"],\
+\"actionPointsCz\":[\"Konkrétní akční krok česky.\"],\
+\"actionPointsEn\":[\"Concrete action step in English.\"],\
+\"nextStepCz\":\"Jeden jasný bezprostřední krok česky.\",\
+\"nextStepEn\":\"One clear immediate next step in English.\",\
 \"customerName\":null,\"taskType\":\"other\",\"estimatedEffort\":null,\"dueAt\":null,\
 \"suggestedReply\":null,\"skipReason\":null}}\n\n\
 Field rules:\n\
@@ -644,7 +652,9 @@ Field rules:\n\
 - estimatedEffort: hours as number or null\n\
 - dueAt: ISO 8601 date or null\n\
 - skipReason: brief reason if isTask=false, else null\n\
-- suggestedReply: 1-2 sentence acknowledgement if a reply is appropriate, else null"
+- suggestedReply: 1-2 sentence acknowledgement if a reply is appropriate, else null\n\
+- ALL bilingual fields (summaryCz, summaryEn, *Cz, *En) are MANDATORY when isTask=true\n\
+- *Cz fields: natural Czech. *En fields: natural English."
             );
 
             let text_result = call_openai(&api_key, &model, instructions, &prompt).await;
