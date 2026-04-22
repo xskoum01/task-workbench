@@ -115,6 +115,11 @@ export default function OutlookImport({ clientId, onClose, onImport, onForceCrea
     setItemErrors((prev) => { const n = { ...prev }; delete n[msg.id]; return n; });
     try {
       const fullMsg = await tauriApi.getOutlookMessageFull(clientId, msg.id);
+      console.log(
+        `[import-html] OutlookImport: msgId=${msg.id.slice(0, 12)}`,
+        `bodyHtml present=${!!fullMsg.bodyHtml}`,
+        `bodyHtml length=${fullMsg.bodyHtml?.length ?? 0}`,
+      );
       const result = await (force ? onForceCreate(fullMsg) : onImport(fullMsg));
       setResults((prev) => ({ ...prev, [msg.id]: result }));
       setStates((prev) => ({ ...prev, [msg.id]: result.outcome }));

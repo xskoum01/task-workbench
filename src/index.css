@@ -544,6 +544,26 @@ body {
   word-break: break-word;
 }
 
+/* HTML email body rendered via DOMPurify — scoped so email styles don't leak into the app. */
+.email-card-body--html {
+  white-space: normal;
+  overflow-x: auto;
+  max-width: 100%;
+  font-size: 13px;
+  line-height: 1.6;
+  word-break: break-word;
+}
+.email-card-body--html img {
+  max-width: 100%;
+  height: auto;
+  display: block;
+}
+.email-card-body--html table {
+  max-width: 100%;
+  border-collapse: collapse;
+}
+
+
 .detail-suggestions {
   display: flex;
   flex-direction: column;

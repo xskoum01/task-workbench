@@ -54,6 +54,11 @@ export interface ImportMessageInput {
    * The ADO deterministic path never sets this — it has its own confidence values.
    */
   captureMode?: 'explicit';
+  /**
+   * CID-resolved HTML body from Microsoft Graph — used only for display in TaskDetail.
+   * Never fed into AI, prefilter, ADO parsing, or text normalization.
+   */
+  emailBodyHtml?: string;
 }
 
 export type ImportOutcome = 'duplicate' | 'rejected' | 'analyzed' | 'created';
@@ -362,6 +367,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
       // Execution probe — appears in browser DevTools console (NOT in the Tauri terminal).
       // Open DevTools in the Tauri app: right-click inside the app → Inspect.
       console.log(`[import] ▶ "${input.title?.slice(0, 70)}" source=${input.source} forceCreate=${!!input.forceCreate} customers=${customers.length}`);
+      console.log(`[import-html] emailBodyHtml present=${!!input.emailBodyHtml} length=${input.emailBodyHtml?.length ?? 0}`);
 
       const dedupeKey = input.externalMessageId?.trim();
 
@@ -385,14 +391,28 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
           );
           if (existing?.classificationState === 'created') {
             console.log(`[import] force-create: already a task "${input.title}"`);
+            // Still backfill emailBodyHtml if the existing task is missing it.
+            if (input.source === 'email' && input.emailBodyHtml && !existing.emailBodyHtml) {
+              console.log(`[import-html] force-create duplicate: backfilling emailBodyHtml length=${input.emailBodyHtml.length}`);
+              const patched = tasksRef.current.map((t) =>
+                t.id === existing.id ? { ...t, emailBodyHtml: input.emailBodyHtml } : t
+              );
+              tasksRef.current = patched;
+              setTasks(patched);
+              api.saveTasks(patched).catch((e) => console.warn('[import] save force-create html backfill failed:', e));
+            }
             return { outcome: 'duplicate', reason: 'Already a task', existingState: 'created', taskId: existing.id };
           }
           if (existing) {
-            // Upgrade rejected/analyzed → created
+            // Upgrade rejected/analyzed → created; also carry emailBodyHtml forward.
             console.log(`[import] force-create: upgrading ${existing.classificationState} → created "${input.title}"`);
+            const htmlPatch = (input.source === 'email' && input.emailBodyHtml && !existing.emailBodyHtml)
+              ? { emailBodyHtml: input.emailBodyHtml }
+              : {};
+            if (Object.keys(htmlPatch).length > 0) console.log(`[import-html] force-create upgrade: adding emailBodyHtml length=${input.emailBodyHtml?.length}`);
             const upgraded = tasksRef.current.map((t) =>
               t.id === existing.id
-                ? { ...t, classificationState: 'created' as const, confidence: Math.max(t.confidence, 80) }
+                ? { ...t, ...htmlPatch, classificationState: 'created' as const, confidence: Math.max(t.confidence, 80) }
                 : t,
             );
             tasksRef.current = upgraded;
@@ -431,6 +451,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
           suggestedPlanningBucket: input.heuristicBucket,
           priorityScore:           input.heuristicPriority,
           priorityReason:          input.heuristicReason,
+          emailBodyHtml:           input.emailBodyHtml,
         };
         console.log(`[import] force-create: new task "${cleanTitle}"`);
         const withForced = [...tasksRef.current, forcedTask];
@@ -456,33 +477,43 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
         if (existing) {
           // --- Per-message trace logs for dedupe path ---
           console.log(`[ado-link] duplicate existingTaskId=${existing.id}`);
+          console.log(`[import-html] dedupe: existing.emailBodyHtml present=${!!existing.emailBodyHtml} incoming present=${!!input.emailBodyHtml}`);
+
+          // Collect all fields that need backfilling into a single update.
+          // This avoids multiple setState/saveTasks calls for the same task.
+          const backfill: Partial<Task> = {};
+
+          // Backfill emailBodyHtml for email tasks — the primary fix for the
+          // "already imported before HTML patch" scenario.
+          if (input.source === 'email' && input.emailBodyHtml && !existing.emailBodyHtml) {
+            backfill.emailBodyHtml = input.emailBodyHtml;
+            console.log(`[import-html] dedupe: backfilling emailBodyHtml (length=${input.emailBodyHtml.length})`);
+          }
+
+          // Backfill adoContext when new data has URLs that existing record is missing.
           const existingPrUrl = existing.adoContext?.prUrl;
           const newPrUrl = input.adoContext?.prUrl;
-          // Only backfill if this is a PR or work item, and new adoContext has a prUrl or workItemUrl not present in existing
           if (input.adoContext &&
               ((newPrUrl && !existingPrUrl) ||
                (input.adoContext.workItemUrl && !existing.adoContext?.workItemUrl))) {
-            // Backfill missing adoContext fields
-            const mergedAdoContext = { ...existing.adoContext, ...input.adoContext };
+            backfill.adoContext = { ...existing.adoContext, ...input.adoContext };
+            if (!existingPrUrl && newPrUrl) console.log('[ado-link] existing prUrl missing -> backfilling');
+            if (!existing.adoContext?.workItemUrl && input.adoContext?.workItemUrl) console.log('[ado-link] existing workItemUrl missing -> backfilling');
+          } else {
+            if (!existingPrUrl) console.log('[ado-link] existing prUrl missing but no new prUrl found');
+            else console.log('[ado-link] existing prUrl already present -> no update');
+          }
+
+          if (Object.keys(backfill).length > 0) {
             const upgraded = tasksRef.current.map((t) =>
-              t.id === existing.id ? { ...t, adoContext: mergedAdoContext } : t
+              t.id === existing.id ? { ...t, ...backfill } : t
             );
             tasksRef.current = upgraded;
             setTasks(upgraded);
-            api.saveTasks(upgraded).catch((e) => console.warn('[ado-link] save backfill failed:', e));
-            if (!existingPrUrl && newPrUrl) {
-              console.log('[ado-link] existing prUrl missing -> backfilling');
-            }
-            if (!existing.adoContext?.workItemUrl && input.adoContext?.workItemUrl) {
-              console.log('[ado-link] existing workItemUrl missing -> backfilling');
-            }
-          } else {
-            if (!existingPrUrl) {
-              console.log('[ado-link] existing prUrl missing but no new prUrl found');
-            } else {
-              console.log('[ado-link] existing prUrl already present -> no update');
-            }
+            api.saveTasks(upgraded).catch((e) => console.warn('[import] dedupe backfill save failed:', e));
+            console.log(`[import-html] dedupe: saved backfill for taskId=${existing.id}`);
           }
+
           return { outcome: 'duplicate', reason: 'Already imported', existingState: existing.classificationState, taskId: existing.id };
         }
       }
@@ -531,6 +562,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
           suggestedPlanningBucket: input.heuristicBucket,
           priorityScore:           input.heuristicPriority,
           priorityReason:          input.heuristicReason,
+          emailBodyHtml:           input.emailBodyHtml,
         };
         // Read from ref so a concurrent import's pending task is not lost
         const next = [...tasksRef.current, rejectedTask];
@@ -583,9 +615,12 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
         suggestedPlanningBucket: input.heuristicBucket,
         priorityScore:           input.heuristicPriority,
         priorityReason:          input.heuristicReason,
+        // HTML display path — not used by AI/prefilter (stays plain text via originalMessage).
+        emailBodyHtml:           input.emailBodyHtml,
       };
 
       console.log(`[import] pending "${input.title}" (${input.source})`);
+      console.log(`[import-html] pending: emailBodyHtml stored=${!!pendingTask.emailBodyHtml} length=${pendingTask.emailBodyHtml?.length ?? 0}`);
       const withPending = [...tasksRef.current, pendingTask];
       // *** Critical: update ref synchronously before any awaits ***
       // Concurrent imports (Promise.all) all read tasksRef.current. Without this

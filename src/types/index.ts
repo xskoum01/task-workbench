@@ -130,6 +130,13 @@ export interface Task {
 
   /** Free-text notes the user can write on this task. */
   notes?: string;
+
+  /**
+   * Sanitized HTML of the original email body with CID inline images resolved to data: URIs.
+   * Only populated for email tasks imported via Microsoft Graph (get_outlook_message_full).
+   * Used for display only — never fed into AI, prefilter, or text analysis.
+   */
+  emailBodyHtml?: string;
 }
 
 export type ClassificationState = 'pending' | 'analyzed' | 'rejected' | 'created';
@@ -502,6 +509,8 @@ export interface OutlookMessage {
   bodyPreview: string;
   /** Full message body stripped of HTML tags. Available when Graph fetches body field. */
   bodyFull?: string;
+  /** Raw HTML body with CID inline images resolved to data: URIs. Only present on full-fetch (getOutlookMessageFull). */
+  bodyHtml?: string;
   webLink: string;
   /**
    * True when the email has been flagged by the user in Outlook.

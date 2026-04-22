@@ -98,6 +98,11 @@ export default function InboxPage() {
       `body source=${msg.bodyFull ? 'bodyFull' : 'bodyPreview'}`,
       `bodyLength=${bodyText?.length ?? 0}`,
     );
+    console.log(
+      `[import-html] InboxPage: msgId=${msg.id.slice(0, 12)}`,
+      `bodyHtml present=${!!msg.bodyHtml}`,
+      `bodyHtml length=${msg.bodyHtml?.length ?? 0}`,
+    );
 
     // Try deterministic Azure DevOps parsing first.
     const adoParsed = parseAdoEmail(msg.subject, msg.fromEmail, bodyText);
@@ -163,6 +168,7 @@ export default function InboxPage() {
         heuristicBucket:     adoBucket,
         heuristicPriority:   adoPriority,
         heuristicReason:     adoParsed.classificationLabel,
+        emailBodyHtml:       msg.bodyHtml,
         forceCreate,
       });
     }
@@ -190,6 +196,7 @@ export default function InboxPage() {
       // AI enriches metadata but no longer gatekeeps task candidacy.
       // Future: when isFlagged is available from Graph, only flagged emails reach here.
       captureMode:        'explicit',
+      emailBodyHtml:      msg.bodyHtml,
       forceCreate,
     });
   }

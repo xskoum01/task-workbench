@@ -1,4 +1,5 @@
 import { useState, useEffect } from 'react';
+import DOMPurify from 'dompurify';
 import type { Task, TaskStatus, PlanningBucket, SkeletonPreview } from '../types';
 import { useApp } from '../context/AppContext';
 import { TypeBadge, SourceBadge, STATUS_LABELS } from './StatusBadge';
@@ -336,6 +337,13 @@ function EmailCard({ task }: { task: Task }) {
   const quotedSegments = segments.slice(1);
   const hasMeta = task.senderName || task.senderEmail || task.receivedAt;
 
+  console.log(
+    `[import-html] EmailCard: taskId=${task.id.slice(0, 12)}`,
+    `emailBodyHtml present=${!!task.emailBodyHtml}`,
+    `length=${task.emailBodyHtml?.length ?? 0}`,
+    `branch=${task.emailBodyHtml ? 'html' : 'plain-text'}`,
+  );
+
   return (
     <div className="email-card">
       {hasMeta && (
@@ -361,7 +369,27 @@ function EmailCard({ task }: { task: Task }) {
         </div>
       )}
 
-      {newestBody && <div className="email-card-body">{newestBody}</div>}
+      {/* Render sanitized HTML when available (Outlook import with CID images resolved),
+          otherwise fall back to the plain-text thread parser. */}
+      {task.emailBodyHtml ? (
+        <div
+          className="email-card-body email-card-body--html"
+          dangerouslySetInnerHTML={{
+            __html: DOMPurify.sanitize(task.emailBodyHtml, {
+              // FORCE_BODY wraps output in a <body> context so DOMPurify evaluates
+              // URI attributes with the same rules as a real document (needed for
+              // data: URIs to pass through ALLOWED_URI_REGEXP).
+              FORCE_BODY: true,
+              ADD_TAGS: ['img'],
+              ADD_ATTR: ['src', 'alt', 'width', 'height', 'style'],
+              // Allow https:// external images and data:image/* for CID-resolved attachments.
+              ALLOWED_URI_REGEXP: /^(https?:|data:image\/[a-z+]+;base64,)/i,
+            }),
+          }}
+        />
+      ) : (
+        newestBody && <div className="email-card-body">{newestBody}</div>
+      )}
 
       {quotedSegments.length > 0 && (
         <div className="email-thread-older">

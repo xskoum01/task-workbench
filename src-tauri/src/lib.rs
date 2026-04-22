@@ -1632,6 +1632,56 @@ async fn get_outlook_flagged_list(
     Ok(serde_json::json!({ "messages": messages, "fetchedCount": fetched_count }))
 }
 
+/// Replace `cid:<contentId>` references in an HTML body with `data:` URIs.
+///
+/// Fetches the message's file attachments from Graph and substitutes any inline
+/// attachment whose `contentId` matches a `cid:` reference found in the HTML.
+/// Fails safely: returns the original HTML unchanged if the fetch errors or if
+/// no inline attachments are present.
+async fn resolve_cid_attachments(html: &str, message_id: &str, token: &str) -> String {
+    if !html.contains("cid:") {
+        return html.to_string();
+    }
+    let att_url = format!("{MS_GRAPH_BASE}/me/messages/{message_id}/attachments");
+    let att_data = match graph_get(&att_url, token).await {
+        Ok(d)  => d,
+        Err(e) => {
+            eprintln!("[cid] attachment fetch failed for {}: {}", &message_id[..message_id.len().min(12)], e);
+            return html.to_string();
+        }
+    };
+    let attachments = match att_data["value"].as_array() {
+        Some(a) => a.clone(),
+        None    => return html.to_string(),
+    };
+
+    let mut resolved = html.to_string();
+    for att in &attachments {
+        // Only handle inline file attachments that carry base64 content.
+        let is_inline      = att["isInline"].as_bool().unwrap_or(false);
+        let content_id     = att["contentId"].as_str().unwrap_or("");
+        let content_type   = att["contentType"].as_str().unwrap_or("image/png");
+        let content_bytes  = att["contentBytes"].as_str().unwrap_or("");
+        if !is_inline || content_id.is_empty() || content_bytes.is_empty() {
+            continue;
+        }
+        let data_uri = format!("data:{};base64,{}", content_type, content_bytes);
+
+        // Outlook uses both bare and angle-bracket CID formats.
+        // Replace all variants that can appear as an HTML attribute value.
+        let bare = format!("cid:{}", content_id);
+        let angled = format!("cid:<{}>", content_id);
+        resolved = resolved.replace(&bare, &data_uri);
+        resolved = resolved.replace(&angled, &data_uri);
+    }
+    eprintln!(
+        "[cid] resolved {} inline attachment(s) for messageId={}",
+        attachments.len(),
+        &message_id[..message_id.len().min(12)]
+    );
+    resolved
+}
+
 /// Fetch one Outlook message by id with full body, HTML stripping, and ADO link extraction.
 /// Called lazily when the user clicks Import for a specific email — not during panel load.
 #[tauri::command]
@@ -1651,6 +1701,7 @@ async fn get_outlook_message_full(
     let preview_str = m["bodyPreview"].as_str().unwrap_or("");
     let body_html   = m["body"]["content"].as_str().unwrap_or("").to_string();
     // strip_html_email preserves block-level line breaks for quoted-reply detection.
+    // body_full is the plain-text path — AI, prefilter, ADO parsing all use this.
     let mut body_full = strip_html_email(&body_html);
     if is_potential_ado_email(&from_email, subject_str, preview_str) {
         let ado_pairs = extract_ado_link_pairs(&body_html);
@@ -1661,6 +1712,19 @@ async fn get_outlook_message_full(
             eprintln!("[ado-link] {} ADO link(s) for messageId={}", ado_pairs.len(), &message_id[..message_id.len().min(12)]);
         }
     }
+    // Resolve CID inline images → data: URIs for the HTML display path.
+    // This is separate from body_full and does not affect any text analysis.
+    let had_cid = body_html.contains("cid:");
+    let body_html_resolved = resolve_cid_attachments(&body_html, &message_id, &token).await;
+    let still_has_cid = body_html_resolved.contains("cid:");
+    eprintln!(
+        "[import-html] Rust: msgId={} had_cid={} still_has_cid={} length={}",
+        &message_id[..message_id.len().min(12)],
+        had_cid,
+        still_has_cid,
+        body_html_resolved.len()
+    );
+
     let is_flagged = m["flag"]["flagStatus"].as_str() == Some("flagged");
     eprintln!("[Outlook] get_outlook_message_full: messageId={}", &message_id[..message_id.len().min(12)]);
     Ok(serde_json::json!({
@@ -1671,6 +1735,7 @@ async fn get_outlook_message_full(
         "receivedAt": m["receivedDateTime"],
         "bodyPreview": m["bodyPreview"],
         "bodyFull":   body_full,
+        "bodyHtml":   body_html_resolved,
         "webLink":    m["webLink"],
         "isFlagged":  is_flagged,
     }))
