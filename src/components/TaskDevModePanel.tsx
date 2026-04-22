@@ -28,6 +28,12 @@ export interface TaskDevModePanelProps {
   scriptOpenPath: string | undefined;
   /** Called when an error should be surfaced to the parent. */
   onError: (msg: string) => void;
+  /**
+   * When true, the panel starts collapsed and the user must click the header
+   * to reveal it. Use this for tasks where dev work was not detected so the
+   * panel doesn't clutter non-dev tasks.
+   */
+  autoCollapsed?: boolean;
 }
 
 export default function TaskDevModePanel({
@@ -37,11 +43,25 @@ export default function TaskDevModePanel({
   defaultMode,
   scriptOpenPath,
   onError,
+  autoCollapsed = false,
 }: TaskDevModePanelProps) {
+  // --- collapse toggle ---
+  const [expanded, setExpanded] = useState(!autoCollapsed);
+
   // --- mode ---
   const [devMode, setDevMode] = useState<'script' | 'plugin'>(
     defaultMode === 'plugin' ? 'plugin' : 'script',
   );
+
+  // If no explicit git root is provided, infer it as the parent directory of
+  // pluginsDir (e.g. "C:/repo/Plugins" → "C:/repo"). This covers customers
+  // that have pluginFolder set but no repositoryRoot configured.
+  const effectiveRepoRoot: string | undefined = repoRootForGit ?? (() => {
+    if (!pluginsDir) return undefined;
+    const norm = pluginsDir.replace(/[\\/]+$/, '').replace(/\\/g, '/');
+    const slashIdx = norm.lastIndexOf('/');
+    return slashIdx > 0 ? norm.slice(0, slashIdx) : undefined;
+  })();
 
   // --- plugin projects ---
   const [pluginProjects, setPluginProjects]               = useState<string[]>([]);
@@ -61,6 +81,7 @@ export default function TaskDevModePanel({
 
   // Reset all state when the viewed task changes.
   useEffect(() => {
+    setExpanded(!autoCollapsed);
     setDevMode(defaultMode === 'plugin' ? 'plugin' : 'script');
     setSelectedPlugin('');
     setPluginProjects([]);
@@ -92,13 +113,13 @@ export default function TaskDevModePanel({
 
   // Load branch info when mode = plugin.
   useEffect(() => {
-    if (devMode !== 'plugin' || !repoRootForGit || currentBranch !== null) return;
+    if (devMode !== 'plugin' || !effectiveRepoRoot || currentBranch !== null) return;
     setBranchLoading(true);
     setBranchError(null);
     Promise.all([
-      tauriApi.getGitBranch(repoRootForGit),
-      tauriApi.listGitBranches(repoRootForGit),
-      tauriApi.gitHasUncommitted(repoRootForGit),
+      tauriApi.getGitBranch(effectiveRepoRoot),
+      tauriApi.listGitBranches(effectiveRepoRoot),
+      tauriApi.gitHasUncommitted(effectiveRepoRoot),
     ])
       .then(([branch, branchList, dirty]) => {
         setBranch(branch);
@@ -108,7 +129,7 @@ export default function TaskDevModePanel({
       })
       .catch((err) => setBranchError(String(err)))
       .finally(() => setBranchLoading(false));
-  }, [devMode, repoRootForGit, currentBranch]);
+  }, [devMode, effectiveRepoRoot, currentBranch]);
 
   // Scan selected plugin folder for .sln / .csproj.
   useEffect(() => {
@@ -131,18 +152,18 @@ export default function TaskDevModePanel({
   // --- handlers ---
 
   async function handleSwitchBranch() {
-    if (!repoRootForGit || !selectedBranch || selectedBranch === currentBranch) return;
+    if (!effectiveRepoRoot || !selectedBranch || selectedBranch === currentBranch) return;
     setBranchError(null);
     setBranchSwitching(true);
     try {
-      const dirty = await tauriApi.gitHasUncommitted(repoRootForGit);
+      const dirty = await tauriApi.gitHasUncommitted(effectiveRepoRoot);
       if (dirty) {
         setBranchDirty(true);
         setBranchError('Cannot switch branch because the repository has uncommitted changes.');
         return;
       }
-      await tauriApi.gitCheckoutBranch(repoRootForGit, selectedBranch);
-      const newBranch = await tauriApi.getGitBranch(repoRootForGit);
+      await tauriApi.gitCheckoutBranch(effectiveRepoRoot, selectedBranch);
+      const newBranch = await tauriApi.getGitBranch(effectiveRepoRoot);
       setBranch(newBranch);
       setBranchDirty(false);
       setPluginProjectsLoaded(false);
@@ -189,6 +210,19 @@ export default function TaskDevModePanel({
 
   return (
     <div className="detail-devmode-block">
+      {/* Collapse toggle header — only shown when the panel starts collapsed */}
+      {autoCollapsed && (
+        <button
+          className="detail-devmode-collapse-btn"
+          onClick={() => setExpanded((v) => !v)}
+        >
+          <span className="detail-devmode-collapse-arrow">{expanded ? '▾' : '▸'}</span>
+          Dev tools
+        </button>
+      )}
+
+      {expanded && (
+        <>
       {/* Mode toggle */}
       <div className="detail-devmode-toggle">
         <button
@@ -208,44 +242,50 @@ export default function TaskDevModePanel({
       {devMode === 'plugin' ? (
         <>
           {/* Branch panel */}
-          {repoRootForGit && (
+          {effectiveRepoRoot && (
             <div className="detail-devmode-branch">
-              <div className="detail-devmode-branch-current">
-                Branch:{' '}
-                <span className="detail-devmode-branch-name">
-                  {branchLoading ? '…' : (currentBranch ?? 'unknown')}
-                </span>
-                {branchDirty && (
-                  <span className="detail-devmode-branch-dirty" title="Uncommitted changes present">
-                    {' '}(dirty)
-                  </span>
-                )}
-              </div>
+              {branchLoading ? (
+                <div className="detail-devmode-branch-current">Branch: <span className="detail-devmode-branch-name">…</span></div>
+              ) : branchError ? (
+                <div className="detail-devmode-branch-error">{branchError}</div>
+              ) : (
+                <>
+                  <div className="detail-devmode-branch-current">
+                    Branch:{' '}
+                    <span className="detail-devmode-branch-name">
+                      {currentBranch ?? 'unknown'}
+                    </span>
+                    {branchDirty && (
+                      <span className="detail-devmode-branch-dirty" title="Uncommitted changes present">
+                        {' '}(dirty)
+                      </span>
+                    )}
+                  </div>
 
-              {branches.length > 1 && (
-                <div className="detail-devmode-branch-row">
-                  <select
-                    className="form-select detail-devmode-branch-select"
-                    value={selectedBranch}
-                    onChange={(e) => setSelectedBranch(e.target.value)}
-                    disabled={branchSwitching}
-                  >
-                    {branches.map((b) => (
-                      <option key={b} value={b}>{b}</option>
-                    ))}
-                  </select>
-                  <button
-                    className="btn btn-secondary btn-sm"
-                    onClick={handleSwitchBranch}
-                    disabled={branchSwitching || !selectedBranch || selectedBranch === currentBranch}
-                    title="Switch to selected branch"
-                  >
-                    {branchSwitching ? <><span className="btn-spinner" /> Switching…</> : 'Switch'}
-                  </button>
-                </div>
+                  {branches.length > 1 && (
+                    <div className="detail-devmode-branch-row">
+                      <select
+                        className="form-select detail-devmode-branch-select"
+                        value={selectedBranch}
+                        onChange={(e) => setSelectedBranch(e.target.value)}
+                        disabled={branchSwitching}
+                      >
+                        {branches.map((b) => (
+                          <option key={b} value={b}>{b}</option>
+                        ))}
+                      </select>
+                      <button
+                        className="btn btn-secondary btn-sm"
+                        onClick={handleSwitchBranch}
+                        disabled={branchSwitching || !selectedBranch || selectedBranch === currentBranch}
+                        title="Switch to selected branch"
+                      >
+                        {branchSwitching ? <><span className="btn-spinner" /> Switching…</> : 'Switch'}
+                      </button>
+                    </div>
+                  )}
+                </>
               )}
-
-              {branchError && <div className="detail-fs-error">{branchError}</div>}
             </div>
           )}
 
@@ -294,6 +334,8 @@ export default function TaskDevModePanel({
         >
           <Icon name="terminal" size={13} /> Open Script in VS Code
         </button>
+      )}
+        </>
       )}
     </div>
   );

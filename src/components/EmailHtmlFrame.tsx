@@ -87,12 +87,19 @@ function buildSrcDoc(rawHtml: string): string {
   const isFullDoc = /^\s*(?:<!DOCTYPE|<html)/i.test(safe.trimStart());
 
   if (isFullDoc) {
-    const bodyClose = safe.lastIndexOf('</body>');
+    // Inject a dark-theme base style before anything else so the email reads
+    // legibly against the app's dark background. We only set base body colors;
+    // all original HTML structure and inline formatting is preserved.
+    const darkStyle = `<style>html,body{background:#1e1e1e!important;color:#d4d4d4!important}a{color:#6ab0f5!important}img{max-width:100%;height:auto}</style>`;
+    const headClose = safe.search(/<\/head>/i);
+    const withStyle = headClose !== -1
+      ? safe.slice(0, headClose) + darkStyle + safe.slice(headClose)
+      : darkStyle + safe;
+    const bodyClose = withStyle.lastIndexOf('</body>');
     if (bodyClose !== -1) {
-      return safe.slice(0, bodyClose) + IFRAME_BRIDGE + safe.slice(bodyClose);
+      return withStyle.slice(0, bodyClose) + IFRAME_BRIDGE + withStyle.slice(bodyClose);
     }
-    // No </body> — append at end.
-    return safe + IFRAME_BRIDGE;
+    return withStyle + IFRAME_BRIDGE;
   }
 
   // Fragment — wrap in a minimal shell.
@@ -102,17 +109,19 @@ function buildSrcDoc(rawHtml: string): string {
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <style>
-  /* Minimal reset so the email body is flush with the iframe edges.
-     Explicit white canvas + dark text prevents black-on-dark rendering
-     when the host app uses a dark theme. */
+  /* Dark theme shell matching the host app. */
   html, body {
     margin: 0;
     padding: 8px;
     box-sizing: border-box;
-    background: #ffffff;
-    color: #111111;
+    background: #1e1e1e;
+    color: #d4d4d4;
+    font-family: system-ui, sans-serif;
+    font-size: 13px;
+    line-height: 1.5;
   }
   img { max-width: 100%; height: auto; }
+  a { color: #6ab0f5; }
 </style>
 </head>
 <body>

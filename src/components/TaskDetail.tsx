@@ -1014,6 +1014,7 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
                   defaultMode={devTarget.kind === 'plugin' ? 'plugin' : 'script'}
                   scriptOpenPath={customer?.scriptFolder ?? effectiveVscodePath}
                   onError={setFsError}
+                  autoCollapsed={devTarget.kind === 'repo'}
                 />
               )}
 

@@ -2406,6 +2406,25 @@ body {
   gap: 6px;
 }
 
+.detail-devmode-collapse-btn {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  background: none;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  color: var(--text-muted);
+  font-size: var(--font-size-xs);
+  padding: 3px 8px;
+  cursor: pointer;
+  width: 100%;
+  text-align: left;
+}
+.detail-devmode-collapse-btn:hover {
+  color: var(--text-primary);
+  border-color: var(--border-active);
+}
+
 .detail-devmode-toggle {
   display: flex;
   gap: 4px;
@@ -2446,6 +2465,15 @@ body {
 .detail-devmode-branch-dirty {
   color: var(--color-blocked);
   font-weight: 600;
+}
+
+.detail-devmode-branch-error {
+  font-size: var(--font-size-xs);
+  color: var(--color-blocked);
+  background: color-mix(in srgb, var(--color-blocked) 10%, transparent);
+  border: 1px solid color-mix(in srgb, var(--color-blocked) 22%, transparent);
+  border-radius: var(--radius-sm);
+  padding: 4px 8px;
 }
 
 .detail-devmode-branch-row {

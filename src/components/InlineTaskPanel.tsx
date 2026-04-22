@@ -176,18 +176,6 @@ export default function InlineTaskPanel({ task, onOpenDetail }: Props) {
         {/* ────── Right column: Notes + Actions ────── */}
         <div className="tip-col-side">
 
-          {/* Notes */}
-          <div className="tip-section tip-section--notes">
-            <div className="tip-sec-label">Notes</div>
-            <textarea
-              className="tip-notes"
-              value={notes}
-              placeholder="Notes, context, reminders…"
-              onChange={(e) => setNotes(e.target.value)}
-              onBlur={handleNotesSave}
-            />
-          </div>
-
           {/* Actions */}
           <div className="tip-section tip-section--actions">
             <div className="tip-sec-label">Actions</div>
@@ -216,6 +204,7 @@ export default function InlineTaskPanel({ task, onOpenDetail }: Props) {
                   defaultMode={devTarget.kind === 'plugin' ? 'plugin' : 'script'}
                   scriptOpenPath={customer?.scriptFolder ?? effectiveVscodePath}
                   onError={() => {}}
+                  autoCollapsed={devTarget.kind === 'repo'}
                 />
               )}
               {showOpenRepo && (
@@ -262,6 +251,18 @@ export default function InlineTaskPanel({ task, onOpenDetail }: Props) {
                 )}
               </div>
             </div>
+          </div>
+
+          {/* Notes */}
+          <div className="tip-section tip-section--notes">
+            <div className="tip-sec-label">Notes</div>
+            <textarea
+              className="tip-notes"
+              value={notes}
+              placeholder="Notes, context, reminders…"
+              onChange={(e) => setNotes(e.target.value)}
+              onBlur={handleNotesSave}
+            />
           </div>
         </div>
       </div>
