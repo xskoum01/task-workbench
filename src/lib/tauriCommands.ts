@@ -4,7 +4,7 @@
  */
 import { invoke } from '@tauri-apps/api/core';
 import { openUrl as openerOpen } from '@tauri-apps/plugin-opener';
-import type { Task, Customer, AppSettings, TaskAnalysis, SkeletonPreview, GitInitStatus, OutlookMessage, OutlookFlaggedListResult, TeamsChat, TeamsChatMessage, TeamsFlatMessage, ClassificationResult } from '../types';
+import type { Task, Customer, AppSettings, TaskAnalysis, SkeletonPreview, GitInitStatus, OutlookMessage, OutlookFlaggedListResult, TeamsChat, TeamsChatMessage, TeamsFlatMessage, ClassificationResult, AiReviewResult } from '../types';
 
 export type { ClassificationResult };
 
@@ -161,6 +161,36 @@ export function generateSkeletonPreview(task: Task, customer: Customer | null): 
 /** Writes content to the given absolute path, creating directories as needed. */
 export function saveGeneratedFile(path: string, content: string): Promise<void> {
   return invoke('save_generated_file', { path, content });
+}
+
+/**
+ * Runs an AI review of a task result before delivery.
+ * @param draft  Optional generated draft content to include in the review context.
+ */
+export function aiReviewTask(task: Task, customer: Customer | null, draft?: string): Promise<AiReviewResult> {
+  return invoke('ai_review_task', { task, customer, draft: draft ?? '' });
+}
+
+/**
+ * Creates a new plugin project from a local template folder.
+ * Copies the template into <pluginsDir>/<projectName>, replacing __PROJECT_NAME__
+ * and __NAMESPACE__ placeholders in file content and file names.
+ * Returns the absolute path of the created project folder.
+ */
+export function createPluginProjectFromTemplate(
+  templateDir: string,
+  pluginsDir: string,
+  projectName: string,
+  namespace: string,
+  createInitialClass: boolean,
+): Promise<string> {
+  return invoke('create_plugin_project_from_template', {
+    templateDir,
+    pluginsDir,
+    projectName,
+    namespace,
+    createInitialClass,
+  });
 }
 
 /**

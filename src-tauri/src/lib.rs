@@ -565,6 +565,159 @@ Execute method stub with TODO comments derived from the task\n\
     })
 }
 
+/// Runs an AI code/work review on a task and optional draft content.
+/// Returns a structured AiReviewResult JSON object with summary, issues, suggestions, and passed.
+#[tauri::command]
+async fn ai_review_task(app: tauri::AppHandle, task: Value, customer: Value, draft: Value) -> Result<Value, String> {
+    let (api_key, model) = get_ai_settings(&app)?;
+
+    let title         = task["title"].as_str().unwrap_or("");
+    let task_type     = task["taskType"].as_str().unwrap_or("");
+    let message       = task["originalMessage"].as_str().unwrap_or("");
+    let analysis_cz   = task["analysisResult"]["summaryCz"].as_str().unwrap_or("");
+    let analysis_en   = task["analysisResult"]["summaryEn"].as_str().unwrap_or("");
+    let customer_name = customer["name"].as_str().unwrap_or("Unknown");
+    let draft_content = draft.as_str().unwrap_or("");
+
+    let draft_section = if draft_content.is_empty() {
+        "(no generated draft provided)".to_string()
+    } else {
+        let trimmed = if draft_content.len() > 3000 {
+            format!("{}…[truncated]", &draft_content[..3000])
+        } else {
+            draft_content.to_string()
+        };
+        format!("Generated draft / code:\n{trimmed}")
+    };
+
+    let instructions = "You are a senior Dynamics 365 / Dataverse developer doing a pre-delivery code review. \
+Return ONLY valid JSON — no markdown, no prose, no code fences.";
+
+    let prompt = format!(
+        "Review this developer task result before it is marked ready for delivery.\n\n\
+Task:\n- Title: {title}\n- Type: {task_type}\n- Customer: {customer_name}\n\
+- Original message: {message}\n\n\
+AI analysis summary (CZ): {analysis_cz}\n\
+AI analysis summary (EN): {analysis_en}\n\n\
+{draft_section}\n\n\
+Evaluate whether the work is complete, correct, and ready for the customer. \
+Return ONLY this exact JSON:\n\
+{{\"summary\":\"1-2 sentences on overall review outcome\",\
+\"issues\":[\"Issue 1\",\"Issue 2\"],\
+\"suggestions\":[\"Suggestion 1\"],\
+\"passed\":true}}\n\n\
+Rules:\n\
+- passed=true only when there are no blocking issues\n\
+- issues: list concrete problems found; empty array [] when none\n\
+- suggestions: improvement ideas even when passing\n\
+- Be concise and specific"
+    );
+
+    let text = call_openai(&api_key, &model, instructions, &prompt).await?;
+
+    serde_json::from_str(strip_fences(&text)).map_err(|e| {
+        let snippet = &text[..text.len().min(300)];
+        format!("Failed to parse AI review response: {e}. Response: {snippet}")
+    })
+}
+
+/// Creates a new plugin project directory from a local template folder.
+/// Copies the template tree into target_dir/<project_name>, replacing
+/// __PROJECT_NAME__ and __NAMESPACE__ placeholders in file contents and names.
+/// Returns the absolute path of the created project folder.
+#[tauri::command]
+fn create_plugin_project_from_template(
+    template_dir: String,
+    plugins_dir: String,
+    project_name: String,
+    namespace: String,
+    create_initial_class: bool,
+) -> Result<String, String> {
+    if template_dir.is_empty() {
+        return Err("Plugin template folder is not configured. Set it in Settings first.".to_string());
+    }
+    let src = std::path::Path::new(&template_dir);
+    if !src.is_dir() {
+        return Err(format!("Template directory not found: {template_dir}"));
+    }
+    let dest = std::path::Path::new(&plugins_dir).join(&project_name);
+    if dest.exists() {
+        return Err(format!("Project folder already exists: {}", dest.display()));
+    }
+    // Copy template tree with placeholder substitution
+    copy_template_tree(src, &dest, &project_name, &namespace)
+        .map_err(|e| format!("Template copy failed: {e}"))?;
+
+    // Optionally create an initial plugin class file
+    if create_initial_class {
+        let class_name = format!("{}Plugin", &project_name);
+        let class_file = dest.join(format!("{class_name}.cs"));
+        if !class_file.exists() {
+            let content = format!(
+                "using Microsoft.Xrm.Sdk;\n\
+using System;\n\n\
+namespace {namespace}\n{{{{\
+\n    /// <summary>\n\
+    /// Initial plugin class for {project_name}.\n\
+    /// </summary>\n\
+    public class {class_name} : IPlugin\n\
+    {{{{\n\
+        public void Execute(IServiceProvider serviceProvider)\n\
+        {{{{\n\
+            // TODO: implement plugin logic\n\
+        }}}}\n\
+    }}}}\n\
+}}}}"
+            );
+            fs::write(&class_file, content).map_err(|e| format!("Failed to write initial class: {e}"))?;
+        }
+    }
+
+    Ok(dest.to_string_lossy().to_string())
+}
+
+/// Recursively copies `src` into `dest`, substituting __PROJECT_NAME__ and
+/// __NAMESPACE__ in both file contents and file/folder names.
+fn copy_template_tree(
+    src: &std::path::Path,
+    dest: &std::path::Path,
+    project_name: &str,
+    namespace: &str,
+) -> Result<(), io::Error> {
+    fs::create_dir_all(dest)?;
+    for entry in fs::read_dir(src)? {
+        let entry = entry?;
+        let file_name = entry.file_name();
+        let name_str = file_name.to_string_lossy();
+        // Substitute placeholders in the entry name itself
+        let new_name = name_str
+            .replace("__PROJECT_NAME__", project_name)
+            .replace("__NAMESPACE__", namespace);
+        let src_path  = entry.path();
+        let dest_path = dest.join(&new_name);
+        if src_path.is_dir() {
+            copy_template_tree(&src_path, &dest_path, project_name, namespace)?;
+        } else {
+            // Only substitute placeholders in text-like files
+            let ext = src_path.extension()
+                .and_then(|e| e.to_str())
+                .unwrap_or("");
+            let is_text = matches!(ext, "cs" | "csproj" | "sln" | "json" | "xml"
+                | "config" | "txt" | "md" | "targets" | "props" | "yml" | "yaml");
+            if is_text {
+                let content = fs::read_to_string(&src_path).unwrap_or_default();
+                let new_content = content
+                    .replace("__PROJECT_NAME__", project_name)
+                    .replace("__NAMESPACE__", namespace);
+                fs::write(&dest_path, new_content)?;
+            } else {
+                fs::copy(&src_path, &dest_path)?;
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Classifies an imported inbox item (Outlook email or Teams message) using OpenAI.
 /// Returns a ClassificationResult JSON object with isTask, confidence, title, etc.
 /// Falls back to heuristic classification when no API key is configured.
@@ -3005,6 +3158,8 @@ pub fn run() {
             generate_reply,
             generate_skeleton_preview,
             save_generated_file,
+            ai_review_task,
+            create_plugin_project_from_template,
             classify_inbox_item,
             reset_local_data,
             connect_microsoft_account,

@@ -380,6 +380,28 @@ export interface AppSettings {
    * Configure by pasting a Teams chat link or a raw chat ID.
    */
   teamsIntakeChatId?: string;
+
+  /**
+   * Absolute path to the local plugin project template folder.
+   * Used by "Create Plugin Project" to copy a skeleton into <repo>/Plugins/<Name>.
+   * Template files may contain __PROJECT_NAME__ and __NAMESPACE__ placeholders.
+   */
+  pluginTemplateFolder?: string;
+}
+
+/**
+ * Result of the AI Review action.
+ * Returned by `ai_review_task`.
+ */
+export interface AiReviewResult {
+  /** Short review summary (1-2 sentences). */
+  summary: string;
+  /** List of concrete issues found. Empty when none. */
+  issues: string[];
+  /** Suggested fixes or improvements. */
+  suggestions: string[];
+  /** True = ready for review; false = still needs work. */
+  passed: boolean;
 }
 
 /** Which planning time-box a task belongs to. */

@@ -631,6 +631,53 @@ export default function SettingsPage() {
             />
           </SettingsBlock>
 
+          {/* Plugin Project Template */}
+          <SettingsBlock
+            icon="folder"
+            title="Plugin Template"
+            description="Local folder used as a template when scaffolding new plugin projects"
+          >
+            <SettingsField label="Template Folder">
+              <div style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
+                <input
+                  className="form-input"
+                  type="text"
+                  placeholder="C:\Templates\PluginTemplate"
+                  value={draft.pluginTemplateFolder ?? ''}
+                  onChange={(e) => set('pluginTemplateFolder', e.target.value)}
+                  style={{ flex: 1 }}
+                />
+                <button
+                  className="btn btn-ghost btn-sm"
+                  type="button"
+                  onClick={async () => {
+                    try {
+                      const picked = await tauriApi.pickFolder();
+                      if (picked) set('pluginTemplateFolder', picked);
+                    } catch {}
+                  }}
+                  title="Browse for template folder"
+                >
+                  Browse
+                </button>
+                {draft.pluginTemplateFolder && (
+                  <button
+                    className="btn btn-ghost btn-sm"
+                    type="button"
+                    onClick={() => tauriApi.openPath(draft.pluginTemplateFolder!).catch(() => {})}
+                    title="Open template folder"
+                  >
+                    Open
+                  </button>
+                )}
+              </div>
+            </SettingsField>
+            <div className="settings-field-hint">
+              Files may contain <code>__PROJECT_NAME__</code> and <code>__NAMESPACE__</code> placeholders.
+              They are replaced when scaffolding a new plugin project.
+            </div>
+          </SettingsBlock>
+
         </div>{/* end left column */}
 
         {/* Right column: AI Configuration → Microsoft 365 → Data Management */}

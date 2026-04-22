@@ -1,5 +1,5 @@
 ﻿import { useState, useEffect } from 'react';
-import type { Task, TaskStatus, PlanningBucket, SkeletonPreview } from '../types';
+import type { Task, TaskStatus, PlanningBucket, SkeletonPreview, AiReviewResult } from '../types';
 import TaskEmailContent from './TaskEmailContent';
 import TaskDevModePanel from './TaskDevModePanel';
 import { useApp } from '../context/AppContext';
@@ -8,6 +8,7 @@ import ReplyModal from './ReplyModal';
 import SkeletonPreviewModal from './SkeletonPreviewModal';
 import ScriptAssistantPanel from './ScriptAssistantPanel';
 import TaskForm from './TaskForm';
+import CreatePluginProjectModal from './CreatePluginProjectModal';
 import Icon from './Icon';
 import * as tauriApi from '../lib/tauriCommands';
 import { resolveTaskDevTarget, resolveBestPluginPath, getPluginsDir } from '../lib/resolveTaskDevTarget';
@@ -19,7 +20,7 @@ interface TaskDetailProps {
   onClose: () => void;
 }
 
-type AiAction = 'analyze' | 'reply' | 'skeleton';
+type AiAction = 'analyze' | 'reply' | 'draft' | 'review';
 
 // All statuses in the progression order shown in the selector
 const STATUS_OPTIONS: TaskStatus[] = [
@@ -310,9 +311,13 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
   // Reply modal
   const [showReply, setShowReply]         = useState(false);
   const [generatedReply, setGeneratedReply] = useState<string | null>(null);
-  // Skeleton preview modal
+  // Draft (plugin skeleton or script preview)
   const [showSkeleton, setShowSkeleton]       = useState(false);
   const [skeletonPreview, setSkeletonPreview] = useState<SkeletonPreview | null>(null);
+  // Create Plugin Project modal
+  const [showCreatePlugin, setShowCreatePlugin] = useState(false);
+  // AI Review result
+  const [aiReview, setAiReview] = useState<AiReviewResult | null>(null);
   // Edit task form
   const [showEditForm, setShowEditForm] = useState(false);
   // Delete confirmation step
@@ -369,28 +374,48 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
     }
   }
 
-  async function handleDoIt() {
-    // Set in-progress and open the best available dev path in VS Code
+  async function handleOpenWork() {
+    // Open the correct development environment without generating code.
+    // Plugin task: open .sln in Visual Studio (via shell), fall back to .csproj or folder.
+    // Script task: open script target in VS Code.
+    setFsError(null);
     await updateTask(task.id, { status: 'in-progress' });
-    let devPath: string | undefined;
     if (devTarget.kind === 'plugin') {
-      devPath = await resolveBestPluginPath(task, customer);
-    } else {
-      devPath = devTarget.path;
-    }
-    if (devPath) {
-      try {
-        await tauriApi.openInVscode(devPath);
-      } catch (e) {
-        setFsError(String(e));
+      const resolvedPath = await resolveBestPluginPath(task, customer);
+      if (resolvedPath) {
+        try {
+          // If it's an .sln file, open with shell (Visual Studio).
+          if (resolvedPath.endsWith('.sln')) {
+            await tauriApi.openWithShell(resolvedPath);
+          } else {
+            await tauriApi.openInVscode(resolvedPath);
+          }
+        } catch (e) { setFsError(String(e)); }
+      } else if (pluginsDir) {
+        // No specific plugin resolved — open plugins folder so developer can orient
+        try { await tauriApi.openInVscode(pluginsDir); } catch (e) { setFsError(String(e)); }
+      } else {
+        setFeedback('Status set to In Progress. No plugin path configured for this customer.');
       }
     } else {
-      setFeedback('Status set to In Progress. Configure customer paths to open VS Code automatically.');
+      // Script / repo task
+      const openPath = customer?.scriptFolder ?? effectiveVscodePath;
+      if (openPath) {
+        try { await tauriApi.openInVscode(openPath); } catch (e) { setFsError(String(e)); }
+      } else {
+        setFeedback('Status set to In Progress. Configure a script folder for this customer.');
+      }
     }
   }
 
-  async function handleCreateSkeleton() {
-    setAiLoading('skeleton');
+  async function handleGenerateDraft() {
+    // Plugin tasks: generate a C# skeleton preview using AI.
+    // Script tasks: the ScriptAssistantPanel manages draft generation — inform user.
+    if (devTarget.kind !== 'plugin') {
+      setFeedback('Use the Script Assistant below to generate a draft for script tasks.');
+      return;
+    }
+    setAiLoading('draft');
     setAiError(null);
     try {
       const preview = await tauriApi.generateSkeletonPreview(task, customer ?? null);
@@ -403,9 +428,48 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
     }
   }
 
-  async function handleValidate() {
-    await updateTask(task.id, { status: 'ready-for-review' });
-    setFeedback('Status set to Ready for Review');
+  async function handleApplyDraft() {
+    // For plugin drafts: write the skeleton preview to disk.
+    // Requires the draft to have been generated first.
+    if (!skeletonPreview) {
+      setFeedback('Generate a draft first before applying.');
+      return;
+    }
+    if (!pluginsDir) {
+      setFsError('No plugin folder configured for this customer.');
+      return;
+    }
+    const subPath = skeletonPreview.targetPath
+      ? `${pluginsDir}/${skeletonPreview.targetPath}/${skeletonPreview.fileName}`
+      : `${pluginsDir}/${skeletonPreview.fileName}`;
+    try {
+      await tauriApi.saveGeneratedFile(subPath, skeletonPreview.content);
+      setFeedback(`Draft written: ${skeletonPreview.fileName}`);
+      setSkeletonPreview(null);
+    } catch (e) {
+      setFsError(String(e));
+    }
+  }
+
+  async function handleAiReview() {
+    setAiLoading('review');
+    setAiError(null);
+    setAiReview(null);
+    try {
+      const draft = skeletonPreview?.content;
+      const result = await tauriApi.aiReviewTask(task, customer ?? null, draft);
+      setAiReview(result);
+      if (result.passed) {
+        await updateTask(task.id, { status: 'ready-for-review' });
+        setFeedback('AI Review passed — status set to Ready for Review');
+      } else {
+        setFeedback('AI Review found issues — see review results below');
+      }
+    } catch (e) {
+      setAiError(String(e));
+    } finally {
+      setAiLoading(null);
+    }
   }
 
   // --- Communication ---
@@ -911,31 +975,93 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
               </button>
               <button
                 className="btn btn-secondary btn-sm"
-                onClick={handleDoIt}
+                onClick={handleOpenWork}
                 disabled={!!aiLoading}
-                title="Set In Progress and open in VS Code"
+                title={devTarget.kind === 'plugin'
+                  ? 'Open plugin project in Visual Studio or VS Code'
+                  : 'Open script folder in VS Code'}
               >
-                <Icon name="play" size={13} /> Do It
+                <Icon name="play" size={13} /> Open Work
               </button>
               <button
                 className="btn btn-secondary btn-sm"
-                onClick={handleCreateSkeleton}
+                onClick={handleGenerateDraft}
                 disabled={!!aiLoading}
-                title="Generate C# plugin skeleton with AI"
+                title={devTarget.kind === 'plugin'
+                  ? 'Generate C# plugin class draft (preview before writing)'
+                  : 'Use Script Assistant below to generate a draft'}
               >
-                {aiLoading === 'skeleton'
+                {aiLoading === 'draft'
                   ? <><span className="btn-spinner" /> Generating…</>
-                  : <><Icon name="layers" size={13} /> Skeleton</>}
+                  : <><Icon name="layers" size={13} /> Generate Draft</>}
               </button>
+              {skeletonPreview && (
+                <button
+                  className="btn btn-secondary btn-sm"
+                  onClick={handleApplyDraft}
+                  disabled={!!aiLoading}
+                  title={`Write draft to disk: ${skeletonPreview.fileName}`}
+                >
+                  <Icon name="check" size={13} /> Apply Draft
+                </button>
+              )}
+              {devTarget.kind === 'plugin' && pluginsDir && (
+                <button
+                  className="btn btn-secondary btn-sm"
+                  onClick={() => setShowCreatePlugin(true)}
+                  disabled={!!aiLoading}
+                  title="Create a new plugin project from a local template folder"
+                >
+                  <Icon name="folder" size={13} /> Create Plugin Project
+                </button>
+              )}
               <button
                 className="btn btn-secondary btn-sm"
-                onClick={handleValidate}
+                onClick={handleAiReview}
                 disabled={!!aiLoading}
-                title="Mark as Ready for Review"
+                title="Run AI review. Sets status to Ready for Review when the review passes."
               >
-                <Icon name="check" size={13} /> Validate
+                {aiLoading === 'review'
+                  ? <><span className="btn-spinner" /> Reviewing…</>
+                  : <><Icon name="check" size={13} /> AI Review</>}
               </button>
             </div>
+
+            {/* AI Review results */}
+            {aiReview && (
+              <div className={`detail-ai-review${aiReview.passed ? ' detail-ai-review--pass' : ' detail-ai-review--fail'}`}>
+                <div className="detail-ai-review-summary">
+                  <Icon name={aiReview.passed ? 'check' : 'alert-circle'} size={13} />
+                  {aiReview.summary}
+                </div>
+                {aiReview.issues.length > 0 && (
+                  <div className="detail-ai-review-section">
+                    <div className="detail-ai-review-label">Issues</div>
+                    <ul className="detail-ai-review-list">
+                      {aiReview.issues.map((issue, i) => <li key={i}>{issue}</li>)}
+                    </ul>
+                  </div>
+                )}
+                {aiReview.suggestions.length > 0 && (
+                  <div className="detail-ai-review-section">
+                    <div className="detail-ai-review-label">Suggestions</div>
+                    <ul className="detail-ai-review-list">
+                      {aiReview.suggestions.map((s, i) => <li key={i}>{s}</li>)}
+                    </ul>
+                  </div>
+                )}
+                {!aiReview.passed && (
+                  <div style={{ marginTop: 4 }}>
+                    <button
+                      className="btn btn-ghost btn-sm"
+                      onClick={() => setAiReview(null)}
+                    >
+                      Dismiss
+                    </button>
+                  </div>
+                )}
+              </div>
+            )}
           </div>
 
           {/* SCRIPT ASSISTANT — shown when customer has a script folder or repo root */}
@@ -1101,7 +1227,20 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
         <SkeletonPreviewModal
           preview={skeletonPreview}
           customer={customer}
-          onClose={() => { setShowSkeleton(false); setSkeletonPreview(null); }}
+          onClose={() => { setShowSkeleton(false); }}
+        />
+      )}
+
+      {/* Create Plugin Project modal */}
+      {showCreatePlugin && customer && pluginsDir && (
+        <CreatePluginProjectModal
+          customer={customer}
+          pluginsDir={pluginsDir}
+          onCreated={(path) => {
+            setShowCreatePlugin(false);
+            setFeedback(`Plugin project created: ${path}`);
+          }}
+          onClose={() => setShowCreatePlugin(false)}
         />
       )}
 
