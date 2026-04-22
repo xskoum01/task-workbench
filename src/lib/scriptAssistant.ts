@@ -1039,10 +1039,16 @@ var ${candidateFunctionName} = function (formContext) {
 
 /**
  * Return the best available script folder path for a customer.
- * Priority: scriptFolder > resolvedRepositoryPath > repositoryRoot
+ * Priority:
+ *   1. Explicit scriptFolder (used as-is — the user set the exact path)
+ *   2. resolvedRepositoryPath + /Scripts (conventional subfolder)
+ *   3. repositoryRoot + /Scripts
  */
 export function resolveCustomerScriptFolder(customer: Customer): string | null {
-  return customer.scriptFolder ?? customer.resolvedRepositoryPath ?? customer.repositoryRoot ?? null;
+  if (customer.scriptFolder) return customer.scriptFolder;
+  const repo = customer.resolvedRepositoryPath ?? customer.repositoryRoot;
+  if (repo) return `${repo}/Scripts`;
+  return null;
 }
 
 // ---------------------------------------------------------------------------

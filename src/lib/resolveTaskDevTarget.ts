@@ -143,7 +143,9 @@ export function resolveTaskDevTarget(
   }
 
   if (isScriptTask(task, customer)) {
-    const path = customer?.scriptFolder ?? customer?.repositoryRoot ?? crmFolderFallback;
+    // Mirror resolveCustomerScriptFolder: explicit scriptFolder, else <repo>/Scripts subfolder.
+    const repoRoot = customer?.resolvedRepositoryPath ?? customer?.repositoryRoot ?? crmFolderFallback;
+    const path = customer?.scriptFolder ?? (repoRoot ? `${repoRoot}/Scripts` : undefined) ?? crmFolderFallback;
     console.log('[devTarget] detected kind: script', { taskId: task.id, path });
     return { kind: 'script', path, label: 'Open Script in VS Code' };
   }

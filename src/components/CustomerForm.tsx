@@ -310,7 +310,7 @@ export default function CustomerForm({ initialData, onClose }: CustomerFormProps
               <input
                 className="form-input"
                 type="text"
-                placeholder={'\u2026/scripts'}
+                placeholder={'…/Scripts  (leave blank to use <repo>/Scripts)'}
                 value={form.scriptFolder ?? ''}
                 onChange={(e) => set('scriptFolder', e.target.value)}
               />

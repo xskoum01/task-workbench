@@ -2333,7 +2333,7 @@ body {
 
 /* Restructured action footer — now a right sidebar */
 .detail-action-groups {
-  width: 340px;
+  width: 420px;
   flex-shrink: 0;
   padding: var(--gap-lg) var(--gap-md);
   border-left: 1px solid var(--border);

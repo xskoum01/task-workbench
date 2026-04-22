@@ -295,12 +295,13 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
   const devTarget = resolveTaskDevTarget(task, customer, crmFolderPath);
   const effectiveVscodePath = devTarget.path;
 
-  // Resolved script folder: customer fields first, then the same fallback used by Open Work.
-  // This ensures ScriptAssistantPanel is mounted whenever a script path is available.
+  // Resolved script folder: explicit scriptFolder first, then repo root + /Scripts subfolder.
+  // This ensures scripts land in <repo>/Scripts/ rather than the repo root.
+  // Must be consistent with resolveCustomerScriptFolder in scriptAssistant.ts.
+  const repoFallback = customer?.resolvedRepositoryPath ?? customer?.repositoryRoot;
   const effectiveScriptFolder =
     customer?.scriptFolder ??
-    customer?.resolvedRepositoryPath ??
-    customer?.repositoryRoot ??
+    (repoFallback ? `${repoFallback}/Scripts` : undefined) ??
     (devTarget.kind !== 'plugin' ? effectiveVscodePath : undefined);
 
   // Container directory for plugin project subfolders.
