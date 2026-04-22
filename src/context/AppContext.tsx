@@ -704,7 +704,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
       // Explicit-capture (captureMode === 'explicit'):
       //   AI enriches only — never rejects.
       //   conf >= AUTO → created; otherwise → analyzed
-      const { isTask, confidence, title, summary, summaryCz, nextStepCz, customerName, taskType, estimatedEffort, dueAt } =
+      const { isTask, confidence, title, summary, summaryCz, summaryEn, problemPointsCz, problemPointsEn, actionPointsCz, actionPointsEn, nextStepCz, nextStepEn, customerName, taskType, estimatedEffort, dueAt } =
         classification;
 
       if ((!isTask || confidence < IMPORT_CONFIG.MIN_CONFIDENCE_ANALYZE) && input.captureMode !== 'explicit') {
@@ -774,8 +774,14 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
         estimatedEffort:        estimatedEffort ?? undefined,
         analysisResult:         {
           summary,
-          summaryCz:        summaryCz ?? undefined,
-          nextStepCz:       nextStepCz ?? undefined,
+          summaryCz:        summaryCz   ?? undefined,
+          summaryEn:        summaryEn   ?? undefined,
+          problemPointsCz:  problemPointsCz ?? undefined,
+          problemPointsEn:  problemPointsEn ?? undefined,
+          actionPointsCz:   actionPointsCz  ?? undefined,
+          actionPointsEn:   actionPointsEn  ?? undefined,
+          nextStepCz:       nextStepCz  ?? undefined,
+          nextStepEn:       nextStepEn  ?? undefined,
           suggestedActions: [],
           confidence,
         },

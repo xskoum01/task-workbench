@@ -176,7 +176,13 @@ export interface ClassificationResult {
   title: string;
   summary: string;
   summaryCz?: string | null;
+  summaryEn?: string | null;
+  problemPointsCz?: string[] | null;
+  problemPointsEn?: string[] | null;
+  actionPointsCz?: string[] | null;
+  actionPointsEn?: string[] | null;
   nextStepCz?: string | null;
+  nextStepEn?: string | null;
   customerName?: string | null;
   taskType: TaskType;
   estimatedEffort?: number | null;
