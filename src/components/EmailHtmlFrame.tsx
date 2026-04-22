@@ -102,8 +102,16 @@ function buildSrcDoc(rawHtml: string): string {
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <style>
-  /* Minimal reset so the email body is flush with the iframe edges. */
-  html, body { margin: 0; padding: 8px; box-sizing: border-box; }
+  /* Minimal reset so the email body is flush with the iframe edges.
+     Explicit white canvas + dark text prevents black-on-dark rendering
+     when the host app uses a dark theme. */
+  html, body {
+    margin: 0;
+    padding: 8px;
+    box-sizing: border-box;
+    background: #ffffff;
+    color: #111111;
+  }
   img { max-width: 100%; height: auto; }
 </style>
 </head>

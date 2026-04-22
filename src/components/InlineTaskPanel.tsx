@@ -14,6 +14,9 @@ import type { Task } from '../types';
 import { useApp } from '../context/AppContext';
 import Icon from './Icon';
 import * as tauriApi from '../lib/tauriCommands';
+import TaskEmailContent from './TaskEmailContent';
+import TaskDevModePanel from './TaskDevModePanel';
+import { resolveTaskDevTarget, getPluginsDir } from '../lib/resolveTaskDevTarget';
 
 interface Props {
   task: Task;
@@ -82,14 +85,20 @@ export default function InlineTaskPanel({ task, onOpenDetail }: Props) {
   // ── Action links ────────────────────────────────────────────────────────────
   const adoUrl   = task.adoContext?.workItemUrl || task.adoContext?.prUrl;
   const repoRoot = customer?.repositoryRoot;
-  // Mirror TaskDetail: effectiveVscodePath = pluginFolder ?? repositoryRoot ?? crmFolderPath
   const crmFolderPath = (settings?.crmBaseDirectory && customer?.folderName)
     ? `${settings.crmBaseDirectory}/${customer.folderName}`
     : undefined;
-  const effectiveVscodePath = customer?.pluginFolder ?? customer?.repositoryRoot ?? crmFolderPath;
+  const devTarget        = resolveTaskDevTarget(task, customer, crmFolderPath);
+  const effectiveVscodePath = devTarget.path;
+  const pluginsDir       = getPluginsDir(customer, crmFolderPath);
+  const repoRootForGit   = customer?.resolvedRepositoryPath ?? customer?.repositoryRoot;
+  const hasRepo          = !!repoRoot;
+  const hasVscodePath    = !!effectiveVscodePath;
   // Show Open Repository when customer has a repo root and the task is script-related
   const isScriptTask = !!(task.scriptAnalysis || customer?.scriptFolder);
   const showOpenRepo = !!(repoRoot && isScriptTask);
+  // Is this an email-sourced task that should use rich email rendering?
+  const isEmailTask = !!(task.emailBodyHtml || task.senderName || task.senderEmail);
 
   return (
     <div className="tip-panel" onClick={(e) => e.stopPropagation()}>
@@ -99,7 +108,12 @@ export default function InlineTaskPanel({ task, onOpenDetail }: Props) {
         <div className="tip-col-main">
 
           {/* Message */}
-          {msg && (
+          {isEmailTask ? (
+            <div className="tip-section">
+              <div className="tip-sec-label">Message</div>
+              <TaskEmailContent task={task} />
+            </div>
+          ) : msg ? (
             <div className="tip-section">
               <div className="tip-sec-label">Message</div>
               <pre className="tip-message-body">{msgPreview}</pre>
@@ -109,7 +123,7 @@ export default function InlineTaskPanel({ task, onOpenDetail }: Props) {
                 </button>
               )}
             </div>
-          )}
+          ) : null}
 
           {/* Analysis */}
           <div className="tip-section">
@@ -193,10 +207,16 @@ export default function InlineTaskPanel({ task, onOpenDetail }: Props) {
                   <Icon name="external-link" size={11} /> Ticket
                 </button>
               )}
-              {effectiveVscodePath && (
-                <button className="tip-action-btn" onClick={() => tauriApi.openInVscode(effectiveVscodePath).catch(() => {})} title={effectiveVscodePath}>
-                  <Icon name="terminal" size={11} /> Open in VS Code
-                </button>
+              {(hasRepo || hasVscodePath) && (
+                <TaskDevModePanel
+                  task={task}
+                  customer={customer}
+                  pluginsDir={pluginsDir}
+                  repoRootForGit={repoRootForGit}
+                  defaultMode={devTarget.kind === 'plugin' ? 'plugin' : 'script'}
+                  scriptOpenPath={customer?.scriptFolder ?? effectiveVscodePath}
+                  onError={() => {}}
+                />
               )}
               {showOpenRepo && (
                 <button className="tip-action-btn" onClick={() => tauriApi.openPath(repoRoot!).catch(() => {})} title={repoRoot}>

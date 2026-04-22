@@ -46,6 +46,11 @@ export function openInVscode(path: string): Promise<void> {
   return invoke('open_in_vscode', { path });
 }
 
+/** Open a file/folder using the OS default application (file association). */
+export function openWithShell(path: string): Promise<void> {
+  return invoke('open_with_shell', { path });
+}
+
 /**
  * Opens a URL in the system default browser.
  * Uses the Tauri opener plugin — window.open is blocked inside the WebView.

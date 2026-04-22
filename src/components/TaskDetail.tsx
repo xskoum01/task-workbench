@@ -1,6 +1,7 @@
-import { useState, useEffect } from 'react';
+﻿import { useState, useEffect } from 'react';
 import type { Task, TaskStatus, PlanningBucket, SkeletonPreview } from '../types';
-import EmailHtmlFrame from './EmailHtmlFrame';
+import TaskEmailContent from './TaskEmailContent';
+import TaskDevModePanel from './TaskDevModePanel';
 import { useApp } from '../context/AppContext';
 import { TypeBadge, SourceBadge, STATUS_LABELS } from './StatusBadge';
 import ReplyModal from './ReplyModal';
@@ -9,7 +10,7 @@ import ScriptAssistantPanel from './ScriptAssistantPanel';
 import TaskForm from './TaskForm';
 import Icon from './Icon';
 import * as tauriApi from '../lib/tauriCommands';
-import { resolveTaskDevTarget, resolveBestPluginPath, getPluginsDir, hintedPluginProject } from '../lib/resolveTaskDevTarget';
+import { resolveTaskDevTarget, resolveBestPluginPath, getPluginsDir } from '../lib/resolveTaskDevTarget';
 import { BUCKET_META, BUCKET_ORDER, computePlanning, effectiveBucket } from '../lib/planning';
 import { isOverdue, formatRelativeDate } from '../lib/dates';
 
@@ -36,365 +37,12 @@ function confidenceClass(value: number): string {
   return 'low';
 }
 
-function formatDate(iso: string): string {
-  return new Date(iso).toLocaleString(undefined, {
-    year:   'numeric',
-    month:  'short',
-    day:    'numeric',
-    hour:   '2-digit',
-    minute: '2-digit',
-  });
-}
-
 function formatEffort(hours: number): string {
   if (hours < 1) return `${Math.round(hours * 60)}m`;
   if (hours === 1) return '1h';
   return `${hours}h`;
 }
 
-// ---------------------------------------------------------------------------
-// Email message rendering helpers
-// ---------------------------------------------------------------------------
-
-const EMAIL_HEADER_FIELDS = ['From', 'Sent', 'Date', 'To', 'Cc', 'Bcc', 'Subject'] as const;
-type EmailHeaderField = typeof EMAIL_HEADER_FIELDS[number];
-
-// Gmail safety trust banner — appears inline when HTML is stripped.
-const GMAIL_TRUST_BANNER_RE = /You don['']t often get email from\s+\S+\.?\s*Learn why this is important\.?\s*/gi;
-
-// A header line at the start of a line — requires colon so "From what I know" is safe.
-const HEADER_LINE_RE = /^(?:From|To|Cc|Bcc|Date|Sent|Subject):\s*.+/i;
-
-const MIN_BODY_LENGTH = 20;
-
-// ---------------------------------------------------------------------------
-// Single-segment parser (line-by-line — accurate for multiline, regex for single-line)
-// ---------------------------------------------------------------------------
-
-interface ParsedSegment {
-  headers: Partial<Record<EmailHeaderField, string>>;
-  body: string;
-}
-
-/**
- * Parses a quoted email segment using a line-by-line approach.
- * Stops reading headers as soon as it hits a blank line or a non-header line.
- * This is accurate and never consumes body text as a header value.
- */
-function parseSegmentLines(raw: string): ParsedSegment {
-  const headers: Partial<Record<EmailHeaderField, string>> = {};
-  const lines = raw.split('\n');
-  let i = 0;
-
-  while (i < lines.length) {
-    const line = lines[i].trim();
-    if (line === '') { i++; break; }
-    const m = line.match(/^(From|Sent|Date|To|Cc|Bcc|Subject):\s*(.+)/i);
-    if (m) {
-      headers[m[1] as EmailHeaderField] = m[2].trim();
-      i++;
-    } else {
-      break;
-    }
-  }
-
-  return { headers, body: lines.slice(i).join('\n').trim() };
-}
-
-/**
- * In single-line email parsing the last header value absorbs body text because
- * there is no structural line separator. This function splits them apart.
- *
- * Heuristics (applied in order):
- *   1. Subject / generic: first sentence-end (.!?) followed by whitespace + any word
- *      that is NOT another "Word:" header pattern → body starts there.
- *      Covers: "Subject: RE: portal komentar 7. aha ok" → Subject="RE: portal komentar 7."
- *   2. From field: leading CamelCase name words, then first lowercase word = body.
- *      Covers: "From: Jaroslav Barták ok, super" → From="Jaroslav Barták", body="ok, super"
- *
- * Applied ALWAYS to the last parsed header (not only when trailing body is empty).
- * When uncertain, leaves value intact and returns empty body — never wrongly trims.
- */
-function splitLastHeaderFromBody(
-  field: EmailHeaderField,
-  value: string,
-): { headerVal: string; body: string } {
-  // Heuristic 1: sentence-end followed by whitespace + text that does NOT look
-  // like a new "Word: " header continuation (e.g. "RE: foo"). This is safe for
-  // Subject lines like "RE: portal komentar 7. aha ok to ma nenapadlo".
-  // We require the post-sentence text to NOT match "^\s*[A-Za-z]+:\s" (header start).
-  const sentenceMatch = value.match(/^(.*?[.!?])\s+(?![A-Za-z]+:\s)(.+)$/s);
-  if (sentenceMatch) {
-    return { headerVal: sentenceMatch[1].trim(), body: sentenceMatch[2].trim() };
-  }
-  // Heuristic 2 (From field): capitalised name words, then first lowercase word = body.
-  if (field === 'From') {
-    const nameBodyMatch = value.match(/^((?:[A-Z]\S*(?:\s+|$))+)([a-z].*)$/);
-    if (nameBodyMatch) {
-      return { headerVal: nameBodyMatch[1].trim(), body: nameBodyMatch[2].trim() };
-    }
-  }
-  return { headerVal: value, body: '' };
-}
-
-/**
- * Parses a quoted segment that may be on a single line (old stored data).
- * Uses a greedy lookahead regex — only call this when there are no newlines.
- */
-function parseSegmentInline(raw: string): ParsedSegment {
-  const headers: Partial<Record<EmailHeaderField, string>> = {};
-  const fieldPattern = EMAIL_HEADER_FIELDS.join('|');
-  const fullPattern = new RegExp(
-    `(${fieldPattern}):\\s*((?:(?!(?:${fieldPattern}):)[\\s\\S])*?)(?=(?:${fieldPattern}):|$)`,
-    'gi',
-  );
-  const matches = [...raw.matchAll(fullPattern)];
-  if (matches.length === 0) return { headers, body: raw.trim() };
-
-  for (const m of matches) {
-    const val = m[2].replace(/\s+/g, ' ').trim();
-    if (val) headers[m[1] as EmailHeaderField] = val;
-  }
-  const last = matches[matches.length - 1];
-  let body = raw.slice((last.index ?? 0) + last[0].length).trim();
-
-  // Always attempt to split body out of the last header value.
-  // The last field's regex group greedily absorbs body text when there is no
-  // following header to stop it — so we must split regardless of whether there
-  // is trailing text after the match.
-  const lastKey = last[1] as EmailHeaderField;
-  const lastVal = headers[lastKey] ?? '';
-  const split = splitLastHeaderFromBody(lastKey, lastVal);
-  if (split.body) {
-    headers[lastKey] = split.headerVal;
-    // Prepend any newly found body to whatever (if anything) followed the matches.
-    body = body ? `${split.body} ${body}` : split.body;
-  }
-
-  return { headers, body };
-}
-
-function parseSegment(raw: string): ParsedSegment {
-  return raw.includes('\n') ? parseSegmentLines(raw) : parseSegmentInline(raw);
-}
-
-// ---------------------------------------------------------------------------
-// Thread splitter
-// ---------------------------------------------------------------------------
-
-/**
- * Returns true when `line` looks like the start of a quoted-reply header block
- * (i.e. "From: <something>") AND at least one companion field appears within
- * the next 4 lines. This avoids splitting on "From:" inside normal sentences.
- */
-function isReplyHeaderStart(line: string, lines: string[], idx: number): boolean {
-  if (!/^From:\s+.+/i.test(line)) return false;
-  const COMPANION = /^(?:Sent|Date|To|Cc|Subject):\s+/i;
-  for (let j = idx + 1; j < Math.min(idx + 5, lines.length); j++) {
-    const t = lines[j].trim();
-    if (COMPANION.test(t)) return true;
-    if (t === '' && j > idx + 1) break; // blank line gap without companion — stop
-  }
-  return false;
-}
-
-/**
- * Splits a multiline email body into thread segments.
- * [0] is the newest message body; subsequent entries are older quoted replies.
- */
-function splitMultilineThread(text: string): string[] {
-  const lines = text.split('\n');
-  const segments: string[] = [];
-  let current: string[] = [];
-
-  for (let i = 0; i < lines.length; i++) {
-    if (isReplyHeaderStart(lines[i].trim(), lines, i)) {
-      const seg = current.join('\n').trim();
-      if (seg) segments.push(seg);
-      current = [lines[i]];
-    } else {
-      current.push(lines[i]);
-    }
-  }
-  const last = current.join('\n').trim();
-  if (last) segments.push(last);
-
-  return segments.length > 0 ? segments : [text];
-}
-
-/**
- * Splits a single-line (legacy stored) email body into thread segments.
- * Only splits on "From: " that has a companion header field within 200 chars.
- */
-function splitInlineThread(text: string): string[] {
-  const FROM_RE = /\bFrom:\s+/gi;
-  const COMPANION = /(?:Date|Sent|To|Cc|Subject):/i;
-  const splitPoints: number[] = [];
-  let m: RegExpExecArray | null;
-
-  while ((m = FROM_RE.exec(text)) !== null) {
-    const window = text.slice(m.index + m[0].length, m.index + m[0].length + 200);
-    if (COMPANION.test(window)) splitPoints.push(m.index);
-  }
-
-  if (splitPoints.length === 0) return [text];
-
-  const segments: string[] = [];
-  let last = 0;
-  for (const pos of splitPoints) {
-    if (pos > last) segments.push(text.slice(last, pos).trim());
-    last = pos;
-  }
-  segments.push(text.slice(last).trim());
-  return segments.filter(Boolean);
-}
-
-/** Splits an email body into thread segments; handles both multiline and flat formats. */
-function splitEmailThread(raw: string): string[] {
-  const trimmed = raw.trim();
-  if (!trimmed) return [''];
-  return trimmed.includes('\n')
-    ? splitMultilineThread(trimmed)
-    : splitInlineThread(trimmed);
-}
-
-// ---------------------------------------------------------------------------
-// Body cleaning for the newest message
-// ---------------------------------------------------------------------------
-
-/**
- * Cleans the newest message segment for display:
- *   1. Strips Gmail trust banner
- *   2. Strips leading "From: <sender>" prefix when sender is known
- *   3. Strips leading header-line block (multiline format)
- * Falls back to original if stripping removes too much.
- */
-function getDisplayMessageBody(raw: string, senderName?: string, senderEmail?: string): string {
-  const trimmed = raw.trim();
-  if (!trimmed) return '';
-
-  let result = trimmed;
-
-  // Step 1: strip Gmail trust banner wherever it appears
-  result = result.replace(GMAIL_TRUST_BANNER_RE, ' ').replace(/[ \t]{2,}/g, ' ').trim();
-
-  // Step 2: strip leading "From: <sender>" prefix (single-line format)
-  const knownSender = senderName ?? senderEmail;
-  if (knownSender) {
-    const escaped = knownSender.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-    result = result.replace(new RegExp(`^From:\\s+${escaped}\\s*`, 'i'), '').trim();
-  }
-
-  // Step 3: strip leading header-line block (multiline format)
-  if (result.includes('\n')) {
-    const lines = result.split('\n');
-    let i = 0;
-    while (i < lines.length) {
-      const line = lines[i].trim();
-      if (HEADER_LINE_RE.test(line)) { i++; }
-      else if (line === '') { i++; break; }
-      else break;
-    }
-    if (i > 0) {
-      const stripped = lines.slice(i).join('\n').trim();
-      if (stripped) result = stripped;
-    }
-  }
-
-  if (result.length < MIN_BODY_LENGTH && trimmed.length > MIN_BODY_LENGTH) return trimmed;
-  return result || trimmed;
-}
-
-// ---------------------------------------------------------------------------
-// Rendering components
-// ---------------------------------------------------------------------------
-
-/** One dimmed quoted-reply block with its own parsed header. */
-function QuotedSegment({ raw }: { raw: string }) {
-  const { headers, body } = parseSegment(raw);
-  const hasHeaders = Object.keys(headers).length > 0;
-
-  return (
-    <div className="email-segment email-segment--dimmed">
-      {hasHeaders && (
-        <div className="email-headers">
-          {EMAIL_HEADER_FIELDS.filter((f) => headers[f]).map((f) => (
-            <div key={f} className="email-header-row">
-              <span className="email-header-key">{f}</span>
-              <span className="email-header-val">{headers[f]}</span>
-            </div>
-          ))}
-        </div>
-      )}
-      {body && <div className="email-body">{body}</div>}
-    </div>
-  );
-}
-
-/** Email card: top metadata + newest body + dimmed quoted replies. */
-function EmailCard({ task }: { task: Task }) {
-  const segments = splitEmailThread(task.originalMessage);
-  const newestBody = getDisplayMessageBody(segments[0], task.senderName, task.senderEmail);
-  const quotedSegments = segments.slice(1);
-  const hasMeta = task.senderName || task.senderEmail || task.receivedAt;
-  const useIframe = !!task.emailBodyHtml;
-
-  console.log(
-    `[email-html] TaskDetail: taskId=${task.id.slice(0, 12)}`,
-    `usingIframe=${useIframe}`,
-    `htmlPresent=${useIframe}`,
-  );
-
-  return (
-    <div className="email-card">
-      {hasMeta && (
-        <div className="email-card-meta">
-          {task.senderName && (
-            <div className="email-card-meta-row">
-              <span className="email-card-meta-key">Od</span>
-              <span className="email-card-meta-val">{task.senderName}</span>
-            </div>
-          )}
-          {task.senderEmail && (
-            <div className="email-card-meta-row">
-              <span className="email-card-meta-key">Email</span>
-              <span className="email-card-meta-val">{task.senderEmail}</span>
-            </div>
-          )}
-          {task.receivedAt && (
-            <div className="email-card-meta-row">
-              <span className="email-card-meta-key">Přijato</span>
-              <span className="email-card-meta-val">{formatDate(task.receivedAt)}</span>
-            </div>
-          )}
-        </div>
-      )}
-
-      {/* Iframe renderer for exact Outlook HTML rendering — isolated from app CSS.
-          Falls back to plain-text thread parser when no HTML body is available. */}
-      {useIframe ? (
-        <EmailHtmlFrame html={task.emailBodyHtml!} />
-      ) : (
-        newestBody && <div className="email-card-body">{newestBody}</div>
-      )}
-
-      {/* Quoted reply segments are only shown in plain-text fallback mode.
-          The full HTML body already contains the complete thread. */}
-      {!useIframe && quotedSegments.length > 0 && (
-        <div className="email-thread-older">
-          {quotedSegments.map((seg, i) => (
-            <div key={i}>
-              <div className="email-thread-sep" />
-              <QuotedSegment raw={seg} />
-            </div>
-          ))}
-        </div>
-      )}
-    </div>
-  );
-}
-
-// ---------------------------------------------------------------------------
 // Bilingual analysis block
 // ---------------------------------------------------------------------------
 
@@ -496,9 +144,9 @@ function AnalysisBlock({ result }: { result: NonNullable<Task['analysisResult']>
             problems={result.problemPointsCz}
             actions={result.actionPointsCz}
             nextStep={result.nextStepCz}
-            labelProblem="Problém"
-            labelAction="Co udělat"
-            labelNext="Další krok"
+            labelProblem="ProblĂ©m"
+            labelAction="Co udÄ›lat"
+            labelNext="DalĹˇĂ­ krok"
           />
         )}
         {hasCz && hasEn && <div className="detail-analysis-divider" />}
@@ -518,7 +166,7 @@ function AnalysisBlock({ result }: { result: NonNullable<Task['analysisResult']>
     );
   }
 
-  // Legacy mode — old task with English-only analysis
+  // Legacy mode â€” old task with English-only analysis
   return (
     <div className="detail-analysis-block">
       <div className="analysis-legacy-block">
@@ -613,7 +261,7 @@ function PlanningSection({ task }: PlanningSectionProps) {
         )}
         {isMismatch && suggested && (
           <span className="detail-planning-suggestion" title="Auto-suggestion differs from manual choice">
-            → suggested: {BUCKET_META[suggested].label}
+            â†’ suggested: {BUCKET_META[suggested].label}
           </span>
         )}
       </div>
@@ -642,12 +290,14 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
     ? `${settings.crmBaseDirectory}/${customer.folderName}`
     : undefined;
 
-  // Smart resolver — picks plugin / script / repo based on task heuristics.
+  // Smart resolver â€” picks plugin / script / repo based on task heuristics.
   const devTarget = resolveTaskDevTarget(task, customer, crmFolderPath);
   const effectiveVscodePath = devTarget.path;
 
   // Container directory for plugin project subfolders.
   const pluginsDir = getPluginsDir(customer, crmFolderPath);
+  // Root used for git operations (branch switching).
+  const repoRootForGit = customer?.resolvedRepositoryPath ?? customer?.repositoryRoot;
 
   // Inline feedback message (e.g. "Analysis recorded")
   const [feedback, setFeedback] = useState<string | null>(null);
@@ -667,180 +317,36 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
   const [showEditForm, setShowEditForm] = useState(false);
   // Delete confirmation step
   const [confirmDelete, setConfirmDelete] = useState(false);
-  // Notes — local state, saved on blur
+  // Notes â€” local state, saved on blur
   const [notes, setNotes] = useState(task.notes ?? '');
   // Keep notes in sync when task changes (e.g. different task selected)
   useEffect(() => { setNotes(task.notes ?? ''); }, [task.id, task.notes]);
 
-  // --- Dev mode switcher state ---
-  // Initialized from heuristic; user can override via Script/Plugin toggle.
-  const [devMode, setDevMode] = useState<'script' | 'plugin'>(
-    devTarget.kind === 'plugin' ? 'plugin' : 'script',
-  );
-  const [pluginProjects, setPluginProjects]               = useState<string[]>([]);
-  const [pluginProjectsLoaded, setPluginProjectsLoaded]   = useState(false);
-  const [pluginProjectsLoading, setPluginProjectsLoading] = useState(false);
-  const [selectedPlugin, setSelectedPlugin]               = useState<string>('');
-  const [pluginOpenHint, setPluginOpenHint]               = useState<string | null>(null);
-
-  // --- Branch awareness state (V2) ---
-  const repoRootForGit = customer?.resolvedRepositoryPath ?? customer?.repositoryRoot;
-  const [currentBranch, setCurrentBranch]       = useState<string | null>(null);
-  const [branches, setBranches]                 = useState<string[]>([]);
-  const [selectedBranch, setSelectedBranch]     = useState<string>('');
-  const [branchDirty, setBranchDirty]           = useState(false);
-  const [branchLoading, setBranchLoading]       = useState(false);
-  const [branchSwitching, setBranchSwitching]   = useState(false);
-  const [branchError, setBranchError]           = useState<string | null>(null);
-
-  // Reset all plugin + branch state when the viewed task changes.
-  useEffect(() => {
-    const initialMode = devTarget.kind === 'plugin' ? 'plugin' : 'script';
-    setDevMode(initialMode);
-    setSelectedPlugin('');
-    setPluginProjects([]);
-    setPluginProjectsLoaded(false);
-    setPluginOpenHint(null);
-    setCurrentBranch(null);
-    setBranches([]);
-    setSelectedBranch('');
-    setBranchDirty(false);
-    setBranchError(null);
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [task.id]);
-
-  async function handleDelete() {
-    await deleteTask(task.id);
-    onClose();
-  }
-
-  async function handleNotesSave() {
-    if (notes !== (task.notes ?? '')) {
-      await updateTask(task.id, { notes });
-    }
-  }
-
-  // Auto-clear feedback / error messages after a delay
-  useEffect(() => {
-    if (!feedback) return;
-    const t = setTimeout(() => setFeedback(null), 3000);
-    return () => clearTimeout(t);
-  }, [feedback]);
-
-  useEffect(() => {
-    if (!fsError) return;
-    const t = setTimeout(() => setFsError(null), 6000);
-    return () => clearTimeout(t);
-  }, [fsError]);
-
-  useEffect(() => {
-    if (!aiError) return;
-    const t = setTimeout(() => setAiError(null), 8000);
-    return () => clearTimeout(t);
-  }, [aiError]);
-
-  // Load plugin project subfolders when dev mode switches to 'plugin'.
-  useEffect(() => {
-    if (devMode !== 'plugin' || !pluginsDir || pluginProjectsLoaded) return;
-    setPluginProjectsLoading(true);
-    tauriApi.listSubfolders(pluginsDir)
-      .then((folders) => {
-        setPluginProjects(folders);
-        // Try to preselect from ADO task hint
-        const hint = hintedPluginProject(task);
-        if (hint && folders.includes(hint)) {
-          setSelectedPlugin(hint);
-        } else if (folders.length === 1) {
-          setSelectedPlugin(folders[0]);
-        }
-        setPluginProjectsLoaded(true);
-      })
-      .catch(() => {
-        setPluginProjects([]);
-        setPluginProjectsLoaded(true);
-      })
-      .finally(() => setPluginProjectsLoading(false));
-  }, [devMode, pluginsDir, pluginProjectsLoaded, task]);
-
-  // Load branch info when plugin mode is first activated.
-  useEffect(() => {
-    if (devMode !== 'plugin' || !repoRootForGit || currentBranch !== null) return;
-    setBranchLoading(true);
-    setBranchError(null);
-    Promise.all([
-      tauriApi.getGitBranch(repoRootForGit),
-      tauriApi.listGitBranches(repoRootForGit),
-      tauriApi.gitHasUncommitted(repoRootForGit),
-    ])
-      .then(([branch, branchList, dirty]) => {
-        setCurrentBranch(branch);
-        setSelectedBranch(branch);
-        setBranches(branchList);
-        setBranchDirty(dirty);
-      })
-      .catch((err) => {
-        setBranchError(String(err));
-      })
-      .finally(() => setBranchLoading(false));
-  }, [devMode, repoRootForGit, currentBranch]);
-
-  // Scan selected plugin folder for .sln / .csproj to populate the hint.
-  useEffect(() => {
-    if (!selectedPlugin || !pluginsDir) {
-      setPluginOpenHint(null);
-      return;
-    }
-    const pluginPath = `${pluginsDir}/${selectedPlugin}`;
-    tauriApi.listDirectoryFiles(pluginPath, 'sln')
-      .then((slns) => {
-        if (slns.length > 0) {
-          setPluginOpenHint(`.sln found: ${slns[0]}`);
-          return;
-        }
-        return tauriApi.listDirectoryFiles(pluginPath, 'csproj').then((csprojs) => {
-          setPluginOpenHint(
-            csprojs.length > 0
-              ? `.csproj found: ${csprojs[0]}`
-              : 'No .sln or .csproj found in this plugin folder.',
-          );
-        });
-      })
-      .catch(() => setPluginOpenHint(null));
-  }, [selectedPlugin, pluginsDir]);
-
-  // Handler: switch to selected branch, then refresh plugin folder and hint.
-  async function handleSwitchBranch() {
-    if (!repoRootForGit || !selectedBranch || selectedBranch === currentBranch) return;
-    setBranchError(null);
-    setBranchSwitching(true);
-    try {
-      const dirty = await tauriApi.gitHasUncommitted(repoRootForGit);
-      if (dirty) {
-        setBranchDirty(true);
-        setBranchError(
-          'Cannot switch branch because the repository has uncommitted changes.',
-        );
-        return;
-      }
-      await tauriApi.gitCheckoutBranch(repoRootForGit, selectedBranch);
-      const newBranch = await tauriApi.getGitBranch(repoRootForGit);
-      setCurrentBranch(newBranch);
-      setBranchDirty(false);
-      // Reload plugin projects on the new branch
-      setPluginProjectsLoaded(false);
-      setSelectedPlugin('');
-      setPluginOpenHint(null);
-    } catch (err) {
-      setBranchError(String(err));
-    } finally {
-      setBranchSwitching(false);
-    }
-  }
 
   // --- Status change ---
 
   async function handleStatusChange(status: TaskStatus) {
     await updateTask(task.id, { status });
+  }
+
+  // --- Delete ---
+
+  async function handleDelete() {
+    await deleteTask(task.id);
+    setConfirmDelete(false);
+  }
+
+  // --- Notes ---
+
+  async function handleNotesSave() {
+    await updateTask(task.id, { notes });
+  }
+
+  // --- Helpers ---
+
+  function formatDate(iso: string | undefined): string {
+    if (!iso) return '—';
+    return new Date(iso).toLocaleString();
   }
 
   // --- Workflow actions ---
@@ -855,7 +361,7 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
         analysisResult: result,
         confidence:     result.confidence,
       });
-      setFeedback('AI analysis complete — status set to Analyzed');
+      setFeedback('AI analysis complete â€” status set to Analyzed');
     } catch (e) {
       setAiError(String(e));
     } finally {
@@ -912,7 +418,7 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
       await updateTask(task.id, { generatedReply: draft });
       setGeneratedReply(draft);
     } catch (e) {
-      // Fall back to local template — open modal anyway
+      // Fall back to local template â€” open modal anyway
       setGeneratedReply(null);
       setAiError(String(e));
     } finally {
@@ -938,7 +444,7 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
   async function handleToggleLock() {
     const next = !task.isPlanningLocked;
     await updateTask(task.id, { isPlanningLocked: next });
-    setFeedback(next ? 'Planning locked to manual choice' : 'Planning unlocked — auto-suggest active');
+    setFeedback(next ? 'Planning locked to manual choice' : 'Planning unlocked â€” auto-suggest active');
   }
 
   // --- URL actions ---
@@ -961,57 +467,6 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
     }
     try {
       await tauriApi.openPath(path);
-    } catch (e) {
-      setFsError(String(e));
-    }
-  }
-
-  async function handleOpenVscode(path: string | undefined) {
-    // For plugin tasks, try to find the best specific target (.sln / .csproj)
-    let resolvedPath = path;
-    if (devTarget.kind === 'plugin') {
-      resolvedPath = await resolveBestPluginPath(task, customer);
-    }
-    if (!resolvedPath) {
-      setFsError('No repository root configured for this customer.');
-      return;
-    }
-    try {
-      await tauriApi.openInVscode(resolvedPath);
-    } catch (e) {
-      setFsError(String(e));
-    }
-  }
-
-  // Opens the selected plugin project in VS Code (.sln > .csproj > folder).
-  async function handleOpenPluginVscode() {
-    if (!pluginsDir || !selectedPlugin) {
-      setFsError('Select a plugin project first.');
-      return;
-    }
-    const pluginPath = `${pluginsDir}/${selectedPlugin}`;
-    try {
-      const slns = await tauriApi.listDirectoryFiles(pluginPath, 'sln');
-      if (slns.length > 0) {
-        const target = `${pluginPath}/${slns[0]}`;
-        console.log('[devTarget] final path=', target, '(from .sln)');
-        await tauriApi.openInVscode(target);
-        return;
-      }
-      const csprojs = await tauriApi.listDirectoryFiles(pluginPath, 'csproj');
-      if (csprojs.length > 0) {
-        const target = `${pluginPath}/${csprojs[0]}`;
-        console.log('[devTarget] final path=', target, '(from .csproj)');
-        await tauriApi.openInVscode(target);
-        return;
-      }
-      const exists = await tauriApi.checkPathExists(pluginPath);
-      if (!exists) {
-        setFsError('Plugin not found on the current branch or path.');
-        return;
-      }
-      console.log('[devTarget] final path=', pluginPath, '(folder — no .sln/.csproj)');
-      await tauriApi.openInVscode(pluginPath);
     } catch (e) {
       setFsError(String(e));
     }
@@ -1043,7 +498,7 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
             <div className="detail-panel-title">{task.title}</div>
 
             <div style={{ marginTop: 6, display: 'flex', gap: 6, alignItems: 'center', flexWrap: 'wrap' }}>
-              {/* Inline status selector — styled to match the badge palette */}
+              {/* Inline status selector â€” styled to match the badge palette */}
               <select
                 className={`detail-status-select detail-status-${task.status}`}
                 value={task.status}
@@ -1141,7 +596,7 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
                         await updateTask(task.id, { customerId });
                       }}
                     >
-                      <option value="" disabled>Assign customer…</option>
+                      <option value="" disabled>Assign customerâ€¦</option>
                       {customers.map((c) => (
                         <option key={c.id} value={c.id}>{c.name}</option>
                       ))}
@@ -1220,7 +675,7 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
             <span className="detail-section-label">Original Message</span>
             {task.originalMessage ? (
               task.source === 'email' ? (
-                <EmailCard task={task} />
+                <TaskEmailContent task={task} />
               ) : (
                 <div className="detail-message">
                   <div className="email-body" style={{ padding: 'var(--gap-md) var(--gap-lg)' }}>
@@ -1239,13 +694,13 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
             <textarea
               className="detail-notes-textarea"
               value={notes}
-              placeholder="Write notes, context, or reminders…"
+              placeholder="Write notes, context, or remindersâ€¦"
               onChange={(e) => setNotes(e.target.value)}
               onBlur={handleNotesSave}
             />
           </div>
 
-          {/* Azure DevOps context — shown for ADO-sourced tasks with parsed metadata */}
+          {/* Azure DevOps context â€” shown for ADO-sourced tasks with parsed metadata */}
           {task.adoContext && task.adoContext.type !== 'other' && (
             <div className="detail-section detail-ado-section">
               <span className="detail-section-label">
@@ -1333,7 +788,7 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
                           className="detail-tracking-link"
                           onClick={() => handleOpenUrl(task.adoContext!.workItemUrl)}
                         >
-                          Open in Azure DevOps ↗
+                          Open in Azure DevOps â†—
                         </button>
                       </div>
                     )}
@@ -1346,17 +801,17 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
           {/* AI Analysis result */}
           {task.analysisResult && (
             <div className="detail-section">
-              <span className="detail-section-label detail-ai-label">AI analýza / analysis</span>
+              <span className="detail-section-label detail-ai-label">AI analĂ˝za / analysis</span>
               <AnalysisBlock result={task.analysisResult} />
             </div>
           )}
 
-          {/* Legacy suggested steps — hidden when bilingual action bullets cover them */}
+          {/* Legacy suggested steps â€” hidden when bilingual action bullets cover them */}
           {!(task.analysisResult?.actionPointsCz?.length) && !(task.analysisResult?.actionPointsEn?.length) &&
            (task.analysisResult?.suggestedActions ?? task.suggestedActions).length > 0 && (
             <div className="detail-section">
               <span className="detail-section-label">
-                {task.analysisResult ? 'Navrhované kroky' : 'Suggested Steps'}
+                {task.analysisResult ? 'NavrhovanĂ© kroky' : 'Suggested Steps'}
               </span>
               <div className="detail-suggestions">
                 {(task.analysisResult?.suggestedActions ?? task.suggestedActions).map((sa, i) => (
@@ -1369,7 +824,7 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
             </div>
           )}
 
-          {/* Tracking section — only rendered when at least one field is set */}
+          {/* Tracking section â€” only rendered when at least one field is set */}
           {(task.ticketUrl || task.devopsTaskUrl || task.budgetHours !== undefined || task.budgetNote) && (
             <div className="detail-section">
               <span className="detail-section-label">Tracking</span>
@@ -1382,7 +837,7 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
                       onClick={() => handleOpenUrl(task.ticketUrl)}
                       title={task.ticketUrl}
                     >
-                      Open Ticket ↗
+                      Open Ticket â†—
                     </button>
                   </div>
                 )}
@@ -1394,7 +849,7 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
                       onClick={() => handleOpenUrl(task.devopsTaskUrl)}
                       title={task.devopsTaskUrl}
                     >
-                      Open DevOps Task ↗
+                      Open DevOps Task â†—
                     </button>
                   </div>
                 )}
@@ -1451,7 +906,7 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
                 title="Analyse task with AI and set status to Analyzed"
               >
                 {aiLoading === 'analyze'
-                  ? <><span className="btn-spinner" /> Analysing…</>
+                  ? <><span className="btn-spinner" /> Analysingâ€¦</>
                   : <><Icon name="search" size={13} /> Analyze</>}
               </button>
               <button
@@ -1469,7 +924,7 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
                 title="Generate C# plugin skeleton with AI"
               >
                 {aiLoading === 'skeleton'
-                  ? <><span className="btn-spinner" /> Generating…</>
+                  ? <><span className="btn-spinner" /> Generatingâ€¦</>
                   : <><Icon name="layers" size={13} /> Skeleton</>}
               </button>
               <button
@@ -1483,12 +938,12 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
             </div>
           </div>
 
-          {/* SCRIPT ASSISTANT — shown when customer has a script folder or repo root */}
+          {/* SCRIPT ASSISTANT â€” shown when customer has a script folder or repo root */}
           {customer && (customer.scriptFolder || customer.resolvedRepositoryPath || customer.repositoryRoot) && (
             <ScriptAssistantPanel task={task} customer={customer} />
           )}
 
-          {/* AZURE DEVOPS — shown for ADO PR comment/review tasks with an extracted deep link */}
+          {/* AZURE DEVOPS â€” shown for ADO PR comment/review tasks with an extracted deep link */}
           {(() => {
             const adoUrl =
               task.adoContext?.type === 'pr-comment'
@@ -1518,7 +973,7 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
             );
           })()}
 
-          {/* FILESYSTEM — only rendered when the customer has at least one path */}
+          {/* FILESYSTEM â€” only rendered when the customer has at least one path */}
           {hasAnyPath && (
             <div className="detail-action-group">
               <div className="detail-action-group-label">Filesystem</div>
@@ -1551,119 +1006,15 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
               )}
 
               {(hasRepo || hasVscodePath) && (
-                <div className="detail-devmode-block">
-                  {/* Script / Plugin mode toggle */}
-                  <div className="detail-devmode-toggle">
-                    <button
-                      className={`btn btn-sm ${devMode === 'script' ? 'btn-primary' : 'btn-secondary'}`}
-                      onClick={() => setDevMode('script')}
-                    >
-                      Script
-                    </button>
-                    <button
-                      className={`btn btn-sm ${devMode === 'plugin' ? 'btn-primary' : 'btn-secondary'}`}
-                      onClick={() => setDevMode('plugin')}
-                    >
-                      Plugin
-                    </button>
-                  </div>
-
-                  {devMode === 'plugin' ? (
-                    <>
-                      {/* Branch awareness */}
-                      {repoRootForGit && (
-                        <div className="detail-devmode-branch">
-                          <div className="detail-devmode-branch-current">
-                            Branch:{' '}
-                            <span className="detail-devmode-branch-name">
-                              {branchLoading ? '…' : (currentBranch ?? 'unknown')}
-                            </span>
-                            {branchDirty && (
-                              <span className="detail-devmode-branch-dirty" title="Uncommitted changes present">
-                                {' '}(dirty)
-                              </span>
-                            )}
-                          </div>
-
-                          {branches.length > 1 && (
-                            <div className="detail-devmode-branch-row">
-                              <select
-                                className="form-select detail-devmode-branch-select"
-                                value={selectedBranch}
-                                onChange={(e) => setSelectedBranch(e.target.value)}
-                                disabled={branchSwitching}
-                              >
-                                {branches.map((b) => (
-                                  <option key={b} value={b}>{b}</option>
-                                ))}
-                              </select>
-                              <button
-                                className="btn btn-secondary btn-sm"
-                                onClick={handleSwitchBranch}
-                                disabled={
-                                  branchSwitching ||
-                                  !selectedBranch ||
-                                  selectedBranch === currentBranch
-                                }
-                                title="Switch to selected branch"
-                              >
-                                {branchSwitching ? <><span className="btn-spinner" /> Switching…</> : 'Switch'}
-                              </button>
-                            </div>
-                          )}
-
-                          {branchError && (
-                            <div className="detail-fs-error">{branchError}</div>
-                          )}
-                        </div>
-                      )}
-
-                      {pluginProjectsLoading && (
-                        <div className="detail-devmode-hint">Loading plugin projects…</div>
-                      )}
-
-                      {!pluginProjectsLoading && pluginProjectsLoaded && pluginProjects.length === 0 && (
-                        <div className="detail-devmode-hint">
-                          No plugin project folders found{pluginsDir ? ` in ${pluginsDir}` : ''}.
-                        </div>
-                      )}
-
-                      {!pluginProjectsLoading && pluginProjects.length > 0 && (
-                        <select
-                          className="form-select"
-                          value={selectedPlugin}
-                          onChange={(e) => setSelectedPlugin(e.target.value)}
-                        >
-                          <option value="">— select plugin project —</option>
-                          {pluginProjects.map((p) => (
-                            <option key={p} value={p}>{p}</option>
-                          ))}
-                        </select>
-                      )}
-
-                      {pluginOpenHint && (
-                        <div className="detail-devmode-hint">{pluginOpenHint}</div>
-                      )}
-
-                      <button
-                        className="btn btn-secondary btn-sm btn-full"
-                        onClick={handleOpenPluginVscode}
-                        disabled={!selectedPlugin}
-                      >
-                        <Icon name="terminal" size={13} /> Open Plugin in VS Code
-                      </button>
-                    </>
-                  ) : (
-                    <button
-                      className="btn btn-secondary btn-sm btn-full"
-                      onClick={() => handleOpenVscode(
-                        customer?.scriptFolder ?? effectiveVscodePath,
-                      )}
-                    >
-                      <Icon name="terminal" size={13} /> Open Script in VS Code
-                    </button>
-                  )}
-                </div>
+                <TaskDevModePanel
+                  task={task}
+                  customer={customer}
+                  pluginsDir={pluginsDir}
+                  repoRootForGit={repoRootForGit}
+                  defaultMode={devTarget.kind === 'plugin' ? 'plugin' : 'script'}
+                  scriptOpenPath={customer?.scriptFolder ?? effectiveVscodePath}
+                  onError={setFsError}
+                />
               )}
 
               {/* Filesystem error strip */}
@@ -1687,12 +1038,12 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
               disabled={!!aiLoading}
             >
               {aiLoading === 'reply'
-                ? <><span className="btn-spinner" /> Drafting…</>
+                ? <><span className="btn-spinner" /> Draftingâ€¦</>
                 : <><Icon name="mail" size={13} /> Generate Reply</>}
             </button>
           </div>
 
-          {/* PLANNING — quick bucket assignment */}
+          {/* PLANNING â€” quick bucket assignment */}
           {task.status !== 'done' && (
             <div className="detail-action-group">
               <div className="detail-action-group-label">

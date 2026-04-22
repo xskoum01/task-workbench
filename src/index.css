@@ -2419,7 +2419,47 @@ body {
   font-size: var(--font-size-xs);
   color: var(--text-muted);
   line-height: 1.4;
-}\n\n/* Branch awareness panel inside Plugin mode */\n.detail-devmode-branch {\n  display: flex;\n  flex-direction: column;\n  gap: 5px;\n  padding: 6px 8px;\n  background: color-mix(in srgb, var(--border) 30%, transparent);\n  border: 1px solid var(--border-subtle);\n  border-radius: var(--radius-sm);\n}\n\n.detail-devmode-branch-current {\n  font-size: var(--font-size-xs);\n  color: var(--text-muted);\n}\n\n.detail-devmode-branch-name {\n  font-family: var(--font-mono, monospace);\n  color: var(--text-primary);\n  font-weight: 600;\n}\n\n.detail-devmode-branch-dirty {\n  color: var(--color-blocked);\n  font-weight: 600;\n}\n\n.detail-devmode-branch-row {\n  display: flex;\n  gap: 4px;\n  align-items: center;\n}\n\n.detail-devmode-branch-select {\n  flex: 1;\n  min-width: 0;\n  font-size: var(--font-size-xs);\n  padding: 3px 6px;\n}
+}
+
+/* Branch awareness panel inside Plugin mode */
+.detail-devmode-branch {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  padding: 6px 8px;
+  background: color-mix(in srgb, var(--border) 30%, transparent);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-sm);
+}
+
+.detail-devmode-branch-current {
+  font-size: var(--font-size-xs);
+  color: var(--text-muted);
+}
+
+.detail-devmode-branch-name {
+  font-family: var(--font-mono, monospace);
+  color: var(--text-primary);
+  font-weight: 600;
+}
+
+.detail-devmode-branch-dirty {
+  color: var(--color-blocked);
+  font-weight: 600;
+}
+
+.detail-devmode-branch-row {
+  display: flex;
+  gap: 4px;
+  align-items: center;
+}
+
+.detail-devmode-branch-select {
+  flex: 1;
+  min-width: 0;
+  font-size: var(--font-size-xs);
+  padding: 3px 6px;
+}
 
 /* Success feedback strip */
 .detail-feedback-ok {

@@ -224,6 +224,37 @@ fn open_in_vscode(path: String) -> Result<(), String> {
     })
 }
 
+/// Open a file or folder using the OS default application (respects file
+/// associations, so .sln opens Visual Studio, .pdf opens a viewer, etc.).
+/// Uses `cmd /c start "" "path"` on Windows for correct association handling.
+#[tauri::command]
+fn open_with_shell(path: String) -> Result<(), String> {
+    #[cfg(target_os = "windows")]
+    {
+        std::process::Command::new("cmd")
+            .args(["/c", "start", "", &path])
+            .spawn()
+            .map(|_| ())
+            .map_err(|e| format!("Failed to open with shell: {e}"))
+    }
+    #[cfg(target_os = "macos")]
+    {
+        std::process::Command::new("open")
+            .arg(&path)
+            .spawn()
+            .map(|_| ())
+            .map_err(|e| format!("Failed to open with shell: {e}"))
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    {
+        std::process::Command::new("xdg-open")
+            .arg(&path)
+            .spawn()
+            .map(|_| ())
+            .map_err(|e| format!("Failed to open with shell: {e}"))
+    }
+}
+
 // --- Git helpers -----------------------------------------------------------
 
 /// Helper: run a git command in repo_path; return trimmed stdout or an error string.
@@ -2952,6 +2983,7 @@ pub fn run() {
             save_settings,
             open_path,
             open_in_vscode,
+            open_with_shell,
             pick_folder,
             pick_file,
             check_path_exists,
