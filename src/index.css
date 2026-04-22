@@ -2285,6 +2285,10 @@ body {
   /* Chevron icon */
   background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='8' height='5' viewBox='0 0 8 5'%3E%3Cpath d='M1 1l3 3 3-3' stroke='currentColor' stroke-width='1.2' fill='none' stroke-linecap='round'/%3E%3C/svg%3E");
   transition: opacity 0.1s;
+  /* Ensure the popup list is wide enough for the longest option ("In Progress").
+     With appearance:none, Chromium/Tauri sizes the popup to the element width,
+     so without a min-width the list clips long labels. */
+  min-width: 130px;
 }
 
 .detail-status-select:hover  { opacity: 0.85; }
