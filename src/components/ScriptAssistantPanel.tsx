@@ -353,6 +353,13 @@ function ScriptAssistantPanel({ task, customer, onDraftChange, scriptFolderOverr
   // Restore persisted analysis from task (survives task switching).
   // Track whether we loaded from persistence so the UI can show a subtle indicator.
   const [analysis, setAnalysis] = useState<ScriptAnalysis | null>(task.scriptAnalysis ?? null);
+  // Shadow ref so the imperative generateDraft() can read current analysis synchronously,
+  // including any manual entity correction the user applied between steps.
+  const analysisRef = useRef<ScriptAnalysis | null>(task.scriptAnalysis ?? null);
+  function updateAnalysis(a: ScriptAnalysis | null) {
+    analysisRef.current = a;
+    setAnalysis(a);
+  }
   // True when analysis came from persistence and hasn't been refreshed yet this session.
   // useRef so toggling it to false in handleAnalyze fires before the re-render.
   const analysisIsRestored = useRef<boolean>(!!(task.scriptAnalysis));
@@ -379,22 +386,30 @@ function ScriptAssistantPanel({ task, customer, onDraftChange, scriptFolderOverr
   // ---------------------------------------------------------------------------
 
   useImperativeHandle(ref, () => ({
-    /** Chain all 4 steps using local variables so we don’t rely on async state between steps. */
+    /** Chain all 4 steps using local variables so we don't rely on async state between steps.
+     * Reuses any existing corrected analysis (e.g. manual entity edit) instead of
+     * re-inferring from the task text, so manual corrections are never overwritten.
+     */
     async generateDraft() {
       if (!scriptFolder) throw new Error('No script folder configured for this customer.');
       clearError();
 
-      // Step 1: Analyze (synchronous)
+      // Step 1: Analyze — reuse corrected analysis if already present; otherwise infer fresh.
       setLoading('analyze');
       let localAnalysis: ScriptAnalysis;
       try {
-        localAnalysis = analyzeScriptTask(task, customer);
+        if (analysisRef.current) {
+          // Use existing analysis (may contain manual entity correction).
+          localAnalysis = analysisRef.current;
+        } else {
+          localAnalysis = analyzeScriptTask(task, customer);
+          updateTask(task.id, { scriptAnalysis: localAnalysis }).catch(() => {});
+        }
         analysisIsRestored.current = false;
-        setAnalysis(localAnalysis);
+        updateAnalysis(localAnalysis);
         setPlan(null); setSkeleton(null);
         updatePreview(null);
         setApplyResult(null);
-        updateTask(task.id, { scriptAnalysis: localAnalysis }).catch(() => {});
       } catch (e) {
         setLoading(null);
         setError(String(e));
@@ -487,7 +502,7 @@ function ScriptAssistantPanel({ task, customer, onDraftChange, scriptFolderOverr
     try {
       const result = analyzeScriptTask(task, customer);
       analysisIsRestored.current = false; // fresh analysis — clear the restored hint
-      setAnalysis(result);
+      updateAnalysis(result);
       setPlan(null);
       setSkeleton(null);
       updatePreview(null);
@@ -508,7 +523,7 @@ function ScriptAssistantPanel({ task, customer, onDraftChange, scriptFolderOverr
   function handleEntityChange(newEntity: string) {
     if (!analysis) return;
     const corrected: ScriptAnalysis = { ...analysis, entityLogicalName: newEntity };
-    setAnalysis(corrected);
+    updateAnalysis(corrected);
     setPlan(null);
     setSkeleton(null);
     updatePreview(null);
