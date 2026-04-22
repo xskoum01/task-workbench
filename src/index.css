@@ -314,7 +314,9 @@ body {
   background: var(--bg-surface);
   display: flex;
   flex-direction: column;
-  overflow: hidden;
+  /* overflow: hidden intentionally omitted — panel fills the viewport (inset:0)
+     so clipping by the viewport is sufficient, and omitting it allows native
+     <select> dropdowns to render without being clipped. */
 }
 
 .detail-panel-header {
@@ -325,6 +327,10 @@ body {
   gap: var(--gap-sm);
   flex-shrink: 0;
   background: var(--bg-overlay);
+  /* Allow native <select> dropdown to render beyond the header bounds */
+  overflow: visible;
+  position: relative;
+  z-index: 1;
 }
 
 .detail-panel-header-content {
