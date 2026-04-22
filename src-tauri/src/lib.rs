@@ -1718,11 +1718,10 @@ async fn get_outlook_message_full(
     let body_html_resolved = resolve_cid_attachments(&body_html, &message_id, &token).await;
     let still_has_cid = body_html_resolved.contains("cid:");
     eprintln!(
-        "[import-html] Rust: msgId={} had_cid={} still_has_cid={} length={}",
+        "[email-html] cid resolve: msgId={} hadCid={} stillHasCid={}",
         &message_id[..message_id.len().min(12)],
         had_cid,
-        still_has_cid,
-        body_html_resolved.len()
+        still_has_cid
     );
 
     let is_flagged = m["flag"]["flagStatus"].as_str() == Some("flagged");

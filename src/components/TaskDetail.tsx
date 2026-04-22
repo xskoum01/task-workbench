@@ -1,6 +1,6 @@
 import { useState, useEffect } from 'react';
-import DOMPurify from 'dompurify';
 import type { Task, TaskStatus, PlanningBucket, SkeletonPreview } from '../types';
+import EmailHtmlFrame from './EmailHtmlFrame';
 import { useApp } from '../context/AppContext';
 import { TypeBadge, SourceBadge, STATUS_LABELS } from './StatusBadge';
 import ReplyModal from './ReplyModal';
@@ -9,6 +9,7 @@ import ScriptAssistantPanel from './ScriptAssistantPanel';
 import TaskForm from './TaskForm';
 import Icon from './Icon';
 import * as tauriApi from '../lib/tauriCommands';
+import { resolveTaskDevTarget, resolveBestPluginPath } from '../lib/resolveTaskDevTarget';
 import { BUCKET_META, BUCKET_ORDER, computePlanning, effectiveBucket } from '../lib/planning';
 import { isOverdue, formatRelativeDate } from '../lib/dates';
 
@@ -336,12 +337,12 @@ function EmailCard({ task }: { task: Task }) {
   const newestBody = getDisplayMessageBody(segments[0], task.senderName, task.senderEmail);
   const quotedSegments = segments.slice(1);
   const hasMeta = task.senderName || task.senderEmail || task.receivedAt;
+  const useIframe = !!task.emailBodyHtml;
 
   console.log(
-    `[import-html] EmailCard: taskId=${task.id.slice(0, 12)}`,
-    `emailBodyHtml present=${!!task.emailBodyHtml}`,
-    `length=${task.emailBodyHtml?.length ?? 0}`,
-    `branch=${task.emailBodyHtml ? 'html' : 'plain-text'}`,
+    `[email-html] TaskDetail: taskId=${task.id.slice(0, 12)}`,
+    `usingIframe=${useIframe}`,
+    `htmlPresent=${useIframe}`,
   );
 
   return (
@@ -369,29 +370,17 @@ function EmailCard({ task }: { task: Task }) {
         </div>
       )}
 
-      {/* Render sanitized HTML when available (Outlook import with CID images resolved),
-          otherwise fall back to the plain-text thread parser. */}
-      {task.emailBodyHtml ? (
-        <div
-          className="email-card-body email-card-body--html"
-          dangerouslySetInnerHTML={{
-            __html: DOMPurify.sanitize(task.emailBodyHtml, {
-              // FORCE_BODY wraps output in a <body> context so DOMPurify evaluates
-              // URI attributes with the same rules as a real document (needed for
-              // data: URIs to pass through ALLOWED_URI_REGEXP).
-              FORCE_BODY: true,
-              ADD_TAGS: ['img'],
-              ADD_ATTR: ['src', 'alt', 'width', 'height', 'style'],
-              // Allow https:// external images and data:image/* for CID-resolved attachments.
-              ALLOWED_URI_REGEXP: /^(https?:|data:image\/[a-z+]+;base64,)/i,
-            }),
-          }}
-        />
+      {/* Iframe renderer for exact Outlook HTML rendering — isolated from app CSS.
+          Falls back to plain-text thread parser when no HTML body is available. */}
+      {useIframe ? (
+        <EmailHtmlFrame html={task.emailBodyHtml!} />
       ) : (
         newestBody && <div className="email-card-body">{newestBody}</div>
       )}
 
-      {quotedSegments.length > 0 && (
+      {/* Quoted reply segments are only shown in plain-text fallback mode.
+          The full HTML body already contains the complete thread. */}
+      {!useIframe && quotedSegments.length > 0 && (
         <div className="email-thread-older">
           {quotedSegments.map((seg, i) => (
             <div key={i}>
@@ -652,7 +641,10 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
   const crmFolderPath = (settings?.crmBaseDirectory && customer?.folderName)
     ? `${settings.crmBaseDirectory}/${customer.folderName}`
     : undefined;
-  const effectiveVscodePath = customer?.pluginFolder ?? customer?.repositoryRoot ?? crmFolderPath;
+
+  // Smart resolver — picks plugin / script / repo based on task heuristics.
+  const devTarget = resolveTaskDevTarget(task, customer, crmFolderPath);
+  const effectiveVscodePath = devTarget.path;
 
   // Inline feedback message (e.g. "Analysis recorded")
   const [feedback, setFeedback] = useState<string | null>(null);
@@ -736,7 +728,12 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
   async function handleDoIt() {
     // Set in-progress and open the best available dev path in VS Code
     await updateTask(task.id, { status: 'in-progress' });
-    const devPath = customer?.pluginFolder ?? customer?.repositoryRoot;
+    let devPath: string | undefined;
+    if (devTarget.kind === 'plugin') {
+      devPath = await resolveBestPluginPath(task, customer);
+    } else {
+      devPath = devTarget.path;
+    }
     if (devPath) {
       try {
         await tauriApi.openInVscode(devPath);
@@ -832,12 +829,17 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
   }
 
   async function handleOpenVscode(path: string | undefined) {
-    if (!path) {
+    // For plugin tasks, try to find the best specific target (.sln / .csproj)
+    let resolvedPath = path;
+    if (devTarget.kind === 'plugin') {
+      resolvedPath = await resolveBestPluginPath(task, customer);
+    }
+    if (!resolvedPath) {
       setFsError('No repository root configured for this customer.');
       return;
     }
     try {
-      await tauriApi.openInVscode(path);
+      await tauriApi.openInVscode(resolvedPath);
     } catch (e) {
       setFsError(String(e));
     }
@@ -1381,7 +1383,7 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
                   className="btn btn-secondary btn-sm btn-full"
                   onClick={() => handleOpenVscode(effectiveVscodePath)}
                 >
-                  <Icon name="terminal" size={13} /> Open in VS Code
+                  <Icon name="terminal" size={13} /> {devTarget.label}
                 </button>
               )}
 
