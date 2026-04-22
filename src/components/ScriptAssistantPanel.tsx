@@ -50,8 +50,51 @@ interface ScriptAssistantPanelProps {
 // Sub-components
 // ---------------------------------------------------------------------------
 
-function AnalysisDisplay({ analysis }: { analysis: ScriptAnalysis }) {
+interface AnalysisDisplayProps {
+  analysis: ScriptAnalysis;
+  /** Called with the new entity logical name when the user confirms an edit. */
+  onEntityChange: (newEntity: string) => void;
+}
+
+function AnalysisDisplay({ analysis, onEntityChange }: AnalysisDisplayProps) {
   const isLowConfidence = analysis.confidence < 0.60;
+  const [editing, setEditing] = useState(false);
+  const [draft, setDraft]     = useState('');
+  const [validationError, setValidationError] = useState<string | null>(null);
+
+  function startEditing() {
+    setDraft(analysis.entityLogicalName);
+    setValidationError(null);
+    setEditing(true);
+  }
+
+  function cancelEditing() {
+    setEditing(false);
+    setValidationError(null);
+  }
+
+  function commitEdit() {
+    const trimmed = draft.trim().toLowerCase();
+    if (!trimmed) {
+      setValidationError('Entity name cannot be empty.');
+      return;
+    }
+    if (!/^[a-z][a-z0-9_]*$/.test(trimmed)) {
+      setValidationError('Use only lowercase letters, digits, and underscores.');
+      return;
+    }
+    setEditing(false);
+    setValidationError(null);
+    if (trimmed !== analysis.entityLogicalName) {
+      onEntityChange(trimmed);
+    }
+  }
+
+  function handleKeyDown(e: { key: string }) {
+    if (e.key === 'Enter') commitEdit();
+    if (e.key === 'Escape') cancelEditing();
+  }
+
   return (
     <div className="sa-result">
       {isLowConfidence && (
@@ -59,10 +102,40 @@ function AnalysisDisplay({ analysis }: { analysis: ScriptAnalysis }) {
           Low confidence ({Math.round(analysis.confidence * 100)}%) — entity or trigger may be incorrect. Review before proceeding.
         </div>
       )}
-      <div className="sa-result-row">
+
+      {/* Entity row — editable */}
+      <div className="sa-result-row sa-result-row--editable">
         <span className="sa-result-label">Entity</span>
-        <span className="sa-result-value sa-mono">{analysis.entityLogicalName}</span>
+        {editing ? (
+          <span className="sa-edit-inline">
+            <input
+              className="sa-edit-input"
+              value={draft}
+              onChange={e => { setDraft(e.target.value); setValidationError(null); }}
+              onKeyDown={handleKeyDown}
+              autoFocus
+              spellCheck={false}
+            />
+            <button className="btn btn-ghost btn-sm" onClick={commitEdit} title="Apply">✓</button>
+            <button className="btn btn-ghost btn-sm" onClick={cancelEditing} title="Cancel">✕</button>
+          </span>
+        ) : (
+          <span className="sa-edit-display">
+            <span className="sa-result-value sa-mono">{analysis.entityLogicalName}</span>
+            <button
+              className="btn btn-ghost btn-sm sa-edit-btn"
+              onClick={startEditing}
+              title="Edit entity logical name"
+            >
+              <Icon name="pencil" size={11} />
+            </button>
+          </span>
+        )}
       </div>
+      {validationError && (
+        <div className="sa-edit-error">{validationError}</div>
+      )}
+
       <div className="sa-result-row">
         <span className="sa-result-label">Trigger</span>
         <span className="sa-result-value">
@@ -428,6 +501,23 @@ function ScriptAssistantPanel({ task, customer, onDraftChange, scriptFolderOverr
     }
   }
 
+  // --- Manual entity correction ---
+  // Replaces the inferred entity with the user-supplied value and clears
+  // all downstream state so Plan / Skeleton / Preview / Apply use the new entity.
+
+  function handleEntityChange(newEntity: string) {
+    if (!analysis) return;
+    const corrected: ScriptAnalysis = { ...analysis, entityLogicalName: newEntity };
+    setAnalysis(corrected);
+    setPlan(null);
+    setSkeleton(null);
+    updatePreview(null);
+    setApplyResult(null);
+    analysisIsRestored.current = false;
+    // Persist corrected entity to task so it survives navigation
+    updateTask(task.id, { scriptAnalysis: corrected }).catch(() => {});
+  }
+
   // --- Step 2: Plan ---
 
   async function handlePlan() {
@@ -625,7 +715,7 @@ function ScriptAssistantPanel({ task, customer, onDraftChange, scriptFolderOverr
           {analysisIsRestored.current && !plan && (
             <div className="sa-restored-hint">Analysis restored — re-run Analyze to refresh, or continue with Plan.</div>
           )}
-          <AnalysisDisplay analysis={analysis} />
+          <AnalysisDisplay analysis={analysis} onEntityChange={handleEntityChange} />
         </>
       )}
 

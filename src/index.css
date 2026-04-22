@@ -4384,6 +4384,64 @@ body {
   min-height: 18px;
 }
 
+/* Editable rows need center alignment so the edit button sits inline with the value */
+.sa-result-row--editable {
+  align-items: center;
+}
+
+/* Wrapper shown when NOT editing — value + pencil button side by side */
+.sa-edit-display {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  min-width: 0;
+}
+
+.sa-edit-btn {
+  opacity: 0;
+  padding: 1px 4px !important;
+  color: var(--text-muted) !important;
+  transition: opacity 0.1s;
+}
+
+.sa-result-row--editable:hover .sa-edit-btn {
+  opacity: 1;
+}
+
+/* Wrapper shown when editing — input + confirm + cancel */
+.sa-edit-inline {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  flex: 1;
+  min-width: 0;
+}
+
+.sa-edit-input {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  padding: 2px 5px;
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  background: var(--input-bg, var(--bg-secondary));
+  color: var(--text-primary);
+  flex: 1;
+  min-width: 0;
+  outline: none;
+}
+
+.sa-edit-input:focus {
+  border-color: var(--accent);
+}
+
+.sa-edit-error {
+  font-size: 10px;
+  color: var(--error, #d9534f);
+  margin-left: 82px;  /* align under the value, past the label */
+  margin-top: -2px;
+  margin-bottom: 2px;
+}
+
 .sa-result-label {
   font-size: 10px;
   font-weight: 600;
