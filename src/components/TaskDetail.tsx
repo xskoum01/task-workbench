@@ -144,9 +144,9 @@ function AnalysisBlock({ result }: { result: NonNullable<Task['analysisResult']>
             problems={result.problemPointsCz}
             actions={result.actionPointsCz}
             nextStep={result.nextStepCz}
-            labelProblem="ProblĂ©m"
-            labelAction="Co udÄ›lat"
-            labelNext="DalĹˇĂ­ krok"
+            labelProblem="Problém"
+            labelAction="Co udělat"
+            labelNext="Další krok"
           />
         )}
         {hasCz && hasEn && <div className="detail-analysis-divider" />}
@@ -166,7 +166,7 @@ function AnalysisBlock({ result }: { result: NonNullable<Task['analysisResult']>
     );
   }
 
-  // Legacy mode â€” old task with English-only analysis
+  // Legacy mode — old task with English-only analysis
   return (
     <div className="detail-analysis-block">
       <div className="analysis-legacy-block">
@@ -290,7 +290,7 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
     ? `${settings.crmBaseDirectory}/${customer.folderName}`
     : undefined;
 
-  // Smart resolver â€” picks plugin / script / repo based on task heuristics.
+  // Smart resolver — picks plugin / script / repo based on task heuristics.
   const devTarget = resolveTaskDevTarget(task, customer, crmFolderPath);
   const effectiveVscodePath = devTarget.path;
 
@@ -317,7 +317,7 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
   const [showEditForm, setShowEditForm] = useState(false);
   // Delete confirmation step
   const [confirmDelete, setConfirmDelete] = useState(false);
-  // Notes â€” local state, saved on blur
+  // Notes — local state, saved on blur
   const [notes, setNotes] = useState(task.notes ?? '');
   // Keep notes in sync when task changes (e.g. different task selected)
   useEffect(() => { setNotes(task.notes ?? ''); }, [task.id, task.notes]);
@@ -361,7 +361,7 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
         analysisResult: result,
         confidence:     result.confidence,
       });
-      setFeedback('AI analysis complete â€” status set to Analyzed');
+      setFeedback('AI analysis complete — status set to Analyzed');
     } catch (e) {
       setAiError(String(e));
     } finally {
@@ -418,7 +418,7 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
       await updateTask(task.id, { generatedReply: draft });
       setGeneratedReply(draft);
     } catch (e) {
-      // Fall back to local template â€” open modal anyway
+      // Fall back to local template — open modal anyway
       setGeneratedReply(null);
       setAiError(String(e));
     } finally {
@@ -444,7 +444,7 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
   async function handleToggleLock() {
     const next = !task.isPlanningLocked;
     await updateTask(task.id, { isPlanningLocked: next });
-    setFeedback(next ? 'Planning locked to manual choice' : 'Planning unlocked â€” auto-suggest active');
+    setFeedback(next ? 'Planning locked to manual choice' : 'Planning unlocked — auto-suggest active');
   }
 
   // --- URL actions ---
@@ -498,7 +498,7 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
             <div className="detail-panel-title">{task.title}</div>
 
             <div style={{ marginTop: 6, display: 'flex', gap: 6, alignItems: 'center', flexWrap: 'wrap' }}>
-              {/* Inline status selector â€” styled to match the badge palette */}
+              {/* Inline status selector — styled to match the badge palette */}
               <select
                 className={`detail-status-select detail-status-${task.status}`}
                 value={task.status}
@@ -596,7 +596,7 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
                         await updateTask(task.id, { customerId });
                       }}
                     >
-                      <option value="" disabled>Assign customerâ€¦</option>
+                      <option value="" disabled>Assign customer…</option>
                       {customers.map((c) => (
                         <option key={c.id} value={c.id}>{c.name}</option>
                       ))}
@@ -694,13 +694,13 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
             <textarea
               className="detail-notes-textarea"
               value={notes}
-              placeholder="Write notes, context, or remindersâ€¦"
+              placeholder="Write notes, context, or reminders…"
               onChange={(e) => setNotes(e.target.value)}
               onBlur={handleNotesSave}
             />
           </div>
 
-          {/* Azure DevOps context â€” shown for ADO-sourced tasks with parsed metadata */}
+          {/* Azure DevOps context — shown for ADO-sourced tasks with parsed metadata */}
           {task.adoContext && task.adoContext.type !== 'other' && (
             <div className="detail-section detail-ado-section">
               <span className="detail-section-label">
@@ -801,17 +801,17 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
           {/* AI Analysis result */}
           {task.analysisResult && (
             <div className="detail-section">
-              <span className="detail-section-label detail-ai-label">AI analĂ˝za / analysis</span>
+              <span className="detail-section-label detail-ai-label">AI analýza / analysis</span>
               <AnalysisBlock result={task.analysisResult} />
             </div>
           )}
 
-          {/* Legacy suggested steps â€” hidden when bilingual action bullets cover them */}
+          {/* Legacy suggested steps — hidden when bilingual action bullets cover them */}
           {!(task.analysisResult?.actionPointsCz?.length) && !(task.analysisResult?.actionPointsEn?.length) &&
            (task.analysisResult?.suggestedActions ?? task.suggestedActions).length > 0 && (
             <div className="detail-section">
               <span className="detail-section-label">
-                {task.analysisResult ? 'NavrhovanĂ© kroky' : 'Suggested Steps'}
+                {task.analysisResult ? 'Navrhované kroky' : 'Suggested Steps'}
               </span>
               <div className="detail-suggestions">
                 {(task.analysisResult?.suggestedActions ?? task.suggestedActions).map((sa, i) => (
@@ -824,7 +824,7 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
             </div>
           )}
 
-          {/* Tracking section â€” only rendered when at least one field is set */}
+          {/* Tracking section — only rendered when at least one field is set */}
           {(task.ticketUrl || task.devopsTaskUrl || task.budgetHours !== undefined || task.budgetNote) && (
             <div className="detail-section">
               <span className="detail-section-label">Tracking</span>
@@ -906,7 +906,7 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
                 title="Analyse task with AI and set status to Analyzed"
               >
                 {aiLoading === 'analyze'
-                  ? <><span className="btn-spinner" /> Analysingâ€¦</>
+                  ? <><span className="btn-spinner" /> Analysing…</>
                   : <><Icon name="search" size={13} /> Analyze</>}
               </button>
               <button
@@ -924,7 +924,7 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
                 title="Generate C# plugin skeleton with AI"
               >
                 {aiLoading === 'skeleton'
-                  ? <><span className="btn-spinner" /> Generatingâ€¦</>
+                  ? <><span className="btn-spinner" /> Generating…</>
                   : <><Icon name="layers" size={13} /> Skeleton</>}
               </button>
               <button
@@ -938,12 +938,12 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
             </div>
           </div>
 
-          {/* SCRIPT ASSISTANT â€” shown when customer has a script folder or repo root */}
+          {/* SCRIPT ASSISTANT — shown when customer has a script folder or repo root */}
           {customer && (customer.scriptFolder || customer.resolvedRepositoryPath || customer.repositoryRoot) && (
             <ScriptAssistantPanel task={task} customer={customer} />
           )}
 
-          {/* AZURE DEVOPS â€” shown for ADO PR comment/review tasks with an extracted deep link */}
+          {/* AZURE DEVOPS — shown for ADO PR comment/review tasks with an extracted deep link */}
           {(() => {
             const adoUrl =
               task.adoContext?.type === 'pr-comment'
@@ -973,7 +973,7 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
             );
           })()}
 
-          {/* FILESYSTEM â€” only rendered when the customer has at least one path */}
+          {/* FILESYSTEM — only rendered when the customer has at least one path */}
           {hasAnyPath && (
             <div className="detail-action-group">
               <div className="detail-action-group-label">Filesystem</div>
@@ -1039,12 +1039,12 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
               disabled={!!aiLoading}
             >
               {aiLoading === 'reply'
-                ? <><span className="btn-spinner" /> Draftingâ€¦</>
+                ? <><span className="btn-spinner" /> Drafting…</>
                 : <><Icon name="mail" size={13} /> Generate Reply</>}
             </button>
           </div>
 
-          {/* PLANNING â€” quick bucket assignment */}
+          {/* PLANNING — quick bucket assignment */}
           {task.status !== 'done' && (
             <div className="detail-action-group">
               <div className="detail-action-group-label">

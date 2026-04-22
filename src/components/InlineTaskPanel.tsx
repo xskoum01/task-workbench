@@ -130,20 +130,14 @@ export default function InlineTaskPanel({ task, onOpenDetail }: Props) {
             <div className="tip-sec-label">Analysis</div>
             {hasAnalysis ? (
               <div className="tip-analysis-body">
-                {czSummary && <p className="tip-content-text">{czSummary}</p>}
-                {czNext && (
+                {czSummary
+                  ? <p className="tip-content-text">{czSummary}</p>
+                  : enSummary && <p className="tip-content-text">{enSummary}</p>
+                }
+                {(czNext || enNext) && (
                   <div className="tip-nextstep">
                     <span className="tip-nextstep-label">Další krok</span>
-                    <span className="tip-nextstep-text">{czNext}</span>
-                  </div>
-                )}
-                {enSummary && enSummary !== czSummary && (
-                  <p className="tip-content-text tip-content-text--secondary">{enSummary}</p>
-                )}
-                {enNext && enNext !== czNext && (
-                  <div className="tip-nextstep">
-                    <span className="tip-nextstep-label tip-nextstep-label--en">Next step</span>
-                    <span className="tip-nextstep-text">{enNext}</span>
+                    <span className="tip-nextstep-text">{czNext ?? enNext}</span>
                   </div>
                 )}
                 <div>
