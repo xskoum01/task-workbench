@@ -110,8 +110,8 @@ export default function InlineTaskPanel({ task, onOpenDetail }: Props) {
   const repoRootForGit   = customer?.resolvedRepositoryPath ?? customer?.repositoryRoot;
   const hasRepo          = !!repoRoot;
   const hasVscodePath    = !!effectiveVscodePath;
-  // Show Open Repository when customer has a repo root and the task is script-related
-  const isScriptTask = !!(task.scriptAnalysis || customer?.scriptFolder);
+  // Use the same resolver as TaskDetail so Open Work / Open Repository branching is consistent.
+  const isScriptTask = devTarget.kind === 'script';
   const showOpenRepo = !!(repoRoot && isScriptTask);
   // Is this an email-sourced task that should use rich email rendering?
   const isEmailTask = !!(task.emailBodyHtml || task.senderName || task.senderEmail);

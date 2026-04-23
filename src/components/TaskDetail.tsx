@@ -1069,10 +1069,16 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
               <button
                 className="btn btn-secondary btn-sm"
                 onClick={handleGenerateDraft}
-                disabled={!!aiLoading}
+                disabled={
+                  !!aiLoading ||
+                  // Script draft requires the Script Assistant panel to be mounted.
+                  (devTarget.kind !== 'plugin' && !effectiveScriptFolder)
+                }
                 title={devTarget.kind === 'plugin'
                   ? 'Generate C# plugin class draft (preview before writing)'
-                  : 'Use Script Assistant below to generate a draft'}
+                  : !effectiveScriptFolder
+                    ? 'No script folder configured for this customer'
+                    : 'Use Script Assistant below to generate a draft'}
               >
                 {aiLoading === 'draft'
                   ? <><span className="btn-spinner" /> Generating…</>
@@ -1083,11 +1089,17 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
                 <button
                   className="btn btn-secondary btn-sm"
                   onClick={handleApplyDraft}
-                  disabled={!!aiLoading}
+                  disabled={
+                    !!aiLoading ||
+                    // Plugin draft requires a project selection before it can be written.
+                    (devTarget.kind === 'plugin' && !!skeletonPreview && !selectedPluginProject)
+                  }
                   title={
-                    devTarget.kind === 'plugin' && skeletonPreview
-                      ? `Write draft to disk: ${skeletonPreview.fileName}`
-                      : 'Apply script draft to repository'
+                    devTarget.kind === 'plugin' && skeletonPreview && !selectedPluginProject
+                      ? 'Select a plugin project in the Dev panel first'
+                      : devTarget.kind === 'plugin' && skeletonPreview
+                        ? `Write draft to disk: ${skeletonPreview.fileName}`
+                        : 'Apply script draft to repository'
                   }
                 >
                   <Icon name="check" size={13} /> Apply Draft
@@ -1158,8 +1170,8 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
             )}
           </div>
 
-          {/* SCRIPT ASSISTANT — shown when any script-capable path exists (customer fields or fallback repo path) */}
-          {customer && effectiveScriptFolder && (
+          {/* SCRIPT ASSISTANT — shown only for script tasks with a resolvable script folder. */}
+          {customer && effectiveScriptFolder && devTarget.kind !== 'plugin' && (
             <ScriptAssistantPanel
               ref={scriptPanelRef}
               task={task}

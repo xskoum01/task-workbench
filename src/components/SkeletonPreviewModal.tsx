@@ -24,28 +24,31 @@ interface SkeletonPreviewModalProps {
 
 /** Builds the absolute save path for the .cs file.
  *
- * When a plugin project is selected, resolvedPluginBase is the solution root
- * (<pluginsDir>/<projectName>). The .cs file lives in the nested C# project
- * folder which always has the same name as the project:
+ * Requires `resolvedPluginBase` (<pluginsDir>/<projectName>) to be provided.
+ * The .cs file lives in the nested C# project folder which has the same name
+ * as the solution root:
  *   <resolvedPluginBase>/<projectName>/<fileName>
  *
- * Without a selected project, falls back to customer.pluginFolder + targetPath.
+ * Returns null when no project is selected, so the Save to File button is
+ * disabled and the user is directed to pick a project in the Dev panel.
+ * This matches the path built by TaskDetail.handleApplyDraft.
  */
 function buildSavePath(
   preview: SkeletonPreview,
-  customer: Customer | undefined,
   resolvedPluginBase?: string,
 ): string | null {
   if (resolvedPluginBase) {
     // Extract project name from last path segment of the solution root.
+    // Convention (matches TaskDetail.handleApplyDraft):
+    //   <pluginsDir>/<project>/<project>/<fileName>
     const projectName = resolvedPluginBase.replace(/\\/g, '/').split('/').filter(Boolean).pop() ?? '';
     return `${resolvedPluginBase}/${projectName}/${preview.fileName}`;
   }
-  const base = customer?.pluginFolder;
-  if (!base) return null;
-  const rel = preview.targetPath?.trim();
-  const parts = rel ? [base, rel, preview.fileName] : [base, preview.fileName];
-  return parts.join('/');
+  // No project selected — return null so "Save to File" is disabled.
+  // The AI-supplied targetPath is not reliable for plugin folder layout and
+  // would produce a path inconsistent with handleApplyDraft in TaskDetail.
+  // Users must either select a project in the Dev panel or use "Apply Draft (Create Project)".
+  return null;
 }
 
 export default function SkeletonPreviewModal({ preview, customer, onClose, onCreateAndApply, resolvedPluginBase }: SkeletonPreviewModalProps) {
@@ -56,7 +59,7 @@ export default function SkeletonPreviewModal({ preview, customer, onClose, onCre
   const [creating, setCreating]     = useState(false);
   const [createError, setCreateError] = useState<string | null>(null);
 
-  const savePath = buildSavePath(preview, customer, resolvedPluginBase);
+  const savePath = buildSavePath(preview, resolvedPluginBase);
 
   async function handleCopy() {
     try {
@@ -122,7 +125,7 @@ export default function SkeletonPreviewModal({ preview, customer, onClose, onCre
           {creating ? 'Creating…' : 'Apply Draft (Create Project)'}
         </button>
       ) : (
-        <button className="btn btn-secondary btn-sm" disabled title="No plugin folder configured">
+        <button className="btn btn-secondary btn-sm" disabled title="Select a plugin project in the Dev panel first">
           Save to File
         </button>
       )}
@@ -138,7 +141,7 @@ export default function SkeletonPreviewModal({ preview, customer, onClose, onCre
         <span className="skeleton-path-value">
           {savePath ?? (
             <span style={{ color: 'var(--color-blocked)', fontStyle: 'italic' }}>
-              No plugin folder configured for this customer
+              Select a plugin project in the Dev panel to see the target path
             </span>
           )}
         </span>
