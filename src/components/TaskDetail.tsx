@@ -1372,6 +1372,20 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
                   const targetFile = `${solutionRoot}/${projectName}/${skeletonPreview.fileName}`;
                   await tauriApi.saveGeneratedFile(targetFile, skeletonPreview.content);
 
+                  // Open the project in Visual Studio: prefer .sln, fall back to .csproj, then folder.
+                  const slns = await tauriApi.listDirectoryFiles(solutionRoot, 'sln').catch(() => [] as string[]);
+                  if (slns.length > 0) {
+                    await tauriApi.openWithShell(`${solutionRoot}/${slns[0]}`).catch(() => {});
+                  } else {
+                    const projDir = `${solutionRoot}/${projectName}`;
+                    const csprojs = await tauriApi.listDirectoryFiles(projDir, 'csproj').catch(() => [] as string[]);
+                    if (csprojs.length > 0) {
+                      await tauriApi.openInVscode(`${projDir}/${csprojs[0]}`).catch(() => {});
+                    } else {
+                      await tauriApi.openInVscode(solutionRoot).catch(() => {});
+                    }
+                  }
+
                   // Persist the selection so future actions in this task use the new project.
                   await updateTask(task.id, { selectedPluginProject: projectName });
 
