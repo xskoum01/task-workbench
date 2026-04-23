@@ -544,16 +544,33 @@ async fn generate_skeleton_preview(app: tauri::AppHandle, task: Value, customer:
     let instructions = "Generate C# plugin skeletons for Dynamics 365 / Dataverse. \
 Respond with ONLY valid JSON — no markdown, no code fences.";
 
+    let base_stub = "\
+public void Execute(IServiceProvider serviceProvider)\n\
+{\n\
+    ITracingService tracer = (ITracingService)serviceProvider.GetService(typeof(ITracingService));\n\
+    IPluginExecutionContext context = (IPluginExecutionContext)serviceProvider.GetService(typeof(IPluginExecutionContext));\n\
+    IOrganizationServiceFactory serviceFactory = (IOrganizationServiceFactory)serviceProvider.GetService(typeof(IOrganizationServiceFactory));\n\
+    IOrganizationService service = serviceFactory.CreateOrganizationService(context.UserId);\n\
+\n\
+    if (context.InputParameters.Contains(\"Target\") && context.InputParameters[\"Target\"] is Entity)\n\
+    {\n\
+        Entity ContextEntity = (Entity)context.InputParameters[\"Target\"];\n\
+        Guid InitiatingUserID = context.InitiatingUserId;\n\
+    }\n\
+}";
+
     let prompt = format!(
         "Generate a C# plugin class skeleton.\n\n\
 Task:\n- Title: {title}\n- Type: {task_type}\n- Message: {message}\n\n\
 Customer namespace: {namespace}\n\n\
+Base Execute stub — you MUST preserve this structure and extend it with task-specific logic:\n\
+```csharp\n{base_stub}\n```\n\n\
 Respond with ONLY this JSON (no markdown, no fences):\n\
 {{\"fileName\":\"PluginClassName.cs\",\"content\":\"// full C# file\",\"targetPath\":\"\"}}\n\n\
 Rules:\n\
 - fileName: PascalCase class name + .cs\n\
 - content: complete C# file with using statements, namespace block, class implementing IPlugin, \
-Execute method stub with TODO comments derived from the task\n\
+Execute method built on the base stub above with task-specific logic replacing the TODO comment\n\
 - targetPath: relative subfolder within plugin folder (empty string for root)"
     );
 
@@ -633,16 +650,104 @@ fn create_plugin_project_from_template(
     namespace: String,
     create_initial_class: bool,
 ) -> Result<String, String> {
-    if template_dir.is_empty() {
-        return Err("Plugin template folder is not configured. Set it in Settings first.".to_string());
-    }
-    let src = std::path::Path::new(&template_dir);
-    if !src.is_dir() {
-        return Err(format!("Template directory not found: {template_dir}"));
-    }
     let dest = std::path::Path::new(&plugins_dir).join(&project_name);
     if dest.exists() {
         return Err(format!("Project folder already exists: {}", dest.display()));
+    }
+
+    if template_dir.is_empty() {
+        // -----------------------------------------------------------------
+        // Built-in default scaffold — no custom template configured.
+        // Generates:
+        //   <plugins_dir>/<project_name>/
+        //     <project_name>.csproj
+        //     <project_name>.sln
+        //     <ClassName>.cs  (when create_initial_class is true)
+        // -----------------------------------------------------------------
+        fs::create_dir_all(&dest).map_err(|e| format!("Failed to create project folder: {e}"))?;
+
+        // Minimal .csproj (targets .NET Framework 4.6.2 — standard for Dataverse plugins)
+        let csproj = format!(
+            r#"<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net462</TargetFramework>
+    <AssemblyName>{project_name}</AssemblyName>
+    <RootNamespace>{namespace}</RootNamespace>
+    <Nullable>disable</Nullable>
+    <GenerateAssemblyInfo>false</GenerateAssemblyInfo>
+  </PropertyGroup>
+  <ItemGroup>
+    <PackageReference Include="Microsoft.CrmSdk.CoreAssemblies" Version="9.0.2.49" />
+  </ItemGroup>
+</Project>
+"#
+        );
+        fs::write(dest.join(format!("{project_name}.csproj")), &csproj)
+            .map_err(|e| format!("Failed to write .csproj: {e}"))?;
+
+        // Minimal .sln so the folder can be opened in Visual Studio directly
+        let sln_guid = "FAE04EC0-301F-11D3-BF4B-00C04F79EFBC"; // C# project type
+        let proj_guid = "00000000-0000-0000-0000-000000000001";
+        let sln = format!(
+            "Microsoft Visual Studio Solution File, Format Version 12.00\n\
+# Visual Studio Version 17\nVisualStudioVersion = 17.0.0.0\n\
+Project(\"{{{sln_guid}}}\") = \"{project_name}\", \"{project_name}.csproj\", \"{{{proj_guid}}}\"\n\
+EndProject\nGlobal\n\
+\tGlobalSection(SolutionConfigurationPlatforms) = preSolution\n\
+\t\tDebug|Any CPU = Debug|Any CPU\n\
+\t\tRelease|Any CPU = Release|Any CPU\n\
+\tEndGlobalSection\n\
+EndGlobal\n"
+        );
+        fs::write(dest.join(format!("{project_name}.sln")), &sln)
+            .map_err(|e| format!("Failed to write .sln: {e}"))?;
+
+        if create_initial_class {
+            let class_name = format!("{}Plugin", &project_name
+                .split('.')
+                .last()
+                .unwrap_or(&project_name));
+            let class_file = dest.join(format!("{class_name}.cs"));
+            if !class_file.exists() {
+                let content = format!(
+                    "using Microsoft.Xrm.Sdk;\n\
+using System;\n\n\
+namespace {namespace}\n{{\n\
+    /// <summary>\n\
+    /// Plugin stub for {project_name}.\n\
+    /// </summary>\n\
+    public class {class_name} : IPlugin\n\
+    {{\n\
+        public void Execute(IServiceProvider serviceProvider)\n\
+        {{\n\
+            ITracingService tracer = (ITracingService)serviceProvider.GetService(typeof(ITracingService));\n\
+            IPluginExecutionContext context = (IPluginExecutionContext)serviceProvider.GetService(typeof(IPluginExecutionContext));\n\
+            IOrganizationServiceFactory serviceFactory = (IOrganizationServiceFactory)serviceProvider.GetService(typeof(IOrganizationServiceFactory));\n\
+            IOrganizationService service = serviceFactory.CreateOrganizationService(context.UserId);\n\n\
+            if (context.InputParameters.Contains(\"Target\") && context.InputParameters[\"Target\"] is Entity)\n\
+            {{\n\
+                Entity ContextEntity = (Entity)context.InputParameters[\"Target\"];\n\
+                Guid InitiatingUserID = context.InitiatingUserId;\n\
+                // TODO: implement plugin logic\n\
+            }}\n\
+        }}\n\
+    }}\n\
+}}\n"
+                );
+                fs::write(&class_file, content)
+                    .map_err(|e| format!("Failed to write initial class: {e}"))?;
+            }
+        }
+
+        return Ok(dest.to_string_lossy().to_string());
+    }
+
+    // -----------------------------------------------------------------
+    // Custom template path
+    // -----------------------------------------------------------------
+    let src = std::path::Path::new(&template_dir);
+    if !src.is_dir() {
+        return Err(format!("Template directory not found: {template_dir}"));
     }
     // Copy template tree with placeholder substitution
     copy_template_tree(src, &dest, &project_name, &namespace)

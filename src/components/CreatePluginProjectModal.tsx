@@ -188,10 +188,7 @@ export default function CreatePluginProjectModal({
   async function handleCreate() {
     const projectName = sanitize(form.projectName.trim());
     if (!projectName) { setError('Project name is required.'); return; }
-    if (!templateDir) {
-      setError('Plugin template folder is not configured. Set it in Settings → Plugin Template.');
-      return;
-    }
+    // No check for templateDir — the backend falls back to the built-in stub when it is empty.
     setCreating(true);
     setError(null);
     try {
@@ -240,8 +237,9 @@ export default function CreatePluginProjectModal({
 
       {/* Template status */}
       {!templateDir && (
-        <div className="detail-fs-error" style={{ marginBottom: 12 }}>
-          No plugin template folder configured. Open Settings and set a Plugin Template folder path.
+        <div style={{ fontSize: 11, color: 'var(--text-muted)', marginBottom: 12 }}>
+          No custom template configured — a built-in default Dataverse plugin stub will be used.
+          Set a Plugin Template folder in Settings to use your own template instead.
         </div>
       )}
       {templateDir && (
