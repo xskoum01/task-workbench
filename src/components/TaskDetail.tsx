@@ -8,7 +8,7 @@ import ReplyModal from './ReplyModal';
 import SkeletonPreviewModal from './SkeletonPreviewModal';
 import ScriptAssistantPanel, { type ScriptAssistantPanelHandle } from './ScriptAssistantPanel';
 import TaskForm from './TaskForm';
-import CreatePluginProjectModal from './CreatePluginProjectModal';
+import CreatePluginProjectModal, { inferPluginSuggestions, sanitize } from './CreatePluginProjectModal';
 import Icon from './Icon';
 import * as tauriApi from '../lib/tauriCommands';
 import { resolveTaskDevTarget, resolveBestPluginPath, getPluginsDir, hintedPluginProject } from '../lib/resolveTaskDevTarget';
@@ -1352,6 +1352,35 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
           preview={skeletonPreview}
           customer={customer}
           onClose={() => { setShowSkeleton(false); }}
+          onCreateAndApply={
+            // Offer "Create Project & Apply" only when no plugin project is selected yet
+            // and we have both a pluginsDir and a customer to derive naming from.
+            (!selectedPluginProject && pluginsDir && customer)
+              ? async () => {
+                  const folders = await tauriApi.listSubfolders(pluginsDir).catch(() => [] as string[]);
+                  const suggested = inferPluginSuggestions(task, customer, folders);
+                  const projectName = sanitize(suggested.projectName);
+                  if (!projectName) throw new Error('Could not infer a project name from this task.');
+
+                  // Create the built-in scaffold (empty templateDir triggers the built-in path).
+                  const solutionRoot = await tauriApi.createPluginProjectFromTemplate(
+                    '', pluginsDir, projectName, suggested.namespace, false,
+                  );
+
+                  // Write the generated .cs into the nested project subfolder:
+                  //   <solutionRoot>/<projectName>/<fileName>
+                  const targetFile = `${solutionRoot}/${projectName}/${skeletonPreview.fileName}`;
+                  await tauriApi.saveGeneratedFile(targetFile, skeletonPreview.content);
+
+                  // Persist the selection so future actions in this task use the new project.
+                  await updateTask(task.id, { selectedPluginProject: projectName });
+
+                  setShowSkeleton(false);
+                  setSkeletonPreview(null);
+                  setFeedback(`Plugin project created and draft applied: ${projectName}`);
+                }
+              : undefined
+          }
         />
       )}
 

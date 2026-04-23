@@ -42,6 +42,9 @@ function sanitize(name: string): string {
   return name.replace(/[^a-zA-Z0-9._-]/g, '');
 }
 
+/** Exported so callers like TaskDetail can derive the same default project/namespace. */
+export { sanitize, inferPluginSuggestions };
+
 /** Remove Czech/Slovak diacritics so words can be PascalCased safely. */
 function removeDiacritics(s: string): string {
   return s.normalize('NFD').replace(/[\u0300-\u036f]/g, '');
