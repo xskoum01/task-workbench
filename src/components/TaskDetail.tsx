@@ -325,6 +325,9 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
   const [skeletonPreview, setSkeletonPreview] = useState<SkeletonPreview | null>(null);
   // Create Plugin Project modal
   const [showCreatePlugin, setShowCreatePlugin] = useState(false);
+  // Plugin project folder names loaded when the Create Plugin Project modal opens.
+  // Used to improve naming-convention auto-suggestions inside the modal.
+  const [pluginProjectsForModal, setPluginProjectsForModal] = useState<string[]>([]);
   // AI Review result
   const [aiReview, setAiReview] = useState<AiReviewResult | null>(null);
   // Script Assistant imperative ref + draft-ready flag
@@ -1089,7 +1092,13 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
               {devTarget.kind === 'plugin' && pluginsDir && (
                 <button
                   className="btn btn-secondary btn-sm"
-                  onClick={() => setShowCreatePlugin(true)}
+                  onClick={async () => {
+                    // Load existing plugin projects so the modal can use them for
+                    // naming-convention auto-suggestions.
+                    const folders = await tauriApi.listSubfolders(pluginsDir).catch(() => [] as string[]);
+                    setPluginProjectsForModal(folders);
+                    setShowCreatePlugin(true);
+                  }}
                   disabled={!!aiLoading}
                   title="Create a new plugin project from a local template folder"
                 >
@@ -1323,8 +1332,10 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
       {/* Create Plugin Project modal */}
       {showCreatePlugin && customer && pluginsDir && (
         <CreatePluginProjectModal
+          task={task}
           customer={customer}
           pluginsDir={pluginsDir}
+          existingPluginProjects={pluginProjectsForModal}
           onCreated={(path) => {
             setShowCreatePlugin(false);
             setFeedback(`Plugin project created: ${path}`);
