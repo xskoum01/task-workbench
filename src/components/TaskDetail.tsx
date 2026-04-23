@@ -341,6 +341,13 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
   // Reset script draft flag when switching tasks
   useEffect(() => { setScriptHasDraft(false); }, [task.id]);
 
+  // Selected plugin project is persisted on the task model so it is shared
+  // between InlineTaskPanel and TaskDetail without local-only state.
+  const selectedPluginProject = task.selectedPluginProject ?? '';
+  function handleSelectedPluginChange(plugin: string) {
+    updateTask(task.id, { selectedPluginProject: plugin || undefined }).catch(() => {});
+  }
+
 
   // --- Status change ---
 
@@ -455,6 +462,27 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
     }
   }
 
+  /**
+   * Normalise an AI-supplied targetPath so it is safe to append under
+   * <pluginsDir>/<selectedProject>/.
+   *
+   * - converts backslashes to forward slashes
+   * - trims leading / trailing slashes
+   * - strips a leading "Plugins/" segment (case-insensitive)
+   * - strips a leading <selectedProject>/ segment to avoid duplication
+   */
+  function normalizePluginTargetPath(raw: string, projectName: string): string {
+    let p = raw.replace(/\\/g, '/').replace(/^\/+|\/+$/g, '');
+    // Strip leading "Plugins/" prefix if present
+    if (/^plugins\//i.test(p)) p = p.replace(/^plugins\//i, '');
+    // Strip leading "<projectName>/" prefix if present (case-sensitive match)
+    const projectPrefix = `${projectName}/`;
+    if (p.startsWith(projectPrefix)) p = p.slice(projectPrefix.length);
+    // One more trim in case stripping left stray slashes
+    p = p.replace(/^\/+|\/+$/g, '');
+    return p;
+  }
+
   async function handleApplyDraft() {
     if (devTarget.kind === 'plugin') {
       // Plugin: write the skeleton preview to disk.
@@ -466,9 +494,16 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
         setFsError('No plugin folder configured for this customer.');
         return;
       }
-      const subPath = skeletonPreview.targetPath
-        ? `${pluginsDir}/${skeletonPreview.targetPath}/${skeletonPreview.fileName}`
-        : `${pluginsDir}/${skeletonPreview.fileName}`;
+      if (!selectedPluginProject) {
+        setFsError('Select a plugin project in the Dev panel before applying the draft.');
+        return;
+      }
+      const normalizedSub = skeletonPreview.targetPath
+        ? normalizePluginTargetPath(skeletonPreview.targetPath, selectedPluginProject)
+        : '';
+      const subPath = normalizedSub
+        ? `${pluginsDir}/${selectedPluginProject}/${normalizedSub}/${skeletonPreview.fileName}`
+        : `${pluginsDir}/${selectedPluginProject}/${skeletonPreview.fileName}`;
       try {
         await tauriApi.saveGeneratedFile(subPath, skeletonPreview.content);
         setFeedback(`Draft written: ${skeletonPreview.fileName}`);
@@ -1193,6 +1228,8 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
                   scriptOpenPath={customer?.scriptFolder ?? effectiveVscodePath}
                   onError={setFsError}
                   autoCollapsed={devTarget.kind === 'repo'}
+                  selectedPluginProject={task.selectedPluginProject}
+                  onSelectedPluginChange={handleSelectedPluginChange}
                 />
               )}
 

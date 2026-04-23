@@ -224,6 +224,10 @@ export default function InlineTaskPanel({ task, onOpenDetail }: Props) {
                   scriptOpenPath={customer?.scriptFolder ?? effectiveVscodePath}
                   onError={() => {}}
                   autoCollapsed={devTarget.kind === 'repo'}
+                  selectedPluginProject={task.selectedPluginProject}
+                  onSelectedPluginChange={(plugin) =>
+                    updateTask(task.id, { selectedPluginProject: plugin || undefined }).catch(() => {})
+                  }
                 />
               )}
               {showOpenRepo && (

@@ -34,6 +34,16 @@ export interface TaskDevModePanelProps {
    * panel doesn't clutter non-dev tasks.
    */
   autoCollapsed?: boolean;
+  /**
+   * Called whenever the selected plugin project changes (including when cleared).
+   * Allows parent components to track the selection for Apply Draft targeting.
+   */
+  onSelectedPluginChange?: (plugin: string) => void;
+  /**
+   * Persisted selected plugin project for this task (from task model).
+   * When set, takes priority over the heuristic auto-selection on mount/reset.
+   */
+  selectedPluginProject?: string;
 }
 
 export default function TaskDevModePanel({
@@ -44,6 +54,8 @@ export default function TaskDevModePanel({
   scriptOpenPath,
   onError,
   autoCollapsed = false,
+  onSelectedPluginChange,
+  selectedPluginProject: persistedSelectedPlugin,
 }: TaskDevModePanelProps) {
   // --- collapse toggle ---
   const [expanded, setExpanded] = useState(!autoCollapsed);
@@ -68,6 +80,12 @@ export default function TaskDevModePanel({
   const [pluginProjectsLoaded, setPluginProjectsLoaded]   = useState(false);
   const [pluginProjectsLoading, setPluginProjectsLoading] = useState(false);
   const [selectedPlugin, setSelectedPlugin]               = useState<string>('');
+
+  // Wrap setSelectedPlugin so the parent is always notified.
+  function updateSelectedPlugin(plugin: string) {
+    setSelectedPlugin(plugin);
+    onSelectedPluginChange?.(plugin);
+  }
   const [pluginOpenHint, setPluginOpenHint]               = useState<string | null>(null);
 
   // --- branch (V2) ---
@@ -83,7 +101,7 @@ export default function TaskDevModePanel({
   useEffect(() => {
     setExpanded(!autoCollapsed);
     setDevMode(defaultMode === 'plugin' ? 'plugin' : 'script');
-    setSelectedPlugin('');
+    updateSelectedPlugin('');
     setPluginProjects([]);
     setPluginProjectsLoaded(false);
     setPluginOpenHint(null);
@@ -102,9 +120,14 @@ export default function TaskDevModePanel({
     tauriApi.listSubfolders(pluginsDir)
       .then((folders) => {
         setPluginProjects(folders);
-        const hint = hintedPluginProject(task);
-        if (hint && folders.includes(hint)) setSelectedPlugin(hint);
-        else if (folders.length === 1) setSelectedPlugin(folders[0]);
+        // Selection priority: persisted value → heuristic hint → single folder
+        if (persistedSelectedPlugin && folders.includes(persistedSelectedPlugin)) {
+          updateSelectedPlugin(persistedSelectedPlugin);
+        } else {
+          const hint = hintedPluginProject(task);
+          if (hint && folders.includes(hint)) updateSelectedPlugin(hint);
+          else if (folders.length === 1) updateSelectedPlugin(folders[0]);
+        }
         setPluginProjectsLoaded(true);
       })
       .catch(() => { setPluginProjects([]); setPluginProjectsLoaded(true); })
@@ -167,7 +190,7 @@ export default function TaskDevModePanel({
       setBranch(newBranch);
       setBranchDirty(false);
       setPluginProjectsLoaded(false);
-      setSelectedPlugin('');
+      updateSelectedPlugin('');
       setPluginOpenHint(null);
     } catch (err) {
       setBranchError(String(err));
@@ -304,7 +327,7 @@ export default function TaskDevModePanel({
             <select
               className="form-select"
               value={selectedPlugin}
-              onChange={(e) => setSelectedPlugin(e.target.value)}
+              onChange={(e) => updateSelectedPlugin(e.target.value)}
             >
               <option value="">— select plugin project —</option>
               {pluginProjects.map((p) => (

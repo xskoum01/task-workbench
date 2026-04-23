@@ -85,6 +85,8 @@ export interface Task {
   generatedReply?: string;
   /** Persisted Script Assistant analysis result. */
   scriptAnalysis?: ScriptAnalysis;
+  /** Persisted selected plugin project folder name for dev work (shared between InlineTaskPanel and TaskDetail). */
+  selectedPluginProject?: string;
 
   // --- Tracking / delivery metadata ---
   /** Where the work item originates (helpdesk ticket, ADO task, etc.). */
