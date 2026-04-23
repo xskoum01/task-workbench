@@ -624,6 +624,7 @@ function findBestExistingHandler(
   inspection: ScriptFileInspection,
   triggerType: ScriptTriggerType,
   triggerField?: string,
+  entity?: string,
 ): string | undefined {
   const { handlers } = inspection;
 
@@ -643,7 +644,15 @@ function findBestExistingHandler(
   const re = triggerRe[triggerType];
   if (re) return handlers.find(h => re.test(h));
 
-  return undefined;
+  // helper_only: no trigger-based regex — look for a handler that contains the
+  // entity name (e.g. nvr_solution_handler matches entity nvr_solution).
+  if (entity) {
+    const entityBare = entity.toLowerCase().replace(/^nvr_/, '');
+    const entityMatch = handlers.find(h => h.toLowerCase().includes(entityBare));
+    if (entityMatch) return entityMatch;
+  }
+  // Last resort: any handler in the file.
+  return handlers[0];
 }
 
 // ---------------------------------------------------------------------------
@@ -679,7 +688,10 @@ function determineOperationType(
     return 'helper_plus_hook';
   }
 
-  return 'extend_existing_helper';
+  // helper_only (and any other trigger): only use extend_existing_helper when a
+  // handler was actually resolved — otherwise fall back to helper_plus_hook so
+  // buildScriptPreview never receives extend_existing_helper without a handler.
+  return existingHandlerName ? 'extend_existing_helper' : 'helper_plus_hook';
 }
 
 function buildRecommendedAction(
@@ -754,7 +766,7 @@ export async function buildScriptPlan(
     try {
       const content = await getFileContent(targetFile);
       inspection = inspectScriptFile(content, targetFile, targetFileName);
-      existingHandlerName = findBestExistingHandler(inspection, triggerType, triggerField);
+      existingHandlerName = findBestExistingHandler(inspection, triggerType, triggerField, entityLogicalName);
       // Attach existingHandlerName to inspection for convenience
       inspection = { ...inspection, existingHandlerName };
     } catch {
