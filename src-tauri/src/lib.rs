@@ -554,8 +554,10 @@ public void Execute(IServiceProvider serviceProvider)\n\
 \n\
     if (context.InputParameters.Contains(\"Target\") && context.InputParameters[\"Target\"] is Entity)\n\
     {\n\
-        Entity ContextEntity = (Entity)context.InputParameters[\"Target\"];\n\
-        Guid InitiatingUserID = context.InitiatingUserId;\n\
+        Entity contextEntity = (Entity)context.InputParameters[\"Target\"];\n\
+        Guid initiatingUserId = context.InitiatingUserId;\n\
+\n\
+        // TODO: implement plugin logic\n\
     }\n\
 }";
 
@@ -717,9 +719,10 @@ EndGlobal\n"
                 let content = format!(
                     "using Microsoft.Xrm.Sdk;\n\
 using System;\n\n\
-namespace {namespace}\n{{\n\
+namespace {namespace}\n\
+{{\n\
     /// <summary>\n\
-    /// Plugin stub for {project_name}.\n\
+    /// Plugin stub for {namespace}.\n\
     /// </summary>\n\
     public class {class_name} : IPlugin\n\
     {{\n\
@@ -731,8 +734,8 @@ namespace {namespace}\n{{\n\
             IOrganizationService service = serviceFactory.CreateOrganizationService(context.UserId);\n\n\
             if (context.InputParameters.Contains(\"Target\") && context.InputParameters[\"Target\"] is Entity)\n\
             {{\n\
-                Entity ContextEntity = (Entity)context.InputParameters[\"Target\"];\n\
-                Guid InitiatingUserID = context.InitiatingUserId;\n\
+                Entity contextEntity = (Entity)context.InputParameters[\"Target\"];\n\
+                Guid initiatingUserId = context.InitiatingUserId;\n\n\
                 // TODO: implement plugin logic\n\
             }}\n\
         }}\n\
