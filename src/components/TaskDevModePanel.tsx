@@ -205,6 +205,13 @@ export default function TaskDevModePanel({
     catch (e) { onError(String(e)); }
   }
 
+  function handleRefreshPlugins() {
+    setPluginProjectsLoaded(false);
+    setPluginProjects([]);
+    updateSelectedPlugin('');
+    setPluginOpenHint(null);
+  }
+
   async function handleOpenPlugin() {
     if (!pluginsDir || !selectedPlugin) { onError('Select a plugin project first.'); return; }
     const pluginPath = `${pluginsDir}/${selectedPlugin}`;
@@ -318,22 +325,39 @@ export default function TaskDevModePanel({
           )}
 
           {!pluginProjectsLoading && pluginProjectsLoaded && pluginProjects.length === 0 && (
-            <div className="detail-devmode-hint">
-              No plugin project folders found{pluginsDir ? ` in ${pluginsDir}` : ''}.
+            <div className="detail-devmode-hint" style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+              <span>No plugin project folders found{pluginsDir ? ` in ${pluginsDir}` : ''}.</span>
+              <button
+                className="btn btn-ghost btn-sm"
+                onClick={handleRefreshPlugins}
+                title="Refresh plugin project list"
+              >
+                <Icon name="refresh-cw" size={11} /> Refresh
+              </button>
             </div>
           )}
 
           {!pluginProjectsLoading && pluginProjects.length > 0 && (
-            <select
-              className="form-select"
-              value={selectedPlugin}
-              onChange={(e) => updateSelectedPlugin(e.target.value)}
-            >
-              <option value="">— select plugin project —</option>
-              {pluginProjects.map((p) => (
-                <option key={p} value={p}>{p}</option>
-              ))}
-            </select>
+            <div style={{ display: 'flex', gap: 4, alignItems: 'center' }}>
+              <select
+                className="form-select"
+                style={{ flex: 1 }}
+                value={selectedPlugin}
+                onChange={(e) => updateSelectedPlugin(e.target.value)}
+              >
+                <option value="">— select plugin project —</option>
+                {pluginProjects.map((p) => (
+                  <option key={p} value={p}>{p}</option>
+                ))}
+              </select>
+              <button
+                className="btn btn-ghost btn-sm"
+                onClick={handleRefreshPlugins}
+                title="Refresh plugin project list"
+              >
+                <Icon name="refresh-cw" size={11} />
+              </button>
+            </div>
           )}
 
           {pluginOpenHint && (

@@ -491,27 +491,6 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
     }
   }
 
-  /**
-   * Normalise an AI-supplied targetPath so it is safe to append under
-   * <pluginsDir>/<selectedProject>/.
-   *
-   * - converts backslashes to forward slashes
-   * - trims leading / trailing slashes
-   * - strips a leading "Plugins/" segment (case-insensitive)
-   * - strips a leading <selectedProject>/ segment to avoid duplication
-   */
-  function normalizePluginTargetPath(raw: string, projectName: string): string {
-    let p = raw.replace(/\\/g, '/').replace(/^\/+|\/+$/g, '');
-    // Strip leading "Plugins/" prefix if present
-    if (/^plugins\//i.test(p)) p = p.replace(/^plugins\//i, '');
-    // Strip leading "<projectName>/" prefix if present (case-sensitive match)
-    const projectPrefix = `${projectName}/`;
-    if (p.startsWith(projectPrefix)) p = p.slice(projectPrefix.length);
-    // One more trim in case stripping left stray slashes
-    p = p.replace(/^\/+|\/+$/g, '');
-    return p;
-  }
-
   async function handleApplyDraft() {
     if (devTarget.kind === 'plugin') {
       // Plugin: write the skeleton preview to disk.
@@ -527,12 +506,11 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
         setFsError('Select a plugin project in the Dev panel before applying the draft.');
         return;
       }
-      const normalizedSub = skeletonPreview.targetPath
-        ? normalizePluginTargetPath(skeletonPreview.targetPath, selectedPluginProject)
-        : '';
-      const subPath = normalizedSub
-        ? `${pluginsDir}/${selectedPluginProject}/${normalizedSub}/${skeletonPreview.fileName}`
-        : `${pluginsDir}/${selectedPluginProject}/${skeletonPreview.fileName}`;
+      // The VS solution layout is always:
+      //   <pluginsDir>/<selectedProject>/          ← solution root
+      //   <pluginsDir>/<selectedProject>/<selectedProject>/  ← C# project folder (where .cs lives)
+      // Ignore AI-supplied targetPath for the subfolder — it is unreliable.
+      const subPath = `${pluginsDir}/${selectedPluginProject}/${selectedPluginProject}/${skeletonPreview.fileName}`;
       try {
         await tauriApi.saveGeneratedFile(subPath, skeletonPreview.content);
         setFeedback(`Draft written: ${skeletonPreview.fileName}`);
@@ -1351,6 +1329,11 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
         <SkeletonPreviewModal
           preview={skeletonPreview}
           customer={customer}
+          resolvedPluginBase={
+            (pluginsDir && selectedPluginProject)
+              ? `${pluginsDir}/${selectedPluginProject}`
+              : undefined
+          }
           onClose={() => { setShowSkeleton(false); }}
           onCreateAndApply={
             // Offer "Create Project & Apply" only when no plugin project is selected yet

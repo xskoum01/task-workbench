@@ -14,10 +14,33 @@ interface SkeletonPreviewModalProps {
    * Throwing from the callback surfaces an error message in the modal.
    */
   onCreateAndApply?: () => Promise<void>;
+  /**
+   * Explicit plugin project base path (e.g. pluginsDir/selectedPluginProject).
+   * When set, takes priority over customer.pluginFolder so the save path
+   * always matches the project actually selected in the Dev panel.
+   */
+  resolvedPluginBase?: string;
 }
 
-/** Builds the absolute save path from customer pluginFolder + targetPath + fileName. */
-function buildSavePath(preview: SkeletonPreview, customer: Customer | undefined): string | null {
+/** Builds the absolute save path for the .cs file.
+ *
+ * When a plugin project is selected, resolvedPluginBase is the solution root
+ * (<pluginsDir>/<projectName>). The .cs file lives in the nested C# project
+ * folder which always has the same name as the project:
+ *   <resolvedPluginBase>/<projectName>/<fileName>
+ *
+ * Without a selected project, falls back to customer.pluginFolder + targetPath.
+ */
+function buildSavePath(
+  preview: SkeletonPreview,
+  customer: Customer | undefined,
+  resolvedPluginBase?: string,
+): string | null {
+  if (resolvedPluginBase) {
+    // Extract project name from last path segment of the solution root.
+    const projectName = resolvedPluginBase.replace(/\\/g, '/').split('/').filter(Boolean).pop() ?? '';
+    return `${resolvedPluginBase}/${projectName}/${preview.fileName}`;
+  }
   const base = customer?.pluginFolder;
   if (!base) return null;
   const rel = preview.targetPath?.trim();
@@ -25,7 +48,7 @@ function buildSavePath(preview: SkeletonPreview, customer: Customer | undefined)
   return parts.join('/');
 }
 
-export default function SkeletonPreviewModal({ preview, customer, onClose, onCreateAndApply }: SkeletonPreviewModalProps) {
+export default function SkeletonPreviewModal({ preview, customer, onClose, onCreateAndApply, resolvedPluginBase }: SkeletonPreviewModalProps) {
   const [copied, setCopied]         = useState(false);
   const [saving, setSaving]         = useState(false);
   const [saved, setSaved]           = useState(false);
@@ -33,7 +56,7 @@ export default function SkeletonPreviewModal({ preview, customer, onClose, onCre
   const [creating, setCreating]     = useState(false);
   const [createError, setCreateError] = useState<string | null>(null);
 
-  const savePath = buildSavePath(preview, customer);
+  const savePath = buildSavePath(preview, customer, resolvedPluginBase);
 
   async function handleCopy() {
     try {
