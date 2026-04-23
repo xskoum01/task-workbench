@@ -5,7 +5,8 @@ import * as tauriApi from '../lib/tauriCommands';
 
 interface SkeletonPreviewModalProps {
   preview: SkeletonPreview;
-  customer: Customer | undefined;
+  /** @deprecated No longer used in path calculation; kept only for call-site compatibility. */
+  customer?: Customer;
   onClose: () => void;
   /**
    * When provided and no plugin folder is configured, a "Create Project & Apply" button

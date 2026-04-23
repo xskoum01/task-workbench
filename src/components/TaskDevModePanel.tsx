@@ -44,6 +44,11 @@ export interface TaskDevModePanelProps {
    * When set, takes priority over the heuristic auto-selection on mount/reset.
    */
   selectedPluginProject?: string;
+  /**
+   * When incremented, forces the plugin project list to re-scan.
+   * Increment this in the parent after creating a new plugin project.
+   */
+  pluginRefreshTick?: number;
 }
 
 export default function TaskDevModePanel({
@@ -56,6 +61,7 @@ export default function TaskDevModePanel({
   autoCollapsed = false,
   onSelectedPluginChange,
   selectedPluginProject: persistedSelectedPlugin,
+  pluginRefreshTick = 0,
 }: TaskDevModePanelProps) {
   // --- collapse toggle ---
   const [expanded, setExpanded] = useState(!autoCollapsed);
@@ -87,6 +93,8 @@ export default function TaskDevModePanel({
     onSelectedPluginChange?.(plugin);
   }
   const [pluginOpenHint, setPluginOpenHint]               = useState<string | null>(null);
+  // ADO-hinted project name that was not found in the folder listing on the current branch.
+  const [hintedProjectMissing, setHintedProjectMissing]   = useState<string | null>(null);
 
   // --- branch (V2) ---
   const [currentBranch, setBranch]          = useState<string | null>(null);
@@ -105,6 +113,7 @@ export default function TaskDevModePanel({
     setPluginProjects([]);
     setPluginProjectsLoaded(false);
     setPluginOpenHint(null);
+    setHintedProjectMissing(null);
     setBranch(null);
     setBranches([]);
     setSelectedBranch('');
@@ -112,6 +121,17 @@ export default function TaskDevModePanel({
     setBranchError(null);
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [task.id]);
+
+  // Re-scan plugin projects when the parent signals a refresh (e.g. after creating a new project).
+  useEffect(() => {
+    if (!pluginRefreshTick) return; // skip initial mount (tick = 0)
+    setPluginProjects([]);
+    setPluginProjectsLoaded(false);
+    updateSelectedPlugin('');
+    setPluginOpenHint(null);
+    setHintedProjectMissing(null);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [pluginRefreshTick]);
 
   // Load plugin project subfolders when mode = plugin.
   useEffect(() => {
@@ -123,10 +143,20 @@ export default function TaskDevModePanel({
         // Selection priority: persisted value → heuristic hint → single folder
         if (persistedSelectedPlugin && folders.includes(persistedSelectedPlugin)) {
           updateSelectedPlugin(persistedSelectedPlugin);
+          setHintedProjectMissing(null);
         } else {
           const hint = hintedPluginProject(task);
-          if (hint && folders.includes(hint)) updateSelectedPlugin(hint);
-          else if (folders.length === 1) updateSelectedPlugin(folders[0]);
+          if (hint && folders.includes(hint)) {
+            updateSelectedPlugin(hint);
+            setHintedProjectMissing(null);
+          } else if (hint && !folders.includes(hint)) {
+            // The ADO context points to a project that is not present on the current branch.
+            setHintedProjectMissing(hint);
+            if (folders.length === 1) updateSelectedPlugin(folders[0]);
+          } else {
+            setHintedProjectMissing(null);
+            if (folders.length === 1) updateSelectedPlugin(folders[0]);
+          }
         }
         setPluginProjectsLoaded(true);
       })
@@ -322,6 +352,13 @@ export default function TaskDevModePanel({
           {/* Plugin project listing */}
           {pluginProjectsLoading && (
             <div className="detail-devmode-hint">Loading plugin projects…</div>
+          )}
+
+          {!pluginProjectsLoading && pluginProjectsLoaded && hintedProjectMissing && (
+            <div className="detail-devmode-hint">
+              ADO-hinted project <strong>{hintedProjectMissing}</strong> not found on this branch.
+              Switch branches or use Create Plugin Project in the Workflow section.
+            </div>
           )}
 
           {!pluginProjectsLoading && pluginProjectsLoaded && pluginProjects.length === 0 && (

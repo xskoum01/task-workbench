@@ -359,6 +359,8 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
   // Script Assistant imperative ref + draft-ready flag
   const scriptPanelRef = useRef<ScriptAssistantPanelHandle>(null);
   const [scriptHasDraft, setScriptHasDraft] = useState(false);
+  // Refresh counter for the Dev panel — increment after creating a new plugin project.
+  const [devPanelRefreshTick, setDevPanelRefreshTick] = useState(0);
   // Edit task form
   const [showEditForm, setShowEditForm] = useState(false);
   // Delete confirmation step
@@ -1255,6 +1257,7 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
                   autoCollapsed={devTarget.kind === 'repo'}
                   selectedPluginProject={task.selectedPluginProject}
                   onSelectedPluginChange={handleSelectedPluginChange}
+                  pluginRefreshTick={devPanelRefreshTick}
                 />
               )}
 
@@ -1386,6 +1389,7 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
 
                   setShowSkeleton(false);
                   setSkeletonPreview(null);
+                  setDevPanelRefreshTick((t) => t + 1);
                   setFeedback(`Plugin project created and draft applied: ${projectName}`);
                 }
               : undefined
@@ -1402,7 +1406,13 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
           existingPluginProjects={pluginProjectsForModal}
           onCreated={(path) => {
             setShowCreatePlugin(false);
-            setFeedback(`Plugin project created: ${path}`);
+            // Persist the new project so the Dev panel auto-selects it after refresh.
+            const projectName = path.replace(/\\/g, '/').split('/').filter(Boolean).pop() ?? '';
+            if (projectName) {
+              updateTask(task.id, { selectedPluginProject: projectName }).catch(() => {});
+            }
+            setDevPanelRefreshTick((t) => t + 1);
+            setFeedback(`Plugin project created: ${projectName || path}`);
           }}
           onClose={() => setShowCreatePlugin(false)}
         />
