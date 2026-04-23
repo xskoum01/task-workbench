@@ -800,6 +800,10 @@ fn copy_template_tree(
         let entry = entry?;
         let file_name = entry.file_name();
         let name_str = file_name.to_string_lossy();
+        // Skip .github — it must never be copied into a plugin project folder
+        if name_str == ".github" {
+            continue;
+        }
         // Substitute placeholders in the entry name itself
         let new_name = name_str
             .replace("__PROJECT_NAME__", project_name)
