@@ -16,6 +16,29 @@ use rand::Rng;
 
 // --- Helpers ---------------------------------------------------------------
 
+/// Attempts to resolve the latest stable version of a NuGet package.
+/// Uses the NuGet flat-container index (returns versions sorted ascending).
+/// Filters out pre-release versions (containing '-').
+/// Falls back to `fallback` on any error.
+fn resolve_nuget_version(package: &str, fallback: &str) -> String {
+    let url = format!(
+        "https://api.nuget.org/v3-flatcontainer/{}/index.json",
+        package.to_lowercase()
+    );
+    let result: Option<String> = (|| -> Option<String> {
+        let resp = reqwest::blocking::get(&url).ok()?;
+        if !resp.status().is_success() { return None; }
+        let json: Value = resp.json().ok()?;
+        let versions = json["versions"].as_array()?;
+        // Versions are sorted ascending; walk from the end to find the latest stable
+        versions.iter().rev()
+            .filter_map(|v| v.as_str())
+            .find(|v| !v.contains('-'))
+            .map(|v| v.to_string())
+    })();
+    result.unwrap_or_else(|| fallback.to_string())
+}
+
 /// Returns the app data directory, creating it if it does not exist.
 fn app_data_dir(app: &tauri::AppHandle) -> Result<PathBuf, String> {
     let dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
@@ -673,6 +696,9 @@ fn create_plugin_project_from_template(
         let proj_dir = dest.join(&project_name);
         fs::create_dir_all(&proj_dir).map_err(|e| format!("Failed to create project folder: {e}"))?;
 
+        // Resolve the latest stable CrmSdk version from NuGet; fall back to a known-good version.
+        let crmsdk_version = resolve_nuget_version("Microsoft.CrmSdk.CoreAssemblies", "9.0.2.49");
+
         // Minimal .csproj (targets .NET Framework 4.6.2 — standard for Dataverse plugins)
         let csproj = format!(
             r#"<Project Sdk="Microsoft.NET.Sdk">
@@ -684,7 +710,7 @@ fn create_plugin_project_from_template(
     <GenerateAssemblyInfo>false</GenerateAssemblyInfo>
   </PropertyGroup>
   <ItemGroup>
-    <PackageReference Include="Microsoft.CrmSdk.CoreAssemblies" Version="9.0.2.49" />
+    <PackageReference Include="Microsoft.CrmSdk.CoreAssemblies" Version="{crmsdk_version}" />
   </ItemGroup>
 </Project>
 "#
