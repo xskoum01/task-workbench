@@ -747,6 +747,15 @@ namespace {namespace}\n\
             }
         }
 
+        // Try to format the generated code with `dotnet format`.
+        // Failure is intentionally ignored — project creation succeeds regardless.
+        let _ = std::process::Command::new("dotnet")
+            .arg("format")
+            .arg(dest.join(format!("{project_name}.sln")).to_string_lossy().as_ref())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+
         // Return the solution root so the caller can open the .sln from there
         return Ok(dest.to_string_lossy().to_string());
     }
