@@ -266,9 +266,9 @@ export default function CreatePluginProjectModal({
           autoFocus
         />
         <div className="form-hint">
-          Convention: <code>Navertica.&lt;BroaderArea&gt;</code>. Used for the folder name,
+          Convention: <code>Navertica.&lt;BroaderArea&gt;</code>. Used for the solution folder name,
           .sln, .csproj, and the <code>__PROJECT_NAME__</code> placeholder.
-          Solution and project are created in the same directory.
+          Standard VS layout: <code>{sanitize(form.projectName) || 'ProjectName'}/{sanitize(form.projectName) || 'ProjectName'}/</code>.
         </div>
       </div>
 

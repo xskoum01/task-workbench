@@ -658,13 +658,18 @@ fn create_plugin_project_from_template(
     if template_dir.is_empty() {
         // -----------------------------------------------------------------
         // Built-in default scaffold — no custom template configured.
-        // Generates:
-        //   <plugins_dir>/<project_name>/
-        //     <project_name>.csproj
+        // Standard Visual Studio layout:
+        //   <plugins_dir>/<project_name>/                ← solution root
         //     <project_name>.sln
-        //     <ClassName>.cs  (when create_initial_class is true)
+        //     <project_name>/                            ← project folder
+        //       <project_name>.csproj
+        //       <ClassName>.cs  (when create_initial_class is true)
         // -----------------------------------------------------------------
-        fs::create_dir_all(&dest).map_err(|e| format!("Failed to create project folder: {e}"))?;
+        fs::create_dir_all(&dest).map_err(|e| format!("Failed to create solution root: {e}"))?;
+
+        // Nested project folder inside the solution root
+        let proj_dir = dest.join(&project_name);
+        fs::create_dir_all(&proj_dir).map_err(|e| format!("Failed to create project folder: {e}"))?;
 
         // Minimal .csproj (targets .NET Framework 4.6.2 — standard for Dataverse plugins)
         let csproj = format!(
@@ -682,16 +687,16 @@ fn create_plugin_project_from_template(
 </Project>
 "#
         );
-        fs::write(dest.join(format!("{project_name}.csproj")), &csproj)
+        fs::write(proj_dir.join(format!("{project_name}.csproj")), &csproj)
             .map_err(|e| format!("Failed to write .csproj: {e}"))?;
 
-        // Minimal .sln so the folder can be opened in Visual Studio directly
-        let sln_guid = "FAE04EC0-301F-11D3-BF4B-00C04F79EFBC"; // C# project type
+        // .sln goes in the solution root; .csproj path is relative: <ProjectName>/<ProjectName>.csproj
+        let sln_guid = "FAE04EC0-301F-11D3-BF4B-00C04F79EFBC"; // C# project type GUID
         let proj_guid = "00000000-0000-0000-0000-000000000001";
         let sln = format!(
             "Microsoft Visual Studio Solution File, Format Version 12.00\n\
 # Visual Studio Version 17\nVisualStudioVersion = 17.0.0.0\n\
-Project(\"{{{sln_guid}}}\") = \"{project_name}\", \"{project_name}.csproj\", \"{{{proj_guid}}}\"\n\
+Project(\"{{{sln_guid}}}\") = \"{project_name}\", \"{project_name}\\{project_name}.csproj\", \"{{{proj_guid}}}\"\n\
 EndProject\nGlobal\n\
 \tGlobalSection(SolutionConfigurationPlatforms) = preSolution\n\
 \t\tDebug|Any CPU = Debug|Any CPU\n\
@@ -707,7 +712,7 @@ EndGlobal\n"
                 .split('.')
                 .last()
                 .unwrap_or(&project_name));
-            let class_file = dest.join(format!("{class_name}.cs"));
+            let class_file = proj_dir.join(format!("{class_name}.cs"));
             if !class_file.exists() {
                 let content = format!(
                     "using Microsoft.Xrm.Sdk;\n\
@@ -739,6 +744,7 @@ namespace {namespace}\n{{\n\
             }
         }
 
+        // Return the solution root so the caller can open the .sln from there
         return Ok(dest.to_string_lossy().to_string());
     }
 
