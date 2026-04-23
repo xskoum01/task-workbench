@@ -11,7 +11,7 @@ import TaskForm from './TaskForm';
 import CreatePluginProjectModal from './CreatePluginProjectModal';
 import Icon from './Icon';
 import * as tauriApi from '../lib/tauriCommands';
-import { resolveTaskDevTarget, resolveBestPluginPath, getPluginsDir } from '../lib/resolveTaskDevTarget';
+import { resolveTaskDevTarget, resolveBestPluginPath, getPluginsDir, hintedPluginProject } from '../lib/resolveTaskDevTarget';
 import { BUCKET_META, BUCKET_ORDER, computePlanning, effectiveBucket } from '../lib/planning';
 import { isOverdue, formatRelativeDate } from '../lib/dates';
 
@@ -21,6 +21,32 @@ interface TaskDetailProps {
 }
 
 type AiAction = 'analyze' | 'reply' | 'draft' | 'review';
+
+/**
+ * Returns true only when the task clearly requests creating a brand-new plugin
+ * and there is no concrete existing plugin project already associated with it.
+ *
+ * Hiding criteria (returns false):
+ *   - A plugin project is already selected on the task
+ *   - ADO context yields a hinted existing project
+ *   - Title or body contains typical edit/review/fix verbs
+ *   - Task is not a feature type AND has no create-new signal
+ */
+function isNewPluginTask(task: Task): boolean {
+  // Already linked to an existing project
+  if (task.selectedPluginProject) return false;
+  if (hintedPluginProject(task)) return false;
+
+  const text = `${task.title} ${task.originalMessage ?? ''}`.toLowerCase();
+
+  // Explicit edit / fix / review signals
+  const editPattern = /\b(fix|bug|review|update|modify|change|refactor|adjust|extend|edit|oprav|uprav|změ|kontrola|review)\b/;
+  if (editPattern.test(text)) return false;
+
+  // Must have at least one create-new signal
+  const createPattern = /\b(create|new|scaffold|nový|nová|nové|vytvořit|vytvořte|založ|nový plugin|new plugin)\b/;
+  return createPattern.test(text) || task.taskType === 'feature';
+}
 
 // All statuses in the progression order shown in the selector
 const STATUS_OPTIONS: TaskStatus[] = [
@@ -1089,7 +1115,7 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
                   <Icon name="check" size={13} /> Apply Draft
                 </button>
               )}
-              {devTarget.kind === 'plugin' && pluginsDir && (
+              {devTarget.kind === 'plugin' && pluginsDir && isNewPluginTask(task) && (
                 <button
                   className="btn btn-secondary btn-sm"
                   onClick={async () => {
