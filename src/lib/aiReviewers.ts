@@ -151,7 +151,18 @@ export function selectReviewer(
   devMode?: 'plugin' | 'script',
 ): AiReviewerConfig | undefined {
   const ext = fileExt(filePath);
-  if (!ext) return undefined;
+
+  // Priority 0: no file extension — fall back to devMode-only match.
+  // This handles cases where the path is a directory or the file hasn't been resolved yet.
+  if (!ext) {
+    if (devMode === undefined) return undefined;
+    return configs.find(
+      (r) =>
+        r.enabled &&
+        r.appliesTo.devTargetKinds &&
+        r.appliesTo.devTargetKinds.includes(devMode),
+    );
+  }
 
   // Priority 1: extension + devTargetKind both match
   const strictMatch = configs.find(

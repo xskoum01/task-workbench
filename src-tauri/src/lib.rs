@@ -1459,6 +1459,104 @@ fn read_file_content(path: String) -> Result<String, String> {
     }
 }
 
+/// Recursively walks `base_path` and returns the best candidate file for AI review.
+/// For plugin mode: looks for .cs files, excluding bin/obj/.vs/packages directories,
+/// preferring files that match the project name or contain "IPlugin".
+/// For script mode: looks for .js/.ts files, excluding node_modules/dist/build/.next/coverage,
+/// preferring files containing formContext/executionContext/Xrm keywords.
+/// Returns the absolute path of the best candidate, or empty string if none found.
+#[tauri::command]
+fn infer_review_file_path(base_path: String, mode: String, project_name: String) -> String {
+    let base = std::path::Path::new(&base_path);
+    if !base.exists() {
+        return String::new();
+    }
+
+    let is_plugin = mode == "plugin";
+    let excluded_dirs_plugin: &[&str] = &["bin", "obj", ".vs", "packages", ".git"];
+    let excluded_dirs_script: &[&str] = &["node_modules", "dist", "build", ".next", "coverage", ".git"];
+
+    let mut candidates: Vec<(i32, std::path::PathBuf)> = Vec::new();
+    let proj_lower = project_name.to_lowercase();
+
+    fn walk_dir(
+        dir: &std::path::Path,
+        is_plugin: bool,
+        excluded: &[&str],
+        proj_lower: &str,
+        candidates: &mut Vec<(i32, std::path::PathBuf)>,
+    ) {
+        let entries = match fs::read_dir(dir) {
+            Ok(e) => e,
+            Err(_) => return,
+        };
+        for entry in entries.filter_map(|e| e.ok()) {
+            let path = entry.path();
+            let name = path.file_name().unwrap_or_default().to_string_lossy().to_lowercase();
+
+            if path.is_dir() {
+                if excluded.iter().any(|ex| name == *ex) {
+                    continue;
+                }
+                walk_dir(&path, is_plugin, excluded, proj_lower, candidates);
+            } else if path.is_file() {
+                let ext = path.extension().unwrap_or_default().to_string_lossy().to_lowercase();
+                if is_plugin {
+                    if ext != "cs" {
+                        continue;
+                    }
+                    let stem = path.file_stem().unwrap_or_default().to_string_lossy().to_lowercase();
+                    let mut score: i32 = 0;
+                    if !proj_lower.is_empty() && stem.contains(&*proj_lower) {
+                        score += 10;
+                    }
+                    // Check for IPlugin implementation hint in file content (light scan)
+                    if let Ok(content) = fs::read_to_string(&path) {
+                        if content.contains("IPlugin") || content.contains(": IPlugin") {
+                            score += 5;
+                        }
+                        if content.contains("class ") {
+                            score += 1;
+                        }
+                    }
+                    candidates.push((score, path));
+                } else {
+                    if ext != "js" && ext != "ts" {
+                        continue;
+                    }
+                    // Skip declaration and test files
+                    let fname = path.file_name().unwrap_or_default().to_string_lossy().to_lowercase();
+                    if fname.ends_with(".d.ts") || fname.contains(".test.") || fname.contains(".spec.") {
+                        continue;
+                    }
+                    let mut score: i32 = 0;
+                    if let Ok(content) = fs::read_to_string(&path) {
+                        for kw in &["formContext", "executionContext", "Xrm.", "getFormContext"] {
+                            if content.contains(kw) {
+                                score += 5;
+                            }
+                        }
+                        if content.contains("function ") || content.contains("=>") {
+                            score += 1;
+                        }
+                    }
+                    candidates.push((score, path));
+                }
+            }
+        }
+    }
+
+    let excluded = if is_plugin { excluded_dirs_plugin } else { excluded_dirs_script };
+    walk_dir(base, is_plugin, excluded, &proj_lower, &mut candidates);
+
+    candidates.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+    candidates
+        .into_iter()
+        .next()
+        .map(|(_, p)| p.to_string_lossy().to_string())
+        .unwrap_or_default()
+}
+
 /// Lists files in `dir` that match `extension` (e.g. "js"), non-recursively.
 /// Returns file names only (not full paths). Never fails — returns empty vec on any error.
 #[tauri::command]
@@ -3361,6 +3459,7 @@ pub fn run() {
             get_teams_self_chat_messages,
             read_file_content,
             list_directory_files,
+            infer_review_file_path,
             list_crm_folders,
             get_git_branch,
             list_git_branches,

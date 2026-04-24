@@ -128,6 +128,8 @@ export default forwardRef<TaskDevModePanelHandle, TaskDevModePanelProps>(functio
   const [reviewRunning, setReviewRunning]       = useState(false);
   const [reviewError, setReviewError]           = useState<string | null>(null);
   const [reviewMarkdown, setReviewMarkdown]     = useState<string | null>(null);
+  const [reviewInferring, setReviewInferring]   = useState(false);
+  const [reviewInferError, setReviewInferError] = useState<string | null>(null);
 
   // Reset all state when the viewed task changes.
   useEffect(() => {
@@ -149,6 +151,8 @@ export default forwardRef<TaskDevModePanelHandle, TaskDevModePanelProps>(functio
     setReviewSelectedId('');
     setReviewMarkdown(null);
     setReviewError(null);
+    setReviewInferError(null);
+    setReviewInferring(false);
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [task.id]);
 
@@ -308,10 +312,31 @@ export default forwardRef<TaskDevModePanelHandle, TaskDevModePanelProps>(functio
    * Infers a best default review file path from the current dev mode and selection.
    * Used to pre-fill the path input when the review panel is first opened.
    */
-  function inferReviewPath(): string {
+  /**
+   * Infers the best concrete file path for AI review.
+   * For script mode: returns scriptOpenPath directly (already a file).
+   * For plugin mode: calls the Rust backend to find the best .cs file in the plugin folder.
+   * Sets reviewInferError when no concrete file is found.
+   */
+  async function inferReviewPath(): Promise<string> {
     if (devMode === 'script') return scriptOpenPath ?? '';
     if (devMode === 'plugin' && pluginsDir && selectedPlugin) {
-      return `${pluginsDir}/${selectedPlugin}`;
+      const dirPath = `${pluginsDir}/${selectedPlugin}`;
+      setReviewInferring(true);
+      setReviewInferError(null);
+      try {
+        const found = await tauriApi.inferReviewFilePath(dirPath, 'plugin', selectedPlugin);
+        if (!found) {
+          setReviewInferError(`No .cs file found in ${selectedPlugin}. Open the panel and enter the path manually.`);
+          return '';
+        }
+        return found;
+      } catch {
+        setReviewInferError('Could not search for files. Enter the path manually.');
+        return '';
+      } finally {
+        setReviewInferring(false);
+      }
     }
     return '';
   }
@@ -326,9 +351,9 @@ export default forwardRef<TaskDevModePanelHandle, TaskDevModePanelProps>(functio
     return selectReviewer(allReviewers, reviewFilePath, devMode);
   }
 
-  function handleOpenReviewPanel() {
+  async function handleOpenReviewPanel() {
     if (!reviewExpanded) {
-      const defaultPath = inferReviewPath();
+      const defaultPath = await inferReviewPath();
       setReviewFilePath((prev) => prev || defaultPath);
     }
     setReviewExpanded((v) => !v);
@@ -367,7 +392,7 @@ export default forwardRef<TaskDevModePanelHandle, TaskDevModePanelProps>(functio
     runReview: async () => {
       // Ensure the review panel is visible so the user sees the results
       if (!reviewExpanded) {
-        const defaultPath = inferReviewPath();
+        const defaultPath = await inferReviewPath();
         setReviewFilePath((prev) => prev || defaultPath);
         setReviewExpanded(true);
         setReviewMarkdown(null);
@@ -561,8 +586,17 @@ export default forwardRef<TaskDevModePanelHandle, TaskDevModePanelProps>(functio
                     setReviewSelectedId(''); // reset manual override on path change
                     setReviewMarkdown(null);
                     setReviewError(null);
+                    setReviewInferError(null);
                   }}
                 />
+                {reviewInferring && (
+                  <div className="detail-devmode-hint" style={{ marginTop: 3 }}>Searching for file…</div>
+                )}
+                {reviewInferError && !reviewFilePath && (
+                  <div className="detail-devmode-hint" style={{ color: 'var(--color-blocked)', marginTop: 3 }}>
+                    {reviewInferError}
+                  </div>
+                )}
               </div>
 
               {/* Reviewer selector */}
@@ -589,7 +623,7 @@ export default forwardRef<TaskDevModePanelHandle, TaskDevModePanelProps>(functio
               <button
                 className="btn btn-primary btn-sm btn-full"
                 onClick={handleRunReview}
-                disabled={reviewRunning || !reviewFilePath.trim() || !getActiveReviewer()}
+                disabled={reviewRunning || reviewInferring || !reviewFilePath.trim() || !getActiveReviewer()}
                 type="button"
               >
                 {reviewRunning

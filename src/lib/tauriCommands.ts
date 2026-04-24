@@ -248,6 +248,20 @@ export function listDirectoryFiles(dir: string, extension: string): Promise<stri
 }
 
 /**
+ * Searches `basePath` recursively for the best candidate file to review.
+ * For plugin mode: looks for .cs files (IPlugin preferred).
+ * For script mode: looks for .js/.ts files (formContext/Xrm preferred).
+ * Returns the absolute file path, or empty string if nothing found.
+ */
+export function inferReviewFilePath(
+  basePath: string,
+  mode: 'plugin' | 'script',
+  projectName: string,
+): Promise<string> {
+  return invoke<string>('infer_review_file_path', { basePath, mode, projectName });
+}
+
+/**
  * Lists immediate subfolder names under `dir` (hidden folders excluded, sorted).
  * Reuses the same Rust command as listCrmFolders.
  * Returns empty array if dir not found or not a directory.
