@@ -1,7 +1,7 @@
 ﻿import { useState, useEffect, useRef } from 'react';
 import type { Task, TaskStatus, PlanningBucket, SkeletonPreview } from '../types';
 import TaskEmailContent from './TaskEmailContent';
-import TaskDevModePanel from './TaskDevModePanel';
+import TaskDevModePanel, { type TaskDevModePanelHandle } from './TaskDevModePanel';
 import { useApp } from '../context/AppContext';
 import { TypeBadge, SourceBadge } from './StatusBadge';
 import ReplyModal from './ReplyModal';
@@ -341,6 +341,7 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
   const [pluginProjectsForModal, setPluginProjectsForModal] = useState<string[]>([]);
   // Script Assistant imperative ref + draft-ready flag
   const scriptPanelRef = useRef<ScriptAssistantPanelHandle>(null);
+  const devModePanelRef  = useRef<TaskDevModePanelHandle>(null);
   const [scriptHasDraft, setScriptHasDraft] = useState(false);
   // Refresh counter for the Dev panel — increment after creating a new plugin project.
   const [devPanelRefreshTick, setDevPanelRefreshTick] = useState(0);
@@ -491,16 +492,39 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
 
   // --- Communication ---
 
+  async function handleSendForReview() {
+    // Run the AI file review via the dev panel's imperative handle.
+    // Status advances only if the review succeeds.
+    if (!devModePanelRef.current) {
+      // Dev panel not mounted (e.g. no repo path configured) — fall back to direct status change.
+      await handleStatusChange('ready-for-review');
+      setFeedback('Status set to Ready for Review');
+      return;
+    }
+    const ok = await devModePanelRef.current.runReview();
+    if (ok) {
+      await handleStatusChange('ready-for-review');
+      setFeedback('AI review complete — status set to Ready for Review');
+    }
+    // On failure, reviewError is shown inside the dev panel — status unchanged.
+  }
+
+  async function handleMarkDone() {
+    await handleStatusChange('done');
+    setFeedback('Task marked as Done');
+  }
+
   /**
-   * Dispatches the action for the current workflow stage.
-   * Called by both the BPF stepper click and the right-panel workflow buttons.
+   * Single dispatcher for all stage-advancing actions.
+   * Called by the BPF stepper. Right-panel buttons also call these same
+   * handlers directly so the logic lives in one place per action.
    */
   function runCurrentStageAction() {
     switch (task.status) {
       case 'new':              handleAnalyze(); break;
       case 'analyzed':         handleGenerateDraft(); break;
-      case 'in-progress':      handleStatusChange('ready-for-review'); break;
-      case 'ready-for-review': handleStatusChange('done'); break;
+      case 'in-progress':      handleSendForReview(); break;
+      case 'ready-for-review': handleMarkDone(); break;
       default: break;
     }
   }
@@ -1116,6 +1140,7 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
 
               {(hasRepo || hasVscodePath) && (
                 <TaskDevModePanel
+                  ref={devModePanelRef}
                   task={task}
                   customer={customer}
                   pluginsDir={pluginsDir}

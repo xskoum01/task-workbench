@@ -9,7 +9,7 @@
  *
  * Used in both TaskDetail and InlineTaskPanel.
  */
-import { useState, useEffect } from 'react';
+import { useState, useEffect, forwardRef, useImperativeHandle } from 'react';
 import type { Task, Customer, AiReviewerConfig } from '../types';
 import Icon from './Icon';
 import * as tauriApi from '../lib/tauriCommands';
@@ -58,7 +58,15 @@ export interface TaskDevModePanelProps {
   reviewerConfigs?: AiReviewerConfig[];
 }
 
-export default function TaskDevModePanel({
+export interface TaskDevModePanelHandle {
+  /**
+   * Runs the AI file review using the currently configured file path and reviewer.
+   * Returns true when the review completes successfully, false on error or missing config.
+   */
+  runReview(): Promise<boolean>;
+}
+
+export default forwardRef<TaskDevModePanelHandle, TaskDevModePanelProps>(function TaskDevModePanel({
   task,
   pluginsDir,
   repoRootForGit,
@@ -70,7 +78,7 @@ export default function TaskDevModePanel({
   selectedPluginProject: persistedSelectedPlugin,
   pluginRefreshTick = 0,
   reviewerConfigs,
-}: TaskDevModePanelProps) {
+}: TaskDevModePanelProps, ref: React.Ref<TaskDevModePanelHandle>) {
   // --- collapse toggle ---
   const [expanded, setExpanded] = useState(!autoCollapsed);
 
@@ -328,11 +336,11 @@ export default function TaskDevModePanel({
     setReviewError(null);
   }
 
-  async function handleRunReview() {
+  async function handleRunReview(): Promise<boolean> {
     const path = reviewFilePath.trim();
-    if (!path) { setReviewError('Enter the file path to review.'); return; }
+    if (!path) { setReviewError('Enter the file path to review.'); return false; }
     const reviewer = getActiveReviewer();
-    if (!reviewer) { setReviewError('No matching reviewer. Configure one in Settings → AI Reviewers.'); return; }
+    if (!reviewer) { setReviewError('No matching reviewer. Configure one in Settings → AI Reviewers.'); return false; }
     setReviewRunning(true);
     setReviewError(null);
     setReviewMarkdown(null);
@@ -345,12 +353,29 @@ export default function TaskDevModePanel({
         reviewer.temperature ?? 0.2,
       );
       setReviewMarkdown(result.markdown);
+      return true;
     } catch (err) {
       setReviewError(String(err));
+      return false;
     } finally {
       setReviewRunning(false);
     }
   }
+
+  // Imperative handle — lets TaskDetail trigger the review programmatically
+  useImperativeHandle(ref, () => ({
+    runReview: async () => {
+      // Ensure the review panel is visible so the user sees the results
+      if (!reviewExpanded) {
+        const defaultPath = inferReviewPath();
+        setReviewFilePath((prev) => prev || defaultPath);
+        setReviewExpanded(true);
+        setReviewMarkdown(null);
+        setReviewError(null);
+      }
+      return handleRunReview();
+    },
+  }));
 
   // --- render ---
 
@@ -593,4 +618,4 @@ export default function TaskDevModePanel({
       )}
     </div>
   );
-}
+});
