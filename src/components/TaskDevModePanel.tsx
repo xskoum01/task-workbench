@@ -10,10 +10,12 @@
  * Used in both TaskDetail and InlineTaskPanel.
  */
 import { useState, useEffect } from 'react';
-import type { Task, Customer } from '../types';
+import type { Task, Customer, AiReviewerConfig } from '../types';
 import Icon from './Icon';
 import * as tauriApi from '../lib/tauriCommands';
 import { hintedPluginProject } from '../lib/resolveTaskDevTarget';
+import { mergeWithDefaults, selectReviewer } from '../lib/aiReviewers';
+import MarkdownView from './MarkdownView';
 
 export interface TaskDevModePanelProps {
   task: Task;
@@ -49,6 +51,11 @@ export interface TaskDevModePanelProps {
    * Increment this in the parent after creating a new plugin project.
    */
   pluginRefreshTick?: number;
+  /**
+   * AI reviewer configurations from settings.
+   * When provided, the Run AI Review button is shown after the open button.
+   */
+  reviewerConfigs?: AiReviewerConfig[];
 }
 
 export default function TaskDevModePanel({
@@ -62,6 +69,7 @@ export default function TaskDevModePanel({
   onSelectedPluginChange,
   selectedPluginProject: persistedSelectedPlugin,
   pluginRefreshTick = 0,
+  reviewerConfigs,
 }: TaskDevModePanelProps) {
   // --- collapse toggle ---
   const [expanded, setExpanded] = useState(!autoCollapsed);
@@ -105,6 +113,14 @@ export default function TaskDevModePanel({
   const [branchSwitching, setBranchSwitching] = useState(false);
   const [branchError, setBranchError]       = useState<string | null>(null);
 
+  // --- AI Review state ---
+  const [reviewExpanded, setReviewExpanded]     = useState(false);
+  const [reviewFilePath, setReviewFilePath]     = useState('');
+  const [reviewSelectedId, setReviewSelectedId] = useState('');
+  const [reviewRunning, setReviewRunning]       = useState(false);
+  const [reviewError, setReviewError]           = useState<string | null>(null);
+  const [reviewMarkdown, setReviewMarkdown]     = useState<string | null>(null);
+
   // Reset all state when the viewed task changes.
   useEffect(() => {
     setExpanded(!autoCollapsed);
@@ -119,6 +135,12 @@ export default function TaskDevModePanel({
     setSelectedBranch('');
     setBranchDirty(false);
     setBranchError(null);
+    // Reset review state
+    setReviewExpanded(false);
+    setReviewFilePath('');
+    setReviewSelectedId('');
+    setReviewMarkdown(null);
+    setReviewError(null);
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [task.id]);
 
@@ -264,6 +286,70 @@ export default function TaskDevModePanel({
       console.log('[devTarget] final path=', pluginPath, '(folder — no .sln/.csproj)');
       await tauriApi.openInVscode(pluginPath);
     } catch (e) { onError(String(e)); }
+  }
+
+  // --- AI Review helpers ---
+
+  /**
+   * Returns the list of enabled reviewer configs (merged with defaults).
+   * Returns empty array when no reviewer configs are provided.
+   */
+  const allReviewers = reviewerConfigs ? mergeWithDefaults(reviewerConfigs).filter((r) => r.enabled) : [];
+
+  /**
+   * Infers a best default review file path from the current dev mode and selection.
+   * Used to pre-fill the path input when the review panel is first opened.
+   */
+  function inferReviewPath(): string {
+    if (devMode === 'script') return scriptOpenPath ?? '';
+    if (devMode === 'plugin' && pluginsDir && selectedPlugin) {
+      return `${pluginsDir}/${selectedPlugin}`;
+    }
+    return '';
+  }
+
+  /**
+   * Returns the currently selected reviewer, auto-resolved when reviewSelectedId is blank.
+   */
+  function getActiveReviewer() {
+    if (reviewSelectedId) {
+      return allReviewers.find((r) => r.id === reviewSelectedId);
+    }
+    return selectReviewer(allReviewers, reviewFilePath, devMode);
+  }
+
+  function handleOpenReviewPanel() {
+    if (!reviewExpanded) {
+      const defaultPath = inferReviewPath();
+      setReviewFilePath((prev) => prev || defaultPath);
+    }
+    setReviewExpanded((v) => !v);
+    setReviewMarkdown(null);
+    setReviewError(null);
+  }
+
+  async function handleRunReview() {
+    const path = reviewFilePath.trim();
+    if (!path) { setReviewError('Enter the file path to review.'); return; }
+    const reviewer = getActiveReviewer();
+    if (!reviewer) { setReviewError('No matching reviewer. Configure one in Settings → AI Reviewers.'); return; }
+    setReviewRunning(true);
+    setReviewError(null);
+    setReviewMarkdown(null);
+    try {
+      const result = await tauriApi.runAiFileReview(
+        path,
+        reviewer.name,
+        reviewer.instructions,
+        reviewer.model ?? '',
+        reviewer.temperature ?? 0.2,
+      );
+      setReviewMarkdown(result.markdown);
+    } catch (err) {
+      setReviewError(String(err));
+    } finally {
+      setReviewRunning(false);
+    }
   }
 
   // --- render ---
@@ -421,6 +507,87 @@ export default function TaskDevModePanel({
         >
           <Icon name="terminal" size={13} /> Open Script in VS Code
         </button>
+      )}
+
+      {/* AI Review panel — shown when reviewer configs are available */}
+      {allReviewers.length > 0 && (
+        <div className="detail-devmode-review-section">
+          <button
+            className="btn btn-ghost btn-sm detail-devmode-review-toggle"
+            onClick={handleOpenReviewPanel}
+            type="button"
+          >
+            <Icon name="search" size={12} />
+            {reviewExpanded ? 'Hide AI Review' : 'Run AI Review'}
+          </button>
+
+          {reviewExpanded && (
+            <div className="detail-devmode-review-panel">
+              {/* File path input */}
+              <div className="detail-devmode-review-row">
+                <label className="form-label" style={{ marginBottom: 2 }}>File to review</label>
+                <input
+                  className="form-input"
+                  type="text"
+                  placeholder="C:\path\to\file.cs"
+                  value={reviewFilePath}
+                  onChange={(e) => {
+                    setReviewFilePath(e.target.value);
+                    setReviewSelectedId(''); // reset manual override on path change
+                    setReviewMarkdown(null);
+                    setReviewError(null);
+                  }}
+                />
+              </div>
+
+              {/* Reviewer selector */}
+              <div className="detail-devmode-review-row">
+                <label className="form-label" style={{ marginBottom: 2 }}>Reviewer</label>
+                <select
+                  className="form-select"
+                  value={reviewSelectedId || (getActiveReviewer()?.id ?? '')}
+                  onChange={(e) => setReviewSelectedId(e.target.value)}
+                >
+                  <option value="">— auto-select by file type —</option>
+                  {allReviewers.map((r) => (
+                    <option key={r.id} value={r.id}>{r.name}</option>
+                  ))}
+                </select>
+                {!getActiveReviewer() && reviewFilePath && (
+                  <div className="detail-devmode-hint" style={{ color: 'var(--color-blocked)', marginTop: 3 }}>
+                    No reviewer matches this file type. Configure one in Settings → AI Reviewers.
+                  </div>
+                )}
+              </div>
+
+              {/* Run button */}
+              <button
+                className="btn btn-primary btn-sm btn-full"
+                onClick={handleRunReview}
+                disabled={reviewRunning || !reviewFilePath.trim() || !getActiveReviewer()}
+                type="button"
+              >
+                {reviewRunning
+                  ? <><span className="btn-spinner" /> Running review…</>
+                  : <><Icon name="search" size={12} /> Run AI Review</>}
+              </button>
+
+              {/* Error */}
+              {reviewError && (
+                <div className="detail-devmode-hint" style={{ color: 'var(--color-blocked)', marginTop: 6 }}>
+                  {reviewError}
+                </div>
+              )}
+
+              {/* Result */}
+              {reviewMarkdown && (
+                <div className="detail-devmode-review-result">
+                  <MarkdownView markdown={reviewMarkdown} />
+                </div>
+              )}
+            </div>
+          )}
+        </div>
       )}
         </>
       )}

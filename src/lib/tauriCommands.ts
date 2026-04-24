@@ -4,7 +4,7 @@
  */
 import { invoke } from '@tauri-apps/api/core';
 import { openUrl as openerOpen } from '@tauri-apps/plugin-opener';
-import type { Task, Customer, AppSettings, TaskAnalysis, SkeletonPreview, GitInitStatus, OutlookMessage, OutlookFlaggedListResult, TeamsChat, TeamsChatMessage, TeamsFlatMessage, ClassificationResult, AiReviewResult } from '../types';
+import type { Task, Customer, AppSettings, TaskAnalysis, SkeletonPreview, GitInitStatus, OutlookMessage, OutlookFlaggedListResult, TeamsChat, TeamsChatMessage, TeamsFlatMessage, ClassificationResult, AiReviewResult, AiFileReviewResult } from '../types';
 
 export type { ClassificationResult };
 
@@ -169,6 +169,32 @@ export function saveGeneratedFile(path: string, content: string): Promise<void> 
  */
 export function aiReviewTask(task: Task, customer: Customer | null, draft?: string): Promise<AiReviewResult> {
   return invoke('ai_review_task', { task, customer, draft: draft ?? '' });
+}
+
+/**
+ * Reads a source file from disk and runs a configurable AI reviewer against it.
+ * The API key stays in Rust — it is never passed from the frontend.
+ *
+ * @param filePath      Absolute path to the file to review.
+ * @param reviewerName  Display name of the reviewer (included in the result header).
+ * @param instructions  Full reviewer instructions (system prompt).
+ * @param modelOverride Optional model name. Pass '' to use the global AI model.
+ * @param temperature   Model temperature (0–2). Pass 0 to use the reviewer default.
+ */
+export function runAiFileReview(
+  filePath: string,
+  reviewerName: string,
+  instructions: string,
+  modelOverride: string,
+  temperature: number,
+): Promise<AiFileReviewResult> {
+  return invoke<string>('run_ai_file_review', {
+    filePath,
+    reviewerName,
+    instructions,
+    modelOverride,
+    temperature,
+  }).then((markdown) => ({ reviewerName, filePath, markdown }));
 }
 
 /**

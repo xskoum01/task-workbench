@@ -228,6 +228,7 @@ export default function InlineTaskPanel({ task, onOpenDetail }: Props) {
                   onSelectedPluginChange={(plugin) =>
                     updateTask(task.id, { selectedPluginProject: plugin || undefined }).catch(() => {})
                   }
+                  reviewerConfigs={settings.aiReviewers}
                 />
               )}
               {showOpenRepo && (

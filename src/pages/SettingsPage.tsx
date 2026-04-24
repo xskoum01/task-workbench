@@ -5,6 +5,7 @@ import Icon from '../components/Icon';
 import type { IconName } from '../components/Icon';
 import * as tauriApi from '../lib/tauriCommands';
 import TemplatesSection from '../components/TemplatesSection';
+import AiReviewersSettingsPanel from '../components/AiReviewersSettingsPanel';
 
 // ---------------------------------------------------------------------------
 // Sub-components
@@ -710,6 +711,26 @@ export default function SettingsPage() {
                 style={{ maxWidth: 280 }}
               />
             </SettingsField>
+          </SettingsBlock>
+
+          {/* AI Reviewers */}
+          <SettingsBlock
+            icon="search"
+            title="AI Reviewers"
+            description="Configurable AI reviewer profiles for plugin and script code review"
+          >
+            <AiReviewersSettingsPanel
+              configs={draft.aiReviewers}
+              onChange={(updated) => {
+                setDraft((prev) => ({ ...prev, aiReviewers: updated }));
+                setIsDirty(true);
+                setSaved(false);
+              }}
+            />
+            <p className="settings-hint">
+              Reviewer instructions are sent as the AI system prompt. Changes take effect
+              immediately when you save Settings.
+            </p>
           </SettingsBlock>
 
           {/* Microsoft Graph / M365 */}

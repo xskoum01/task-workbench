@@ -1258,6 +1258,7 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
                   selectedPluginProject={task.selectedPluginProject}
                   onSelectedPluginChange={handleSelectedPluginChange}
                   pluginRefreshTick={devPanelRefreshTick}
+                  reviewerConfigs={settings.aiReviewers}
                 />
               )}
 

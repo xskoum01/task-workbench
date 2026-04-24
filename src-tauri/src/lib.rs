@@ -663,6 +663,94 @@ Rules:\n\
     })
 }
 
+/// Reads a source file from disk and runs a configurable AI review against it.
+/// The API key is read from settings.json — never exposed to the frontend.
+/// `model_override` is used when non-empty; otherwise falls back to the global AI model.
+/// `temperature` is clamped to [0.0, 2.0]; defaults to 0.2 when 0.0 is passed and
+/// the caller did not explicitly intend zero temperature (we treat 0.0 as "use default").
+/// Returns the AI response as a Markdown-formatted string.
+#[tauri::command]
+async fn run_ai_file_review(
+    app: tauri::AppHandle,
+    file_path: String,
+    reviewer_name: String,
+    instructions: String,
+    model_override: String,
+    temperature: f64,
+) -> Result<String, String> {
+    // Read API key and base model from settings
+    let (api_key, base_model) = get_ai_settings(&app)?;
+    let model = if model_override.trim().is_empty() { base_model } else { model_override.trim().to_string() };
+
+    // Read the file from disk (cap at 200 KB to stay within token budgets)
+    const MAX_BYTES: usize = 200 * 1024;
+    let path_ref = std::path::Path::new(&file_path);
+    if path_ref.is_dir() {
+        return Err(format!(
+            "'{file_path}' is a directory. Enter the path of a specific source file (e.g. a .cs or .js file)."
+        ));
+    }
+    let raw = fs::read_to_string(&file_path)
+        .map_err(|e| format!("Cannot read file '{file_path}': {e}"))?;
+    let content = if raw.len() > MAX_BYTES {
+        // Walk back to the last valid UTF-8 character boundary before MAX_BYTES
+        let boundary = (0..=MAX_BYTES).rev().find(|&i| raw.is_char_boundary(i)).unwrap_or(0);
+        format!("{}\n\n… [file truncated at 200 KB]", &raw[..boundary])
+    } else {
+        raw
+    };
+
+    let file_name = std::path::Path::new(&file_path)
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| file_path.clone());
+
+    let prompt = format!(
+        "Review the following file: **{file_name}**\n\n```\n{content}\n```"
+    );
+
+    // Use temperature if caller provided a non-zero value; otherwise let OpenAI use its default.
+    let client = reqwest::Client::new();
+    let mut body = serde_json::json!({
+        "model": model,
+        "input": prompt,
+    });
+    if !instructions.is_empty() {
+        body["instructions"] = serde_json::Value::String(instructions.clone());
+    }
+    if temperature > 0.0 {
+        body["temperature"] = serde_json::Value::from(temperature.clamp(0.0, 2.0));
+    }
+
+    let resp = client
+        .post("https://api.openai.com/v1/responses")
+        .bearer_auth(&api_key)
+        .header("content-type", "application/json")
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| format!("Network error: {e}"))?;
+
+    if !resp.status().is_success() {
+        let status = resp.status().as_u16();
+        let text = resp.text().await.unwrap_or_default();
+        return Err(format!("OpenAI API error {status}: {text}"));
+    }
+
+    let json: Value = resp.json().await.map_err(|e| e.to_string())?;
+    let text = json["output"][0]["content"][0]["text"]
+        .as_str()
+        .map(|s| s.to_string())
+        .ok_or_else(|| {
+            let snippet = json.to_string();
+            format!("Unexpected OpenAI response: {}", &snippet[..snippet.len().min(300)])
+        })?;
+
+    // Prepend reviewer attribution so the frontend can display it without additional state
+    let header = format!("**Reviewer:** {reviewer_name}  \n**File:** {file_name}\n\n---\n\n");
+    Ok(format!("{header}{text}"))
+}
+
 /// Creates a new plugin project directory from a local template folder.
 /// Copies the template tree into target_dir/<project_name>, replacing
 /// __PROJECT_NAME__ and __NAMESPACE__ placeholders in file contents and names.
@@ -3312,6 +3400,7 @@ pub fn run() {
             generate_skeleton_preview,
             save_generated_file,
             ai_review_task,
+            run_ai_file_review,
             create_plugin_project_from_template,
             classify_inbox_item,
             reset_local_data,

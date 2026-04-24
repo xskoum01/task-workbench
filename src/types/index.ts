@@ -389,6 +389,55 @@ export interface AppSettings {
    * Template files may contain __PROJECT_NAME__ and __NAMESPACE__ placeholders.
    */
   pluginTemplateFolder?: string;
+
+  /**
+   * Configurable AI reviewer profiles.
+   * Each reviewer defines its instructions, file-type targeting, and optional model override.
+   */
+  aiReviewers?: AiReviewerConfig[];
+}
+
+// ── AI Reviewer types ─────────────────────────────────────────────────────────
+
+/**
+ * Targeting rules that determine when a reviewer auto-applies.
+ * A reviewer matches when at least one of its fileExtensions matches the file
+ * being reviewed AND (optionally) one of its devTargetKinds matches the current dev mode.
+ */
+export interface AiReviewerAppliesTo {
+  fileExtensions: string[];
+  keywords?: string[];
+  devTargetKinds?: ('plugin' | 'script')[];
+}
+
+/**
+ * Configuration for a single AI reviewer profile.
+ * Stored in settings.json under aiReviewers[].
+ */
+export interface AiReviewerConfig {
+  id: string;
+  name: string;
+  description: string;
+  /** Full system instructions sent to the AI as the reviewer context. */
+  instructions: string;
+  /** Short prompts the user can pick instead of writing a custom prompt. */
+  quickPrompts: string[];
+  enabled: boolean;
+  /** Optional model override — uses the global AI model when absent. */
+  model?: string;
+  temperature?: number;
+  appliesTo: AiReviewerAppliesTo;
+}
+
+/**
+ * Result returned by the run_ai_file_review Tauri command.
+ * The review text is Markdown-formatted.
+ */
+export interface AiFileReviewResult {
+  reviewerName: string;
+  filePath: string;
+  /** Markdown text of the review. */
+  markdown: string;
 }
 
 /**
