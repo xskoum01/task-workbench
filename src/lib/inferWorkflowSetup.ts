@@ -117,7 +117,7 @@ export interface InferWorkflowSetupInput {
 }
 
 export interface InferWorkflowSetupResult {
-  defaults: Required<Omit<WorkflowSetup, 'confirmedAt' | 'repositoryRoot'>> & {
+  defaults: Required<Omit<WorkflowSetup, 'confirmedAt' | 'repositoryRoot' | 'artifactPath'>> & {
     customerId: string;
   };
   hints: SetupInferenceHints;

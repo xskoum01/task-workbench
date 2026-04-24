@@ -180,6 +180,12 @@ export interface WorkflowSetup {
   reviewerId?: string;
   /** ISO timestamp of when the user confirmed. */
   confirmedAt?: string;
+  /**
+   * Absolute path of the file created by "Apply Draft" in a Create workflow.
+   * Stored after the draft is written to disk so subsequent Open and AI Review
+   * actions can navigate directly to the created artifact.
+   */
+  artifactPath?: string;
 }
 
 /**

@@ -461,6 +461,10 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
       const subPath = `${pluginsDir}/${selectedPluginProject}/${selectedPluginProject}/${skeletonPreview.fileName}`;
       try {
         await tauriApi.saveGeneratedFile(subPath, skeletonPreview.content);
+        // Persist the created file path so Open and AI Review know exactly where it landed.
+        await updateTask(task.id, {
+          workflowSetup: { ...task.workflowSetup, artifactPath: subPath },
+        });
         setFeedback(`Draft written: ${skeletonPreview.fileName}`);
         setSkeletonPreview(null);
       } catch (e) {
@@ -472,7 +476,13 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
       setAiLoading('draft');
       setAiError(null);
       try {
-        await scriptPanelRef.current.applyDraft();
+        const writtenPath = await scriptPanelRef.current.applyDraft();
+        // Persist the created file path so subsequent Open/AI Review can use it directly.
+        if (writtenPath) {
+          await updateTask(task.id, {
+            workflowSetup: { ...task.workflowSetup, artifactPath: writtenPath },
+          });
+        }
         setFeedback('Script draft applied.');
       } catch (e) {
         setAiError(String(e));
@@ -511,9 +521,12 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
    * Used for Update / Fix scenarios where the task works on an existing file.
    */
   async function handleStartWork() {
+    const artifact = task.workflowSetup?.artifactPath;
     try {
-      if (devTarget.kind === 'plugin' && pluginsDir && selectedPluginProject) {
-        const pluginPath = `${pluginsDir}/${selectedPluginProject}`;
+      if (artifact) {
+        // A file was already created by Apply Draft — open it directly.
+        await tauriApi.openInVscode(artifact);
+      } else if (devTarget.kind === 'plugin' && pluginsDir && selectedPluginProject) {        const pluginPath = `${pluginsDir}/${selectedPluginProject}`;
         // Prefer .sln for Visual Studio, fall back to .csproj / folder.
         const slns = await tauriApi.listDirectoryFiles(pluginPath, 'sln').catch(() => [] as string[]);
         if (slns.length > 0) {
@@ -1218,6 +1231,7 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
                   onSelectedPluginChange={handleSelectedPluginChange}
                   pluginRefreshTick={devPanelRefreshTick}
                   reviewerConfigs={plan.requiresAiFileReview ? settings.aiReviewers : undefined}
+                  artifactPath={task.workflowSetup?.artifactPath}
                 />
               )}
 

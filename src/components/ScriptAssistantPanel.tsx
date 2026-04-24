@@ -26,8 +26,11 @@ import {
 export interface ScriptAssistantPanelHandle {
   /** Run the full Analyze → Plan → Skeleton → Preview pipeline. Throws on failure. */
   generateDraft(): Promise<void>;
-  /** Write the current preview to disk. Throws if no preview is available. */
-  applyDraft(): Promise<void>;
+  /**
+   * Write the current preview to disk. Throws if no preview is available.
+   * Resolves with the absolute path of the written file.
+   */
+  applyDraft(): Promise<string>;
 }
 
 interface ScriptAssistantPanelProps {
@@ -469,7 +472,7 @@ function ScriptAssistantPanel({ task, customer, onDraftChange, scriptFolderOverr
       setLoading(null);
     },
 
-    async applyDraft() {
+    async applyDraft(): Promise<string> {
       const currentPreview = previewRef.current;
       if (!currentPreview) throw new Error('No preview available. Run Generate Draft first.');
       if (currentPreview.isNoop) throw new Error('No file changes to apply — logic already present.');
@@ -485,6 +488,7 @@ function ScriptAssistantPanel({ task, customer, onDraftChange, scriptFolderOverr
           bytesWritten: new TextEncoder().encode(currentPreview.newContent).length,
         });
         onDraftChange?.(false); // draft consumed
+        return currentPreview.targetFile;
       } catch (e) {
         setLoading(null);
         setError(String(e));

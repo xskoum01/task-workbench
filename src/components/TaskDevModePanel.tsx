@@ -57,6 +57,14 @@ export interface TaskDevModePanelProps {
    * When provided, the Run AI Review button is shown after the open button.
    */
   reviewerConfigs?: AiReviewerConfig[];
+  /**
+   * Absolute path of an artifact file created by "Apply Draft" in a Create workflow.
+   * When set:
+   *   - Script mode: opens this file instead of the generic scriptOpenPath folder.
+   *   - Plugin mode: skips .sln/.csproj search and opens this file directly.
+   *   - AI Review: uses this path directly; skips inference.
+   */
+  artifactPath?: string;
 }
 
 export interface TaskDevModePanelHandle {
@@ -79,6 +87,7 @@ export default forwardRef<TaskDevModePanelHandle, TaskDevModePanelProps>(functio
   selectedPluginProject: persistedSelectedPlugin,
   pluginRefreshTick = 0,
   reviewerConfigs,
+  artifactPath,
 }: TaskDevModePanelProps, ref: React.Ref<TaskDevModePanelHandle>) {
   // --- collapse toggle ---
   const [expanded, setExpanded] = useState(!autoCollapsed);
@@ -267,8 +276,10 @@ export default forwardRef<TaskDevModePanelHandle, TaskDevModePanelProps>(functio
   }
 
   async function handleOpenScript() {
-    if (!scriptOpenPath) { onError('No script path configured for this customer.'); return; }
-    try { await tauriApi.openInVscode(scriptOpenPath); }
+    // When a specific artifact was created (Create workflow), open the file directly.
+    const target = artifactPath ?? scriptOpenPath;
+    if (!target) { onError('No script path configured for this customer.'); return; }
+    try { await tauriApi.openInVscode(target); }
     catch (e) { onError(String(e)); }
   }
 
@@ -281,6 +292,12 @@ export default forwardRef<TaskDevModePanelHandle, TaskDevModePanelProps>(functio
 
   async function handleOpenPlugin() {
     if (!pluginsDir || !selectedPlugin) { onError('Select a plugin project first.'); return; }
+    // When a specific artifact file was created (Create workflow), open it directly.
+    if (artifactPath) {
+      try { await tauriApi.openInVscode(artifactPath); }
+      catch (e) { onError(String(e)); }
+      return;
+    }
     const pluginPath = `${pluginsDir}/${selectedPlugin}`;
     try {
       const slns = await tauriApi.listDirectoryFiles(pluginPath, 'sln');
@@ -321,6 +338,8 @@ export default forwardRef<TaskDevModePanelHandle, TaskDevModePanelProps>(functio
   async function inferReviewPath(): Promise<string> {
     // Never infer if the user has already typed something manually.
     if (reviewPathUserEdited) return reviewFilePath;
+    // A created artifact always wins — no inference needed.
+    if (artifactPath) return artifactPath;
     if (devMode === 'script') return scriptOpenPath ?? '';
     if (devMode === 'plugin' && pluginsDir && selectedPlugin) {
       const dirPath = `${pluginsDir}/${selectedPlugin}`;
