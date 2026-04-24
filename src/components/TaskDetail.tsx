@@ -14,6 +14,7 @@ import Icon from './Icon';
 import Modal from './Modal';
 import AiReviewResultView from './AiReviewResultView';
 import * as tauriApi from '../lib/tauriCommands';
+import { openReviewTarget } from '../lib/openReviewTarget';
 import { WorkflowStepper } from './WorkflowStepper';
 import { buildTaskWorkflowPlan } from '../lib/workflowPlan';
 import { resolveTaskDevTarget, getPluginsDir } from '../lib/resolveTaskDevTarget';
@@ -1182,6 +1183,16 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
                   >
                     <Icon name="search" size={11} /> Otevřít recenzi
                   </button>
+                  {effectiveMode === 'developer' && plan.requiresDevTools && (
+                    <button
+                      className="btn btn-ghost btn-sm"
+                      onClick={() => devModePanelRef.current?.openReviewModal()}
+                      type="button"
+                      title="Open the review panel to run a fresh review"
+                    >
+                      <Icon name="refresh-cw" size={11} /> Spustit znovu
+                    </button>
+                  )}
                 </div>
               </div>
             </div>
@@ -1683,23 +1694,8 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
         const isPlugin = reviewKind === 'plugin';
 
         async function handleReviewOpen(fp: string) {
-          try {
-            if (isPlugin) {
-              const target = await tauriApi.resolvePluginOpenTargetFromFile(fp);
-              if (target) {
-                if (target.kind === 'sln') {
-                  await tauriApi.openWithShell(target.path);
-                } else {
-                  await tauriApi.openWithShell(target.path);
-                }
-              } else {
-                // Fallback: open the file itself in VS Code
-                await tauriApi.openInVscode(fp);
-              }
-            } else {
-              await tauriApi.openInVscode(fp);
-            }
-          } catch { /* ignore */ }
+          const err = await openReviewTarget(fp, reviewKind);
+          if (err) setFsError(err);
         }
 
         return (
@@ -1724,7 +1720,7 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
                   markdown={latestReview.markdown}
                   onOpenFile={handleReviewOpen}
                   openLabel={isPlugin ? 'Otevřít projekt' : 'Otevřít soubor'}
-                  openTitle={isPlugin ? 'Otevře .sln ve Visual Studiu, pokud existuje.' : undefined}
+                  openTitle={isPlugin ? 'Otevře .sln ve Visual Studiu, pokud existuje.' : 'Otevře soubor ve VS Code.'}
                 />
               </div>
             </div>

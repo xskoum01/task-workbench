@@ -14,6 +14,7 @@ import type { Task, Customer, AiReviewerConfig, AiStructuredReview, AiFileReview
 import Icon from './Icon';
 import Modal from './Modal';
 import * as tauriApi from '../lib/tauriCommands';
+import { openReviewTarget } from '../lib/openReviewTarget';
 import { hintedPluginProject } from '../lib/resolveTaskDevTarget';
 import { mergeWithDefaults, selectReviewer } from '../lib/aiReviewers';
 import AiReviewResultView from './AiReviewResultView';
@@ -88,6 +89,11 @@ export interface TaskDevModePanelHandle {
    * Returns true when the review completes successfully, false on error or missing config.
    */
   runReview(): Promise<boolean>;
+  /**
+   * Opens the AI review modal with the current file/reviewer prefilled.
+   * Does NOT immediately run the review — user presses Run inside the modal.
+   */
+  openReviewModal(): Promise<void>;
 }
 
 export default forwardRef<TaskDevModePanelHandle, TaskDevModePanelProps>(function TaskDevModePanel({
@@ -343,12 +349,8 @@ export default forwardRef<TaskDevModePanelHandle, TaskDevModePanelProps>(functio
 
   async function handleOpenPlugin() {
     if (!pluginsDir || !selectedPlugin) { onError('Select a plugin project first.'); return; }
-    // When a specific artifact file was created (Create workflow), open it directly.
-    if (artifactPath) {
-      try { await tauriApi.openInVscode(artifactPath); }
-      catch (e) { onError(String(e)); }
-      return;
-    }
+    // Always open the plugin project/solution in Visual Studio — never a raw .cs file.
+    // artifactPath is used for AI Review file selection only, not for opening the project.
     const pluginPath = `${pluginsDir}/${selectedPlugin}`;
     try {
       const slns = await tauriApi.listDirectoryFiles(pluginPath, 'sln');
@@ -494,7 +496,12 @@ export default forwardRef<TaskDevModePanelHandle, TaskDevModePanelProps>(functio
       if (result.structured) setReviewStructured(result.structured);
       if (result.markdown)   setReviewMarkdown(result.markdown);
       // Persist the result on the task via the parent callback.
-      const persisted: AiFileReviewResult = { ...result, reviewedAt: new Date().toISOString() };
+      const persisted: AiFileReviewResult = {
+        ...result,
+        id: crypto.randomUUID(),
+        reviewerId: reviewer.id,
+        reviewedAt: new Date().toISOString(),
+      };
       onReviewSaved?.(persisted);
       return true;
     } catch (err) {
@@ -516,6 +523,9 @@ export default forwardRef<TaskDevModePanelHandle, TaskDevModePanelProps>(functio
       }
       setReviewModalOpen(true);
       return handleRunReview();
+    },
+    openReviewModal: async () => {
+      await handleOpenReviewModal();
     },
   }));
 
@@ -804,9 +814,12 @@ export default forwardRef<TaskDevModePanelHandle, TaskDevModePanelProps>(functio
                   structured={reviewStructured ?? undefined}
                   markdown={reviewMarkdown ?? undefined}
                   onOpenFile={async (fp) => {
-                    try { await tauriApi.openInVscode(fp); }
-                    catch (e) { setReviewError(String(e)); }
+                    // Use the shared helper: .cs → open .sln in Visual Studio, .js/.ts → VS Code.
+                    const err = await openReviewTarget(fp, devMode === 'plugin' ? 'plugin' : 'script');
+                    if (err) setReviewError(err);
                   }}
+                  openLabel={devMode === 'plugin' ? 'Otevřít projekt' : 'Otevřít soubor'}
+                  openTitle={devMode === 'plugin' ? 'Otevře .sln ve Visual Studiu, pokud existuje.' : 'Otevře soubor ve VS Code.'}
                 />
               </div>
             )}

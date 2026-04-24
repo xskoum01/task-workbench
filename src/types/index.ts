@@ -521,6 +521,10 @@ export interface AiStructuredReview {
  * `markdown` is a fallback when JSON parsing failed.
  */
 export interface AiFileReviewResult {
+  /** Unique identifier for this review entry. */
+  id?: string;
+  /** ID of the reviewer config that ran this review. */
+  reviewerId?: string;
   reviewerName: string;
   filePath: string;
   /** ISO timestamp of when the review was run. */
