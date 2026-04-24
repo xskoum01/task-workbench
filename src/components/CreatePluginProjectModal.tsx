@@ -205,15 +205,20 @@ export default function CreatePluginProjectModal({
 
       if (form.openAfterCreate) {
         // Try to open .sln; fall back to .csproj; fall back to folder
+        // The Rust command returns the solution root. The .sln is at solutionRoot/ProjectName.sln
+        // The .csproj is one level deeper: solutionRoot/ProjectName/ProjectName.csproj
+        // Always use openWithShell so Visual Studio is used (not VS Code).
         const slns = await tauriApi.listDirectoryFiles(createdPath, 'sln').catch(() => [] as string[]);
         if (slns.length > 0) {
           await tauriApi.openWithShell(`${createdPath}/${slns[0]}`).catch(() => {});
         } else {
-          const csprojs = await tauriApi.listDirectoryFiles(createdPath, 'csproj').catch(() => [] as string[]);
+          // .sln not found — try .csproj in the nested project subfolder
+          const projDir = `${createdPath}/${projectName}`;
+          const csprojs = await tauriApi.listDirectoryFiles(projDir, 'csproj').catch(() => [] as string[]);
           if (csprojs.length > 0) {
-            await tauriApi.openInVscode(`${createdPath}/${csprojs[0]}`).catch(() => {});
+            await tauriApi.openWithShell(`${projDir}/${csprojs[0]}`).catch(() => {});
           } else {
-            await tauriApi.openInVscode(createdPath).catch(() => {});
+            await tauriApi.openWithShell(createdPath).catch(() => {});
           }
         }
       }

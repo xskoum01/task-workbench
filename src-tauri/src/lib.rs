@@ -793,96 +793,38 @@ fn create_plugin_project_from_template(
         let proj_dir = dest.join(&project_name);
         fs::create_dir_all(&proj_dir).map_err(|e| format!("Failed to create project folder: {e}"))?;
 
-        // Properties/ subfolder (needed for AssemblyInfo.cs — required by the old MSBuild format)
-        let props_dir = proj_dir.join("Properties");
-        fs::create_dir_all(&props_dir).map_err(|e| format!("Failed to create Properties folder: {e}"))?;
-
         // Resolve the latest stable CrmSdk version from NuGet; fall back to a known-good version.
         let crmsdk_version = resolve_nuget_version("Microsoft.CrmSdk.CoreAssemblies", "9.0.2.49");
 
-        // Generate a proper GUID for the project reference inside the .sln
+        // Generate a stable GUID for the project reference inside the .sln.
+        // A fixed-but-unique GUID per project is fine — what matters is consistency between .sln and .csproj.
         let proj_guid = format!("{:08X}-{:04X}-{:04X}-{:04X}-{:012X}",
             0xAABBCCDDu32, 0x1234u16, 0x5678u16, 0x9ABCu16, 0x0123456789ABu64);
 
-        // Old-style MSBuild .csproj — this is what Visual Studio recognises as
-        // "Class Library (.NET Framework)".  SDK-style projects targeting net462
-        // open differently and cannot carry the classic project type GUID.
+        // SDK-style .csproj — supported by VS 2017+ and MSBuild 15+.
+        // All .cs files in the project directory are included automatically (no <Compile> lists needed).
+        // This means the generated plugin class saved later by saveGeneratedFile is compiled without
+        // any manual project file edits.
         let csproj = format!(
-            r#"<?xml version="1.0" encoding="utf-8"?>
-<Project ToolsVersion="15.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
-  <Import Project="$(MSBuildExtensionsPath)\$(MSBuildToolsVersion)\Microsoft.Common.props"
-          Condition="Exists('$(MSBuildExtensionsPath)\$(MSBuildToolsVersion)\Microsoft.Common.props')" />
+            r#"<Project Sdk="Microsoft.NET.Sdk">
   <PropertyGroup>
-    <Configuration Condition=" '$(Configuration)' == '' ">Debug</Configuration>
-    <Platform Condition=" '$(Platform)' == '' ">AnyCPU</Platform>
-    <ProjectGuid>{{{proj_guid}}}</ProjectGuid>
-    <OutputType>Library</OutputType>
-    <AppDesignerFolder>Properties</AppDesignerFolder>
-    <RootNamespace>{namespace}</RootNamespace>
+    <TargetFramework>net462</TargetFramework>
+    <LangVersion>latest</LangVersion>
+    <Nullable>disable</Nullable>
     <AssemblyName>{project_name}</AssemblyName>
-    <TargetFrameworkVersion>v4.6.2</TargetFrameworkVersion>
-    <FileAlignment>512</FileAlignment>
-    <Deterministic>true</Deterministic>
-    <NuGetPackageImportStamp></NuGetPackageImportStamp>
-  </PropertyGroup>
-  <PropertyGroup Condition=" '$(Configuration)|$(Platform)' == 'Debug|AnyCPU' ">
-    <DebugSymbols>true</DebugSymbols>
-    <DebugType>full</DebugType>
-    <Optimize>false</Optimize>
-    <OutputPath>bin\Debug\</OutputPath>
-    <DefineConstants>DEBUG;TRACE</DefineConstants>
-    <ErrorReport>prompt</ErrorReport>
-    <WarningLevel>4</WarningLevel>
-  </PropertyGroup>
-  <PropertyGroup Condition=" '$(Configuration)|$(Platform)' == 'Release|AnyCPU' ">
-    <DebugType>pdbonly</DebugType>
-    <Optimize>true</Optimize>
-    <OutputPath>bin\Release\</OutputPath>
-    <DefineConstants>TRACE</DefineConstants>
-    <ErrorReport>prompt</ErrorReport>
-    <WarningLevel>4</WarningLevel>
+    <RootNamespace>{namespace}</RootNamespace>
+    <GenerateAssemblyInfo>false</GenerateAssemblyInfo>
   </PropertyGroup>
   <ItemGroup>
-    <Reference Include="System" />
-    <Reference Include="System.Core" />
-    <Reference Include="System.Xml" />
+    <PackageReference Include="Microsoft.CrmSdk.CoreAssemblies" Version="{crmsdk_version}" />
   </ItemGroup>
-  <ItemGroup>
-    <Compile Include="Properties\AssemblyInfo.cs" />
-  </ItemGroup>
-  <ItemGroup>
-    <PackageReference Include="Microsoft.CrmSdk.CoreAssemblies">
-      <Version>{crmsdk_version}</Version>
-    </PackageReference>
-  </ItemGroup>
-  <Import Project="$(MSBuildToolsPath)\Microsoft.CSharp.targets" />
 </Project>
 "#
         );
         fs::write(proj_dir.join(format!("{project_name}.csproj")), &csproj)
             .map_err(|e| format!("Failed to write .csproj: {e}"))?;
 
-        // AssemblyInfo.cs — required by the old MSBuild project format.
-        let assembly_info = format!(
-            r#"using System.Reflection;
-using System.Runtime.InteropServices;
-
-[assembly: AssemblyTitle("{project_name}")]
-[assembly: AssemblyDescription("Dataverse plugin assembly")]
-[assembly: AssemblyConfiguration("")]
-[assembly: AssemblyCompany("")]
-[assembly: AssemblyProduct("{project_name}")]
-[assembly: AssemblyCopyright("")]
-[assembly: AssemblyTrademark("")]
-[assembly: ComVisible(false)]
-[assembly: AssemblyVersion("1.0.0.0")]
-[assembly: AssemblyFileVersion("1.0.0.0")]
-"#
-        );
-        fs::write(props_dir.join("AssemblyInfo.cs"), assembly_info)
-            .map_err(|e| format!("Failed to write AssemblyInfo.cs: {e}"))?;
-
-        // C# project type GUID for the old-style MSBuild format
+        // C# project type GUID (used by Visual Studio to identify SDK-style and legacy C# projects alike)
         let cs_project_type_guid = "FAE04EC0-301F-11D3-BF4B-00C04F79EFBC";
 
         // .sln goes in the solution root; .csproj path is relative: <ProjectName>\<ProjectName>.csproj
