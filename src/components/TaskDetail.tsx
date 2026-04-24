@@ -1,5 +1,5 @@
 ﻿import { useState, useEffect, useRef } from 'react';
-import type { Task, TaskStatus, PlanningBucket, SkeletonPreview, WorkflowSetup } from '../types';
+import type { Task, TaskStatus, PlanningBucket, SkeletonPreview, WorkflowSetup, AiFileReviewResult } from '../types';
 import TaskEmailContent from './TaskEmailContent';
 import TaskDevModePanel, { type TaskDevModePanelHandle } from './TaskDevModePanel';
 import { useApp } from '../context/AppContext';
@@ -11,6 +11,8 @@ import TaskForm from './TaskForm';
 import CreatePluginProjectModal, { inferPluginSuggestions, sanitize } from './CreatePluginProjectModal';
 import ConfirmSetupModal from './ConfirmSetupModal';
 import Icon from './Icon';
+import Modal from './Modal';
+import AiReviewResultView from './AiReviewResultView';
 import * as tauriApi from '../lib/tauriCommands';
 import { WorkflowStepper } from './WorkflowStepper';
 import { buildTaskWorkflowPlan } from '../lib/workflowPlan';
@@ -339,6 +341,16 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
   useEffect(() => { setNotes(task.notes ?? ''); }, [task.id, task.notes]);
   // Reset script draft flag when switching tasks
   useEffect(() => { setScriptHasDraft(false); }, [task.id]);
+  // AI Code Review — modal state for viewing a saved review
+  const [showSavedReviewModal, setShowSavedReviewModal] = useState(false);
+  const latestReview = task.aiFileReviews?.[0];
+
+  // Persists a new AI review result on the task (newest first, capped at 5).
+  async function handleReviewSaved(review: AiFileReviewResult) {
+    const existing = task.aiFileReviews ?? [];
+    const updated = [review, ...existing].slice(0, 5);
+    await updateTask(task.id, { aiFileReviews: updated });
+  }
 
   // Centralized workflow plan — drives BPF stages, action labels, feature flags.
   // Pass the heuristic devTarget kind so tasks without confirmed setup still work.
@@ -1010,6 +1022,79 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
             </div>
           )}
 
+          {/* AI Code Review — compact card showing the latest saved review */}
+          {latestReview && (
+            <div className="detail-section">
+              <span className="detail-section-label detail-ai-label">AI recenze kódu</span>
+              <div style={{
+                border: '1px solid var(--border-subtle)',
+                borderRadius: 4,
+                background: 'var(--bg-overlay)',
+                padding: '8px 10px',
+                display: 'flex',
+                flexDirection: 'column',
+                gap: 5,
+              }}>
+                {/* Top row: file name + verdict */}
+                <div style={{ display: 'flex', alignItems: 'center', gap: 6, flexWrap: 'wrap' }}>
+                  <span style={{ fontSize: 12, fontWeight: 600, color: 'var(--text-primary)', flex: 1, minWidth: 0,
+                    overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                    {latestReview.structured?.fileName ??
+                      latestReview.filePath.replace(/\\/g, '/').split('/').pop() ?? latestReview.filePath}
+                  </span>
+                  {latestReview.structured?.verdict && (() => {
+                    const VERDICT_COLOR: Record<string, string> = {
+                      pass: '#3fb950', comment: '#388bfd', needs_changes: '#d29922',
+                    };
+                    const VERDICT_LABEL: Record<string, string> = {
+                      pass: 'Bez zásadních připomínek',
+                      comment: 'Komentář',
+                      needs_changes: 'Vyžaduje úpravy',
+                    };
+                    const v = latestReview.structured!.verdict;
+                    return (
+                      <span style={{
+                        fontSize: 10, fontWeight: 600, padding: '1px 6px',
+                        borderRadius: 3, letterSpacing: '0.04em',
+                        color: VERDICT_COLOR[v],
+                        border: `1px solid ${VERDICT_COLOR[v]}`,
+                        background: `color-mix(in srgb, ${VERDICT_COLOR[v]} 12%, var(--bg-surface))`,
+                      }}>{VERDICT_LABEL[v]}</span>
+                    );
+                  })()}
+                </div>
+                {/* Meta row */}
+                <div style={{ fontSize: 11, color: 'var(--text-muted)', display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+                  <span>Recenzent: {latestReview.reviewerName}</span>
+                  {latestReview.structured?.comments?.length != null && (
+                    <span>{latestReview.structured.comments.length} komentářů</span>
+                  )}
+                  {latestReview.reviewedAt && (
+                    <span>{formatRelativeDate(latestReview.reviewedAt)}</span>
+                  )}
+                </div>
+                {/* Summary preview */}
+                {latestReview.structured?.summary && (
+                  <p style={{ margin: 0, fontSize: 11, color: 'var(--text-secondary)',
+                    display: '-webkit-box', WebkitLineClamp: 2, WebkitBoxOrient: 'vertical',
+                    overflow: 'hidden' }}>
+                    {latestReview.structured.summary}
+                  </p>
+                )}
+                {/* Actions */}
+                <div style={{ display: 'flex', gap: 6, marginTop: 2 }}>
+                  <button
+                    className="btn btn-secondary btn-sm"
+                    onClick={() => setShowSavedReviewModal(true)}
+                    type="button"
+                  >
+                    <Icon name="search" size={11} /> Otevřít recenzi
+                  </button>
+                </div>
+              </div>
+            </div>
+          )}
+
           {/* Legacy suggested steps — hidden when bilingual action bullets cover them */}
           {!(task.analysisResult?.actionPointsCz?.length) && !(task.analysisResult?.actionPointsEn?.length) &&
            (task.analysisResult?.suggestedActions ?? task.suggestedActions).length > 0 && (
@@ -1301,6 +1386,8 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
                   pluginRefreshTick={devPanelRefreshTick}
                   reviewerConfigs={plan.requiresAiFileReview ? settings.aiReviewers : undefined}
                   artifactPath={task.workflowSetup?.artifactPath}
+                  initialReview={task.aiFileReviews?.[0]}
+                  onReviewSaved={handleReviewSaved}
                 />
               )}
 
@@ -1495,6 +1582,37 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
           initialTask={task}
           onClose={() => setShowEditForm(false)}
         />
+      )}
+
+      {/* AI Code Review — full PR-style view of the latest saved review */}
+      {showSavedReviewModal && latestReview && (
+        <Modal
+          title="AI recenze kódu"
+          size="xl"
+          onClose={() => setShowSavedReviewModal(false)}
+          footer={
+            <button
+              className="btn btn-secondary btn-sm"
+              onClick={() => setShowSavedReviewModal(false)}
+              type="button"
+            >
+              Zavřít
+            </button>
+          }
+        >
+          <div className="ai-review-modal-body">
+            <div className="ai-review-modal-result">
+              <AiReviewResultView
+                structured={latestReview.structured}
+                markdown={latestReview.markdown}
+                onOpenFile={async (fp) => {
+                  try { await tauriApi.openInVscode(fp); }
+                  catch { /* ignore */ }
+                }}
+              />
+            </div>
+          </div>
+        </Modal>
       )}
     </>
   );

@@ -10,7 +10,7 @@
  * Used in both TaskDetail and InlineTaskPanel.
  */
 import { useState, useEffect, forwardRef, useImperativeHandle } from 'react';
-import type { Task, Customer, AiReviewerConfig, AiStructuredReview } from '../types';
+import type { Task, Customer, AiReviewerConfig, AiStructuredReview, AiFileReviewResult } from '../types';
 import Icon from './Icon';
 import Modal from './Modal';
 import * as tauriApi from '../lib/tauriCommands';
@@ -65,6 +65,15 @@ export interface TaskDevModePanelProps {
    *   - AI Review: uses this path directly; skips inference.
    */
   artifactPath?: string;
+  /**
+   * Latest persisted AI review for this task.
+   * Shown in the modal when no fresh run has been performed in this session.
+   */
+  initialReview?: AiFileReviewResult;
+  /**
+   * Called after a successful review so the parent can persist the result to the task.
+   */
+  onReviewSaved?: (review: AiFileReviewResult) => void;
 }
 
 export interface TaskDevModePanelHandle {
@@ -88,6 +97,8 @@ export default forwardRef<TaskDevModePanelHandle, TaskDevModePanelProps>(functio
   pluginRefreshTick = 0,
   reviewerConfigs,
   artifactPath,
+  initialReview,
+  onReviewSaved,
 }: TaskDevModePanelProps, ref: React.Ref<TaskDevModePanelHandle>) {
   // --- collapse toggle ---
   const [expanded, setExpanded] = useState(!autoCollapsed);
@@ -429,6 +440,11 @@ export default forwardRef<TaskDevModePanelHandle, TaskDevModePanelProps>(functio
       const defaultPath = await inferReviewPath();
       setReviewFilePath((prev) => prev || defaultPath);
     }
+    // If no fresh result for this session, show the latest persisted review.
+    if (!reviewStructured && !reviewMarkdown && initialReview) {
+      if (initialReview.structured) setReviewStructured(initialReview.structured);
+      if (initialReview.markdown)   setReviewMarkdown(initialReview.markdown ?? null);
+    }
     setReviewModalOpen(true);
   }
 
@@ -452,6 +468,9 @@ export default forwardRef<TaskDevModePanelHandle, TaskDevModePanelProps>(functio
       );
       if (result.structured) setReviewStructured(result.structured);
       if (result.markdown)   setReviewMarkdown(result.markdown);
+      // Persist the result on the task via the parent callback.
+      const persisted: AiFileReviewResult = { ...result, reviewedAt: new Date().toISOString() };
+      onReviewSaved?.(persisted);
       return true;
     } catch (err) {
       setReviewError(String(err));

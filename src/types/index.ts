@@ -87,6 +87,11 @@ export interface Task {
   scriptAnalysis?: ScriptAnalysis;
   /** Persisted selected plugin project folder name for dev work (shared between InlineTaskPanel and TaskDetail). */
   selectedPluginProject?: string;
+  /**
+   * Persisted AI code review results, newest first.
+   * Capped at 5 entries. Stored without API keys or prompts.
+   */
+  aiFileReviews?: AiFileReviewResult[];
 
   // --- Tracking / delivery metadata ---
   /** Where the work item originates (helpdesk ticket, ADO task, etc.). */
@@ -512,6 +517,8 @@ export interface AiStructuredReview {
 export interface AiFileReviewResult {
   reviewerName: string;
   filePath: string;
+  /** ISO timestamp of when the review was run. */
+  reviewedAt?: string;
   /** Parsed structured review. Present when JSON parsing succeeded. */
   structured?: AiStructuredReview;
   /** Raw markdown fallback. Present when JSON parsing failed. */

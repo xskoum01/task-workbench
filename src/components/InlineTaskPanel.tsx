@@ -255,6 +255,31 @@ export default function InlineTaskPanel({ task, onOpenDetail }: Props) {
               </div>
             )}
 
+            {/* AI Code Review indicator — shown when a saved review exists */}
+            {task.aiFileReviews?.[0] && (() => {
+              const r = task.aiFileReviews![0];
+              const VERDICT_COLOR: Record<string, string> = {
+                pass: '#3fb950', comment: '#388bfd', needs_changes: '#d29922',
+              };
+              const VERDICT_LABEL: Record<string, string> = {
+                pass: 'Bez připomínek', comment: 'Komentář', needs_changes: 'Vyžaduje úpravy',
+              };
+              const verdict = r.structured?.verdict;
+              return (
+                <div style={{ padding: '3px 8px', fontSize: 11, color: 'var(--text-muted)',
+                  display: 'flex', alignItems: 'center', gap: 5 }}>
+                  <span style={{ color: 'var(--text-muted)' }}>AI recenze:</span>
+                  {verdict ? (
+                    <span style={{ color: VERDICT_COLOR[verdict] ?? 'var(--text-muted)', fontWeight: 600 }}>
+                      {VERDICT_LABEL[verdict] ?? verdict}
+                    </span>
+                  ) : (
+                    <span style={{ color: 'var(--text-muted)' }}>k dispozici</span>
+                  )}
+                </div>
+              );
+            })()}
+
             {/* Task actions */}
             <div className="tip-action-group">
               <div className="tip-group-label">Task</div>
