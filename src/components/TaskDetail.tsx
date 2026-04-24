@@ -1492,6 +1492,10 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
                   artifactPath={task.workflowSetup?.artifactPath}
                   initialReview={task.aiFileReviews?.[0]}
                   onReviewSaved={handleReviewSaved}
+                  onChangeReviewComplete={async () => {
+                    await handleStatusChange('ready-for-review');
+                    setFeedback('AI review complete — status set to Ready for Review');
+                  }}
                 />
               )}
 

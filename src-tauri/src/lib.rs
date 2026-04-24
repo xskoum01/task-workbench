@@ -349,6 +349,63 @@ fn git_checkout_branch(repo_path: String, branch: String) -> Result<(), String> 
     git_run(&repo_path, &["checkout", &branch]).map(|_| ())
 }
 
+/// Returns the Git diff for the repository (or a specific file within it).
+///
+/// Combines unstaged (`git diff`) and staged (`git diff --cached`) changes so
+/// that the caller always gets all pending modifications regardless of staging
+/// state. Empty string is returned when there are no pending changes.
+///
+/// # Errors
+/// - `repo_path` does not exist.
+/// - `repo_path` is not a Git repository.
+/// - `git` is not installed / not on PATH.
+#[tauri::command]
+fn get_git_diff(repo_path: String, file_path: Option<String>) -> Result<String, String> {
+    let p = std::path::Path::new(&repo_path);
+    if !p.exists() {
+        return Err(format!("Repository path does not exist: {repo_path}"));
+    }
+    if !p.join(".git").exists() {
+        return Err(format!("'{repo_path}' is not a Git repository (no .git directory found)."));
+    }
+
+    // Helper: run git diff with the given extra args and return raw stdout.
+    let run_diff = |extra: &[&str]| -> Result<String, String> {
+        let mut cmd = std::process::Command::new("git");
+        cmd.arg("-C").arg(&repo_path).arg("diff");
+        for a in extra { cmd.arg(a); }
+        if let Some(ref fp) = file_path {
+            cmd.arg("--").arg(fp);
+        }
+        let out = cmd.output().map_err(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                "git is not installed or not on PATH.".to_string()
+            } else {
+                format!("Failed to run git: {e}")
+            }
+        })?;
+        if out.status.success() {
+            Ok(String::from_utf8_lossy(&out.stdout).to_string())
+        } else {
+            // Non-zero exit for diff usually means "not a repo" or bad args.
+            let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+            Err(stderr)
+        }
+    };
+
+    let unstaged = run_diff(&[])?;
+    let staged   = run_diff(&["--cached"])?;
+
+    // Return combined diff when both halves have content, avoiding duplication.
+    let diff = match (unstaged.is_empty(), staged.is_empty()) {
+        (false, false) => format!("{unstaged}\n{staged}"),
+        (false, true)  => unstaged,
+        (true,  false) => staged,
+        (true,  true)  => String::new(),
+    };
+    Ok(diff)
+}
+
 // --- AI helpers ------------------------------------------------------------
 
 /// Reads aiApiKey and aiModel from settings.json.
@@ -758,6 +815,145 @@ fn strip_json_fences(s: &str) -> &str {
             else                           { s };
     let s = s.trim_start();
     if s.ends_with("```") { s[..s.len() - 3].trim_end() } else { s }
+}
+
+/// AI code review that operates on a Git diff rather than a complete source file.
+///
+/// # Parameters
+/// - `diff`          - Raw unified diff text (output of `git diff`).
+/// - `task_context`  - Short task description used as context for the AI.
+/// - `file_name`     - Display name of the file being reviewed (e.g. "CustomerPlugin.cs").
+/// - `reviewer_name` - Name of the reviewer profile (injected into the result).
+/// - `instructions`  - Reviewer-specific system instructions (from AI Reviewers settings).
+/// - `model_override`- Overrides the default AI model when non-empty.
+/// - `temperature`   - Sampling temperature (0.0 = deterministic).
+#[tauri::command]
+async fn run_ai_change_review(
+    app: tauri::AppHandle,
+    diff: String,
+    task_context: String,
+    file_name: String,
+    reviewer_name: String,
+    instructions: String,
+    model_override: String,
+    temperature: f64,
+) -> Result<Value, String> {
+    let (api_key, base_model) = get_ai_settings(&app)?;
+    let model = if model_override.trim().is_empty() { base_model } else { model_override.trim().to_string() };
+
+    // Cap diff at 200 KB to stay within model context limits.
+    const MAX_BYTES: usize = 200 * 1024;
+    let diff_content = if diff.len() > MAX_BYTES {
+        let boundary = (0..=MAX_BYTES).rev().find(|&i| diff.is_char_boundary(i)).unwrap_or(0);
+        format!("{}\n\n… [diff truncated at 200 KB]", &diff[..boundary])
+    } else {
+        diff.clone()
+    };
+
+    let context_line = if task_context.is_empty() {
+        String::new()
+    } else {
+        format!("\n\nTask context: {task_context}")
+    };
+
+    let prompt = format!(
+        "Review the following Git diff for file: **{file_name}**{context_line}\n\n```diff\n{diff_content}\n```"
+    );
+
+    let json_format_requirement = r#"
+
+Recenzuješ POUZE změny zobrazené v diff — nekomentuješ kód, který diff nezahrnuje.
+Pokud diff neobsahuje dostatek kontextu pro posouzení určitého aspektu, uveď to stručně,
+ale nevymýšlej problémy v kódu, který v diffu není vidět.
+
+Vráť POUZE platné JSON bez prose, bez markdown kódových bloků, bez jiného textu.
+Veškerý textový obsah (summary, title, problem, recommendation, generalSuggestions) piš česky.
+Kódové úseky (codeSnippet, suggestedCode) ponechávej v originálním programovacím jazyce.
+
+Požadované schéma:
+{
+  "verdict": "pass" | "needs_changes" | "comment",
+  "summary": "český souhrnný odstavec o změnách v diffu.",
+  "comments": [
+    {
+      "severity": "critical" | "major" | "minor" | "suggestion",
+      "lineStart": 42,
+      "lineEnd": 58,
+      "title": "Krátký český název problému",
+      "problem": "- První problém\n- Druhý problém",
+      "recommendation": "- První krok\n- Druhý krok",
+      "codeSnippet": "1–5 řádků z diffu ilustrující problém",
+      "suggestedCode": "Volitelný opravový kód"
+    }
+  ],
+  "generalSuggestions": ["české obecné doporučení k diffu"]
+}
+
+Pravidla:
+- Odpovídej česky.
+- Komentuj POUZE řádky označené '+' nebo '-' v diffu — ignoruj kontext ('  ').
+- Nejvýše 8 komentářů.
+- title: krátký, max 6 slov.
+- problem a recommendation: krátké odrážkové body, každý začínající '-'.
+- lineStart/lineEnd: čísla řádků z diffu ('+' strany), pokud je lze spolehlivě určit.
+- verdict: "pass" = vše v pořádku; "comment" = drobná doporučení; "needs_changes" = důležité problémy.
+- Zaměř se na konkrétní problémy v nových/změněných řádcích — správnost, udržovatelnost, Dataverse/Power Apps specifika."#;
+
+    let full_instructions = if instructions.is_empty() {
+        json_format_requirement.trim_start().to_string()
+    } else {
+        format!("{instructions}{json_format_requirement}")
+    };
+
+    let client = reqwest::Client::new();
+    let mut body = serde_json::json!({
+        "model": model,
+        "input": prompt,
+        "instructions": full_instructions,
+    });
+    if temperature > 0.0 {
+        body["temperature"] = serde_json::Value::from(temperature.clamp(0.0, 2.0));
+    }
+
+    let resp = client
+        .post("https://api.openai.com/v1/responses")
+        .bearer_auth(&api_key)
+        .header("content-type", "application/json")
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| format!("Network error: {e}"))?;
+
+    if !resp.status().is_success() {
+        let status = resp.status().as_u16();
+        let text = resp.text().await.unwrap_or_default();
+        return Err(format!("OpenAI API error {status}: {text}"));
+    }
+
+    let json: Value = resp.json().await.map_err(|e| e.to_string())?;
+    let text = json["output"][0]["content"][0]["text"]
+        .as_str()
+        .map(|s| s.to_string())
+        .ok_or_else(|| {
+            let snippet = json.to_string();
+            format!("Unexpected OpenAI response: {}", &snippet[..snippet.len().min(300)])
+        })?;
+
+    let stripped = strip_json_fences(text.trim());
+
+    match serde_json::from_str::<Value>(stripped) {
+        Ok(mut parsed) => {
+            parsed["reviewerName"] = serde_json::Value::String(reviewer_name);
+            // filePath is not a single file for a diff review — use file_name as a hint.
+            parsed["filePath"]     = serde_json::Value::String(file_name.clone());
+            parsed["fileName"]     = serde_json::Value::String(file_name);
+            Ok(serde_json::json!({ "structured": parsed, "markdown": null }))
+        }
+        Err(_) => {
+            let header = format!("**Reviewer:** {reviewer_name}  \n**File (diff):** {file_name}\n\n---\n\n");
+            Ok(serde_json::json!({ "structured": null, "markdown": format!("{header}{text}") }))
+        }
+    }
 }
 
 /// Creates a new plugin project directory from a local template folder.
@@ -3641,6 +3837,8 @@ pub fn run() {
             list_git_branches,
             git_has_uncommitted,
             git_checkout_branch,
+            get_git_diff,
+            run_ai_change_review,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

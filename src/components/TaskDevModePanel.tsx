@@ -18,6 +18,7 @@ import { openReviewTarget } from '../lib/openReviewTarget';
 import { hintedPluginProject } from '../lib/resolveTaskDevTarget';
 import { mergeWithDefaults, selectReviewer } from '../lib/aiReviewers';
 import AiReviewResultView from './AiReviewResultView';
+import CodeChangeReviewModal from './CodeChangeReviewModal';
 
 export interface TaskDevModePanelProps {
   task: Task;
@@ -81,6 +82,11 @@ export interface TaskDevModePanelProps {
    * Called after a successful review so the parent can persist the result to the task.
    */
   onReviewSaved?: (review: AiFileReviewResult) => void;
+  /**
+   * Called after a git-diff change review completes successfully inside the diff modal.
+   * Use this to advance task status to ready-for-review in the parent.
+   */
+  onChangeReviewComplete?: () => void;
 }
 
 export interface TaskDevModePanelHandle {
@@ -112,6 +118,7 @@ export default forwardRef<TaskDevModePanelHandle, TaskDevModePanelProps>(functio
   artifactPath,
   initialReview,
   onReviewSaved,
+  onChangeReviewComplete,
 }: TaskDevModePanelProps, ref: React.Ref<TaskDevModePanelHandle>) {
   // --- collapse toggle ---
   const [expanded, setExpanded] = useState(!autoCollapsed);
@@ -157,6 +164,15 @@ export default forwardRef<TaskDevModePanelHandle, TaskDevModePanelProps>(functio
   const [branchSwitching, setBranchSwitching] = useState(false);
   const [branchError, setBranchError]       = useState<string | null>(null);
 
+  // Diff-based change review (Update / Fix workflows).
+  const [diffModalOpen, setDiffModalOpen]     = useState(false);
+  const [diffContent, setDiffContent]         = useState('');
+  const [diffLoadingGit, setDiffLoadingGit]   = useState(false);
+
+  // Whether this task uses diff-based review (Update or Fix workIntent).
+  const workIntent = task.workflowSetup?.workIntent;
+  const isDiffWorkflow = workIntent === 'update' || workIntent === 'fix';
+
   // --- AI Review state ---
   const [reviewModalOpen, setReviewModalOpen]           = useState(false);
   const [reviewFilePath, setReviewFilePath]             = useState('');
@@ -194,6 +210,9 @@ export default forwardRef<TaskDevModePanelHandle, TaskDevModePanelProps>(functio
     setReviewError(null);
     setReviewInferError(null);
     setReviewInferring(false);
+    // Reset diff modal state
+    setDiffModalOpen(false);
+    setDiffContent('');
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [task.id]);
 
@@ -475,8 +494,86 @@ export default forwardRef<TaskDevModePanelHandle, TaskDevModePanelProps>(functio
     setReviewModalOpen(true);
   }
 
+  /**
+   * Loads the git diff for the current file/repo and updates `diffContent`.
+   * Returns the loaded diff string (empty string when nothing changed or on error).
+   */
+  async function handleLoadGitDiff(): Promise<string> {
+    if (!effectiveRepoRoot) return '';
+    setDiffLoadingGit(true);
+    try {
+      const filePath = (reviewFilePath.trim() || artifactPath || '').trim() || undefined;
+      const diff = await tauriApi.getGitDiff(effectiveRepoRoot, filePath);
+      setDiffContent(diff);
+      return diff;
+    } catch {
+      setDiffContent('');
+      return '';
+    } finally {
+      setDiffLoadingGit(false);
+    }
+  }
+
+  /**
+   * Runs the AI change review over whatever is currently in `diffContent`.
+   * Called from inside CodeChangeReviewModal when the user clicks Run AI Review.
+   */
+  async function handleRunDiffReview() {
+    if (!diffContent.trim()) { setReviewError('Diff je prázdný — vložte kód nebo diff ke kontrole.'); return; }
+    const reviewer = getActiveReviewer();
+    if (!reviewer) { setReviewError('Žádný recenzent. Nastavte AI Reviewers v Settings.'); return; }
+    const path = (reviewFilePath.trim() || artifactPath || '').trim();
+    const fileName = path ? path.replace(/\\/g, '/').split('/').pop() ?? path : 'changed file';
+    setReviewRunning(true);
+    setReviewError(null);
+    setReviewMarkdown(null);
+    setReviewStructured(null);
+    try {
+      const result = await tauriApi.runAiChangeReview(
+        diffContent,
+        task.title,
+        fileName,
+        reviewer.name,
+        reviewer.instructions,
+        reviewer.model ?? '',
+        reviewer.temperature ?? 0.2,
+      );
+      if (result.structured) setReviewStructured(result.structured);
+      if (result.markdown)   setReviewMarkdown(result.markdown);
+      const persisted: AiFileReviewResult = {
+        ...result,
+        id: crypto.randomUUID(),
+        reviewerId: reviewer.id,
+        reviewedAt: new Date().toISOString(),
+      };
+      onReviewSaved?.(persisted);
+      setDiffModalOpen(false);
+      // Show the review result in the normal review modal.
+      setReviewModalOpen(true);
+      onChangeReviewComplete?.();
+    } catch (err) {
+      setReviewError(String(err));
+    } finally {
+      setReviewRunning(false);
+    }
+  }
+
   async function handleRunReview(): Promise<boolean> {
-    // Effective path: user-typed value wins; fall back to persisted artifactPath.
+    // Update / Fix workflows: review only the git diff, not the whole file.
+    if (isDiffWorkflow) {
+      // Ensure review file path is resolved before loading the diff.
+      if (!reviewPathUserEdited && !reviewFilePath.trim() && !artifactPath) {
+        const defaultPath = await inferReviewPath();
+        setReviewFilePath((prev) => prev || defaultPath);
+      }
+      const diff = await handleLoadGitDiff();
+      setDiffContent(diff);
+      setDiffModalOpen(true);
+      // Return false — status advance happens via onChangeReviewComplete when the modal completes.
+      return false;
+    }
+
+    // Create workflows: review the full artifact file (existing behaviour).
     const path = (reviewFilePath.trim() || artifactPath || '').trim();
     if (!path) { setReviewError('Enter the file path to review.'); return false; }
     const reviewer = getActiveReviewer();
@@ -515,7 +612,11 @@ export default forwardRef<TaskDevModePanelHandle, TaskDevModePanelProps>(functio
   // Imperative handle — lets TaskDetail trigger the review programmatically
   useImperativeHandle(ref, () => ({
     runReview: async () => {
-      // Open the modal so the user sees the results
+      if (isDiffWorkflow) {
+        // Diff workflow: handleRunReview opens diffModalOpen itself.
+        return handleRunReview();
+      }
+      // Full-file workflow: open the review modal so the user sees the results.
       const effectivePath = reviewFilePath.trim() || (artifactPath ?? '');
       if (!reviewPathUserEdited && !effectivePath) {
         const defaultPath = await inferReviewPath();
@@ -825,6 +926,25 @@ export default forwardRef<TaskDevModePanelHandle, TaskDevModePanelProps>(functio
             )}
           </div>
         </Modal>
+      )}
+
+      {/* Diff-based change review modal — shown for Update / Fix workflows */}
+      {diffModalOpen && (
+        <CodeChangeReviewModal
+          diff={diffContent}
+          onChange={setDiffContent}
+          fileName={
+            (reviewFilePath.trim() || artifactPath || '')
+              .replace(/\\/g, '/')
+              .split('/')
+              .pop() ?? ''
+          }
+          loadingDiff={diffLoadingGit}
+          runningReview={reviewRunning}
+          onLoadGitDiff={handleLoadGitDiff}
+          onRunReview={handleRunDiffReview}
+          onClose={() => setDiffModalOpen(false)}
+        />
       )}
     </div>
   );

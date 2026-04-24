@@ -377,6 +377,49 @@ export function gitCheckoutBranch(repoPath: string, branch: string): Promise<voi
   return invoke('git_checkout_branch', { repoPath, branch });
 }
 
+/**
+ * Returns the Git diff for `repoPath`, optionally scoped to a single `filePath`.
+ *
+ * Combines unstaged and staged changes so the caller always gets all pending
+ * modifications regardless of staging state. Returns an empty string when
+ * there are no pending changes — this is not an error.
+ *
+ * Rejects when:
+ * - `repoPath` does not exist.
+ * - `repoPath` is not a Git repository.
+ * - `git` is not installed / not on PATH.
+ */
+export function getGitDiff(repoPath: string, filePath?: string): Promise<string> {
+  return invoke<string>('get_git_diff', { repoPath, filePath: filePath ?? null });
+}
+
+/**
+ * Runs an AI review against a Git diff instead of a full source file.
+ *
+ * The AI is instructed to comment only on changed lines ('+'/'-') and to avoid
+ * speculating about code not visible in the diff. The result has the same
+ * `{ structured, markdown }` shape as `runAiFileReview`.
+ */
+export function runAiChangeReview(
+  diff: string,
+  taskContext: string,
+  fileName: string,
+  reviewerName: string,
+  instructions: string,
+  modelOverride: string,
+  temperature: number,
+): Promise<AiFileReviewResult> {
+  return invoke<{ structured: AiStructuredReview | null; markdown: string | null }>(
+    'run_ai_change_review',
+    { diff, taskContext, fileName, reviewerName, instructions, modelOverride, temperature },
+  ).then(({ structured, markdown }) => {
+    const result: AiFileReviewResult = { reviewerName, filePath: fileName };
+    if (structured) result.structured = structured;
+    if (markdown) result.markdown = markdown;
+    return result;
+  });
+}
+
 // ---------------------------------------------------------------------------
 // Microsoft 365 — OAuth2 PKCE sign-in and Microsoft Graph API
 //
