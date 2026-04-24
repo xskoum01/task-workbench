@@ -5085,3 +5085,119 @@ body {
 }
 
 
+/* === Workflow Stepper (BPF-style) ======================================== */
+
+.workflow-stepper {
+  display: flex;
+  align-items: center;
+  flex-shrink: 0;
+  align-self: center;
+}
+
+/*
+ * Each step is a chevron-shaped pill.
+ * Steps overlap by the tip width (8 px) so the arrow of one
+ * step appears to point into the next.
+ */
+.workflow-step {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  height: 22px;
+  padding: 0 10px 0 18px;
+  font-size: 10px;
+  font-weight: 500;
+  letter-spacing: 0.02em;
+  border: none;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: opacity 0.12s, filter 0.12s;
+  /* Chevron shape: notch on left, arrow on right */
+  clip-path: polygon(
+    0 0,
+    calc(100% - 8px) 0,
+    100% 50%,
+    calc(100% - 8px) 100%,
+    0 100%,
+    8px 50%
+  );
+  margin-right: -1px;
+  z-index: 1;
+  color: #6e7681;
+  background: #1c2128;
+}
+
+/* First step: flat left edge, no left notch */
+.workflow-step:first-child {
+  padding-left: 12px;
+  clip-path: polygon(
+    0 0,
+    calc(100% - 8px) 0,
+    100% 50%,
+    calc(100% - 8px) 100%,
+    0 100%
+  );
+  border-radius: 3px 0 0 3px;
+}
+
+/* Last step: flat right edge, no arrow tip */
+.workflow-step:last-child {
+  clip-path: polygon(
+    0 0,
+    100% 0,
+    100% 100%,
+    0 100%,
+    8px 50%
+  );
+  border-radius: 0 3px 3px 0;
+}
+
+.workflow-step:not([disabled]):hover {
+  opacity: 0.85;
+  filter: brightness(1.15);
+}
+
+/* -- Completed -- */
+.workflow-step--completed {
+  background: color-mix(in srgb, var(--color-done) 20%, #1c2128);
+  color: color-mix(in srgb, var(--color-done) 70%, #fff);
+  z-index: 2;
+}
+
+/* -- Active -- */
+.workflow-step--active {
+  z-index: 3;
+  color: #fff;
+  font-weight: 600;
+}
+.workflow-step--active.workflow-step--new              { background: var(--color-new); }
+.workflow-step--active.workflow-step--analyzed         { background: var(--color-analyzed); }
+.workflow-step--active.workflow-step--in-progress      { background: var(--color-in-progress); }
+.workflow-step--active.workflow-step--ready-for-review { background: var(--color-ready-for-review); }
+.workflow-step--active.workflow-step--done             { background: var(--color-done); }
+
+/* -- Upcoming -- */
+.workflow-step--upcoming {
+  opacity: 0.38;
+  z-index: 0;
+}
+
+.workflow-step-check {
+  font-size: 9px;
+  line-height: 1;
+  opacity: 0.85;
+}
+
+/* Blocked badge — shown after the steps when status === 'blocked' */
+.workflow-step-blocked-badge {
+  margin-left: 8px;
+  padding: 2px 7px;
+  border-radius: 3px;
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.03em;
+  background: color-mix(in srgb, var(--color-blocked) 16%, transparent);
+  color: var(--color-blocked);
+  border: 1px solid color-mix(in srgb, var(--color-blocked) 30%, transparent);
+}

@@ -3,7 +3,7 @@ import type { Task, TaskStatus, PlanningBucket, SkeletonPreview } from '../types
 import TaskEmailContent from './TaskEmailContent';
 import TaskDevModePanel from './TaskDevModePanel';
 import { useApp } from '../context/AppContext';
-import { TypeBadge, SourceBadge, STATUS_LABELS } from './StatusBadge';
+import { TypeBadge, SourceBadge } from './StatusBadge';
 import ReplyModal from './ReplyModal';
 import SkeletonPreviewModal from './SkeletonPreviewModal';
 import ScriptAssistantPanel, { type ScriptAssistantPanelHandle } from './ScriptAssistantPanel';
@@ -11,6 +11,7 @@ import TaskForm from './TaskForm';
 import CreatePluginProjectModal, { inferPluginSuggestions, sanitize } from './CreatePluginProjectModal';
 import Icon from './Icon';
 import * as tauriApi from '../lib/tauriCommands';
+import { WorkflowStepper } from './WorkflowStepper';
 import { resolveTaskDevTarget, getPluginsDir, hintedPluginProject } from '../lib/resolveTaskDevTarget';
 import { BUCKET_META, BUCKET_ORDER, computePlanning, effectiveBucket } from '../lib/planning';
 import { isOverdue, formatRelativeDate } from '../lib/dates';
@@ -47,16 +48,6 @@ function isNewPluginTask(task: Task): boolean {
   const createPattern = /\b(create|new|scaffold|nový|nová|nové|vytvořit|vytvořte|založ|nový plugin|new plugin)\b/;
   return createPattern.test(text) || task.taskType === 'feature';
 }
-
-// All statuses in the progression order shown in the selector
-const STATUS_OPTIONS: TaskStatus[] = [
-  'new',
-  'analyzed',
-  'in-progress',
-  'ready-for-review',
-  'done',
-  'blocked',
-];
 
 function confidenceClass(value: number): string {
   if (value >= 80) return '';
@@ -589,25 +580,18 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
           <div className="detail-panel-header-content">
             <div className="detail-panel-title">{task.title}</div>
 
-            <div style={{ marginTop: 6, display: 'flex', gap: 6, alignItems: 'center', flexWrap: 'wrap' }}>
-              {/* Inline status selector — styled to match the badge palette */}
-              <select
-                className={`detail-status-select detail-status-${task.status}`}
-                value={task.status}
-                onChange={(e) => handleStatusChange(e.target.value as TaskStatus)}
-                title="Change status"
-              >
-                {STATUS_OPTIONS.map((s) => (
-                  <option key={s} value={s}>{STATUS_LABELS[s]}</option>
-                ))}
-              </select>
-
+            <div style={{ marginTop: 5, display: 'flex', gap: 6, alignItems: 'center' }}>
               <TypeBadge type={task.taskType} />
               {task.analysisResult && (
                 <span className="detail-ai-badge">AI</span>
               )}
             </div>
           </div>
+
+          <WorkflowStepper
+            status={task.status}
+            onChange={handleStatusChange}
+          />
 
           <button
             className="detail-panel-edit"
