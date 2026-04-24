@@ -19,6 +19,7 @@ export type TargetKind = 'plugin' | 'script' | 'repo';
 
 export type PlanAction =
   | 'analyze'
+  | 'confirm-setup'
   | 'generate-draft'
   | 'start-work'
   | 'run-review'
@@ -47,6 +48,7 @@ type DevKind = NonNullable<WorkflowSetup['devTargetKind']>;
 type WorkIntent = NonNullable<WorkflowSetup['workIntent']>;
 
 const S_NEW: WorkflowStage = { id: 'new', label: 'New', actionLabel: 'Analyze', next: 'analyzed' };
+const S_ANA_CONFIRM: WorkflowStage = { id: 'analyzed', label: 'Analyzed', actionLabel: 'Confirm Setup', next: 'in-progress' };
 const S_ANA_DRAFT: WorkflowStage = { id: 'analyzed', label: 'Analyzed', actionLabel: 'Generate Draft', next: 'in-progress' };
 const S_ANA_START: WorkflowStage = { id: 'analyzed', label: 'Analyzed', actionLabel: 'Start Work', next: 'in-progress' };
 const S_ANA_FIX: WorkflowStage = { id: 'analyzed', label: 'Analyzed', actionLabel: 'Start Fixing', next: 'in-progress' };
@@ -106,7 +108,7 @@ export function buildTaskWorkflowPlan(task: Task, heuristicKind?: DevKind): Task
   if (isGeneral) {
     stages = [S_NEW, S_ANA_DONE, S_DONE];
   } else if (isDeveloperAwaitingSetup) {
-    stages = [S_NEW, S_ANA_START, S_IN_PROGRESS, S_FOR_REVIEW, S_DONE];
+    stages = [S_NEW, S_ANA_CONFIRM, S_IN_PROGRESS, S_FOR_REVIEW, S_DONE];
   } else if (isReview) {
     stages = [S_NEW, S_ANA_REVIEW, S_FOR_REVIEW, S_DONE];
   } else {
@@ -119,11 +121,11 @@ export function buildTaskWorkflowPlan(task: Task, heuristicKind?: DevKind): Task
     case 'new':
       currentAction = 'analyze'; break;
     case 'analyzed':
-      if (isGeneral)                   currentAction = 'mark-done';
-      else if (isDeveloperAwaitingSetup) currentAction = 'start-work'; // TaskDetail redirects to setup modal
-      else if (isReview)               currentAction = 'run-review';
-      else if (isCreate)               currentAction = 'generate-draft';
-      else                             currentAction = 'start-work';
+      if (isGeneral)                     currentAction = 'mark-done';
+      else if (isDeveloperAwaitingSetup) currentAction = 'confirm-setup';
+      else if (isReview)                 currentAction = 'run-review';
+      else if (isCreate)                 currentAction = 'generate-draft';
+      else                               currentAction = 'start-work';
       break;
     case 'in-progress':
       currentAction = isCode ? 'run-review' : 'none'; break;
