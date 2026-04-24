@@ -72,7 +72,8 @@ export function buildTaskWorkflowPlan(task: Task, heuristicKind?: DevKind): Task
 
   // "code task": developer mode AND user has explicitly confirmed plugin or script target.
   // taskMode = general → never code.
-  // taskMode = developer + no confirmed plugin/script → still not code until setup is done.
+  // taskMode = developer + no confirmed plugin/script → not yet full code workflow, but
+  //   still a developer task — use developer stages without dev-tool flags.
   const isPluginOrScript = devKind === 'plugin' || devKind === 'script';
   const isCode = taskMode === 'general'
     ? false
@@ -80,24 +81,32 @@ export function buildTaskWorkflowPlan(task: Task, heuristicKind?: DevKind): Task
       ? isPluginOrScript && !!confirmedKind   // requires explicit user confirmation
       : isPluginOrScript;
 
-  // For developer tasks where setup is not yet confirmed (no plugin/script chosen),
-  // use a minimal analyze-only stage.
+  // True when developer mode but plugin/script target not yet confirmed.
   const isDeveloperAwaitingSetup = taskMode === 'developer' && !confirmedKind;
+  // True for the general (non-developer) workflow shape.
+  const isGeneral = taskMode === 'general';
 
   const isCreate = workIntent === 'create';
   const isFix    = workIntent === 'fix';
   const isReview = workIntent === 'review';
 
   let workflowKind: WorkflowKind;
-  if (!isCode)       workflowKind = 'general';
+  if (!isCode && !isDeveloperAwaitingSetup) workflowKind = 'general';
   else if (isCreate) workflowKind = 'dev-create';
   else if (isFix)    workflowKind = 'dev-fix';
   else if (isReview) workflowKind = 'dev-review';
   else               workflowKind = 'dev-update';
 
+  // Stage shape:
+  //   - general → New → Analyzed → Done
+  //   - developer awaiting setup → New → Analyzed(Start Work) → In Progress → For Review → Done
+  //   - developer confirmed review → New → Analyzed → For Review → Done
+  //   - developer confirmed create/update/fix → New → Analyzed → In Progress → For Review → Done
   let stages: WorkflowStage[];
-  if (!isCode) {
+  if (isGeneral) {
     stages = [S_NEW, S_ANA_DONE, S_DONE];
+  } else if (isDeveloperAwaitingSetup) {
+    stages = [S_NEW, S_ANA_START, S_IN_PROGRESS, S_FOR_REVIEW, S_DONE];
   } else if (isReview) {
     stages = [S_NEW, S_ANA_REVIEW, S_FOR_REVIEW, S_DONE];
   } else {
@@ -110,13 +119,14 @@ export function buildTaskWorkflowPlan(task: Task, heuristicKind?: DevKind): Task
     case 'new':
       currentAction = 'analyze'; break;
     case 'analyzed':
-      if (!isCode)       currentAction = 'mark-done';
-      else if (isReview) currentAction = 'run-review';
-      else if (isCreate) currentAction = 'generate-draft';
-      else               currentAction = 'start-work';
+      if (isGeneral)                   currentAction = 'mark-done';
+      else if (isDeveloperAwaitingSetup) currentAction = 'start-work'; // TaskDetail redirects to setup modal
+      else if (isReview)               currentAction = 'run-review';
+      else if (isCreate)               currentAction = 'generate-draft';
+      else                             currentAction = 'start-work';
       break;
     case 'in-progress':
-      currentAction = 'run-review'; break;
+      currentAction = isCode ? 'run-review' : 'none'; break;
     case 'ready-for-review':
       currentAction = 'mark-done'; break;
     default:

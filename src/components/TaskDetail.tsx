@@ -556,7 +556,12 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
     switch (plan.currentAction) {
       case 'analyze':        openSetupModal();      break;
       case 'generate-draft': handleGenerateDraft(); break;
-      case 'start-work':     handleStartWork();     break;
+      case 'start-work':
+        // When developer mode is active but plugin/script not yet chosen,
+        // redirect the stage action to the setup modal instead of opening code.
+        if (plan.isDeveloperAwaitingSetup) { setShowSetupModal(true); break; }
+        handleStartWork();
+        break;
       case 'run-review':     handleSendForReview(); break;
       case 'mark-done':      handleMarkDone();      break;
       default: break;
