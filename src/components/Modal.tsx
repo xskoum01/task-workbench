@@ -4,8 +4,8 @@ interface ModalProps {
   title: string;
   onClose: () => void;
   children: React.ReactNode;
-  /** Use 'lg' for wider forms (customer form). Default is standard width. */
-  size?: 'md' | 'lg';
+  /** Use 'lg' for wider forms, 'xl' for large reading-focused dialogs. Default is standard width. */
+  size?: 'md' | 'lg' | 'xl';
   footer?: React.ReactNode;
 }
 
@@ -27,7 +27,7 @@ export default function Modal({ title, onClose, children, size = 'md', footer }:
         if (e.target === e.currentTarget) onClose();
       }}
     >
-      <div className={`modal${size === 'lg' ? ' modal-lg' : ''}`}>
+      <div className={`modal${size === 'lg' ? ' modal-lg' : ''}${size === 'xl' ? ' modal-xl' : ''}`}>
         <div className="modal-header">
           <span className="modal-title">{title}</span>
           <button className="modal-close" onClick={onClose} title="Close (Esc)">×</button>

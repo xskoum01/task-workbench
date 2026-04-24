@@ -12,6 +12,7 @@
 import { useState, useEffect, forwardRef, useImperativeHandle } from 'react';
 import type { Task, Customer, AiReviewerConfig } from '../types';
 import Icon from './Icon';
+import Modal from './Modal';
 import * as tauriApi from '../lib/tauriCommands';
 import { hintedPluginProject } from '../lib/resolveTaskDevTarget';
 import { mergeWithDefaults, selectReviewer } from '../lib/aiReviewers';
@@ -122,15 +123,15 @@ export default forwardRef<TaskDevModePanelHandle, TaskDevModePanelProps>(functio
   const [branchError, setBranchError]       = useState<string | null>(null);
 
   // --- AI Review state ---
-  const [reviewExpanded, setReviewExpanded]         = useState(false);
-  const [reviewFilePath, setReviewFilePath]         = useState('');
+  const [reviewModalOpen, setReviewModalOpen]           = useState(false);
+  const [reviewFilePath, setReviewFilePath]             = useState('');
   const [reviewPathUserEdited, setReviewPathUserEdited] = useState(false);
-  const [reviewSelectedId, setReviewSelectedId]     = useState('');
-  const [reviewRunning, setReviewRunning]           = useState(false);
-  const [reviewError, setReviewError]               = useState<string | null>(null);
-  const [reviewMarkdown, setReviewMarkdown]         = useState<string | null>(null);
-  const [reviewInferring, setReviewInferring]       = useState(false);
-  const [reviewInferError, setReviewInferError]     = useState<string | null>(null);
+  const [reviewSelectedId, setReviewSelectedId]         = useState('');
+  const [reviewRunning, setReviewRunning]               = useState(false);
+  const [reviewError, setReviewError]                   = useState<string | null>(null);
+  const [reviewMarkdown, setReviewMarkdown]             = useState<string | null>(null);
+  const [reviewInferring, setReviewInferring]           = useState(false);
+  const [reviewInferError, setReviewInferError]         = useState<string | null>(null);
 
   // Reset all state when the viewed task changes.
   useEffect(() => {
@@ -147,7 +148,7 @@ export default forwardRef<TaskDevModePanelHandle, TaskDevModePanelProps>(functio
     setBranchDirty(false);
     setBranchError(null);
     // Reset review state
-    setReviewExpanded(false);
+    setReviewModalOpen(false);
     setReviewFilePath('');
     setReviewPathUserEdited(false);
     setReviewSelectedId('');
@@ -352,14 +353,13 @@ export default forwardRef<TaskDevModePanelHandle, TaskDevModePanelProps>(functio
     return selectReviewer(allReviewers, reviewFilePath, devMode);
   }
 
-  async function handleOpenReviewPanel() {
-    if (!reviewExpanded) {
+  /** Opens the AI review modal, inferring the file path if not yet set. */
+  async function handleOpenReviewModal() {
+    if (!reviewPathUserEdited && !reviewFilePath) {
       const defaultPath = await inferReviewPath();
       setReviewFilePath((prev) => prev || defaultPath);
     }
-    setReviewExpanded((v) => !v);
-    setReviewMarkdown(null);
-    setReviewError(null);
+    setReviewModalOpen(true);
   }
 
   async function handleRunReview(): Promise<boolean> {
@@ -391,14 +391,12 @@ export default forwardRef<TaskDevModePanelHandle, TaskDevModePanelProps>(functio
   // Imperative handle — lets TaskDetail trigger the review programmatically
   useImperativeHandle(ref, () => ({
     runReview: async () => {
-      // Ensure the review panel is visible so the user sees the results
-      if (!reviewExpanded) {
+      // Open the modal so the user sees the results
+      if (!reviewPathUserEdited && !reviewFilePath) {
         const defaultPath = await inferReviewPath();
         setReviewFilePath((prev) => prev || defaultPath);
-        setReviewExpanded(true);
-        setReviewMarkdown(null);
-        setReviewError(null);
       }
+      setReviewModalOpen(true);
       return handleRunReview();
     },
   }));
@@ -560,23 +558,44 @@ export default forwardRef<TaskDevModePanelHandle, TaskDevModePanelProps>(functio
         </button>
       )}
 
-      {/* AI Review panel — shown when reviewer configs are available */}
+      {/* AI Review — shown when reviewer configs are available */}
       {allReviewers.length > 0 && (
         <div className="detail-devmode-review-section">
           <button
             className="btn btn-ghost btn-sm detail-devmode-review-toggle"
-            onClick={handleOpenReviewPanel}
+            onClick={handleOpenReviewModal}
+            disabled={reviewInferring}
             type="button"
           >
             <Icon name="search" size={12} />
-            {reviewExpanded ? 'Hide AI Review' : 'Run AI Review'}
+            {reviewInferring ? 'Searching file…' : 'Run AI Review'}
           </button>
+        </div>
+      )}
+        </>
+      )}
 
-          {reviewExpanded && (
-            <div className="detail-devmode-review-panel">
+      {/* AI Review modal — rendered outside the expanded block so it persists if the panel collapses */}
+      {reviewModalOpen && (
+        <Modal
+          title="AI Code Review"
+          size="xl"
+          onClose={() => setReviewModalOpen(false)}
+          footer={
+            <button
+              className="btn btn-secondary btn-sm"
+              onClick={() => setReviewModalOpen(false)}
+              type="button"
+            >
+              Close
+            </button>
+          }
+        >
+          <div className="ai-review-modal-body">
+            <div className="ai-review-modal-fields">
               {/* File path input */}
-              <div className="detail-devmode-review-row">
-                <label className="form-label" style={{ marginBottom: 2 }}>File to review</label>
+              <div className="ai-review-modal-row">
+                <label className="form-label">File to review</label>
                 <input
                   className="form-input"
                   type="text"
@@ -584,8 +603,8 @@ export default forwardRef<TaskDevModePanelHandle, TaskDevModePanelProps>(functio
                   value={reviewFilePath}
                   onChange={(e) => {
                     setReviewFilePath(e.target.value);
-                    setReviewPathUserEdited(true); // lock inference once user edits manually
-                    setReviewSelectedId(''); // reset manual override on path change
+                    setReviewPathUserEdited(true);
+                    setReviewSelectedId('');
                     setReviewMarkdown(null);
                     setReviewError(null);
                     setReviewInferError(null);
@@ -602,8 +621,8 @@ export default forwardRef<TaskDevModePanelHandle, TaskDevModePanelProps>(functio
               </div>
 
               {/* Reviewer selector */}
-              <div className="detail-devmode-review-row">
-                <label className="form-label" style={{ marginBottom: 2 }}>Reviewer</label>
+              <div className="ai-review-modal-row">
+                <label className="form-label">Reviewer</label>
                 <select
                   className="form-select"
                   value={reviewSelectedId || (getActiveReviewer()?.id ?? '')}
@@ -623,7 +642,7 @@ export default forwardRef<TaskDevModePanelHandle, TaskDevModePanelProps>(functio
 
               {/* Run button */}
               <button
-                className="btn btn-primary btn-sm btn-full"
+                className="btn btn-primary btn-sm"
                 onClick={handleRunReview}
                 disabled={reviewRunning || reviewInferring || !reviewFilePath.trim() || !getActiveReviewer()}
                 type="button"
@@ -635,22 +654,20 @@ export default forwardRef<TaskDevModePanelHandle, TaskDevModePanelProps>(functio
 
               {/* Error */}
               {reviewError && (
-                <div className="detail-devmode-hint" style={{ color: 'var(--color-blocked)', marginTop: 6 }}>
+                <div className="detail-devmode-hint" style={{ color: 'var(--color-blocked)' }}>
                   {reviewError}
                 </div>
               )}
-
-              {/* Result */}
-              {reviewMarkdown && (
-                <div className="detail-devmode-review-result">
-                  <MarkdownView markdown={reviewMarkdown} />
-                </div>
-              )}
             </div>
-          )}
-        </div>
-      )}
-        </>
+
+            {/* Result */}
+            {reviewMarkdown && (
+              <div className="ai-review-modal-result">
+                <MarkdownView markdown={reviewMarkdown} />
+              </div>
+            )}
+          </div>
+        </Modal>
       )}
     </div>
   );
