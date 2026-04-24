@@ -385,11 +385,22 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
   // --- Workflow actions ---
 
   async function handleAnalyze() {
+    await handleAnalyzeWithSetup(undefined);
+  }
+
+  /**
+   * Runs AI analysis and persists the result in a single updateTask call.
+   * When `extraSetup` is provided (e.g. from Confirm Setup), it is merged into
+   * the same update so that workflowSetup and status are never split across two
+   * updateTask calls (which would lose the setup due to React stale closures).
+   */
+  async function handleAnalyzeWithSetup(extraSetup: import('../types').WorkflowSetup | undefined) {
     setAiLoading('analyze');
     setAiError(null);
     try {
       const result = await tauriApi.analyzeTask(task, customer ?? null);
       await updateTask(task.id, {
+        ...(extraSetup !== undefined ? { workflowSetup: extraSetup } : {}),
         status:         'analyzed',
         analysisResult: result,
         confidence:     result.confidence,
@@ -612,9 +623,10 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
     }
 
     const mergedSetup: WorkflowSetup = { ...setup, artifactPath };
-    // Persist the confirmed setup, then run analyze.
-    await updateTask(task.id, { workflowSetup: mergedSetup });
-    handleAnalyze();
+    // Persist the confirmed setup AND analysis result in one atomic updateTask call.
+    // Two separate calls would race on the stale tasks closure and the first write
+    // (workflowSetup) would be overwritten by the second (status + analysisResult).
+    await handleAnalyzeWithSetup(mergedSetup);
   }
 
   async function handleGenerateReply() {

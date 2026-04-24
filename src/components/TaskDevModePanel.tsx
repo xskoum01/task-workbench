@@ -331,8 +331,13 @@ export default forwardRef<TaskDevModePanelHandle, TaskDevModePanelProps>(functio
   /**
    * Infers the best concrete file path for AI review.
    * Never overwrites a path the user has manually edited.
-   * For script mode: returns scriptOpenPath directly (already a file).
-   * For plugin mode: calls the Rust backend to find the best .cs file in the plugin folder,
+   *
+   * Script mode:
+   *   - If scriptOpenPath (or artifactPath) ends with .js/.ts/.jsx/.tsx → use it directly.
+   *   - Otherwise it is a folder → ask the backend to find the best .js/.ts inside it.
+   *   - If nothing found, returns '' and sets reviewInferError so the modal prompts the user.
+   *
+   * Plugin mode: calls the Rust backend to find the best .cs file in the plugin folder,
    * using the task title as a class-name hint to improve matching.
    */
   async function inferReviewPath(): Promise<string> {
@@ -340,7 +345,33 @@ export default forwardRef<TaskDevModePanelHandle, TaskDevModePanelProps>(functio
     if (reviewPathUserEdited) return reviewFilePath;
     // A created artifact always wins — no inference needed.
     if (artifactPath) return artifactPath;
-    if (devMode === 'script') return scriptOpenPath ?? '';
+
+    if (devMode === 'script') {
+      const base = scriptOpenPath ?? '';
+      if (!base) return '';
+      // Detect whether base is a concrete script file.
+      const lower = base.toLowerCase();
+      const isFile = lower.endsWith('.js') || lower.endsWith('.ts')
+                  || lower.endsWith('.jsx') || lower.endsWith('.tsx');
+      if (isFile) return base;
+      // It is a folder — try to find the best script file inside it.
+      setReviewInferring(true);
+      setReviewInferError(null);
+      try {
+        const found = await tauriApi.inferReviewFilePath(base, 'script', '', task.title);
+        if (!found) {
+          setReviewInferError(`No .js/.ts file found in ${base}. Enter the file path manually.`);
+          return '';
+        }
+        return found;
+      } catch {
+        setReviewInferError('Could not search for script files. Enter the path manually.');
+        return '';
+      } finally {
+        setReviewInferring(false);
+      }
+    }
+
     if (devMode === 'plugin' && pluginsDir && selectedPlugin) {
       const dirPath = `${pluginsDir}/${selectedPlugin}`;
       setReviewInferring(true);
