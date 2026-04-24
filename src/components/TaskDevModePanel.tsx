@@ -527,17 +527,50 @@ export default forwardRef<TaskDevModePanelHandle, TaskDevModePanelProps>(functio
   /**
    * Loads the git diff for the current file/repo and updates `diffContent`.
    * Returns the loaded diff string (empty string when nothing changed or on error).
+   *
+   * For script workflows, derives the Git repo root by walking up from the
+   * selected file when effectiveRepoRoot is missing or not a Git repo.
    */
   async function handleLoadGitDiff(): Promise<string> {
-    if (!effectiveRepoRoot) return '';
+    const filePath = (reviewFilePath.trim() || artifactPath || '').trim() || undefined;
     setDiffLoadingGit(true);
     try {
-      const filePath = (reviewFilePath.trim() || artifactPath || '').trim() || undefined;
-      const diff = await tauriApi.getGitDiff(effectiveRepoRoot, filePath);
+      // 1. Resolve the Git repo root to use for this diff.
+      let repoRoot: string | undefined;
+
+      // Try the pre-configured root first.
+      if (effectiveRepoRoot) {
+        const hasGit = await tauriApi.checkPathExists(`${effectiveRepoRoot.replace(/[\\/]+$/, '')}/.git`).catch(() => false);
+        if (hasGit) repoRoot = effectiveRepoRoot;
+      }
+
+      // If the configured root is missing or not a Git repo, walk upward from the file.
+      if (!repoRoot && filePath) {
+        const norm = filePath.replace(/\\/g, '/');
+        const parts = norm.split('/');
+        // Walk from the file's directory upward (skip the file name itself).
+        for (let i = parts.length - 1; i > 0; i--) {
+          const candidate = parts.slice(0, i).join('/');
+          if (!candidate) break;
+          const hasGit = await tauriApi.checkPathExists(`${candidate}/.git`).catch(() => false);
+          if (hasGit) { repoRoot = candidate; break; }
+        }
+      }
+
+      if (!repoRoot) {
+        const hint = filePath
+          ? `Git repository was not found for this file. Make sure the file is inside a Git repo.`
+          : `No Git repository root configured. Set repositoryRoot on the customer.`;
+        setDiffContent(hint);
+        return '';
+      }
+
+      const diff = await tauriApi.getGitDiff(repoRoot, filePath);
       setDiffContent(diff);
       return diff;
-    } catch {
-      setDiffContent('');
+    } catch (e) {
+      const msg = String(e);
+      setDiffContent(`// Error loading diff:\n// ${msg}`);
       return '';
     } finally {
       setDiffLoadingGit(false);
