@@ -23,6 +23,55 @@ import * as tauriApi from '../lib/tauriCommands';
 
 const PLUGIN_EXCLUDED_DIRS = ['bin', 'obj', '.vs', 'packages', '.git', 'node_modules'];
 
+// ---------------------------------------------------------------------------
+// Auto-scoring for script file preselection (Update / Fix workflows)
+// ---------------------------------------------------------------------------
+
+/**
+ * Scores a script file name against task text.
+ * Higher score = better match. Returns 0 when there is no meaningful signal.
+ */
+function scoreScriptFile(fileName: string, task: Task): number {
+  const name  = fileName.toLowerCase().replace(/\.(js|ts)$/, '');
+  const title = task.title.toLowerCase();
+  const msg   = (task.originalMessage ?? '').toLowerCase();
+  let score = 0;
+
+  // Exact or near-exact match of the bare file name in task text.
+  if (title.includes(name) || msg.includes(name)) score += 15;
+
+  // Individual meaningful words from the task title / message that appear in the file name.
+  const words = [...title.split(/\W+/), ...msg.split(/\W+/)]
+    .filter((w) => w.length > 3);
+  for (const word of words) {
+    if (name.includes(word)) score += 2;
+  }
+
+  // Event-keyword boosts: score higher when both the task text and the file name share an event word.
+  const eventKeywords = ['onload', 'onchange', 'onsave', 'onsubmit', 'oncreate', 'ondelete'];
+  for (const ev of eventKeywords) {
+    if (name.includes(ev) && (title.includes(ev) || msg.includes(ev))) score += 5;
+  }
+
+  return score;
+}
+
+/**
+ * Returns the path of the best-matching file, or empty string when no file
+ * scores above the minimum confidence threshold.
+ */
+function autoSelectScriptFile(files: FileEntry[], task: Task): string {
+  const MIN_SCORE = 2;
+  let best = '';
+  let bestScore = MIN_SCORE - 1; // must beat threshold to qualify
+
+  for (const f of files) {
+    const s = scoreScriptFile(f.name, task);
+    if (s > bestScore) { bestScore = s; best = f.path; }
+  }
+  return best;
+}
+
 interface ConfirmSetupModalProps {
   task: Task;
   customers: Customer[];
@@ -95,6 +144,10 @@ export default function ConfirmSetupModal({
   // --- File picker state (Update/Fix/Review only) ---
   const initSelectedFile = task.workflowSetup?.artifactPath ?? '';
   const [selectedExistingFile, setSelectedExistingFile] = useState<string>(initSelectedFile);
+  // 'auto' = preselected by scoring, 'manual' = changed by user, 'none' = not set
+  const [scriptSelectionSource, setScriptSelectionSource] = useState<'auto' | 'manual' | 'none'>(
+    initSelectedFile ? 'manual' : 'none',
+  );
   const [scriptFiles, setScriptFiles]               = useState<FileEntry[]>([]);
   const [scriptFilesLoading, setScriptFilesLoading] = useState(false);
   const [scriptFilesError, setScriptFilesError]     = useState<string | null>(null);
@@ -131,7 +184,18 @@ export default function ConfirmSetupModal({
     tauriApi.listFilesWithPaths(scriptFolder, ['js', 'ts'], false, [])
       .then((files) => {
         setScriptFiles(files);
-        if (files.length === 1 && !selectedExistingFile) setSelectedExistingFile(files[0].path);
+        // Only auto-select when no file is already chosen (e.g. from a previous confirmation).
+        if (!initSelectedFile) {
+          const autoPath = autoSelectScriptFile(files, task);
+          if (autoPath) {
+            setSelectedExistingFile(autoPath);
+            setScriptSelectionSource('auto');
+          } else if (files.length === 1) {
+            // Single-file fallback — obvious choice.
+            setSelectedExistingFile(files[0].path);
+            setScriptSelectionSource('auto');
+          }
+        }
       })
       .catch(() => setScriptFilesError('Could not read script folder.'))
       .finally(() => setScriptFilesLoading(false));
@@ -178,9 +242,23 @@ export default function ConfirmSetupModal({
   function handleWorkIntentChange(intent: WorkflowSetup['workIntent']) {
     setWorkIntent(intent);
     setSelectedExistingFile('');
+    setScriptSelectionSource('none');
   }
 
+  // Validation error derived from current field state.
+  const confirmError: string | null = (() => {
+    if (!isDev) return null;
+    if (isEditMode && devKind === 'script') {
+      const file = selectedExistingFile.trim();
+      if (!file || (!file.toLowerCase().endsWith('.js') && !file.toLowerCase().endsWith('.ts'))) {
+        return 'Select the existing script file that will be updated.';
+      }
+    }
+    return null;
+  })();
+
   function handleConfirm() {
+    if (confirmError) return;
     if (!isDev) {
       onConfirm({
         customerId: customerId || undefined,
@@ -258,8 +336,8 @@ export default function ConfirmSetupModal({
             className="form-select" value={selectedExistingFile}
             onChange={(e) => {
               const v = e.target.value;
-              if (v === '__manual__') { setScriptManualEntry(true); setSelectedExistingFile(''); }
-              else setSelectedExistingFile(v);
+              if (v === '__manual__') { setScriptManualEntry(true); setSelectedExistingFile(''); setScriptSelectionSource('manual'); }
+              else { setSelectedExistingFile(v); setScriptSelectionSource('manual'); }
             }}
           >
             <option value="">Select script file...</option>
@@ -267,6 +345,15 @@ export default function ConfirmSetupModal({
             <option value="__manual__">Enter path manually...</option>
           </select>
           {scriptFolder && <div className="confirm-setup-hint">From: {scriptFolder}</div>}
+          {scriptSelectionSource === 'auto' && selectedExistingFile && (
+            <div className="confirm-setup-hint confirm-setup-hint--success">Auto-selected from task text</div>
+          )}
+          {scriptSelectionSource === 'manual' && selectedExistingFile && (
+            <div className="confirm-setup-hint">Selected manually</div>
+          )}
+          {selectedExistingFile && (
+            <div className="confirm-setup-hint">Changes will be reviewed from Git diff for this file.</div>
+          )}
         </div>
       );
     }
@@ -276,10 +363,13 @@ export default function ConfirmSetupModal({
         <input
           className="form-input" type="text" value={selectedExistingFile}
           placeholder="Absolute path to existing .js / .ts file"
-          onChange={(e) => setSelectedExistingFile(e.target.value)}
+          onChange={(e) => { setSelectedExistingFile(e.target.value); setScriptSelectionSource('manual'); }}
         />
+        {selectedExistingFile && (
+          <div className="confirm-setup-hint">Changes will be reviewed from Git diff for this file.</div>
+        )}
         <button className="btn btn-secondary btn-xs" type="button" style={{ marginTop: 4 }}
-          onClick={() => { setScriptManualEntry(false); setSelectedExistingFile(''); }}>
+          onClick={() => { setScriptManualEntry(false); setSelectedExistingFile(''); setScriptSelectionSource('none'); }}>
           Back to list
         </button>
       </div>
@@ -399,8 +489,17 @@ export default function ConfirmSetupModal({
       onClose={onCancel}
       footer={
         <div className="confirm-setup-footer">
+          {confirmError && (
+            <span className="confirm-setup-validation-error">{confirmError}</span>
+          )}
           <button className="btn btn-secondary btn-sm" onClick={onCancel} type="button">Cancel</button>
-          <button className="btn btn-primary btn-sm" onClick={handleConfirm} type="button">Confirm &amp; Analyze</button>
+          <button
+            className="btn btn-primary btn-sm"
+            onClick={handleConfirm}
+            disabled={!!confirmError}
+            title={confirmError ?? undefined}
+            type="button"
+          >Confirm &amp; Analyze</button>
         </div>
       }
     >

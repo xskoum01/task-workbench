@@ -5070,6 +5070,20 @@ body {
   white-space: normal;
 }
 
+.confirm-setup-hint--success {
+  font-family: inherit;
+  color: var(--color-success, #3fb950);
+  white-space: normal;
+}
+
+/* Validation error shown in the modal footer */
+.confirm-setup-validation-error {
+  font-size: 11px;
+  color: var(--color-error, #f85149);
+  flex: 1;
+  align-self: center;
+}
+
 /* Subtle label shown below a field when its value was auto-inferred */
 .confirm-setup-inferred {
   font-size: 11px;
