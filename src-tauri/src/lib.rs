@@ -913,28 +913,22 @@ namespace {namespace}\n\
     copy_template_tree(src, &dest, &project_name, &namespace)
         .map_err(|e| format!("Template copy failed: {e}"))?;
 
-    // Optionally create an initial plugin class file
-    if create_initial_class {
-        let class_name = format!("{}Plugin", &project_name);
-        let class_file = dest.join(format!("{class_name}.cs"));
-        if !class_file.exists() {
-            let content = format!(
-                "using Microsoft.Xrm.Sdk;\n\
-using System;\n\n\
-namespace {namespace}\n{{{{\
-\n    /// <summary>\n\
-    /// Initial plugin class for {project_name}.\n\
-    /// </summary>\n\
-    public class {class_name} : IPlugin\n\
-    {{{{\n\
-        public void Execute(IServiceProvider serviceProvider)\n\
-        {{{{\n\
-            // TODO: implement plugin logic\n\
-        }}}}\n\
-    }}}}\n\
-}}}}"
-            );
-            fs::write(&class_file, content).map_err(|e| format!("Failed to write initial class: {e}"))?;
+    // When create_initial_class=false, remove the generic starter plugin class that the
+    // template may include (pattern: <ProjectLastSegment>Plugin.cs e.g. ProjectPlugin.cs).
+    // The task-specific class will be created later by the Generate Draft step.
+    // Both flat layouts (<dest>/FooPlugin.cs) and VS layouts (<dest>/<ProjectName>/FooPlugin.cs)
+    // are handled. Only the predictable template starter name is removed; no glob removal.
+    if !create_initial_class {
+        let last_segment = project_name.split('.').last().unwrap_or(&project_name);
+        let generic_name = format!("{last_segment}Plugin.cs");
+        let candidates = [
+            dest.join(&generic_name),
+            dest.join(&project_name).join(&generic_name),
+        ];
+        for candidate in &candidates {
+            if candidate.exists() {
+                let _ = fs::remove_file(candidate);
+            }
         }
     }
 
