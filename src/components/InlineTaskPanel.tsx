@@ -66,22 +66,6 @@ export default function InlineTaskPanel({ task, onOpenDetail }: Props) {
     }
   }
 
-  async function handleOpenWork() {
-    // Open the correct work target without code generation.
-    // Mirrors TaskDetail.handleOpenWork but without updating status (inline panel is non-intrusive).
-    if (isScriptTask) {
-      const openPath = customer?.scriptFolder ?? effectiveVscodePath;
-      if (openPath) tauriApi.openInVscode(openPath).catch(() => {});
-    } else if (effectiveVscodePath) {
-      // plugin path — try shell (for .sln) or VS Code
-      if (effectiveVscodePath.endsWith('.sln')) {
-        tauriApi.openWithShell(effectiveVscodePath).catch(() => {});
-      } else {
-        tauriApi.openInVscode(effectiveVscodePath).catch(() => {});
-      }
-    }
-  }
-
   // ── Analysis ────────────────────────────────────────────────────────────────
   const r           = task.analysisResult;
   const czSummary   = r?.summaryCz?.trim();
@@ -110,7 +94,7 @@ export default function InlineTaskPanel({ task, onOpenDetail }: Props) {
   const repoRootForGit   = customer?.resolvedRepositoryPath ?? customer?.repositoryRoot;
   const hasRepo          = !!repoRoot;
   const hasVscodePath    = !!effectiveVscodePath;
-  // Use the same resolver as TaskDetail so Open Work / Open Repository branching is consistent.
+  // Use the same resolver as TaskDetail for consistent branching.
   const isScriptTask = devTarget.kind === 'script';
   const showOpenRepo = !!(repoRoot && isScriptTask);
   // Is this an email-sourced task that should use rich email rendering?
@@ -203,15 +187,6 @@ export default function InlineTaskPanel({ task, onOpenDetail }: Props) {
               {task.ticketUrl && (
                 <button className="tip-action-btn" onClick={() => openUrl(task.ticketUrl)} title={task.ticketUrl}>
                   <Icon name="external-link" size={11} /> Ticket
-                </button>
-              )}
-              {(hasRepo || hasVscodePath) && (
-                <button
-                  className="tip-action-btn"
-                  onClick={handleOpenWork}
-                  title={isScriptTask ? 'Open script folder in VS Code' : 'Open plugin/repo in VS Code or Visual Studio'}
-                >
-                  <Icon name="play" size={11} /> Open Work
                 </button>
               )}
               {(hasRepo || hasVscodePath) && (

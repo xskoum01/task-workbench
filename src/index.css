@@ -3994,12 +3994,12 @@ body {
 .tip-action-btn {
   display: flex;
   align-items: center;
-  gap: 7px;
+  gap: 6px;
   background: none;
   border: none;
-  padding: 5px 6px;
+  padding: 3px 6px;
   color: var(--text-secondary);
-  font-size: 12.5px;
+  font-size: 12px;
   font-family: inherit;
   cursor: pointer;
   border-radius: var(--radius-sm);
@@ -4018,8 +4018,8 @@ body {
   display: flex;
   align-items: center;
   flex-wrap: wrap;
-  gap: 8px;
-  margin-top: 10px;
+  gap: 6px;
+  margin-top: 6px;
 }
 
 .tip-delete-btn {
