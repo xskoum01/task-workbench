@@ -48,7 +48,10 @@ type DevKind = NonNullable<WorkflowSetup['devTargetKind']>;
 type WorkIntent = NonNullable<WorkflowSetup['workIntent']>;
 
 const S_NEW: WorkflowStage = { id: 'new', label: 'New', actionLabel: 'Analyze', next: 'analyzed' };
-const S_ANA_CONFIRM: WorkflowStage = { id: 'analyzed', label: 'Analyzed', actionLabel: 'Confirm Setup', next: 'in-progress' };
+// Used for developer tasks awaiting plugin/script selection — New step opens Confirm Setup.
+const S_NEW_CONFIRM: WorkflowStage = { id: 'new', label: 'New', actionLabel: 'Confirm Setup', next: 'analyzed' };
+// Fallback: task already reached Analyzed state but plugin/script was never confirmed.
+const S_ANA_SETUP_REQ: WorkflowStage = { id: 'analyzed', label: 'Analyzed', actionLabel: 'Setup Required', next: 'in-progress' };
 const S_ANA_DRAFT: WorkflowStage = { id: 'analyzed', label: 'Analyzed', actionLabel: 'Generate Draft', next: 'in-progress' };
 const S_ANA_START: WorkflowStage = { id: 'analyzed', label: 'Analyzed', actionLabel: 'Start Work', next: 'in-progress' };
 const S_ANA_FIX: WorkflowStage = { id: 'analyzed', label: 'Analyzed', actionLabel: 'Start Fixing', next: 'in-progress' };
@@ -100,15 +103,20 @@ export function buildTaskWorkflowPlan(task: Task, heuristicKind?: DevKind): Task
   else               workflowKind = 'dev-update';
 
   // Stage shape:
-  //   - general → New → Analyzed → Done
-  //   - developer awaiting setup → New → Analyzed(Start Work) → In Progress → For Review → Done
-  //   - developer confirmed review → New → Analyzed → For Review → Done
-  //   - developer confirmed create/update/fix → New → Analyzed → In Progress → For Review → Done
+  //   - general                     -> New(Analyze)         -> Analyzed(Mark Done) -> Done
+  //   - developer awaiting setup    -> New(Confirm Setup)   -> Analyzed(Start Work*) -> In Progress -> For Review -> Done
+  //        *placeholder: once confirmed, label reflects real workIntent action
+  //   - developer confirmed review  -> New(Analyze)         -> Analyzed(Run Review) -> For Review -> Done
+  //   - developer confirmed create  -> New(Analyze)         -> Analyzed(Generate Draft) -> In Progress -> For Review -> Done
+  //   - developer confirmed update/fix -> New(Analyze)      -> Analyzed(Start Work / Start Fixing) -> In Progress -> For Review -> Done
   let stages: WorkflowStage[];
   if (isGeneral) {
     stages = [S_NEW, S_ANA_DONE, S_DONE];
   } else if (isDeveloperAwaitingSetup) {
-    stages = [S_NEW, S_ANA_CONFIRM, S_IN_PROGRESS, S_FOR_REVIEW, S_DONE];
+    // Use S_NEW_CONFIRM so the active New button says 'Confirm Setup'.
+    // S_ANA_START is a placeholder — once setup is confirmed isDeveloperAwaitingSetup=false
+    // and the stage will reflect the real workIntent action.
+    stages = [S_NEW_CONFIRM, S_ANA_START, S_IN_PROGRESS, S_FOR_REVIEW, S_DONE];
   } else if (isReview) {
     stages = [S_NEW, S_ANA_REVIEW, S_FOR_REVIEW, S_DONE];
   } else {
@@ -119,9 +127,13 @@ export function buildTaskWorkflowPlan(task: Task, heuristicKind?: DevKind): Task
   let currentAction: PlanAction = 'none';
   switch (task.status) {
     case 'new':
-      currentAction = 'analyze'; break;
+      // Developer tasks awaiting setup: Confirm Setup action opens the setup modal.
+      // All other tasks: Analyze action runs analysis (may include re-confirm for edge cases).
+      currentAction = isDeveloperAwaitingSetup ? 'confirm-setup' : 'analyze';
+      break;
     case 'analyzed':
       if (isGeneral)                     currentAction = 'mark-done';
+      // Edge case: task reached Analyzed without confirmed plugin/script (e.g. legacy data).
       else if (isDeveloperAwaitingSetup) currentAction = 'confirm-setup';
       else if (isReview)                 currentAction = 'run-review';
       else if (isCreate)                 currentAction = 'generate-draft';
@@ -135,7 +147,10 @@ export function buildTaskWorkflowPlan(task: Task, heuristicKind?: DevKind): Task
       currentAction = 'none';
   }
 
-  const currentStage = stages.find((s) => s.id === task.status);
+  // For the edge-case analyzed+awaiting state, override the stage label so it reads 'Setup Required'.
+  const currentStage = (isDeveloperAwaitingSetup && task.status === 'analyzed')
+    ? S_ANA_SETUP_REQ
+    : stages.find((s) => s.id === task.status);
   const currentActionLabel = currentStage?.actionLabel ?? 'Analyze';
 
   return {

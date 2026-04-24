@@ -555,9 +555,11 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
   function runCurrentStageAction() {
     switch (plan.currentAction) {
       case 'analyze':
-        // Open setup modal only for the first confirmation. Re-analysis skips setup.
+        // Developer-awaiting-setup tasks never reach this branch (they use 'confirm-setup').
+        // For general tasks and re-opened developer tasks: open setup modal on first run,
+        // then analyze directly on subsequent runs.
         if (!task.workflowSetup?.confirmedAt) {
-          openSetupModal();
+          setShowSetupModal(true);
         } else {
           handleAnalyze();
         }
@@ -569,11 +571,6 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
       case 'mark-done':      handleMarkDone();          break;
       default: break;
     }
-  }
-
-  /** Opens the Confirm Setup modal (for New tasks). */
-  function openSetupModal() {
-    setShowSetupModal(true);
   }
 
   /** Called when the user clicks Confirm & Analyze in the setup modal. */
