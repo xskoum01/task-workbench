@@ -11,7 +11,7 @@ import TaskForm from './TaskForm';
 import CreatePluginProjectModal, { inferPluginSuggestions, sanitize } from './CreatePluginProjectModal';
 import Icon from './Icon';
 import * as tauriApi from '../lib/tauriCommands';
-import { resolveTaskDevTarget, resolveBestPluginPath, getPluginsDir, hintedPluginProject } from '../lib/resolveTaskDevTarget';
+import { resolveTaskDevTarget, getPluginsDir, hintedPluginProject } from '../lib/resolveTaskDevTarget';
 import { BUCKET_META, BUCKET_ORDER, computePlanning, effectiveBucket } from '../lib/planning';
 import { isOverdue, formatRelativeDate } from '../lib/dates';
 
@@ -421,40 +421,6 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
       setAiError(String(e));
     } finally {
       setAiLoading(null);
-    }
-  }
-
-  async function handleOpenWork() {
-    // Open the correct development environment without generating code.
-    // Plugin task: open .sln in Visual Studio (via shell), fall back to .csproj or folder.
-    // Script task: open script target in VS Code.
-    setFsError(null);
-    await updateTask(task.id, { status: 'in-progress' });
-    if (devTarget.kind === 'plugin') {
-      const resolvedPath = await resolveBestPluginPath(task, customer);
-      if (resolvedPath) {
-        try {
-          // If it's an .sln file, open with shell (Visual Studio).
-          if (resolvedPath.endsWith('.sln')) {
-            await tauriApi.openWithShell(resolvedPath);
-          } else {
-            await tauriApi.openInVscode(resolvedPath);
-          }
-        } catch (e) { setFsError(String(e)); }
-      } else if (pluginsDir) {
-        // No specific plugin resolved — open plugins folder so developer can orient
-        try { await tauriApi.openInVscode(pluginsDir); } catch (e) { setFsError(String(e)); }
-      } else {
-        setFeedback('Status set to In Progress. No plugin path configured for this customer.');
-      }
-    } else {
-      // Script / repo task
-      const openPath = customer?.scriptFolder ?? effectiveVscodePath;
-      if (openPath) {
-        try { await tauriApi.openInVscode(openPath); } catch (e) { setFsError(String(e)); }
-      } else {
-        setFeedback('Status set to In Progress. Configure a script folder for this customer.');
-      }
     }
   }
 
@@ -1034,16 +1000,6 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
                 {aiLoading === 'analyze'
                   ? <><span className="btn-spinner" /> Analysing…</>
                   : <><Icon name="search" size={13} /> Analyze</>}
-              </button>
-              <button
-                className="btn btn-secondary btn-sm"
-                onClick={handleOpenWork}
-                disabled={!!aiLoading}
-                title={devTarget.kind === 'plugin'
-                  ? 'Open plugin project in Visual Studio or VS Code'
-                  : 'Open script folder in VS Code'}
-              >
-                <Icon name="play" size={13} /> Open Work
               </button>
               <button
                 className="btn btn-secondary btn-sm"
