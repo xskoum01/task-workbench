@@ -211,11 +211,15 @@ function ReviewCommentCard({ comment, fileName }: { comment: AiReviewComment; fi
 interface Props {
   structured?: AiStructuredReview;
   markdown?: string;
-  /** Called when the user clicks "Open file". */
+  /** Called when the user clicks the open button. */
   onOpenFile?: (filePath: string) => void;
+  /** Label for the open button. Defaults to 'Otevřít soubor'. */
+  openLabel?: string;
+  /** Tooltip for the open button. */
+  openTitle?: string;
 }
 
-export default function AiReviewResultView({ structured, markdown, onOpenFile }: Props) {
+export default function AiReviewResultView({ structured, markdown, onOpenFile, openLabel = 'Otevřít soubor', openTitle }: Props) {
   // Prefer structured output; fall back to markdown.
   if (!structured) {
     return markdown
@@ -274,8 +278,9 @@ export default function AiReviewResultView({ structured, markdown, onOpenFile }:
             onClick={() => onOpenFile(structured.filePath)}
             type="button"
             style={{ fontSize: 10, padding: '1px 6px' }}
+            title={openTitle}
           >
-            Otevřít soubor
+            {openLabel}
           </button>
         )}
         <CopyButton text={allText} label="Kopírovat vše" />

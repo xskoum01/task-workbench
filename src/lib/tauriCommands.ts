@@ -305,6 +305,54 @@ export function listSubfolders(dir: string): Promise<string[]> {
   return invoke<string[]>('list_crm_folders', { baseDir: dir });
 }
 
+/**
+ * Given an absolute path to a reviewed file (e.g. a .cs plugin file), resolves
+ * the best "open" target for its Visual Studio solution or project.
+ *
+ * Search order:
+ *   1. .sln in the parent directory of the file (project folder)
+ *   2. .sln one level above (solution root — most common layout)
+ *   3. .csproj in the parent directory of the file
+ *   4. the parent directory itself as a fallback folder
+ *
+ * Returns null when the file does not appear to be a C# plugin file.
+ */
+export async function resolvePluginOpenTargetFromFile(
+  filePath: string,
+): Promise<{ path: string; kind: 'sln' | 'csproj' | 'folder' } | null> {
+  const normalized = filePath.replace(/\\/g, '/');
+  if (!normalized.toLowerCase().endsWith('.cs')) return null;
+
+  const parts = normalized.split('/');
+  // fileDir: directory containing the .cs file
+  const fileDir = parts.slice(0, -1).join('/');
+  // solutionRoot: one level above fileDir
+  const solutionRoot = parts.slice(0, -2).join('/');
+
+  // 1. .sln inside the project folder (unusual but possible)
+  const slnsInFileDir = await listDirectoryFiles(fileDir, 'sln').catch(() => [] as string[]);
+  if (slnsInFileDir.length > 0) {
+    return { path: `${fileDir}/${slnsInFileDir[0]}`, kind: 'sln' };
+  }
+
+  // 2. .sln one level above (solution root — standard VS layout)
+  if (solutionRoot) {
+    const slnsInRoot = await listDirectoryFiles(solutionRoot, 'sln').catch(() => [] as string[]);
+    if (slnsInRoot.length > 0) {
+      return { path: `${solutionRoot}/${slnsInRoot[0]}`, kind: 'sln' };
+    }
+  }
+
+  // 3. .csproj in the project folder
+  const csprojs = await listDirectoryFiles(fileDir, 'csproj').catch(() => [] as string[]);
+  if (csprojs.length > 0) {
+    return { path: `${fileDir}/${csprojs[0]}`, kind: 'csproj' };
+  }
+
+  // 4. fall back to the project folder itself
+  return { path: fileDir, kind: 'folder' };
+}
+
 // ---------------------------------------------------------------------------
 // Git helpers
 // ---------------------------------------------------------------------------

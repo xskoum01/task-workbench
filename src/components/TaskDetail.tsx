@@ -1332,13 +1332,6 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
                 </button>
               )}
 
-              {/* Hint shown when create+plugin but project not yet created */}
-              {plan.requiresPluginCreate && (
-                <div style={{ fontSize: 11, color: 'var(--text-muted)', marginTop: 4 }}>
-                  Create the plugin project first, then Generate Draft will become available.
-                </div>
-              )}
-
               {/* Apply Draft */}
               {plan.requiresDraftGeneration && (skeletonPreview || scriptHasDraft) && (
                 <button
@@ -1670,35 +1663,74 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
       )}
 
       {/* AI Code Review — full PR-style view of the latest saved review */}
-      {showSavedReviewModal && latestReview && (
-        <Modal
-          title="AI recenze kódu"
-          size="xl"
-          onClose={() => setShowSavedReviewModal(false)}
-          footer={
-            <button
-              className="btn btn-secondary btn-sm"
-              onClick={() => setShowSavedReviewModal(false)}
-              type="button"
-            >
-              Zavřít
-            </button>
-          }
-        >
-          <div className="ai-review-modal-body">
-            <div className="ai-review-modal-result">
-              <AiReviewResultView
-                structured={latestReview.structured}
-                markdown={latestReview.markdown}
-                onOpenFile={async (fp) => {
-                  try { await tauriApi.openInVscode(fp); }
-                  catch { /* ignore */ }
-                }}
-              />
+      {showSavedReviewModal && latestReview && (() => {
+        // Determine whether this is a plugin review.
+        // The reviewed file extension is the primary signal — it is stored on the
+        // review result itself and cannot lie. devTargetKind is used only as a
+        // tiebreaker when the extension is ambiguous (e.g. .ts could be either).
+        const reviewFilePath = latestReview.filePath ?? latestReview.structured?.filePath ?? '';
+        const lowerReviewPath = reviewFilePath.toLowerCase();
+        const reviewKind: 'plugin' | 'script' = (() => {
+          // Extension wins for unambiguous types.
+          if (lowerReviewPath.endsWith('.cs')) return 'plugin';
+          if (lowerReviewPath.endsWith('.js')) return 'script';
+          // For .ts files, use devTargetKind as tiebreaker (plugins don't normally use .ts).
+          const devKind = task.workflowSetup?.devTargetKind;
+          if (devKind === 'plugin') return 'plugin';
+          return 'script';
+        })();
+
+        const isPlugin = reviewKind === 'plugin';
+
+        async function handleReviewOpen(fp: string) {
+          try {
+            if (isPlugin) {
+              const target = await tauriApi.resolvePluginOpenTargetFromFile(fp);
+              if (target) {
+                if (target.kind === 'sln') {
+                  await tauriApi.openWithShell(target.path);
+                } else {
+                  await tauriApi.openWithShell(target.path);
+                }
+              } else {
+                // Fallback: open the file itself in VS Code
+                await tauriApi.openInVscode(fp);
+              }
+            } else {
+              await tauriApi.openInVscode(fp);
+            }
+          } catch { /* ignore */ }
+        }
+
+        return (
+          <Modal
+            title="AI recenze kódu"
+            size="xl"
+            onClose={() => setShowSavedReviewModal(false)}
+            footer={
+              <button
+                className="btn btn-secondary btn-sm"
+                onClick={() => setShowSavedReviewModal(false)}
+                type="button"
+              >
+                Zavřít
+              </button>
+            }
+          >
+            <div className="ai-review-modal-body">
+              <div className="ai-review-modal-result">
+                <AiReviewResultView
+                  structured={latestReview.structured}
+                  markdown={latestReview.markdown}
+                  onOpenFile={handleReviewOpen}
+                  openLabel={isPlugin ? 'Otevřít projekt' : 'Otevřít soubor'}
+                  openTitle={isPlugin ? 'Otevře .sln ve Visual Studiu, pokud existuje.' : undefined}
+                />
+              </div>
             </div>
-          </div>
-        </Modal>
-      )}
+          </Modal>
+        );
+      })()}
     </>
   );
 }
