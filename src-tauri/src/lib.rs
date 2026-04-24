@@ -655,32 +655,40 @@ async fn run_ai_file_review(
     // Append structured-JSON format requirement to whatever reviewer instructions were provided.
     let json_format_requirement = r#"
 
-Return ONLY valid JSON — no prose, no markdown code fences, no extra text.
-Required schema:
+Vráť POUZE platné JSON bez prose, bez markdown kódových blőků, bez jiného textu.
+Veškerý textový obsah (summary, title, problem, recommendation, generalSuggestions) píši český.
+Kódové úseky (codeSnippet, suggestedCode) ponechávej v originálním programovacím jazyce, nepřekládej je.
+
+Požadované schéma:
 {
   "verdict": "pass" | "needs_changes" | "comment",
-  "summary": "One paragraph summary of the review.",
+  "summary": "český souhrnny odstavec.",
   "comments": [
     {
       "severity": "critical" | "major" | "minor" | "suggestion",
       "lineStart": 42,
       "lineEnd": 58,
-      "title": "Short issue title",
-      "problem": "What is wrong and why.",
-      "recommendation": "How to fix it.",
-      "codeSnippet": "1–5 lines from the file showing the problem",
-      "suggestedCode": "Optional replacement code"
+      "title": "Krátký český název problému",
+      "problem": "- První problém\n- Druhý problém\n- Třetí problém",
+      "recommendation": "- První krok\n- Druhý krok\n- Třetí krok",
+      "codeSnippet": "1–5 řádků z původního souboru ilustrující problém",
+      "suggestedCode": "Volitelný opravový kód"
     }
   ],
-  "generalSuggestions": ["Optional general tips not tied to a specific line."]
+  "generalSuggestions": ["české obecné doporučení neodpovídající konkrétnímu řádku"]
 }
-Rules:
-- At most 10 comments.
-- Include lineStart/lineEnd only when you are certain about the exact lines; omit both otherwise.
-- Include codeSnippet with 1–5 lines from the reviewed file when referring to a specific location.
-- suggestedCode is optional; include only when you have a concrete fix.
-- verdict: "pass" = no meaningful issues; "comment" = minor suggestions only; "needs_changes" = important issues found.
-- Keep each problem and recommendation concise and actionable."#;
+
+Pravidla:
+- Odpovídej česky.
+- Nejvýše 8 komentářů.
+- Nápis title: krátký, max 6 slov.
+- problem a recommendation: krátké odrůkové body, každý na novém řádku začínající "-".
+- Nepíši dlouhé odstavce — preferuj 2–4 krátké odrůky.
+- lineStart/lineEnd: uvedeň jen když si jsi jistý přesným místem; jinak vynechat.
+- codeSnippet: 1–5 řádků z původního souboru ilustrující problém.
+- suggestedCode: volitelný, pouze když máš konkrétní oprávněný návrh.
+- verdict: "pass" = žádné zásadní problémy; "comment" = jen mala doporučení; "needs_changes" = důležité problémy.
+- Zaměř se na konkrétní problémy udržovatelného kódu, správnosti, Dataverse/Power Apps specifika."#;
 
     let full_instructions = if instructions.is_empty() {
         json_format_requirement.trim_start().to_string()

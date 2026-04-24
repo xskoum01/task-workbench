@@ -16,9 +16,9 @@ const VERDICT_COLOR: Record<AiStructuredReview['verdict'], string> = {
 };
 
 const VERDICT_LABEL: Record<AiStructuredReview['verdict'], string> = {
-  pass:          'Pass',
-  comment:       'Comments',
-  needs_changes: 'Needs Changes',
+  pass:          'Bez zásadních připomínek',
+  comment:       'Komentář',
+  needs_changes: 'Vyžaduje úpravy',
 };
 
 const SEVERITY_COLOR: Record<AiReviewComment['severity'], string> = {
@@ -92,7 +92,7 @@ function CodeBlock({ code, label }: { code: string; label?: string }) {
   );
 }
 
-function CopyButton({ text, label = 'Copy' }: { text: string; label?: string }) {
+function CopyButton({ text, label = 'Kopírovat' }: { text: string; label?: string }) {
   const [copied, setCopied] = React.useState(false);
   const handleCopy = useCallback(() => {
     navigator.clipboard.writeText(text).then(() => {
@@ -108,17 +108,42 @@ function CopyButton({ text, label = 'Copy' }: { text: string; label?: string }) 
       style={{ fontSize: 10, padding: '1px 6px', opacity: 0.7 }}
       title="Copy to clipboard"
     >
-      {copied ? 'Copied' : label}
+      {copied ? 'Zkopirováno' : label}
     </button>
   );
+}
+
+/**
+ * Renders a problem/recommendation value.
+ * If the value contains newline-separated bullet lines (starting with -, •, or *),
+ * renders them as a <ul>. Otherwise renders as plain text.
+ */
+function ReviewText({ value }: { value: string }) {
+  const lines = value
+    .split('\n')
+    .map((l) => l.trim())
+    .filter(Boolean);
+
+  const bullets = lines.map((l) => l.replace(/^[-•*]\s*/, ''));
+
+  if (bullets.length > 1) {
+    return (
+      <ul style={{ margin: 0, paddingLeft: 16, display: 'flex', flexDirection: 'column', gap: 2 }}>
+        {bullets.map((b, i) => (
+          <li key={i} style={{ fontSize: 12, color: 'var(--text-secondary)', lineHeight: 1.5 }}>{b}</li>
+        ))}
+      </ul>
+    );
+  }
+  return <span style={{ fontSize: 12, color: 'var(--text-secondary)' }}>{value}</span>;
 }
 
 function ReviewCommentCard({ comment, fileName }: { comment: AiReviewComment; fileName: string }) {
   const hasLines = comment.lineStart != null;
 
   const lineLabel = hasLines
-    ? `${fileName} lines ${comment.lineStart}${comment.lineEnd && comment.lineEnd !== comment.lineStart ? `–${comment.lineEnd}` : ''}`
-    : 'General comment';
+    ? `${fileName} řádky ${comment.lineStart}${comment.lineEnd && comment.lineEnd !== comment.lineStart ? `–${comment.lineEnd}` : ''}`
+    : 'Obecný komentář';
 
   // Build a plain-text copy of this comment
   const commentText = [
@@ -160,21 +185,21 @@ function ReviewCommentCard({ comment, fileName }: { comment: AiReviewComment; fi
         </div>
 
         {comment.codeSnippet && (
-          <CodeBlock code={comment.codeSnippet} label="From file" />
+          <CodeBlock code={comment.codeSnippet} label="Z souboru" />
         )}
 
         <div style={{ fontSize: 12, color: 'var(--text-secondary)' }}>
-          <span style={{ color: 'var(--text-muted)', fontSize: 10, marginRight: 4 }}>PROBLEM</span>
-          {comment.problem}
+          <span style={{ color: 'var(--text-muted)', fontSize: 10, marginRight: 4 }}>PROBLÉM</span>
+          <ReviewText value={comment.problem} />
         </div>
 
         <div style={{ fontSize: 12, color: 'var(--text-secondary)' }}>
-          <span style={{ color: 'var(--text-muted)', fontSize: 10, marginRight: 4 }}>RECOMMENDATION</span>
-          {comment.recommendation}
+          <span style={{ color: 'var(--text-muted)', fontSize: 10, marginRight: 4 }}>DOPORUČENÍ</span>
+          <ReviewText value={comment.recommendation} />
         </div>
 
         {comment.suggestedCode && (
-          <CodeBlock code={comment.suggestedCode} label="Suggested code" />
+          <CodeBlock code={comment.suggestedCode} label="Návrh kódu" />
         )}
       </div>
     </div>
@@ -200,25 +225,25 @@ export default function AiReviewResultView({ structured, markdown, onOpenFile }:
 
   const allText = [
     `AI Code Review — ${structured.fileName}`,
-    `Reviewer: ${structured.reviewerName}`,
-    `Verdict: ${VERDICT_LABEL[structured.verdict]}`,
+    `Recenzent: ${structured.reviewerName}`,
+    `Výsledek: ${VERDICT_LABEL[structured.verdict]}`,
     '',
     structured.summary,
     '',
     ...structured.comments.map((c) => {
       const loc = c.lineStart != null
-        ? `${structured.fileName} lines ${c.lineStart}${c.lineEnd && c.lineEnd !== c.lineStart ? `–${c.lineEnd}` : ''}`
-        : 'General comment';
+        ? `${structured.fileName} řádky ${c.lineStart}${c.lineEnd && c.lineEnd !== c.lineStart ? `–${c.lineEnd}` : ''}`
+        : 'Obecný komentář';
       return [
         `[${c.severity.toUpperCase()}] ${c.title} (${loc})`,
-        `Problem: ${c.problem}`,
-        `Recommendation: ${c.recommendation}`,
-        c.suggestedCode ? `Suggested:\n${c.suggestedCode}` : '',
+        `Problém: ${c.problem}`,
+        `Doporučení: ${c.recommendation}`,
+        c.suggestedCode ? `Návrh:\n${c.suggestedCode}` : '',
       ].filter(Boolean).join('\n');
     }),
     '',
     structured.generalSuggestions.length > 0
-      ? `General suggestions:\n${structured.generalSuggestions.map((s) => `- ${s}`).join('\n')}`
+      ? `Obecná doporučení:\n${structured.generalSuggestions.map((s) => `- ${s}`).join('\n')}`
       : '',
   ].filter(Boolean).join('\n\n');
 
@@ -241,7 +266,7 @@ export default function AiReviewResultView({ structured, markdown, onOpenFile }:
         </span>
         <VerdictBadge verdict={structured.verdict} />
         <span style={{ fontSize: 11, color: 'var(--text-muted)' }}>
-          Reviewer: {structured.reviewerName}
+          Recenzent: {structured.reviewerName}
         </span>
         {onOpenFile && structured.filePath && (
           <button
@@ -250,10 +275,10 @@ export default function AiReviewResultView({ structured, markdown, onOpenFile }:
             type="button"
             style={{ fontSize: 10, padding: '1px 6px' }}
           >
-            Open file
+            Otevřít soubor
           </button>
         )}
-        <CopyButton text={allText} label="Copy all" />
+        <CopyButton text={allText} label="Kopírovat vše" />
       </div>
 
       {/* Summary */}
@@ -266,7 +291,7 @@ export default function AiReviewResultView({ structured, markdown, onOpenFile }:
         color: 'var(--text-secondary)',
         lineHeight: 1.55,
       }}>
-        <div style={{ fontSize: 10, color: 'var(--text-muted)', marginBottom: 4 }}>SUMMARY</div>
+        <div style={{ fontSize: 10, color: 'var(--text-muted)', marginBottom: 4 }}>SHRNUTÍ</div>
         {structured.summary}
       </div>
 
@@ -274,7 +299,7 @@ export default function AiReviewResultView({ structured, markdown, onOpenFile }:
       {structured.comments.length > 0 && (
         <div>
           <div style={{ fontSize: 10, color: 'var(--text-muted)', marginBottom: 6 }}>
-            COMMENTS ({structured.comments.length})
+            KOMENTÁŘE ({structured.comments.length})
           </div>
           {structured.comments.map((c, i) => (
             <ReviewCommentCard key={i} comment={c} fileName={structured.fileName} />
@@ -291,7 +316,7 @@ export default function AiReviewResultView({ structured, markdown, onOpenFile }:
           padding: '8px 12px',
         }}>
           <div style={{ fontSize: 10, color: 'var(--text-muted)', marginBottom: 6 }}>
-            GENERAL SUGGESTIONS
+            OBECNÁ DOPORUČENÍ
           </div>
           <ul style={{ margin: 0, padding: 0, listStyle: 'none', display: 'flex', flexDirection: 'column', gap: 4 }}>
             {structured.generalSuggestions.map((s, i) => (
@@ -312,7 +337,7 @@ export default function AiReviewResultView({ structured, markdown, onOpenFile }:
           color: 'var(--color-done)',
           fontSize: 13,
         }}>
-          No issues found.
+          Žádné problémy nebyly nalezeny.
         </div>
       )}
     </div>
