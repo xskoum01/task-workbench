@@ -1,5 +1,5 @@
 ﻿/**
- * ConfirmSetupModal â€” shown when the user clicks Analyze on a New task.
+ * ConfirmSetupModal - shown when the user clicks Analyze on a New task.
  *
  * All fields are pre-filled by inferWorkflowSetupDefaults(). If the task
  * already has a confirmed workflowSetup, those values take priority and new
@@ -27,7 +27,7 @@ interface ConfirmSetupModalProps {
   /** AI reviewer configs from settings. */
   reviewerConfigs?: AiReviewerConfig[];
   /**
-   * Effective task mode â€” controls which fields are visible.
+   * Effective task mode - controls which fields are visible.
    * 'general' hides all developer-specific fields (target kind, plugin, script, reviewer).
    * 'developer' shows the full developer setup.
    */
@@ -49,7 +49,7 @@ export default function ConfirmSetupModal({
   onConfirm,
   onCancel,
 }: ConfirmSetupModalProps) {
-  // Run inference once on mount â€” workflowSetup values win over guesses inside the helper.
+  // Run inference once on mount - workflowSetup values win over guesses inside the helper.
   const { defaults, hints } = inferWorkflowSetupDefaults({
     task,
     customer,
@@ -201,7 +201,7 @@ export default function ConfirmSetupModal({
               value={customerId}
               onChange={(e) => setCustomerId(e.target.value)}
             >
-              <option value="">â€” none â€”</option>
+              <option value="">None</option>
               {customers.map((c) => (
                 <option key={c.id} value={c.id}>{c.name}</option>
               ))}
@@ -212,7 +212,7 @@ export default function ConfirmSetupModal({
           </div>
         )}
 
-        {/* Plugin project â€” developer + plugin only */}
+        {/* Plugin project - developer + plugin only */}
         {isDev && devKind === 'plugin' && (
           <div className="confirm-setup-row">
             <label className="form-label confirm-setup-label">
@@ -243,7 +243,7 @@ export default function ConfirmSetupModal({
           </div>
         )}
 
-        {/* Script path â€” developer + script only */}
+        {/* Script path - developer + script only */}
         {isDev && devKind === 'script' && (
           <div className="confirm-setup-row">
             <label className="form-label confirm-setup-label">
@@ -271,7 +271,7 @@ export default function ConfirmSetupModal({
           </div>
         )}
 
-        {/* Reviewer â€” developer + plugin/script only */}
+        {/* Reviewer - developer + plugin/script only */}
         {isDev && allReviewers.length > 0 && (
           <div className="confirm-setup-row">
             <label className="form-label confirm-setup-label">AI reviewer</label>
@@ -280,7 +280,7 @@ export default function ConfirmSetupModal({
               value={reviewerId}
               onChange={(e) => setReviewerId(e.target.value)}
             >
-              <option value="">â€” auto-select â€”</option>
+              <option value="">Auto-select</option>
               {allReviewers.map((r) => (
                 <option key={r.id} value={r.id}>{r.name}</option>
               ))}
