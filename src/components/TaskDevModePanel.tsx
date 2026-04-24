@@ -10,13 +10,13 @@
  * Used in both TaskDetail and InlineTaskPanel.
  */
 import { useState, useEffect, forwardRef, useImperativeHandle } from 'react';
-import type { Task, Customer, AiReviewerConfig } from '../types';
+import type { Task, Customer, AiReviewerConfig, AiStructuredReview } from '../types';
 import Icon from './Icon';
 import Modal from './Modal';
 import * as tauriApi from '../lib/tauriCommands';
 import { hintedPluginProject } from '../lib/resolveTaskDevTarget';
 import { mergeWithDefaults, selectReviewer } from '../lib/aiReviewers';
-import MarkdownView from './MarkdownView';
+import AiReviewResultView from './AiReviewResultView';
 
 export interface TaskDevModePanelProps {
   task: Task;
@@ -139,6 +139,7 @@ export default forwardRef<TaskDevModePanelHandle, TaskDevModePanelProps>(functio
   const [reviewRunning, setReviewRunning]               = useState(false);
   const [reviewError, setReviewError]                   = useState<string | null>(null);
   const [reviewMarkdown, setReviewMarkdown]             = useState<string | null>(null);
+  const [reviewStructured, setReviewStructured]         = useState<AiStructuredReview | null>(null);
   const [reviewInferring, setReviewInferring]           = useState(false);
   const [reviewInferError, setReviewInferError]         = useState<string | null>(null);
 
@@ -162,6 +163,7 @@ export default forwardRef<TaskDevModePanelHandle, TaskDevModePanelProps>(functio
     setReviewPathUserEdited(false);
     setReviewSelectedId('');
     setReviewMarkdown(null);
+    setReviewStructured(null);
     setReviewError(null);
     setReviewInferError(null);
     setReviewInferring(false);
@@ -180,6 +182,17 @@ export default forwardRef<TaskDevModePanelHandle, TaskDevModePanelProps>(functio
     setHintedProjectMissing(null);
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [pluginRefreshTick]);
+
+  // Auto-fill review file path from persisted artifactPath when it becomes available.
+  // Only runs when the user has not manually typed a path into the review modal.
+  useEffect(() => {
+    if (reviewPathUserEdited) return;
+    if (artifactPath) {
+      setReviewFilePath(artifactPath);
+      setReviewError(null);
+      setReviewInferError(null);
+    }
+  }, [artifactPath, reviewPathUserEdited]);
 
   // Load plugin project subfolders when mode = plugin.
   useEffect(() => {
@@ -330,6 +343,10 @@ export default forwardRef<TaskDevModePanelHandle, TaskDevModePanelProps>(functio
    */
   const allReviewers = reviewerConfigs ? mergeWithDefaults(reviewerConfigs).filter((r) => r.enabled) : [];
 
+  // Effective path for review: user-typed value wins; fall back to persisted artifactPath.
+  // Used for validation, disabled checks, and reviewer auto-selection.
+  const effectiveReviewFilePath = reviewFilePath.trim() || (artifactPath ?? '');
+
   /**
    * Infers the best concrete file path for AI review.
    * Never overwrites a path the user has manually edited.
@@ -402,12 +419,13 @@ export default forwardRef<TaskDevModePanelHandle, TaskDevModePanelProps>(functio
     if (reviewSelectedId) {
       return allReviewers.find((r) => r.id === reviewSelectedId);
     }
-    return selectReviewer(allReviewers, reviewFilePath, devMode);
+    return selectReviewer(allReviewers, effectiveReviewFilePath, devMode);
   }
 
   /** Opens the AI review modal, inferring the file path if not yet set. */
   async function handleOpenReviewModal() {
-    if (!reviewPathUserEdited && !reviewFilePath) {
+    const effectivePath = reviewFilePath.trim() || (artifactPath ?? '');
+    if (!reviewPathUserEdited && !effectivePath) {
       const defaultPath = await inferReviewPath();
       setReviewFilePath((prev) => prev || defaultPath);
     }
@@ -415,13 +433,15 @@ export default forwardRef<TaskDevModePanelHandle, TaskDevModePanelProps>(functio
   }
 
   async function handleRunReview(): Promise<boolean> {
-    const path = reviewFilePath.trim();
+    // Effective path: user-typed value wins; fall back to persisted artifactPath.
+    const path = (reviewFilePath.trim() || artifactPath || '').trim();
     if (!path) { setReviewError('Enter the file path to review.'); return false; }
     const reviewer = getActiveReviewer();
     if (!reviewer) { setReviewError('No matching reviewer. Configure one in Settings → AI Reviewers.'); return false; }
     setReviewRunning(true);
     setReviewError(null);
     setReviewMarkdown(null);
+    setReviewStructured(null);
     try {
       const result = await tauriApi.runAiFileReview(
         path,
@@ -430,7 +450,8 @@ export default forwardRef<TaskDevModePanelHandle, TaskDevModePanelProps>(functio
         reviewer.model ?? '',
         reviewer.temperature ?? 0.2,
       );
-      setReviewMarkdown(result.markdown);
+      if (result.structured) setReviewStructured(result.structured);
+      if (result.markdown)   setReviewMarkdown(result.markdown);
       return true;
     } catch (err) {
       setReviewError(String(err));
@@ -444,7 +465,8 @@ export default forwardRef<TaskDevModePanelHandle, TaskDevModePanelProps>(functio
   useImperativeHandle(ref, () => ({
     runReview: async () => {
       // Open the modal so the user sees the results
-      if (!reviewPathUserEdited && !reviewFilePath) {
+      const effectivePath = reviewFilePath.trim() || (artifactPath ?? '');
+      if (!reviewPathUserEdited && !effectivePath) {
         const defaultPath = await inferReviewPath();
         setReviewFilePath((prev) => prev || defaultPath);
       }
@@ -669,6 +691,7 @@ export default forwardRef<TaskDevModePanelHandle, TaskDevModePanelProps>(functio
                     setReviewPathUserEdited(true);
                     setReviewSelectedId('');
                     setReviewMarkdown(null);
+                    setReviewStructured(null);
                     setReviewError(null);
                     setReviewInferError(null);
                   }}
@@ -676,7 +699,7 @@ export default forwardRef<TaskDevModePanelHandle, TaskDevModePanelProps>(functio
                 {reviewInferring && (
                   <div className="detail-devmode-hint" style={{ marginTop: 3 }}>Searching for file…</div>
                 )}
-                {reviewInferError && !reviewFilePath && (
+                {reviewInferError && !effectiveReviewFilePath && (
                   <div className="detail-devmode-hint" style={{ color: 'var(--color-blocked)', marginTop: 3 }}>
                     {reviewInferError}
                   </div>
@@ -696,7 +719,7 @@ export default forwardRef<TaskDevModePanelHandle, TaskDevModePanelProps>(functio
                     <option key={r.id} value={r.id}>{r.name}</option>
                   ))}
                 </select>
-                {!getActiveReviewer() && reviewFilePath && (
+                {!getActiveReviewer() && effectiveReviewFilePath && (
                   <div className="detail-devmode-hint" style={{ color: 'var(--color-blocked)', marginTop: 3 }}>
                     No reviewer matches this file type. Configure one in Settings → AI Reviewers.
                   </div>
@@ -707,7 +730,7 @@ export default forwardRef<TaskDevModePanelHandle, TaskDevModePanelProps>(functio
               <button
                 className="btn btn-primary btn-sm"
                 onClick={handleRunReview}
-                disabled={reviewRunning || reviewInferring || !reviewFilePath.trim() || !getActiveReviewer()}
+                disabled={reviewRunning || reviewInferring || !effectiveReviewFilePath || !getActiveReviewer()}
                 type="button"
               >
                 {reviewRunning
@@ -723,10 +746,17 @@ export default forwardRef<TaskDevModePanelHandle, TaskDevModePanelProps>(functio
               )}
             </div>
 
-            {/* Result */}
-            {reviewMarkdown && (
+            {/* Structured or markdown result */}
+            {(reviewStructured || reviewMarkdown) && (
               <div className="ai-review-modal-result">
-                <MarkdownView markdown={reviewMarkdown} />
+                <AiReviewResultView
+                  structured={reviewStructured ?? undefined}
+                  markdown={reviewMarkdown ?? undefined}
+                  onOpenFile={async (fp) => {
+                    try { await tauriApi.openInVscode(fp); }
+                    catch (e) { setReviewError(String(e)); }
+                  }}
+                />
               </div>
             )}
           </div>

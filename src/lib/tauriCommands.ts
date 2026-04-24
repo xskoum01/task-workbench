@@ -4,7 +4,7 @@
  */
 import { invoke } from '@tauri-apps/api/core';
 import { openUrl as openerOpen } from '@tauri-apps/plugin-opener';
-import type { Task, Customer, AppSettings, TaskAnalysis, SkeletonPreview, GitInitStatus, OutlookMessage, OutlookFlaggedListResult, TeamsChat, TeamsChatMessage, TeamsFlatMessage, ClassificationResult, AiFileReviewResult } from '../types';
+import type { Task, Customer, AppSettings, TaskAnalysis, SkeletonPreview, GitInitStatus, OutlookMessage, OutlookFlaggedListResult, TeamsChat, TeamsChatMessage, TeamsFlatMessage, ClassificationResult, AiFileReviewResult, AiStructuredReview } from '../types';
 
 export type { ClassificationResult };
 
@@ -180,13 +180,20 @@ export function runAiFileReview(
   modelOverride: string,
   temperature: number,
 ): Promise<AiFileReviewResult> {
-  return invoke<string>('run_ai_file_review', {
-    filePath,
-    reviewerName,
-    instructions,
-    modelOverride,
-    temperature,
-  }).then((markdown) => ({ reviewerName, filePath, markdown }));
+  return invoke<{ structured: AiStructuredReview | null; markdown: string | null }>(
+    'run_ai_file_review',
+    { filePath, reviewerName, instructions, modelOverride, temperature },
+  ).then(({ structured, markdown }) => {
+    const result: AiFileReviewResult = { reviewerName, filePath };
+    if (structured) {
+      // Rust already injected reviewerName/filePath/fileName into the object.
+      result.structured = structured;
+    }
+    if (markdown) {
+      result.markdown = markdown;
+    }
+    return result;
+  });
 }
 
 /**

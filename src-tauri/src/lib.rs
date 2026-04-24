@@ -621,7 +621,7 @@ async fn run_ai_file_review(
     instructions: String,
     model_override: String,
     temperature: f64,
-) -> Result<String, String> {
+) -> Result<Value, String> {
     // Read API key and base model from settings
     let (api_key, base_model) = get_ai_settings(&app)?;
     let model = if model_override.trim().is_empty() { base_model } else { model_override.trim().to_string() };
@@ -637,7 +637,6 @@ async fn run_ai_file_review(
     let raw = fs::read_to_string(&file_path)
         .map_err(|e| format!("Cannot read file '{file_path}': {e}"))?;
     let content = if raw.len() > MAX_BYTES {
-        // Walk back to the last valid UTF-8 character boundary before MAX_BYTES
         let boundary = (0..=MAX_BYTES).rev().find(|&i| raw.is_char_boundary(i)).unwrap_or(0);
         format!("{}\n\n… [file truncated at 200 KB]", &raw[..boundary])
     } else {
@@ -653,15 +652,48 @@ async fn run_ai_file_review(
         "Review the following file: **{file_name}**\n\n```\n{content}\n```"
     );
 
-    // Use temperature if caller provided a non-zero value; otherwise let OpenAI use its default.
+    // Append structured-JSON format requirement to whatever reviewer instructions were provided.
+    let json_format_requirement = r#"
+
+Return ONLY valid JSON — no prose, no markdown code fences, no extra text.
+Required schema:
+{
+  "verdict": "pass" | "needs_changes" | "comment",
+  "summary": "One paragraph summary of the review.",
+  "comments": [
+    {
+      "severity": "critical" | "major" | "minor" | "suggestion",
+      "lineStart": 42,
+      "lineEnd": 58,
+      "title": "Short issue title",
+      "problem": "What is wrong and why.",
+      "recommendation": "How to fix it.",
+      "codeSnippet": "1–5 lines from the file showing the problem",
+      "suggestedCode": "Optional replacement code"
+    }
+  ],
+  "generalSuggestions": ["Optional general tips not tied to a specific line."]
+}
+Rules:
+- At most 10 comments.
+- Include lineStart/lineEnd only when you are certain about the exact lines; omit both otherwise.
+- Include codeSnippet with 1–5 lines from the reviewed file when referring to a specific location.
+- suggestedCode is optional; include only when you have a concrete fix.
+- verdict: "pass" = no meaningful issues; "comment" = minor suggestions only; "needs_changes" = important issues found.
+- Keep each problem and recommendation concise and actionable."#;
+
+    let full_instructions = if instructions.is_empty() {
+        json_format_requirement.trim_start().to_string()
+    } else {
+        format!("{instructions}{json_format_requirement}")
+    };
+
     let client = reqwest::Client::new();
     let mut body = serde_json::json!({
         "model": model,
         "input": prompt,
+        "instructions": full_instructions,
     });
-    if !instructions.is_empty() {
-        body["instructions"] = serde_json::Value::String(instructions.clone());
-    }
     if temperature > 0.0 {
         body["temperature"] = serde_json::Value::from(temperature.clamp(0.0, 2.0));
     }
@@ -690,9 +722,34 @@ async fn run_ai_file_review(
             format!("Unexpected OpenAI response: {}", &snippet[..snippet.len().min(300)])
         })?;
 
-    // Prepend reviewer attribution so the frontend can display it without additional state
-    let header = format!("**Reviewer:** {reviewer_name}  \n**File:** {file_name}\n\n---\n\n");
-    Ok(format!("{header}{text}"))
+    // Strip optional markdown fences the model might still emit despite the instruction.
+    let stripped = strip_json_fences(text.trim());
+
+    // Try to parse the model response as structured JSON.
+    match serde_json::from_str::<Value>(stripped) {
+        Ok(mut parsed) => {
+            // Inject the fields that the frontend expects (reviewerName, filePath, fileName)
+            // directly into the structured object so callers don't need to graft them on.
+            parsed["reviewerName"] = serde_json::Value::String(reviewer_name);
+            parsed["filePath"]     = serde_json::Value::String(file_path);
+            parsed["fileName"]     = serde_json::Value::String(file_name);
+            Ok(serde_json::json!({ "structured": parsed, "markdown": null }))
+        }
+        Err(_) => {
+            // JSON parsing failed — return as markdown so the frontend can still show the result.
+            let header = format!("**Reviewer:** {reviewer_name}  \n**File:** {file_name}\n\n---\n\n");
+            Ok(serde_json::json!({ "structured": null, "markdown": format!("{header}{text}") }))
+        }
+    }
+}
+
+/// Strips optional ```json ... ``` or ``` ... ``` fences the model may emit.
+fn strip_json_fences(s: &str) -> &str {
+    let s = if s.starts_with("```json") { &s[7..] }
+            else if s.starts_with("```")  { &s[3..] }
+            else                           { s };
+    let s = s.trim_start();
+    if s.ends_with("```") { s[..s.len() - 3].trim_end() } else { s }
 }
 
 /// Creates a new plugin project directory from a local template folder.

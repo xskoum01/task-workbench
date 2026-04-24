@@ -474,15 +474,48 @@ export interface AiReviewerConfig {
   appliesTo: AiReviewerAppliesTo;
 }
 
+/** A single inline comment in a structured AI code review. */
+export interface AiReviewComment {
+  severity: 'critical' | 'major' | 'minor' | 'suggestion';
+  /** 1-based line number where the comment starts (omitted when uncertain). */
+  lineStart?: number;
+  /** 1-based line number where the comment ends (omitted when uncertain). */
+  lineEnd?: number;
+  title: string;
+  problem: string;
+  recommendation: string;
+  /** Small excerpt from the reviewed file for context. */
+  codeSnippet?: string;
+  /** Suggested replacement code, if applicable. */
+  suggestedCode?: string;
+}
+
+/**
+ * Structured AI code review response.
+ * The AI is asked to return this exact shape as JSON.
+ */
+export interface AiStructuredReview {
+  reviewerName: string;
+  filePath: string;
+  fileName: string;
+  verdict: 'pass' | 'needs_changes' | 'comment';
+  summary: string;
+  comments: AiReviewComment[];
+  generalSuggestions: string[];
+}
+
 /**
  * Result returned by the run_ai_file_review Tauri command.
- * The review text is Markdown-formatted.
+ * `structured` is present when the model returned valid JSON.
+ * `markdown` is a fallback when JSON parsing failed.
  */
 export interface AiFileReviewResult {
   reviewerName: string;
   filePath: string;
-  /** Markdown text of the review. */
-  markdown: string;
+  /** Parsed structured review. Present when JSON parsing succeeded. */
+  structured?: AiStructuredReview;
+  /** Raw markdown fallback. Present when JSON parsing failed. */
+  markdown?: string;
 }
 
 /** Which planning time-box a task belongs to. */
