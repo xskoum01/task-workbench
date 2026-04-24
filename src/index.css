@@ -320,24 +320,16 @@ body {
 }
 
 .detail-panel-header {
+  padding: 14px var(--gap-lg) 12px;
   border-bottom: 1px solid var(--border);
-  display: flex;
-  flex-direction: column;
-  align-items: stretch;
-  gap: 0;
-  flex-shrink: 0;
-  background: var(--bg-overlay);
-  overflow: hidden;
-  position: relative;
-  z-index: 1;
-}
-
-/* Top row: Back + title content + Edit/Delete */
-.detail-panel-header-top {
   display: flex;
   align-items: flex-start;
   gap: var(--gap-sm);
-  padding: 14px var(--gap-lg) 10px;
+  flex-shrink: 0;
+  background: var(--bg-overlay);
+  overflow: visible;
+  position: relative;
+  z-index: 1;
 }
 
 .detail-panel-header-content {
@@ -590,34 +582,6 @@ body {
   border-radius: var(--radius-sm);
   border-left: 2px solid var(--accent);
   line-height: 1.5;
-}
-
-.detail-confidence-bar {
-  height: 3px;
-  background: var(--bg-hover);
-  border-radius: 2px;
-  overflow: hidden;
-  margin-top: 4px;
-}
-
-.detail-confidence-fill {
-  height: 100%;
-  border-radius: 2px;
-  background: var(--color-done);
-}
-
-.detail-confidence-fill.medium {
-  background: var(--color-in-progress);
-}
-
-.detail-confidence-fill.low {
-  background: var(--color-blocked);
-}
-
-.detail-confidence-value {
-  font-size: var(--font-size-sm);
-  color: var(--text-primary);
-  font-weight: 500;
 }
 
 /* --- Action buttons in detail panel ---------------------- */
