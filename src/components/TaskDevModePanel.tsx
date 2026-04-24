@@ -173,7 +173,9 @@ export default forwardRef<TaskDevModePanelHandle, TaskDevModePanelProps>(functio
     if (!pluginRefreshTick) return; // skip initial mount (tick = 0)
     setPluginProjects([]);
     setPluginProjectsLoaded(false);
-    updateSelectedPlugin('');
+    // Use setSelectedPlugin (not updateSelectedPlugin) so the parent's persisted project name
+    // is NOT cleared via onSelectedPluginChange — we need it intact for post-refresh auto-select.
+    setSelectedPlugin('');
     setPluginOpenHint(null);
     setHintedProjectMissing(null);
   // eslint-disable-next-line react-hooks/exhaustive-deps

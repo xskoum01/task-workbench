@@ -472,9 +472,15 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
       const subPath = `${pluginsDir}/${selectedPluginProject}/${selectedPluginProject}/${skeletonPreview.fileName}`;
       try {
         await tauriApi.saveGeneratedFile(subPath, skeletonPreview.content);
-        // Persist the created file path so Open and AI Review know exactly where it landed.
+        // Persist the file path and the plugin project name so Open, AI Review and all
+        // future actions know exactly which project/file is in use.
         await updateTask(task.id, {
-          workflowSetup: { ...task.workflowSetup, artifactPath: subPath },
+          selectedPluginProject,
+          workflowSetup: {
+            ...task.workflowSetup,
+            pluginProject: selectedPluginProject || undefined,
+            artifactPath:  subPath,
+          },
         });
         setFeedback(`Draft written: ${skeletonPreview.fileName}`);
         setSkeletonPreview(null);
@@ -1421,8 +1427,16 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
                     }
                   }
 
-                  // Persist the selection so future actions in this task use the new project.
-                  await updateTask(task.id, { selectedPluginProject: projectName });
+                  // Persist the selection and artifact path so Open, AI Review and future
+                  // actions all know exactly which project and file to use.
+                  await updateTask(task.id, {
+                    selectedPluginProject: projectName,
+                    workflowSetup: {
+                      ...task.workflowSetup,
+                      pluginProject: projectName,
+                      artifactPath:  targetFile,
+                    },
+                  });
 
                   setShowSkeleton(false);
                   setSkeletonPreview(null);
@@ -1459,10 +1473,14 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
           existingPluginProjects={pluginProjectsForModal}
           onCreated={(path) => {
             setShowCreatePlugin(false);
-            // Persist the new project so the Dev panel auto-selects it after refresh.
             const projectName = path.replace(/\\/g, '/').split('/').filter(Boolean).pop() ?? '';
             if (projectName) {
-              updateTask(task.id, { selectedPluginProject: projectName }).catch(() => {});
+              // Persist both the task-level field and workflowSetup.pluginProject so the
+              // derived selectedPluginProject and the Dev panel both pick it up after refresh.
+              updateTask(task.id, {
+                selectedPluginProject: projectName,
+                workflowSetup: { ...task.workflowSetup, pluginProject: projectName },
+              }).catch(() => {});
             }
             setDevPanelRefreshTick((t) => t + 1);
             setFeedback(`Plugin project created: ${projectName || path}`);
