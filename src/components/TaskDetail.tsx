@@ -554,7 +554,14 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
    */
   function runCurrentStageAction() {
     switch (plan.currentAction) {
-      case 'analyze':        openSetupModal();      break;
+      case 'analyze':
+        // Open setup modal only for the first confirmation. Re-analysis skips setup.
+        if (!task.workflowSetup?.confirmedAt) {
+          openSetupModal();
+        } else {
+          handleAnalyze();
+        }
+        break;
       case 'generate-draft': handleGenerateDraft(); break;
       case 'start-work':
         // When developer mode is active but plugin/script not yet chosen,
