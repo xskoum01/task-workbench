@@ -257,8 +257,10 @@ export function inferReviewFilePath(
   basePath: string,
   mode: 'plugin' | 'script',
   projectName: string,
+  /** Optional free-text hint (e.g. task title) used to boost files whose names match. */
+  classHint: string = '',
 ): Promise<string> {
-  return invoke<string>('infer_review_file_path', { basePath, mode, projectName });
+  return invoke<string>('infer_review_file_path', { basePath, mode, projectName, classHint });
 }
 
 /**

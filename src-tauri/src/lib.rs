@@ -1461,15 +1461,20 @@ fn read_file_content(path: String) -> Result<String, String> {
 
 /// Recursively walks `base_path` and returns the best candidate file for AI review.
 /// For plugin mode: looks for .cs files, excluding bin/obj/.vs/packages directories,
-/// preferring files that match the project name or contain "IPlugin".
+/// preferring files that match the project name, class_hint words, or contain "IPlugin".
 /// For script mode: looks for .js/.ts files, excluding node_modules/dist/build/.next/coverage,
 /// preferring files containing formContext/executionContext/Xrm keywords.
+/// Scoring also prefers files closer to the root (lower depth = higher score).
 /// Returns the absolute path of the best candidate, or empty string if none found.
 #[tauri::command]
-fn infer_review_file_path(base_path: String, mode: String, project_name: String) -> String {
+fn infer_review_file_path(base_path: String, mode: String, project_name: String, class_hint: String) -> String {
     let base = std::path::Path::new(&base_path);
     if !base.exists() {
         return String::new();
+    }
+    // Safety: reject if base_path is not a directory (prevents treating a file as a search root).
+    if base.is_file() {
+        return base_path;
     }
 
     let is_plugin = mode == "plugin";
@@ -1479,11 +1484,20 @@ fn infer_review_file_path(base_path: String, mode: String, project_name: String)
     let mut candidates: Vec<(i32, std::path::PathBuf)> = Vec::new();
     let proj_lower = project_name.to_lowercase();
 
+    // Extract meaningful words (3+ chars) from the class hint for name matching.
+    let hint_words: Vec<String> = class_hint
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|w| w.len() >= 3)
+        .map(|w| w.to_lowercase())
+        .collect();
+
     fn walk_dir(
         dir: &std::path::Path,
         is_plugin: bool,
         excluded: &[&str],
         proj_lower: &str,
+        hint_words: &[String],
+        depth: u32,
         candidates: &mut Vec<(i32, std::path::PathBuf)>,
     ) {
         let entries = match fs::read_dir(dir) {
@@ -1498,21 +1512,31 @@ fn infer_review_file_path(base_path: String, mode: String, project_name: String)
                 if excluded.iter().any(|ex| name == *ex) {
                     continue;
                 }
-                walk_dir(&path, is_plugin, excluded, proj_lower, candidates);
+                walk_dir(&path, is_plugin, excluded, proj_lower, hint_words, depth + 1, candidates);
             } else if path.is_file() {
                 let ext = path.extension().unwrap_or_default().to_string_lossy().to_lowercase();
+                // Prefer files closer to the project root (max +3 bonus for depth 0).
+                let depth_score = (3i32).saturating_sub(depth as i32).max(0);
+
                 if is_plugin {
                     if ext != "cs" {
                         continue;
                     }
                     let stem = path.file_stem().unwrap_or_default().to_string_lossy().to_lowercase();
-                    let mut score: i32 = 0;
+                    let mut score: i32 = depth_score;
+                    // Project folder name match.
                     if !proj_lower.is_empty() && stem.contains(&*proj_lower) {
                         score += 10;
                     }
-                    // Check for IPlugin implementation hint in file content (light scan)
+                    // Class hint word match (e.g. words from task title).
+                    for word in hint_words {
+                        if stem.contains(word.as_str()) {
+                            score += 4;
+                        }
+                    }
+                    // Check for IPlugin implementation hint in file content (light scan).
                     if let Ok(content) = fs::read_to_string(&path) {
-                        if content.contains("IPlugin") || content.contains(": IPlugin") {
+                        if content.contains(": IPlugin") || content.contains("IPlugin") {
                             score += 5;
                         }
                         if content.contains("class ") {
@@ -1524,12 +1548,19 @@ fn infer_review_file_path(base_path: String, mode: String, project_name: String)
                     if ext != "js" && ext != "ts" {
                         continue;
                     }
-                    // Skip declaration and test files
+                    // Skip declaration and test files.
                     let fname = path.file_name().unwrap_or_default().to_string_lossy().to_lowercase();
                     if fname.ends_with(".d.ts") || fname.contains(".test.") || fname.contains(".spec.") {
                         continue;
                     }
-                    let mut score: i32 = 0;
+                    let stem = path.file_stem().unwrap_or_default().to_string_lossy().to_lowercase();
+                    let mut score: i32 = depth_score;
+                    // Class hint word match on file name.
+                    for word in hint_words {
+                        if stem.contains(word.as_str()) {
+                            score += 4;
+                        }
+                    }
                     if let Ok(content) = fs::read_to_string(&path) {
                         for kw in &["formContext", "executionContext", "Xrm.", "getFormContext"] {
                             if content.contains(kw) {
@@ -1547,8 +1578,9 @@ fn infer_review_file_path(base_path: String, mode: String, project_name: String)
     }
 
     let excluded = if is_plugin { excluded_dirs_plugin } else { excluded_dirs_script };
-    walk_dir(base, is_plugin, excluded, &proj_lower, &mut candidates);
+    walk_dir(base, is_plugin, excluded, &proj_lower, &hint_words, 0, &mut candidates);
 
+    // Sort descending by score, then ascending by path for stable tie-breaking.
     candidates.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
     candidates
         .into_iter()

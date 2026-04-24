@@ -122,14 +122,15 @@ export default forwardRef<TaskDevModePanelHandle, TaskDevModePanelProps>(functio
   const [branchError, setBranchError]       = useState<string | null>(null);
 
   // --- AI Review state ---
-  const [reviewExpanded, setReviewExpanded]     = useState(false);
-  const [reviewFilePath, setReviewFilePath]     = useState('');
-  const [reviewSelectedId, setReviewSelectedId] = useState('');
-  const [reviewRunning, setReviewRunning]       = useState(false);
-  const [reviewError, setReviewError]           = useState<string | null>(null);
-  const [reviewMarkdown, setReviewMarkdown]     = useState<string | null>(null);
-  const [reviewInferring, setReviewInferring]   = useState(false);
-  const [reviewInferError, setReviewInferError] = useState<string | null>(null);
+  const [reviewExpanded, setReviewExpanded]         = useState(false);
+  const [reviewFilePath, setReviewFilePath]         = useState('');
+  const [reviewPathUserEdited, setReviewPathUserEdited] = useState(false);
+  const [reviewSelectedId, setReviewSelectedId]     = useState('');
+  const [reviewRunning, setReviewRunning]           = useState(false);
+  const [reviewError, setReviewError]               = useState<string | null>(null);
+  const [reviewMarkdown, setReviewMarkdown]         = useState<string | null>(null);
+  const [reviewInferring, setReviewInferring]       = useState(false);
+  const [reviewInferError, setReviewInferError]     = useState<string | null>(null);
 
   // Reset all state when the viewed task changes.
   useEffect(() => {
@@ -148,6 +149,7 @@ export default forwardRef<TaskDevModePanelHandle, TaskDevModePanelProps>(functio
     // Reset review state
     setReviewExpanded(false);
     setReviewFilePath('');
+    setReviewPathUserEdited(false);
     setReviewSelectedId('');
     setReviewMarkdown(null);
     setReviewError(null);
@@ -309,25 +311,24 @@ export default forwardRef<TaskDevModePanelHandle, TaskDevModePanelProps>(functio
   const allReviewers = reviewerConfigs ? mergeWithDefaults(reviewerConfigs).filter((r) => r.enabled) : [];
 
   /**
-   * Infers a best default review file path from the current dev mode and selection.
-   * Used to pre-fill the path input when the review panel is first opened.
-   */
-  /**
    * Infers the best concrete file path for AI review.
+   * Never overwrites a path the user has manually edited.
    * For script mode: returns scriptOpenPath directly (already a file).
-   * For plugin mode: calls the Rust backend to find the best .cs file in the plugin folder.
-   * Sets reviewInferError when no concrete file is found.
+   * For plugin mode: calls the Rust backend to find the best .cs file in the plugin folder,
+   * using the task title as a class-name hint to improve matching.
    */
   async function inferReviewPath(): Promise<string> {
+    // Never infer if the user has already typed something manually.
+    if (reviewPathUserEdited) return reviewFilePath;
     if (devMode === 'script') return scriptOpenPath ?? '';
     if (devMode === 'plugin' && pluginsDir && selectedPlugin) {
       const dirPath = `${pluginsDir}/${selectedPlugin}`;
       setReviewInferring(true);
       setReviewInferError(null);
       try {
-        const found = await tauriApi.inferReviewFilePath(dirPath, 'plugin', selectedPlugin);
+        const found = await tauriApi.inferReviewFilePath(dirPath, 'plugin', selectedPlugin, task.title);
         if (!found) {
-          setReviewInferError(`No .cs file found in ${selectedPlugin}. Open the panel and enter the path manually.`);
+          setReviewInferError(`No .cs file found in ${selectedPlugin}. Enter the path manually.`);
           return '';
         }
         return found;
@@ -583,6 +584,7 @@ export default forwardRef<TaskDevModePanelHandle, TaskDevModePanelProps>(functio
                   value={reviewFilePath}
                   onChange={(e) => {
                     setReviewFilePath(e.target.value);
+                    setReviewPathUserEdited(true); // lock inference once user edits manually
                     setReviewSelectedId(''); // reset manual override on path change
                     setReviewMarkdown(null);
                     setReviewError(null);
