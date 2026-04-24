@@ -642,8 +642,16 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
           handleAnalyze();
         }
         break;
-      case 'confirm-setup':  setShowSetupModal(true);  break;
-      case 'generate-draft': handleGenerateDraft();     break;
+      case 'confirm-setup':          setShowSetupModal(true);  break;
+      case 'create-plugin-project':  {
+        // Open CreatePluginProjectModal — first load existing folders for naming suggestions.
+        tauriApi.listSubfolders(pluginsDir ?? '').catch(() => [] as string[]).then((folders) => {
+          setPluginProjectsForModal(folders);
+          setShowCreatePlugin(true);
+        });
+        break;
+      }
+      case 'generate-draft':         handleGenerateDraft();     break;
       case 'start-work':     handleStartWork();         break;
       case 'run-review':     handleSendForReview();     break;
       case 'mark-done':      handleMarkDone();          break;
@@ -1287,6 +1295,13 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
                     ? <><span className="btn-spinner" /> Generating…</>
                     : <><Icon name="layers" size={13} /> {plan.draftIsPrimaryAction ? 'Generate Draft' : 'Draft Snippet'}</>}
                 </button>
+              )}
+
+              {/* Hint shown when create+plugin but project not yet created */}
+              {plan.requiresPluginCreate && (
+                <div style={{ fontSize: 11, color: 'var(--text-muted)', marginTop: 4 }}>
+                  Create the plugin project first, then Generate Draft will become available.
+                </div>
               )}
 
               {/* Apply Draft */}

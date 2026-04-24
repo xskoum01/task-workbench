@@ -20,6 +20,7 @@ export type TargetKind = 'plugin' | 'script' | 'repo';
 export type PlanAction =
   | 'analyze'
   | 'confirm-setup'
+  | 'create-plugin-project'
   | 'generate-draft'
   | 'start-work'
   | 'run-review'
@@ -52,6 +53,7 @@ const S_NEW: WorkflowStage = { id: 'new', label: 'New', actionLabel: 'Analyze', 
 const S_NEW_CONFIRM: WorkflowStage = { id: 'new', label: 'New', actionLabel: 'Confirm Setup', next: 'analyzed' };
 // Fallback: task already reached Analyzed state but plugin/script was never confirmed.
 const S_ANA_SETUP_REQ: WorkflowStage = { id: 'analyzed', label: 'Analyzed', actionLabel: 'Setup Required', next: 'in-progress' };
+const S_ANA_CREATE_PLUGIN: WorkflowStage = { id: 'analyzed', label: 'Analyzed', actionLabel: 'Create Plugin Project', next: 'in-progress' };
 const S_ANA_DRAFT: WorkflowStage = { id: 'analyzed', label: 'Analyzed', actionLabel: 'Generate Draft', next: 'in-progress' };
 const S_ANA_START: WorkflowStage = { id: 'analyzed', label: 'Analyzed', actionLabel: 'Start Work', next: 'in-progress' };
 const S_ANA_FIX: WorkflowStage = { id: 'analyzed', label: 'Analyzed', actionLabel: 'Start Fixing', next: 'in-progress' };
@@ -109,6 +111,11 @@ export function buildTaskWorkflowPlan(task: Task, heuristicKind?: DevKind): Task
   //   - developer confirmed review  -> New(Analyze)         -> Analyzed(Run Review) -> For Review -> Done
   //   - developer confirmed create  -> New(Analyze)         -> Analyzed(Generate Draft) -> In Progress -> For Review -> Done
   //   - developer confirmed update/fix -> New(Analyze)      -> Analyzed(Start Work / Start Fixing) -> In Progress -> For Review -> Done
+  // For create+plugin: split the Analyzed stage based on whether the project has been scaffolded.
+  // Before the project exists the BPF action is "Create Plugin Project"; after, "Generate Draft".
+  const isCreatePlugin = isCreate && devKind === 'plugin' && isCode;
+  const pluginProjectExists = isCreatePlugin && !!setup?.pluginProject;
+
   let stages: WorkflowStage[];
   if (isGeneral) {
     stages = [S_NEW, S_ANA_DONE, S_DONE];
@@ -119,6 +126,10 @@ export function buildTaskWorkflowPlan(task: Task, heuristicKind?: DevKind): Task
     stages = [S_NEW_CONFIRM, S_ANA_START, S_IN_PROGRESS, S_FOR_REVIEW, S_DONE];
   } else if (isReview) {
     stages = [S_NEW, S_ANA_REVIEW, S_FOR_REVIEW, S_DONE];
+  } else if (isCreatePlugin) {
+    // create+plugin: show the correct Analyzed stage label depending on project state.
+    const mid = pluginProjectExists ? S_ANA_DRAFT : S_ANA_CREATE_PLUGIN;
+    stages = [S_NEW, mid, S_IN_PROGRESS, S_FOR_REVIEW, S_DONE];
   } else {
     const mid = isCreate ? S_ANA_DRAFT : isFix ? S_ANA_FIX : S_ANA_START;
     stages = [S_NEW, mid, S_IN_PROGRESS, S_FOR_REVIEW, S_DONE];
@@ -132,12 +143,14 @@ export function buildTaskWorkflowPlan(task: Task, heuristicKind?: DevKind): Task
       currentAction = isDeveloperAwaitingSetup ? 'confirm-setup' : 'analyze';
       break;
     case 'analyzed':
-      if (isGeneral)                     currentAction = 'mark-done';
+      if (isGeneral)                       currentAction = 'mark-done';
       // Edge case: task reached Analyzed without confirmed plugin/script (e.g. legacy data).
-      else if (isDeveloperAwaitingSetup) currentAction = 'confirm-setup';
-      else if (isReview)                 currentAction = 'run-review';
-      else if (isCreate)                 currentAction = 'generate-draft';
-      else                               currentAction = 'start-work';
+      else if (isDeveloperAwaitingSetup)   currentAction = 'confirm-setup';
+      else if (isReview)                   currentAction = 'run-review';
+      else if (isCreatePlugin && !pluginProjectExists)
+                                           currentAction = 'create-plugin-project';
+      else if (isCreate)                   currentAction = 'generate-draft';
+      else                                 currentAction = 'start-work';
       break;
     case 'in-progress':
       currentAction = isCode ? 'run-review' : 'none'; break;
@@ -160,11 +173,13 @@ export function buildTaskWorkflowPlan(task: Task, heuristicKind?: DevKind): Task
     currentAction,
     currentActionLabel,
     requiresDevTools:         isCode,
-    requiresDraftGeneration:  isCode && !isReview,
-    draftIsPrimaryAction:     isCode && isCreate,
+    // For create+plugin: draft actions are only available once the project exists.
+    requiresDraftGeneration:  isCode && !isReview && (!isCreatePlugin || pluginProjectExists),
+    draftIsPrimaryAction:     isCode && isCreate && (!isCreatePlugin || pluginProjectExists),
     requiresExistingArtifact: isCode && !isCreate,
     requiresAiFileReview:     isCode,
-    requiresPluginCreate:     confirmedKind === 'plugin' && isCreate,
+    // Show the "Create Plugin Project" sidebar button only when the project doesn't exist yet.
+    requiresPluginCreate:     isCreatePlugin && !pluginProjectExists,
     requiresScriptCreate:     confirmedKind === 'script' && isCreate,
     shouldInferReviewFile:    isCode && !isCreate,
     isDeveloperAwaitingSetup,
