@@ -406,6 +406,20 @@ export default function SettingsPage() {
   const baseDir      = draft.crmBaseDirectory ?? '';
   const templatePath = draft.repositoryTemplatePath ?? '';
 
+  // ---------------------------------------------------------------------------
+  // Tab state
+  // ---------------------------------------------------------------------------
+
+  type SettingsTab = 'general' | 'workspace' | 'ai' | 'm365';
+  const [activeTab, setActiveTab] = useState<SettingsTab>('general');
+
+  const TABS: { id: SettingsTab; label: string; icon: IconName }[] = [
+    { id: 'general',   label: 'General',       icon: 'settings'       },
+    { id: 'workspace', label: 'Workspace',      icon: 'folder'         },
+    { id: 'ai',        label: 'AI',             icon: 'search'         },
+    { id: 'm365',      label: 'Microsoft 365',  icon: 'mail'           },
+  ];
+
   return (
     <div className="page-content">
       <div className="page-header">
@@ -415,604 +429,603 @@ export default function SettingsPage() {
         </div>
       </div>
 
-      <div className="settings-grid">
-
-        {/* Left column: Application → Repository Workspace → Templates */}
-        <div className="settings-col">
-
-          {/* Application */}
-          <SettingsBlock
-            icon="settings"
-            title="Application"
-            description="General application preferences"
+      {/* Tab bar */}
+      <div className="settings-tabs">
+        {TABS.map((tab) => (
+          <button
+            key={tab.id}
+            className={`settings-tab${activeTab === tab.id ? ' active' : ''}`}
+            onClick={() => setActiveTab(tab.id)}
+            type="button"
           >
-            <SettingsField label="App Name">
-              <input
-                className="form-input"
-                type="text"
-                value={draft.appName}
-                onChange={(e) => set('appName', e.target.value)}
-                style={{ maxWidth: 280 }}
-              />
-            </SettingsField>
+            <Icon name={tab.icon} size={13} />
+            {tab.label}
+          </button>
+        ))}
+      </div>
 
-            <SettingsField label="Theme">
-              <select
-                className="form-select"
-                value={draft.theme}
-                onChange={(e) => set('theme', e.target.value)}
-                style={{ maxWidth: 280 }}
-              >
-                <option value="dark">Dark</option>
-                <option value="light">Light (not yet implemented)</option>
-              </select>
-            </SettingsField>
+      {/* Tab content */}
+      <div className="settings-tab-content">
 
-            <SettingsField label="Default Task Confidence %">
-              <input
-                className="form-input"
-                type="number"
-                min={0}
-                max={100}
-                value={draft.defaultTaskConfidence}
-                onChange={(e) =>
-                  set('defaultTaskConfidence', Math.min(100, Math.max(0, parseInt(e.target.value) || 0)))
-                }
-                style={{ maxWidth: 100 }}
-              />
-            </SettingsField>
+        {/* ── General ──────────────────────────────────────────────────────── */}
+        {activeTab === 'general' && (
+          <>
+            <SettingsBlock
+              icon="settings"
+              title="Application"
+              description="General application preferences"
+            >
+              <SettingsField label="App Name">
+                <input
+                  className="form-input"
+                  type="text"
+                  value={draft.appName}
+                  onChange={(e) => set('appName', e.target.value)}
+                  style={{ maxWidth: 280 }}
+                />
+              </SettingsField>
 
-            <SettingsField label="Platform">
-              <span style={{ fontSize: 13, color: 'var(--text-muted)' }}>
-                Tauri 2 / Windows
-              </span>
-            </SettingsField>
-          </SettingsBlock>
+              <SettingsField label="Theme">
+                <select
+                  className="form-select"
+                  value={draft.theme}
+                  onChange={(e) => set('theme', e.target.value)}
+                  style={{ maxWidth: 280 }}
+                >
+                  <option value="dark">Dark</option>
+                  <option value="light">Light (not yet implemented)</option>
+                </select>
+              </SettingsField>
 
-          {/* Repository Workspace */}
-          <SettingsBlock
-            icon="folder"
-            title="Repository Workspace"
-            description="Where customer repositories live, how they are detected, and what default template to use for scaffolding"
-          >
-            {/* Base directory chooser */}
-            <SettingsField label="CRM Base Directory">
-              <div className="settings-repo-dir-row">
-                {baseDir ? (
-                  <span className="settings-repo-dir-value" title={baseDir}>{baseDir}</span>
-                ) : (
-                  <span className="settings-repo-dir-placeholder">No directory selected</span>
-                )}
-                <div className="settings-repo-dir-actions">
+              <SettingsField label="Default Task Confidence %">
+                <input
+                  className="form-input"
+                  type="number"
+                  min={0}
+                  max={100}
+                  value={draft.defaultTaskConfidence}
+                  onChange={(e) =>
+                    set('defaultTaskConfidence', Math.min(100, Math.max(0, parseInt(e.target.value) || 0)))
+                  }
+                  style={{ maxWidth: 100 }}
+                />
+              </SettingsField>
+
+              <SettingsField label="Platform">
+                <span style={{ fontSize: 13, color: 'var(--text-muted)' }}>
+                  Tauri 2 / Windows
+                </span>
+              </SettingsField>
+            </SettingsBlock>
+
+            <SettingsBlock icon="folder" title="Data Management" description="Reset local persisted data. Settings and Microsoft tokens are preserved.">
+              <div className="settings-form-row" style={{ flexDirection: 'column', alignItems: 'flex-start', gap: 8 }}>
+                <div style={{ fontSize: 12, color: 'var(--color-text-muted)' }}>
+                  Clears all tasks and customers stored locally. Use this to start fresh without reinstalling the app.
+                </div>
+                <div className="settings-action-row">
                   <button
-                    className="btn btn-primary btn-sm"
-                    onClick={handleChooseFolder}
-                    title="Open the system folder picker"
+                    className="btn btn-ghost btn-sm"
+                    style={{ color: confirmReset ? 'var(--color-blocked)' : undefined }}
+                    onClick={handleResetLocalData}
+                    disabled={resetting}
+                    title="Clear all local task and customer data"
                   >
-                    <Icon name="folder" size={13} /> Choose…
+                    {resetting ? 'Resetting…' : confirmReset ? 'Click again to confirm reset' : 'Reset local data'}
                   </button>
-                  {baseDir && (
+                  {confirmReset && (
+                    <button
+                      className="btn btn-ghost btn-sm"
+                      onClick={() => setConfirmReset(false)}
+                    >
+                      Cancel
+                    </button>
+                  )}
+                  {resetMsg && (
+                    <span style={{ fontSize: 12, color: 'var(--color-text-muted)' }}>{resetMsg}</span>
+                  )}
+                </div>
+              </div>
+            </SettingsBlock>
+          </>
+        )}
+
+        {/* ── Workspace ────────────────────────────────────────────────────── */}
+        {activeTab === 'workspace' && (
+          <>
+            <SettingsBlock
+              icon="folder"
+              title="Repository Workspace"
+              description="Where customer repositories live, how they are detected, and what default template to use for scaffolding"
+            >
+              {/* Base directory chooser */}
+              <SettingsField label="CRM Base Directory">
+                <div className="settings-repo-dir-row">
+                  {baseDir ? (
+                    <span className="settings-repo-dir-value" title={baseDir}>{baseDir}</span>
+                  ) : (
+                    <span className="settings-repo-dir-placeholder">No directory selected</span>
+                  )}
+                  <div className="settings-repo-dir-actions">
+                    <button
+                      className="btn btn-primary btn-sm"
+                      onClick={handleChooseFolder}
+                      title="Open the system folder picker"
+                    >
+                      <Icon name="folder" size={13} /> Choose…
+                    </button>
+                    {baseDir && (
+                      <button
+                        className="btn btn-secondary btn-sm"
+                        onClick={handleOpenBaseDir}
+                        title="Open in file explorer"
+                      >
+                        Open
+                      </button>
+                    )}
+                  </div>
+                </div>
+                {!baseDir && (
+                  <p className="settings-hint">
+                    Click <strong>Choose…</strong> to select the root folder that contains your customer repositories.
+                  </p>
+                )}
+              </SettingsField>
+
+              {/* Repository template */}
+              <SettingsField label="Default repository template">
+                <div className="settings-template-section">
+                  <div className="settings-template-current">
+                    {templatePath ? (
+                      <>
+                        <span
+                          className="settings-repo-dir-value"
+                          title={templatePath}
+                          style={{ flex: 1 }}
+                        >
+                          {templatePath}
+                        </span>
+                        <span
+                          className={`template-validation-badge${
+                            templateValidation === 'valid'   ? ' template-valid'   :
+                            templateValidation === 'invalid' ? ' template-invalid' : ''
+                          }`}
+                        >
+                          {templateValidation === 'valid'        ? '✓ Valid'
+                           : templateValidation === 'invalid'    ? '✗ Invalid'
+                           : 'Not validated'}
+                        </span>
+                      </>
+                    ) : (
+                      <span className="settings-repo-dir-placeholder">No template selected</span>
+                    )}
+                  </div>
+                  <div className="settings-template-actions">
+                    <button
+                      className="btn btn-primary btn-sm"
+                      onClick={handleChooseZip}
+                      title="Pick a ZIP archive as the repository template"
+                    >
+                      <Icon name="folder" size={13} /> Choose ZIP
+                    </button>
                     <button
                       className="btn btn-secondary btn-sm"
-                      onClick={handleOpenBaseDir}
-                      title="Open in file explorer"
+                      onClick={handleChooseTemplateFolder}
+                      title="Pick a folder as the repository template"
+                    >
+                      <Icon name="folder" size={13} /> Choose Folder
+                    </button>
+                    {templatePath && (
+                      <>
+                        <button
+                          className="btn btn-secondary btn-sm"
+                          onClick={handleValidateTemplate}
+                          disabled={templateValidating}
+                        >
+                          {templateValidating ? 'Validating…' : 'Validate'}
+                        </button>
+                        <button
+                          className="btn btn-secondary btn-sm"
+                          onClick={handleOpenTemplate}
+                        >
+                          Open
+                        </button>
+                        <button
+                          className="btn btn-ghost btn-sm"
+                          onClick={clearTemplate}
+                          style={{ color: 'var(--text-muted)' }}
+                        >
+                          Clear
+                        </button>
+                      </>
+                    )}
+                  </div>
+                </div>
+                <p className="settings-hint">
+                  A ZIP archive with a single top-level folder (e.g.{' '}
+                  <code>_GIT_REPO_TEMPLATE/</code>) is automatically stripped so
+                  the contents land directly in the customer directory.
+                </p>
+              </SettingsField>
+
+              {/* Rescan action */}
+              <SettingsField label="Repository scan">
+                <div className="settings-action-row">
+                  <button
+                    className="btn btn-secondary btn-sm"
+                    onClick={handleRescan}
+                    disabled={rescanning}
+                    title="Re-check all customer repository paths"
+                  >
+                    {rescanning ? 'Scanning…' : 'Rescan Repositories'}
+                  </button>
+                  {rescanMsg && (
+                    <span className="settings-inline-msg">
+                      <Icon name="check" size={12} /> {rescanMsg}
+                    </span>
+                  )}
+                </div>
+                <p className="settings-hint">
+                  Checks each customer's repository folder and updates its status (Linked / Missing / Not created).
+                  {isDirty && <> Unsaved changes will be saved automatically before scanning.</>}
+                </p>
+              </SettingsField>
+            </SettingsBlock>
+
+            <SettingsBlock
+              icon="file-text"
+              title="Templates"
+              description="Plugin and Script templates for new customer repositories"
+            >
+              <TemplatesSection
+                templates={draft.templates ?? []}
+                onChange={(updated: AppTemplate[]) => {
+                  setDraft((prev) => ({ ...prev, templates: updated }));
+                  setIsDirty(true);
+                  setSaved(false);
+                }}
+              />
+            </SettingsBlock>
+
+            <SettingsBlock
+              icon="folder"
+              title="Plugin Template"
+              description="Local folder used as a template when scaffolding new plugin projects"
+            >
+              <SettingsField label="Template Folder">
+                <div style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
+                  <input
+                    className="form-input"
+                    type="text"
+                    placeholder="C:\Templates\PluginTemplate"
+                    value={draft.pluginTemplateFolder ?? ''}
+                    onChange={(e) => set('pluginTemplateFolder', e.target.value)}
+                    style={{ flex: 1 }}
+                  />
+                  <button
+                    className="btn btn-ghost btn-sm"
+                    type="button"
+                    onClick={async () => {
+                      try {
+                        const picked = await tauriApi.pickFolder();
+                        if (picked) set('pluginTemplateFolder', picked);
+                      } catch {}
+                    }}
+                    title="Browse for template folder"
+                  >
+                    Browse
+                  </button>
+                  {draft.pluginTemplateFolder && (
+                    <button
+                      className="btn btn-ghost btn-sm"
+                      type="button"
+                      onClick={() => tauriApi.openPath(draft.pluginTemplateFolder!).catch(() => {})}
+                      title="Open template folder"
                     >
                       Open
                     </button>
                   )}
                 </div>
+              </SettingsField>
+              <div className="settings-field-hint">
+                Files may contain <code>__PROJECT_NAME__</code> and <code>__NAMESPACE__</code> placeholders.
+                They are replaced when scaffolding a new plugin project.
               </div>
-              {!baseDir && (
-                <p className="settings-hint">
-                  Click <strong>Choose…</strong> to select the root folder that contains your customer repositories.
-                </p>
-              )}
-            </SettingsField>
+            </SettingsBlock>
+          </>
+        )}
 
-            {/* Repository template */}
-            <SettingsField label="Default repository template">
-              <div className="settings-template-section">
-                {/* Current selection */}
-                <div className="settings-template-current">
-                  {templatePath ? (
-                    <>
-                      <span
-                        className="settings-repo-dir-value"
-                        title={templatePath}
-                        style={{ flex: 1 }}
-                      >
-                        {templatePath}
-                      </span>
-                      <span
-                        className={`template-validation-badge${
-                          templateValidation === 'valid'   ? ' template-valid'   :
-                          templateValidation === 'invalid' ? ' template-invalid' : ''
-                        }`}
-                      >
-                        {templateValidation === 'valid'        ? '✓ Valid'
-                         : templateValidation === 'invalid'    ? '✗ Invalid'
-                         : 'Not validated'}
-                      </span>
-                    </>
-                  ) : (
-                    <span className="settings-repo-dir-placeholder">No template selected</span>
-                  )}
-                </div>
-
-                {/* Action row */}
-                <div className="settings-template-actions">
-                  <button
-                    className="btn btn-primary btn-sm"
-                    onClick={handleChooseZip}
-                    title="Pick a ZIP archive as the repository template"
-                  >
-                    <Icon name="folder" size={13} /> Choose ZIP
-                  </button>
-                  <button
-                    className="btn btn-secondary btn-sm"
-                    onClick={handleChooseTemplateFolder}
-                    title="Pick a folder as the repository template"
-                  >
-                    <Icon name="folder" size={13} /> Choose Folder
-                  </button>
-                  {templatePath && (
-                    <>
-                      <button
-                        className="btn btn-secondary btn-sm"
-                        onClick={handleValidateTemplate}
-                        disabled={templateValidating}
-                        title="Check that the template file exists and is valid"
-                      >
-                        {templateValidating ? 'Validating…' : 'Validate'}
-                      </button>
-                      <button
-                        className="btn btn-secondary btn-sm"
-                        onClick={handleOpenTemplate}
-                        title="Open the template file or folder in explorer"
-                      >
-                        Open
-                      </button>
-                      <button
-                        className="btn btn-ghost btn-sm"
-                        onClick={clearTemplate}
-                        title="Remove the template selection"
-                        style={{ color: 'var(--text-muted)' }}
-                      >
-                        Clear
-                      </button>
-                    </>
-                  )}
-                </div>
-              </div>
-              <p className="settings-hint">
-                Used when creating a new customer repository.
-                A ZIP archive with a single top-level folder (e.g.{' '}
-                <code>_GIT_REPO_TEMPLATE/</code>) is automatically stripped so
-                the contents land directly in the customer directory.
-              </p>
-            </SettingsField>
-
-            {/* Rescan action */}
-            <SettingsField label="Repository scan">
-              <div className="settings-action-row">
-                <button
-                  className="btn btn-secondary btn-sm"
-                  onClick={handleRescan}
-                  disabled={rescanning}
-                  title="Re-check all customer repository paths"
-                >
-                  {rescanning ? 'Scanning…' : 'Rescan Repositories'}
-                </button>
-                {rescanMsg && (
-                  <span className="settings-inline-msg">
-                    <Icon name="check" size={12} /> {rescanMsg}
-                  </span>
-                )}
-              </div>
-              <p className="settings-hint">
-                Checks each customer's repository folder and updates its status (Linked / Missing / Not created).
-                {isDirty && <> Unsaved changes will be saved automatically before scanning.</>}
-              </p>
-            </SettingsField>
-          </SettingsBlock>
-
-          {/* Templates */}
-          <SettingsBlock
-            icon="file-text"
-            title="Templates"
-            description="Plugin and Script templates for new customer repositories"
-          >
-            <TemplatesSection
-              templates={draft.templates ?? []}
-              onChange={(updated: AppTemplate[]) => {
-                setDraft((prev) => ({ ...prev, templates: updated }));
-                setIsDirty(true);
-                setSaved(false);
-              }}
-            />
-          </SettingsBlock>
-
-          {/* Plugin Project Template */}
-          <SettingsBlock
-            icon="folder"
-            title="Plugin Template"
-            description="Local folder used as a template when scaffolding new plugin projects"
-          >
-            <SettingsField label="Template Folder">
-              <div style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
+        {/* ── AI ───────────────────────────────────────────────────────────── */}
+        {activeTab === 'ai' && (
+          <>
+            <SettingsBlock
+              icon="search"
+              title="AI Configuration"
+              description="OpenAI API key and model for task classification and workflow automation"
+            >
+              <SettingsField label="Model">
                 <input
                   className="form-input"
                   type="text"
-                  placeholder="C:\Templates\PluginTemplate"
-                  value={draft.pluginTemplateFolder ?? ''}
-                  onChange={(e) => set('pluginTemplateFolder', e.target.value)}
-                  style={{ flex: 1 }}
+                  placeholder="gpt-4.1-mini"
+                  value={draft.aiModel}
+                  onChange={(e) => set('aiModel', e.target.value)}
+                  style={{ maxWidth: 280 }}
                 />
-                <button
-                  className="btn btn-ghost btn-sm"
-                  type="button"
-                  onClick={async () => {
-                    try {
-                      const picked = await tauriApi.pickFolder();
-                      if (picked) set('pluginTemplateFolder', picked);
-                    } catch {}
-                  }}
-                  title="Browse for template folder"
-                >
-                  Browse
-                </button>
-                {draft.pluginTemplateFolder && (
-                  <button
-                    className="btn btn-ghost btn-sm"
-                    type="button"
-                    onClick={() => tauriApi.openPath(draft.pluginTemplateFolder!).catch(() => {})}
-                    title="Open template folder"
-                  >
-                    Open
-                  </button>
-                )}
-              </div>
-            </SettingsField>
-            <div className="settings-field-hint">
-              Files may contain <code>__PROJECT_NAME__</code> and <code>__NAMESPACE__</code> placeholders.
-              They are replaced when scaffolding a new plugin project.
-            </div>
-          </SettingsBlock>
+              </SettingsField>
 
-        </div>{/* end left column */}
+              <SettingsField label="API Key">
+                <input
+                  className="form-input"
+                  type="password"
+                  placeholder="sk-…"
+                  value={draft.aiApiKey}
+                  onChange={(e) => set('aiApiKey', e.target.value)}
+                  style={{ maxWidth: 280 }}
+                />
+              </SettingsField>
+            </SettingsBlock>
 
-        {/* Right column: AI Configuration → Microsoft 365 → Data Management */}
-        <div className="settings-col">
-
-          {/* AI Configuration */}
-          <SettingsBlock
-            icon="search"
-            title="AI Configuration"
-            description="OpenAI API key and model for task classification and workflow automation"
-          >
-            <SettingsField label="Model">
-              <input
-                className="form-input"
-                type="text"
-                placeholder="gpt-4.1-mini"
-                value={draft.aiModel}
-                onChange={(e) => set('aiModel', e.target.value)}
-                style={{ maxWidth: 280 }}
+            <SettingsBlock
+              icon="search"
+              title="AI Reviewers"
+              description="Configurable AI reviewer profiles for plugin and script code review"
+            >
+              <AiReviewersSettingsPanel
+                configs={draft.aiReviewers}
+                onChange={(updated) => {
+                  setDraft((prev) => ({ ...prev, aiReviewers: updated }));
+                  setIsDirty(true);
+                  setSaved(false);
+                }}
               />
-            </SettingsField>
+              <p className="settings-hint">
+                Reviewer instructions are sent as the AI system prompt. Changes take effect
+                immediately when you save Settings.
+              </p>
+            </SettingsBlock>
+          </>
+        )}
 
-            <SettingsField label="API Key">
-              <input
-                className="form-input"
-                type="password"
-                placeholder="sk-…"
-                value={draft.aiApiKey}
-                onChange={(e) => set('aiApiKey', e.target.value)}
-                style={{ maxWidth: 280 }}
-              />
-            </SettingsField>
-          </SettingsBlock>
+        {/* ── Microsoft 365 ────────────────────────────────────────────────── */}
+        {activeTab === 'm365' && (
+          <>
+            <SettingsBlock
+              icon="mail"
+              title="Microsoft 365 Integration"
+              description="Sign in with your Microsoft work account to enable Outlook and Teams task ingestion"
+            >
+              {(() => {
+                const status: MicrosoftConnectionStatus =
+                  draft.microsoftConnectionStatus ?? 'disconnected';
 
-          {/* AI Reviewers */}
-          <SettingsBlock
-            icon="search"
-            title="AI Reviewers"
-            description="Configurable AI reviewer profiles for plugin and script code review"
-          >
-            <AiReviewersSettingsPanel
-              configs={draft.aiReviewers}
-              onChange={(updated) => {
-                setDraft((prev) => ({ ...prev, aiReviewers: updated }));
-                setIsDirty(true);
-                setSaved(false);
-              }}
-            />
-            <p className="settings-hint">
-              Reviewer instructions are sent as the AI system prompt. Changes take effect
-              immediately when you save Settings.
-            </p>
-          </SettingsBlock>
-
-          {/* Microsoft Graph / M365 */}
-          <SettingsBlock
-            icon="mail"
-            title="Microsoft 365 Integration"
-            description="Sign in with your Microsoft work account to enable Outlook and Teams task ingestion"
-          >
-            {(() => {
-              const status: MicrosoftConnectionStatus =
-                draft.microsoftConnectionStatus ?? 'disconnected';
-
-              // ── connected ──────────────────────────────────────────────────
-              if (status === 'connected') {
-                return (
-                  <div className="m365-panel">
-                    <div className="m365-connection-info">
-                      <span className="repo-status-badge repo-status-linked">Connected</span>
-                      {draft.microsoftAccountDisplayName && (
-                        <span className="m365-account-name">{draft.microsoftAccountDisplayName}</span>
-                      )}
-                      {draft.m365AccountEmail && (
-                        <span className="m365-account-email">{draft.m365AccountEmail}</span>
-                      )}
-                    </div>
-
-                    {(draft.microsoftTenantName || draft.microsoftTenantId || draft.microsoftTenant) && (
-                      <div className="m365-tenant-row">
-                        <span className="m365-field-label">Tenant</span>
-                        <span className="m365-tenant-name">
-                          {draft.microsoftTenantName ?? draft.microsoftTenantId ?? draft.microsoftTenant}
-                        </span>
+                if (status === 'connected') {
+                  return (
+                    <div className="m365-panel">
+                      <div className="m365-connection-info">
+                        <span className="repo-status-badge repo-status-linked">Connected</span>
+                        {draft.microsoftAccountDisplayName && (
+                          <span className="m365-account-name">{draft.microsoftAccountDisplayName}</span>
+                        )}
+                        {draft.m365AccountEmail && (
+                          <span className="m365-account-email">{draft.m365AccountEmail}</span>
+                        )}
                       </div>
-                    )}
 
-                    <div className="m365-services">
-                      <div className="m365-service-row">
-                        <span className="m365-service-label">Outlook</span>
-                        <span className={`repo-status-badge ${M365_STATUS_CLASS[draft.outlookStatus ?? 'not_configured']}`}>
-                          {M365_STATUS_LABEL[draft.outlookStatus ?? 'not_configured']}
-                        </span>
+                      {(draft.microsoftTenantName || draft.microsoftTenantId || draft.microsoftTenant) && (
+                        <div className="m365-tenant-row">
+                          <span className="m365-field-label">Tenant</span>
+                          <span className="m365-tenant-name">
+                            {draft.microsoftTenantName ?? draft.microsoftTenantId ?? draft.microsoftTenant}
+                          </span>
+                        </div>
+                      )}
+
+                      <div className="m365-services">
+                        <div className="m365-service-row">
+                          <span className="m365-service-label">Outlook</span>
+                          <span className={`repo-status-badge ${M365_STATUS_CLASS[draft.outlookStatus ?? 'not_configured']}`}>
+                            {M365_STATUS_LABEL[draft.outlookStatus ?? 'not_configured']}
+                          </span>
+                        </div>
+                        <div className="m365-service-row">
+                          <span className="m365-service-label">Teams</span>
+                          <span className={`repo-status-badge ${M365_STATUS_CLASS[draft.teamsStatus ?? 'not_configured']}`}>
+                            {M365_STATUS_LABEL[draft.teamsStatus ?? 'not_configured']}
+                          </span>
+                        </div>
                       </div>
-                      <div className="m365-service-row">
-                        <span className="m365-service-label">Teams</span>
-                        <span className={`repo-status-badge ${M365_STATUS_CLASS[draft.teamsStatus ?? 'not_configured']}`}>
-                          {M365_STATUS_LABEL[draft.teamsStatus ?? 'not_configured']}
-                        </span>
+
+                      {draft.lastMicrosoftSyncAt && (
+                        <div className="m365-meta-row">
+                          <span className="m365-field-label">Last sync</span>
+                          <span className="m365-field-value">
+                            {new Date(draft.lastMicrosoftSyncAt).toLocaleString()}
+                          </span>
+                        </div>
+                      )}
+
+                      <div className="settings-action-row" style={{ marginTop: 4 }}>
+                        <button
+                          className="btn btn-ghost btn-sm"
+                          onClick={handleM365Refresh}
+                          title="Silently re-acquire Microsoft tokens"
+                        >
+                          Refresh
+                        </button>
+                        <button
+                          className="btn btn-ghost btn-sm"
+                          onClick={handleM365Disconnect}
+                        >
+                          Disconnect
+                        </button>
                       </div>
                     </div>
+                  );
+                }
 
-                    {draft.lastMicrosoftSyncAt && (
-                      <div className="m365-meta-row">
-                        <span className="m365-field-label">Last sync</span>
-                        <span className="m365-field-value">
-                          {new Date(draft.lastMicrosoftSyncAt).toLocaleString()}
-                        </span>
+                if (status === 'refreshing') {
+                  return (
+                    <div className="m365-panel">
+                      <div className="m365-connection-info">
+                        <span className="repo-status-badge repo-status-missing">Refreshing…</span>
                       </div>
-                    )}
+                    </div>
+                  );
+                }
 
-                    <div className="settings-action-row" style={{ marginTop: 4 }}>
+                if (status === 'connecting') {
+                  return (
+                    <div className="m365-panel">
+                      <div className="m365-connection-info">
+                        <span className="repo-status-badge repo-status-missing">Connecting…</span>
+                      </div>
+                      {m365Notice && (
+                        <div className="settings-m365-notice">
+                          <Icon name="plug" size={13} />
+                          <span>{m365Notice}</span>
+                        </div>
+                      )}
                       <button
                         className="btn btn-ghost btn-sm"
-                        onClick={handleM365Refresh}
-                        title="Silently re-acquire Microsoft tokens"
-                      >
-                        Refresh
-                      </button>
-                      <button
-                        className="btn btn-ghost btn-sm"
+                        style={{ alignSelf: 'flex-start' }}
                         onClick={handleM365Disconnect}
                       >
-                        Disconnect
+                        Cancel
                       </button>
                     </div>
-                  </div>
-                );
-              }
+                  );
+                }
 
-              // ── refreshing ────────────────────────────────────────────────
-              if (status === 'refreshing') {
+                if (status === 'error') {
+                  return (
+                    <div className="m365-panel">
+                      <div className="m365-connection-info">
+                        <span className="repo-status-badge repo-status-missing">Error</span>
+                        {draft.lastMicrosoftError && (
+                          <span className="m365-error-msg">{draft.lastMicrosoftError}</span>
+                        )}
+                      </div>
+                      <div className="settings-action-row">
+                        <button className="btn btn-secondary" onClick={handleM365SignIn}>
+                          Retry
+                        </button>
+                        <button className="btn btn-ghost btn-sm" onClick={handleM365Disconnect}>
+                          Disconnect
+                        </button>
+                      </div>
+                    </div>
+                  );
+                }
+
                 return (
                   <div className="m365-panel">
-                    <div className="m365-connection-info">
-                      <span className="repo-status-badge repo-status-missing">Refreshing…</span>
+                    <p className="settings-hint" style={{ marginTop: 0 }}>
+                      Sign in with your Microsoft work account to enable Outlook and Teams import.
+                    </p>
+                    <div className="m365-client-id-field">
+                      <label className="form-label" htmlFor="ms-tenant-id">
+                        Directory (tenant) ID
+                      </label>
+                      <input
+                        id="ms-tenant-id"
+                        className="form-input"
+                        type="text"
+                        placeholder="xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
+                        value={draft.microsoftTenant ?? ''}
+                        onChange={(e) => { set('microsoftTenant', e.target.value); }}
+                        style={{ maxWidth: 340 }}
+                      />
+                      <label className="form-label" htmlFor="ms-client-id" style={{ marginTop: 6 }}>
+                        Application (client) ID
+                      </label>
+                      <input
+                        id="ms-client-id"
+                        className="form-input"
+                        type="text"
+                        placeholder="xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
+                        value={draft.microsoftClientId ?? ''}
+                        onChange={(e) => {
+                          setDraft((prev) => ({ ...prev, microsoftClientId: e.target.value }));
+                          setIsDirty(true);
+                          setSaved(false);
+                        }}
+                        style={{ maxWidth: 340 }}
+                      />
+                      <p className="settings-hint" style={{ marginTop: 0 }}>
+                        Both IDs are on the <strong>Overview</strong> page of your Azure App Registration.
+                        Redirect URI must be set to <code>http://localhost:3049</code> (Mobile and desktop applications).
+                      </p>
                     </div>
-                  </div>
-                );
-              }
-
-              // ── connecting ────────────────────────────────────────────────
-              if (status === 'connecting') {
-                return (
-                  <div className="m365-panel">
-                    <div className="m365-connection-info">
-                      <span className="repo-status-badge repo-status-missing">Connecting…</span>
-                    </div>
+                    <button
+                      className="btn btn-secondary"
+                      onClick={handleM365SignIn}
+                      style={{ alignSelf: 'flex-start' }}
+                    >
+                      Connect with Microsoft
+                    </button>
                     {m365Notice && (
                       <div className="settings-m365-notice">
                         <Icon name="plug" size={13} />
                         <span>{m365Notice}</span>
                       </div>
                     )}
-                    <button
-                      className="btn btn-ghost btn-sm"
-                      style={{ alignSelf: 'flex-start' }}
-                      onClick={handleM365Disconnect}
-                    >
-                      Cancel
-                    </button>
                   </div>
                 );
-              }
-
-              // ── error ─────────────────────────────────────────────────────
-              if (status === 'error') {
-                return (
-                  <div className="m365-panel">
-                    <div className="m365-connection-info">
-                      <span className="repo-status-badge repo-status-missing">Error</span>
-                      {draft.lastMicrosoftError && (
-                        <span className="m365-error-msg">{draft.lastMicrosoftError}</span>
-                      )}
-                    </div>
-                    <div className="settings-action-row">
-                      <button className="btn btn-secondary" onClick={handleM365SignIn}>
-                        Retry
-                      </button>
-                      <button className="btn btn-ghost btn-sm" onClick={handleM365Disconnect}>
-                        Disconnect
-                      </button>
-                    </div>
-                  </div>
-                );
-              }
-
-              // ── disconnected (default) ────────────────────────────────────
-              return (
-                <div className="m365-panel">
-                  <p className="settings-hint" style={{ marginTop: 0 }}>
-                    Sign in with your Microsoft work account to enable Outlook and Teams import.
-                  </p>
-
-                  <div className="m365-client-id-field">
-                    <label className="form-label" htmlFor="ms-tenant-id">
-                      Directory (tenant) ID
-                    </label>
-                    <input
-                      id="ms-tenant-id"
-                      className="form-input"
-                      type="text"
-                      placeholder="xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
-                      value={draft.microsoftTenant ?? ''}
-                      onChange={(e) => {
-                        set('microsoftTenant', e.target.value);
-                      }}
-                      style={{ maxWidth: 340 }}
-                    />
-
-                    <label className="form-label" htmlFor="ms-client-id" style={{ marginTop: 6 }}>
-                      Application (client) ID
-                    </label>
-                    <input
-                      id="ms-client-id"
-                      className="form-input"
-                      type="text"
-                      placeholder="xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
-                      value={draft.microsoftClientId ?? ''}
-                      onChange={(e) => {
-                        setDraft((prev) => ({ ...prev, microsoftClientId: e.target.value }));
-                        setIsDirty(true);
-                        setSaved(false);
-                      }}
-                      style={{ maxWidth: 340 }}
-                    />
-
-                    <p className="settings-hint" style={{ marginTop: 0 }}>
-                      Both IDs are on the <strong>Overview</strong> page of your Azure App Registration.
-                      Redirect URI must be set to <code>http://localhost:3049</code> (Mobile and desktop applications).
-                    </p>
-                  </div>
-
-                  <button
-                    className="btn btn-secondary"
-                    onClick={handleM365SignIn}
-                    style={{ alignSelf: 'flex-start' }}
-                  >
-                    Connect with Microsoft
-                  </button>
-
-                  {m365Notice && (
-                    <div className="settings-m365-notice">
-                      <Icon name="plug" size={13} />
-                      <span>{m365Notice}</span>
-                    </div>
-                  )}
-                </div>
-              );
-            })()}
-          </SettingsBlock>
-
-          {/* Teams Intake — shown only when Teams is connected */}
-          {draft.teamsStatus === 'connected' && (
-            <SettingsBlock
-              icon="message-square"
-              title="Teams Intake"
-              description="Configure which Teams chat is used as the task intake inbox."
-            >
-              <SettingsField label="Intake chat">
-                <input
-                  className="form-input"
-                  type="text"
-                  placeholder="Paste a Teams chat link or a raw chat ID"
-                  value={draft.teamsIntakeChatId ?? ''}
-                  onChange={(e) => {
-                    const normalized = parseTeamsChatId(e.target.value);
-                    set('teamsIntakeChatId', normalized || undefined);
-                  }}
-                  style={{ maxWidth: 420 }}
-                />
-              </SettingsField>
-              <p className="settings-hint">
-                Open the chat in Teams, copy the link from
-                {' '}<strong>More options → Copy link to chat</strong>, and paste it here.
-                Today’s messages from this chat will appear in the Teams import panel.
-                {draft.teamsIntakeChatId && (
-                  <><br /><span style={{ opacity: 0.7 }}>Stored ID: {draft.teamsIntakeChatId}</span></>
-                )}
-              </p>
+              })()}
             </SettingsBlock>
-          )}
 
-          {/* Data management */}
-          <SettingsBlock icon="folder" title="Data Management" description="Reset local persisted data. Settings and Microsoft tokens are preserved.">
-            <div className="settings-form-row" style={{ flexDirection: 'column', alignItems: 'flex-start', gap: 8 }}>
-              <div style={{ fontSize: 12, color: 'var(--color-text-muted)' }}>
-                Clears all tasks and customers stored locally. Use this to start fresh without reinstalling the app.
-              </div>
-              <div className="settings-action-row">
-                <button
-                  className="btn btn-ghost btn-sm"
-                  style={{ color: confirmReset ? 'var(--color-blocked)' : undefined }}
-                  onClick={handleResetLocalData}
-                  disabled={resetting}
-                  title="Clear all local task and customer data"
-                >
-                  {resetting ? 'Resetting…' : confirmReset ? 'Click again to confirm reset' : 'Reset local data'}
-                </button>
-                {confirmReset && (
-                  <button
-                    className="btn btn-ghost btn-sm"
-                    onClick={() => setConfirmReset(false)}
-                  >
-                    Cancel
-                  </button>
-                )}
-                {resetMsg && (
-                  <span style={{ fontSize: 12, color: 'var(--color-text-muted)' }}>{resetMsg}</span>
-                )}
-              </div>
-            </div>
-          </SettingsBlock>
+            {draft.teamsStatus === 'connected' && (
+              <SettingsBlock
+                icon="message-square"
+                title="Teams Intake"
+                description="Configure which Teams chat is used as the task intake inbox."
+              >
+                <SettingsField label="Intake chat">
+                  <input
+                    className="form-input"
+                    type="text"
+                    placeholder="Paste a Teams chat link or a raw chat ID"
+                    value={draft.teamsIntakeChatId ?? ''}
+                    onChange={(e) => {
+                      const normalized = parseTeamsChatId(e.target.value);
+                      set('teamsIntakeChatId', normalized || undefined);
+                    }}
+                    style={{ maxWidth: 420 }}
+                  />
+                </SettingsField>
+                <p className="settings-hint">
+                  Open the chat in Teams, copy the link from
+                  {' '}<strong>More options → Copy link to chat</strong>, and paste it here.
+                  Today's messages from this chat will appear in the Teams import panel.
+                  {draft.teamsIntakeChatId && (
+                    <><br /><span style={{ opacity: 0.7 }}>Stored ID: {draft.teamsIntakeChatId}</span></>
+                  )}
+                </p>
+              </SettingsBlock>
+            )}
+          </>
+        )}
 
-        </div>{/* end right column */}
+      </div>{/* end settings-tab-content */}
 
-        {/* Save bar — spans both columns */}
-        <div className="settings-save-bar">
-          {saved && (
-            <span className="settings-saved-msg">
-              <Icon name="check" size={13} /> Settings saved
-            </span>
-          )}
-          <button
-            className="btn btn-primary"
-            onClick={handleSave}
-            disabled={saving || !isDirty}
-            style={{ marginLeft: 12 }}
-          >
-            {saving ? 'Saving…' : 'Save Settings'}
-          </button>
-        </div>
-
+      {/* Save bar — always visible */}
+      <div className="settings-save-bar">
+        {saved && (
+          <span className="settings-saved-msg">
+            <Icon name="check" size={13} /> Settings saved
+          </span>
+        )}
+        <button
+          className="btn btn-primary"
+          onClick={handleSave}
+          disabled={saving || !isDirty}
+          style={{ marginLeft: 12 }}
+        >
+          {saving ? 'Saving…' : 'Save Settings'}
+        </button>
       </div>
+
     </div>
   );
 }

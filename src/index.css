@@ -1160,32 +1160,60 @@ body {
 }
 
 /* --- Settings page --------------------------------------- */
-.settings-grid {
-  display: grid;
-  grid-template-columns: repeat(2, 1fr);
-  gap: var(--gap-lg);
-  max-width: 1100px;
-  align-items: start;
+
+/* Tab bar */
+.settings-tabs {
+  display: flex;
+  gap: 2px;
+  border-bottom: 1px solid var(--border);
+  margin-bottom: var(--gap-lg);
+  padding: 0 2px;
 }
 
-/* A vertical stack of cards inside one grid column */
-.settings-col {
+.settings-tab {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 7px 14px;
+  background: none;
+  border: none;
+  border-bottom: 2px solid transparent;
+  margin-bottom: -1px;
+  font-size: 12.5px;
+  font-weight: 500;
+  color: var(--text-secondary);
+  cursor: pointer;
+  transition: color 0.12s, border-color 0.12s;
+  white-space: nowrap;
+}
+
+.settings-tab:hover {
+  color: var(--text-primary);
+}
+
+.settings-tab.active {
+  color: var(--text-primary);
+  border-bottom-color: var(--accent, #4d9cf8);
+}
+
+/* Tab content area */
+.settings-tab-content {
   display: flex;
   flex-direction: column;
   gap: var(--gap-lg);
-  min-width: 0;
+  max-width: 780px;
 }
 
-/* Collapse to single column on narrow screens */
-@media (max-width: 860px) {
-  .settings-grid {
-    grid-template-columns: 1fr;
-  }
-}
-
-/* Full-width block spans both columns (kept for save bar) */
+/* Full-width block (kept for backward compat) */
 .settings-block--full {
-  grid-column: 1 / -1;
+  width: 100%;
+}
+
+.settings-grid { display: contents; } /* no-op shim — grid removed */
+.settings-col  { display: contents; } /* no-op shim — columns removed */
+
+@media (max-width: 860px) {
+  .settings-tab-content { max-width: 100%; }
 }
 
 .settings-block {
@@ -2253,7 +2281,6 @@ body {
 }
 
 .settings-save-bar {
-  grid-column: 1 / -1;
   display: flex;
   justify-content: flex-end;
   align-items: center;
@@ -2261,6 +2288,7 @@ body {
   padding-top: var(--gap-sm);
   border-top: 1px solid var(--border-subtle);
   margin-top: 4px;
+  max-width: 780px;
 }
 
 .settings-saved-msg {
