@@ -181,7 +181,14 @@ function inferPluginSuggestions(
 ): { projectName: string; namespace: string; suggestionReason: string } {
   const fullText = `${task.title} ${task.originalMessage ?? ''}`;
 
-  // 1. Use existing selection on the task when it already follows the convention
+  // 1a. Desired project name — preserved when a project was deleted so the modal re-opens
+  //     with the same name the user previously intended, without running inference again.
+  if (task.workflowSetup?.desiredPluginProject) {
+    const dp = task.workflowSetup.desiredPluginProject;
+    return { projectName: dp, namespace: dp, suggestionReason: 'previous project name' };
+  }
+
+  // 1b. Use existing selection on the task when it already follows the convention
   if (task.selectedPluginProject) {
     const area = areaFromNaverticaProject(task.selectedPluginProject);
     if (area) {

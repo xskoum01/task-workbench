@@ -367,6 +367,28 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
     updateTask(task.id, { selectedPluginProject: plugin || undefined }).catch(() => {});
   }
 
+  /**
+   * Called by TaskDevModePanel when a refresh reveals the persisted plugin project
+   * folder no longer exists on disk.
+   * Preserves the project name as desiredPluginProject so the Create Plugin Project
+   * modal can be prefilled, and resets the workflow back to "Create Plugin Project".
+   */
+  async function handlePluginProjectMissing(projectName: string) {
+    const currentArtifact = task.workflowSetup?.artifactPath;
+    const artifactInsideProject = currentArtifact &&
+      (currentArtifact.replace(/\\/g, '/').includes(`/${projectName}/`));
+    await updateTask(task.id, {
+      selectedPluginProject: undefined,
+      workflowSetup: {
+        ...task.workflowSetup,
+        pluginProject:        undefined,
+        desiredPluginProject: task.workflowSetup?.desiredPluginProject ?? projectName,
+        artifactPath:         artifactInsideProject ? undefined : currentArtifact,
+      },
+    });
+    setFeedback(`Plugin project '${projectName}' not found on disk — reset to Create state.`);
+  }
+
 
   // --- Status change ---
 
@@ -427,6 +449,18 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
 
   async function handleGenerateDraft() {
     if (devTarget.kind === 'plugin') {
+      // For Create+Plugin: verify the project folder exists before generating.
+      // This prevents draft generation from silently targeting a missing project.
+      if (plan.requiresPluginCreate === false && selectedPluginProject && pluginsDir) {
+        const projectPath = `${pluginsDir}/${selectedPluginProject}`;
+        const exists = await tauriApi.checkPathExists(projectPath).catch(() => false);
+        if (!exists) {
+          // Project folder was deleted — reset workflow back to Create Plugin Project.
+          await handlePluginProjectMissing(selectedPluginProject);
+          setAiError(`Plugin project '${selectedPluginProject}' no longer exists. Create it again first.`);
+          return;
+        }
+      }
       // Plugin: call AI to generate a C# skeleton, then open preview modal.
       setAiLoading('draft');
       setAiError(null);
@@ -551,9 +585,10 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
       selectedPluginProject: projectName,
       workflowSetup: {
         ...task.workflowSetup,
-        devTargetKind: 'plugin',
-        pluginProject: projectName,
-        artifactPath:  writtenFilePath,
+        devTargetKind:        'plugin',
+        pluginProject:        projectName,
+        desiredPluginProject: undefined,
+        artifactPath:         writtenFilePath,
       },
     });
     // Close the skeleton modal and clear preview state.
@@ -1447,6 +1482,7 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
                   autoCollapsed={false}
                   selectedPluginProject={selectedPluginProject}
                   onSelectedPluginChange={handleSelectedPluginChange}
+                  onPluginProjectMissing={handlePluginProjectMissing}
                   pluginRefreshTick={devPanelRefreshTick}
                   reviewerConfigs={plan.requiresAiFileReview ? settings.aiReviewers : undefined}
                   artifactPath={task.workflowSetup?.artifactPath}
@@ -1608,9 +1644,14 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
             if (projectName) {
               // Persist both the task-level field and workflowSetup.pluginProject so the
               // derived selectedPluginProject and the Dev panel both pick it up after refresh.
+              // Clear desiredPluginProject — the project now exists, the desired name fulfilled.
               updateTask(task.id, {
                 selectedPluginProject: projectName,
-                workflowSetup: { ...task.workflowSetup, pluginProject: projectName },
+                workflowSetup: {
+                  ...task.workflowSetup,
+                  pluginProject:        projectName,
+                  desiredPluginProject: undefined,
+                },
               }).catch(() => {});
             }
             setDevPanelRefreshTick((t) => t + 1);
