@@ -88,7 +88,10 @@ export default function InlineTaskPanel({ task, onOpenDetail }: Props) {
   const crmFolderPath = (settings?.crmBaseDirectory && customer?.folderName)
     ? `${settings.crmBaseDirectory}/${customer.folderName}`
     : undefined;
-  const devTarget        = resolveTaskDevTarget(task, customer, crmFolderPath);
+  const heuristicDevTarget   = resolveTaskDevTarget(task, customer, crmFolderPath);
+  const devTarget = task.workflowSetup?.devTargetKind
+    ? { ...heuristicDevTarget, kind: task.workflowSetup.devTargetKind as typeof heuristicDevTarget.kind }
+    : heuristicDevTarget;
   const effectiveVscodePath = devTarget.path;
   const pluginsDir       = getPluginsDir(customer, crmFolderPath);
   const repoRootForGit   = customer?.resolvedRepositoryPath ?? customer?.repositoryRoot;
@@ -196,10 +199,10 @@ export default function InlineTaskPanel({ task, onOpenDetail }: Props) {
                   pluginsDir={pluginsDir}
                   repoRootForGit={repoRootForGit}
                   defaultMode={devTarget.kind === 'plugin' ? 'plugin' : 'script'}
-                  scriptOpenPath={customer?.scriptFolder ?? effectiveVscodePath}
+                  scriptOpenPath={task.workflowSetup?.scriptPath ?? customer?.scriptFolder ?? effectiveVscodePath}
                   onError={() => {}}
                   autoCollapsed={devTarget.kind === 'repo'}
-                  selectedPluginProject={task.selectedPluginProject}
+                  selectedPluginProject={task.workflowSetup?.pluginProject ?? task.selectedPluginProject}
                   onSelectedPluginChange={(plugin) =>
                     updateTask(task.id, { selectedPluginProject: plugin || undefined }).catch(() => {})
                   }

@@ -134,6 +134,13 @@ export interface Task {
   notes?: string;
 
   /**
+   * Confirmed workflow setup choices the user verified before analysis.
+   * When present, downstream stages (draft, review, dev mode) prefer these values
+   * over heuristic guesses. Gaps fall back to the resolver as before.
+   */
+  workflowSetup?: WorkflowSetup;
+
+  /**
    * Sanitized HTML of the original email body with CID inline images resolved to data: URIs.
    * Only populated for email tasks imported via Microsoft Graph (get_outlook_message_full).
    * Used for display only — never fed into AI, prefilter, or text analysis.
@@ -142,6 +149,30 @@ export interface Task {
 }
 
 export type ClassificationState = 'pending' | 'analyzed' | 'rejected' | 'created';
+
+/**
+ * User-confirmed setup for a task's development workflow.
+ * Saved when the user clicks "Confirm & Analyze" on a New task.
+ * Downstream stages prefer these values over heuristic guesses.
+ */
+export interface WorkflowSetup {
+  /** What the developer intends to do. */
+  workIntent?: 'create' | 'update' | 'fix' | 'review';
+  /** Plugin / Script / Repo target — overrides resolver when set. */
+  devTargetKind?: 'plugin' | 'script' | 'repo';
+  /** Overrides task.customerId when the user switches customer. */
+  customerId?: string;
+  /** Absolute path to the repository root the user selected. */
+  repositoryRoot?: string;
+  /** Plugin project subfolder name within the plugins directory. */
+  pluginProject?: string;
+  /** Script file or folder path. */
+  scriptPath?: string;
+  /** ID of the AI reviewer profile to default to. */
+  reviewerId?: string;
+  /** ISO timestamp of when the user confirmed. */
+  confirmedAt?: string;
+}
 
 /**
  * Structured context extracted from Azure DevOps notification emails.

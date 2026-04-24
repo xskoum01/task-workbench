@@ -1,5 +1,5 @@
 ﻿import { useState, useEffect, useRef } from 'react';
-import type { Task, TaskStatus, PlanningBucket, SkeletonPreview } from '../types';
+import type { Task, TaskStatus, PlanningBucket, SkeletonPreview, WorkflowSetup } from '../types';
 import TaskEmailContent from './TaskEmailContent';
 import TaskDevModePanel, { type TaskDevModePanelHandle } from './TaskDevModePanel';
 import { useApp } from '../context/AppContext';
@@ -9,6 +9,7 @@ import SkeletonPreviewModal from './SkeletonPreviewModal';
 import ScriptAssistantPanel, { type ScriptAssistantPanelHandle } from './ScriptAssistantPanel';
 import TaskForm from './TaskForm';
 import CreatePluginProjectModal, { inferPluginSuggestions, sanitize } from './CreatePluginProjectModal';
+import ConfirmSetupModal from './ConfirmSetupModal';
 import Icon from './Icon';
 import * as tauriApi from '../lib/tauriCommands';
 import { WorkflowStepper } from './WorkflowStepper';
@@ -303,14 +304,18 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
     : undefined;
 
   // Smart resolver — picks plugin / script / repo based on task heuristics.
-  const devTarget = resolveTaskDevTarget(task, customer, crmFolderPath);
+  // When the user has confirmed a setup, devTargetKind overrides the heuristic.
+  const heuristicDevTarget = resolveTaskDevTarget(task, customer, crmFolderPath);
+  const devTarget = task.workflowSetup?.devTargetKind
+    ? { ...heuristicDevTarget, kind: task.workflowSetup.devTargetKind as typeof heuristicDevTarget.kind }
+    : heuristicDevTarget;
   const effectiveVscodePath = devTarget.path;
 
-  // Resolved script folder: explicit scriptFolder first, then repo root + /Scripts subfolder.
-  // This ensures scripts land in <repo>/Scripts/ rather than the repo root.
+  // Resolved script folder: prefer confirmed scriptPath, then explicit scriptFolder, then fallback.
   // Must be consistent with resolveCustomerScriptFolder in scriptAssistant.ts.
   const repoFallback = customer?.resolvedRepositoryPath ?? customer?.repositoryRoot;
   const effectiveScriptFolder =
+    (devTarget.kind === 'script' ? task.workflowSetup?.scriptPath : undefined) ??
     customer?.scriptFolder ??
     (repoFallback ? `${repoFallback}/Scripts` : undefined) ??
     (devTarget.kind !== 'plugin' ? effectiveVscodePath : undefined);
@@ -328,6 +333,8 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
   const [aiError, setAiError]   = useState<string | null>(null);
   // Which AI action is currently running
   const [aiLoading, setAiLoading] = useState<AiAction | null>(null);
+  // Confirm setup modal (shown for New tasks before Analyze)
+  const [showSetupModal, setShowSetupModal] = useState(false);
   // Reply modal
   const [showReply, setShowReply]         = useState(false);
   const [generatedReply, setGeneratedReply] = useState<string | null>(null);
@@ -356,9 +363,8 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
   // Reset script draft flag when switching tasks
   useEffect(() => { setScriptHasDraft(false); }, [task.id]);
 
-  // Selected plugin project is persisted on the task model so it is shared
-  // between InlineTaskPanel and TaskDetail without local-only state.
-  const selectedPluginProject = task.selectedPluginProject ?? '';
+  // Selected plugin project: prefer confirmed setup, then persisted task field.
+  const selectedPluginProject = task.workflowSetup?.pluginProject ?? task.selectedPluginProject ?? '';
   function handleSelectedPluginChange(plugin: string) {
     updateTask(task.id, { selectedPluginProject: plugin || undefined }).catch(() => {});
   }
@@ -521,12 +527,25 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
    */
   function runCurrentStageAction() {
     switch (task.status) {
-      case 'new':              handleAnalyze(); break;
+      case 'new':              openSetupModal(); break;
       case 'analyzed':         handleGenerateDraft(); break;
       case 'in-progress':      handleSendForReview(); break;
       case 'ready-for-review': handleMarkDone(); break;
       default: break;
     }
+  }
+
+  /** Opens the Confirm Setup modal (for New tasks). */
+  function openSetupModal() {
+    setShowSetupModal(true);
+  }
+
+  /** Called when the user clicks Confirm & Analyze in the setup modal. */
+  async function handleConfirmSetup(setup: WorkflowSetup) {
+    setShowSetupModal(false);
+    // Persist the confirmed setup, then run analyze.
+    await updateTask(task.id, { workflowSetup: setup });
+    handleAnalyze();
   }
 
   async function handleGenerateReply() {
@@ -1146,10 +1165,10 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
                   pluginsDir={pluginsDir}
                   repoRootForGit={repoRootForGit}
                   defaultMode={devTarget.kind === 'plugin' ? 'plugin' : 'script'}
-                  scriptOpenPath={customer?.scriptFolder ?? effectiveVscodePath}
+                  scriptOpenPath={task.workflowSetup?.scriptPath ?? customer?.scriptFolder ?? effectiveVscodePath}
                   onError={setFsError}
                   autoCollapsed={devTarget.kind === 'repo'}
-                  selectedPluginProject={task.selectedPluginProject}
+                  selectedPluginProject={selectedPluginProject}
                   onSelectedPluginChange={handleSelectedPluginChange}
                   pluginRefreshTick={devPanelRefreshTick}
                   reviewerConfigs={settings.aiReviewers}
@@ -1289,6 +1308,20 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
                 }
               : undefined
           }
+        />
+      )}
+
+      {/* Confirm Setup modal — shown when user clicks Analyze on a New task */}
+      {showSetupModal && (
+        <ConfirmSetupModal
+          task={task}
+          customers={customers}
+          devTarget={heuristicDevTarget}
+          pluginsDir={pluginsDir}
+          scriptFolder={effectiveScriptFolder}
+          reviewerConfigs={settings.aiReviewers}
+          onConfirm={handleConfirmSetup}
+          onCancel={() => setShowSetupModal(false)}
         />
       )}
 
