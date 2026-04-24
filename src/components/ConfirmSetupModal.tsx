@@ -96,11 +96,11 @@ export default function ConfirmSetupModal({
 
   function handleConfirm() {
     if (!isDev) {
-      // General task â€” save only intent + customer; clear all dev-specific fields.
+      // General task — save only customer; clear all dev-specific fields.
       const setup: WorkflowSetup = {
-        workIntent,
         customerId:     customerId || undefined,
         // Explicitly clear dev fields so stale data does not survive a mode switch.
+        workIntent:     undefined,
         devTargetKind:  undefined,
         repositoryRoot: undefined,
         pluginProject:  undefined,
@@ -144,25 +144,27 @@ export default function ConfirmSetupModal({
     >
       <div className="confirm-setup-body">
 
-        {/* Work intent */}
-        <div className="confirm-setup-row">
-          <label className="form-label confirm-setup-label">Work intent</label>
-          <div className="confirm-setup-kind-group">
-            {(['update', 'create', 'fix', 'review'] as const).map((intent) => (
-              <button
-                key={intent}
-                type="button"
-                className={`btn btn-sm${workIntent === intent ? ' btn-primary' : ' btn-secondary'}`}
-                onClick={() => setWorkIntent(intent)}
-              >
-                {intent.charAt(0).toUpperCase() + intent.slice(1)}
-              </button>
-            ))}
+        {/* Work intent — developer mode only */}
+        {isDev && (
+          <div className="confirm-setup-row">
+            <label className="form-label confirm-setup-label">Work intent</label>
+            <div className="confirm-setup-kind-group">
+              {(['update', 'create', 'fix', 'review'] as const).map((intent) => (
+                <button
+                  key={intent}
+                  type="button"
+                  className={`btn btn-sm${workIntent === intent ? ' btn-primary' : ' btn-secondary'}`}
+                  onClick={() => setWorkIntent(intent)}
+                >
+                  {intent.charAt(0).toUpperCase() + intent.slice(1)}
+                </button>
+              ))}
+            </div>
+            {hints.workIntent && (
+              <div className="confirm-setup-inferred">{hints.workIntent}</div>
+            )}
           </div>
-          {hints.workIntent && (
-            <div className="confirm-setup-inferred">{hints.workIntent}</div>
-          )}
-        </div>
+        )}
 
         {/* Target kind â€” developer mode only */}
         {isDev && (
