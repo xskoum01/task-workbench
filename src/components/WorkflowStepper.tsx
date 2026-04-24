@@ -2,17 +2,15 @@ import type { TaskStatus } from '../types';
 
 interface StageConfig {
   id: TaskStatus;
-  /** Short display name shown at the top of the step. */
   label: string;
-  /** The action the user takes while in this stage to advance. */
   actionLabel: string;
-  /** Status to move to when the user clicks the advance CTA on this stage. */
+  /** Status to move to after clicking this stage's action. Null = terminal stage. */
   next: TaskStatus | null;
 }
 
-const STAGES: StageConfig[] = [
+export const STAGES: StageConfig[] = [
   { id: 'new',              label: 'New',         actionLabel: 'Analyze',         next: 'analyzed'         },
-  { id: 'analyzed',         label: 'Analyzed',    actionLabel: 'Start Work',      next: 'in-progress'      },
+  { id: 'analyzed',         label: 'Analyzed',    actionLabel: 'Generate Draft',  next: 'in-progress'      },
   { id: 'in-progress',      label: 'In Progress', actionLabel: 'Send for Review', next: 'ready-for-review' },
   { id: 'ready-for-review', label: 'For Review',  actionLabel: 'Mark Done',       next: 'done'             },
   { id: 'done',             label: 'Done',        actionLabel: 'Completed',       next: null               },
@@ -20,11 +18,13 @@ const STAGES: StageConfig[] = [
 
 interface WorkflowStepperProps {
   status: TaskStatus;
-  /** Called with the target status whenever the user clicks a step or the advance CTA. */
-  onChange?: (status: TaskStatus) => void;
+  /** Called when the user clicks the active step to trigger its stage action. */
+  onRunCurrentAction: () => void;
+  /** True while the current stage action is running — disables + shows spinner. */
+  isRunning: boolean;
 }
 
-export function WorkflowStepper({ status, onChange }: WorkflowStepperProps) {
+export function WorkflowStepper({ status, onRunCurrentAction, isRunning }: WorkflowStepperProps) {
   const isBlocked    = status === 'blocked';
   const currentIndex = isBlocked ? -1 : STAGES.findIndex((s) => s.id === status);
 
@@ -38,26 +38,21 @@ export function WorkflowStepper({ status, onChange }: WorkflowStepperProps) {
                          : isCompleted ? 'workflow-bpf-step--completed'
                          :               'workflow-bpf-step--upcoming';
 
-        const handleClick = () => {
-          if (!onChange) return;
-          // Active step → advance to next; all others → navigate to that stage
-          if (isActive && stage.next) onChange(stage.next);
-          else onChange(stage.id);
-        };
-
         return (
           <button
             key={stage.id}
             type="button"
             className={`workflow-bpf-step workflow-bpf-step--${stage.id} ${stateClass}`}
-            onClick={handleClick}
-            disabled={!onChange || (isActive && !stage.next)}
+            onClick={isActive && stage.next ? onRunCurrentAction : undefined}
+            disabled={!isActive || !stage.next || isRunning}
             title={
               isActive && stage.next
-                ? `Click to advance: ${stage.actionLabel}`
+                ? isRunning
+                  ? `Running: ${stage.actionLabel}…`
+                  : `Click to run: ${stage.actionLabel}`
                 : isCompleted
-                  ? `Go back to: ${stage.label}`
-                  : `Jump to: ${stage.label}`
+                  ? stage.label
+                  : `Not yet reached: ${stage.label}`
             }
           >
             <span className="workflow-bpf-stage-name">
@@ -65,8 +60,11 @@ export function WorkflowStepper({ status, onChange }: WorkflowStepperProps) {
               {stage.label}
             </span>
             <span className="workflow-bpf-action-label">
-              {isActive && stage.next && (
+              {isActive && stage.next && !isRunning && (
                 <span className="workflow-bpf-action-arrow" aria-hidden="true">›&nbsp;</span>
+              )}
+              {isActive && isRunning && (
+                <span className="workflow-bpf-spinner" aria-hidden="true" />
               )}
               {isCompleted ? 'Done' : stage.actionLabel}
             </span>

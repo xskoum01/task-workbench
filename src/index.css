@@ -5170,6 +5170,20 @@ body {
   margin-right: 1px;
 }
 
+.workflow-bpf-spinner {
+  display: inline-block;
+  width: 9px;
+  height: 9px;
+  border: 1.5px solid currentColor;
+  border-top-color: transparent;
+  border-radius: 50%;
+  animation: btn-spin 0.65s linear infinite;
+  vertical-align: middle;
+  flex-shrink: 0;
+  opacity: 0.8;
+  margin-right: 3px;
+}
+
 /* --- Completed --- */
 .workflow-bpf-step--completed {
   background: color-mix(in srgb, var(--color-done) 14%, #181e26);

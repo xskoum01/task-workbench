@@ -418,6 +418,8 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
         const preview = await tauriApi.generateSkeletonPreview(task, customer ?? null);
         setSkeletonPreview(preview);
         setShowSkeleton(true);
+        await updateTask(task.id, { status: 'in-progress' });
+        setFeedback('Draft generated — status set to In Progress');
       } catch (e) {
         setAiError(String(e));
       } finally {
@@ -433,6 +435,8 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
       setAiError(null);
       try {
         await scriptPanelRef.current.generateDraft();
+        await updateTask(task.id, { status: 'in-progress' });
+        setFeedback('Draft generated — status set to In Progress');
         // setScriptHasDraft is driven by onDraftChange callback from the panel.
       } catch (e) {
         setAiError(String(e));
@@ -486,6 +490,20 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
   }
 
   // --- Communication ---
+
+  /**
+   * Dispatches the action for the current workflow stage.
+   * Called by both the BPF stepper click and the right-panel workflow buttons.
+   */
+  function runCurrentStageAction() {
+    switch (task.status) {
+      case 'new':              handleAnalyze(); break;
+      case 'analyzed':         handleGenerateDraft(); break;
+      case 'in-progress':      handleStatusChange('ready-for-review'); break;
+      case 'ready-for-review': handleStatusChange('done'); break;
+      default: break;
+    }
+  }
 
   async function handleGenerateReply() {
     setAiLoading('reply');
@@ -616,6 +634,13 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
           )}
         </div>
 
+        {/* ---- Workflow BPF strip (always visible, never scrolls) ---- */}
+        <WorkflowStepper
+          status={task.status}
+          onRunCurrentAction={runCurrentStageAction}
+          isRunning={!!aiLoading}
+        />
+
         {/* ---- Two-column inner layout ---- */}
         <div className="detail-panel-inner">
 
@@ -680,12 +705,6 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
               <TypeBadge type={task.taskType} />
             </div>
           </div>
-
-          {/* Workflow stepper */}
-          <WorkflowStepper
-            status={task.status}
-            onChange={handleStatusChange}
-          />
 
           {/* Customer repository info */}
           {customer && (hasRepo || hasPlugin || hasScript || customer.namespace) && (
@@ -970,7 +989,6 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
                 onClick={handleGenerateDraft}
                 disabled={
                   !!aiLoading ||
-                  // Script draft requires the Script Assistant panel to be mounted.
                   (devTarget.kind !== 'plugin' && !effectiveScriptFolder)
                 }
                 title={devTarget.kind === 'plugin'
