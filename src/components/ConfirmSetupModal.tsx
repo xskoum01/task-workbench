@@ -1,18 +1,21 @@
 /**
  * ConfirmSetupModal — shown when the user clicks Analyze on a New task.
  *
- * Prefills from task.workflowSetup (if already confirmed) or from heuristic
- * resolver results. Saving calls onConfirm with the finalized WorkflowSetup.
+ * All fields are pre-filled by inferWorkflowSetupDefaults(). If the task
+ * already has a confirmed workflowSetup, those values take priority and new
+ * inference does not override them.
  */
 import { useState } from 'react';
 import type { Task, Customer, WorkflowSetup, AiReviewerConfig } from '../types';
 import type { DevTarget } from '../lib/resolveTaskDevTarget';
 import Modal from './Modal';
 import { mergeWithDefaults } from '../lib/aiReviewers';
+import { inferWorkflowSetupDefaults } from '../lib/inferWorkflowSetup';
 
 interface ConfirmSetupModalProps {
   task: Task;
   customers: Customer[];
+  customer: Customer | undefined;
   devTarget: DevTarget;
   /** Resolved plugin project directory (e.g. <repo>/Plugins). */
   pluginsDir: string | undefined;
@@ -28,6 +31,7 @@ interface ConfirmSetupModalProps {
 export default function ConfirmSetupModal({
   task,
   customers,
+  customer,
   devTarget,
   pluginsDir,
   scriptFolder,
@@ -35,33 +39,30 @@ export default function ConfirmSetupModal({
   onConfirm,
   onCancel,
 }: ConfirmSetupModalProps) {
-  const existing = task.workflowSetup;
+  // Run inference once on mount — workflowSetup values win over guesses inside the helper.
+  const { defaults, hints } = inferWorkflowSetupDefaults({
+    task,
+    customer,
+    customers,
+    devTarget,
+    pluginsDir,
+    scriptFolder,
+    reviewerConfigs,
+  });
 
-  // --- Form state — prefill from confirmed setup or heuristics ---
-  const [workIntent, setWorkIntent] = useState<WorkflowSetup['workIntent']>(
-    existing?.workIntent ?? 'update',
-  );
-  const [devKind, setDevKind] = useState<'plugin' | 'script' | 'repo'>(
-    existing?.devTargetKind ?? devTarget.kind,
-  );
-  const [customerId, setCustomerId] = useState<string>(
-    existing?.customerId ?? task.customerId ?? '',
-  );
-  const [pluginProject, setPluginProject] = useState<string>(
-    existing?.pluginProject ?? task.selectedPluginProject ?? task.workflowSetup?.pluginProject ?? '',
-  );
-  const [scriptPath, setScriptPath] = useState<string>(
-    existing?.scriptPath ?? scriptFolder ?? '',
-  );
-  const [reviewerId, setReviewerId] = useState<string>(
-    existing?.reviewerId ?? '',
-  );
+  // --- Form state pre-filled from inference ---
+  const [workIntent, setWorkIntent] = useState<WorkflowSetup['workIntent']>(defaults.workIntent);
+  const [devKind, setDevKind]       = useState<'plugin' | 'script' | 'repo'>(defaults.devTargetKind);
+  const [customerId, setCustomerId] = useState<string>(defaults.customerId);
+  const [pluginProject, setPluginProject] = useState<string>(defaults.pluginProject);
+  const [scriptPath, setScriptPath]       = useState<string>(defaults.scriptPath);
+  const [reviewerId, setReviewerId]       = useState<string>(defaults.reviewerId);
 
   const allReviewers = reviewerConfigs
     ? mergeWithDefaults(reviewerConfigs).filter((r) => r.enabled)
     : [];
 
-  // Compute a human-readable path hint based on current customer selection
+  // Compute a human-readable repo path hint for the selected customer.
   const selectedCustomer = customers.find((c) => c.id === customerId);
   const repoHint =
     selectedCustomer?.resolvedRepositoryPath ??
@@ -69,24 +70,30 @@ export default function ConfirmSetupModal({
     selectedCustomer?.folderName ??
     '';
 
+  // When target kind changes, update the reviewer to the best match for the new kind.
+  function handleKindChange(kind: typeof devKind) {
+    setDevKind(kind);
+    // Only auto-update reviewer when user hasn't manually locked one.
+    if (!task.workflowSetup?.reviewerId) {
+      const match = kind === 'repo' ? undefined : allReviewers.find(
+        (r) => r.appliesTo.devTargetKinds?.includes(kind as 'plugin' | 'script'),
+      );
+      setReviewerId(match?.id ?? '');
+    }
+  }
+
   function handleConfirm() {
     const setup: WorkflowSetup = {
       workIntent,
-      devTargetKind: devKind,
-      customerId:    customerId || undefined,
-      repositoryRoot: repoHint || undefined,
-      pluginProject: devKind === 'plugin' ? (pluginProject.trim() || undefined) : undefined,
-      scriptPath:    devKind === 'script' ? (scriptPath.trim() || undefined)   : undefined,
-      reviewerId:    reviewerId || undefined,
-      confirmedAt:   new Date().toISOString(),
+      devTargetKind:  devKind,
+      customerId:     customerId || undefined,
+      repositoryRoot: repoHint   || undefined,
+      pluginProject:  devKind === 'plugin' ? (pluginProject.trim() || undefined) : undefined,
+      scriptPath:     devKind === 'script' ? (scriptPath.trim()    || undefined) : undefined,
+      reviewerId:     reviewerId || undefined,
+      confirmedAt:    new Date().toISOString(),
     };
     onConfirm(setup);
-  }
-
-  // Change kind and clear irrelevant sub-fields
-  function handleKindChange(kind: typeof devKind) {
-    setDevKind(kind);
-    // Keep scriptPath / pluginProject; they'll be ignored if kind doesn't match.
   }
 
   return (
@@ -111,7 +118,7 @@ export default function ConfirmSetupModal({
         <div className="confirm-setup-row">
           <label className="form-label confirm-setup-label">Work intent</label>
           <div className="confirm-setup-kind-group">
-            {([ 'update', 'create', 'fix', 'review'] as const).map((intent) => (
+            {(['update', 'create', 'fix', 'review'] as const).map((intent) => (
               <button
                 key={intent}
                 type="button"
@@ -122,6 +129,9 @@ export default function ConfirmSetupModal({
               </button>
             ))}
           </div>
+          {hints.workIntent && (
+            <div className="confirm-setup-inferred">{hints.workIntent}</div>
+          )}
         </div>
 
         {/* Target kind */}
@@ -139,6 +149,9 @@ export default function ConfirmSetupModal({
               </button>
             ))}
           </div>
+          {hints.devTargetKind && (
+            <div className="confirm-setup-inferred">{hints.devTargetKind}</div>
+          )}
         </div>
 
         {/* Customer */}
@@ -172,6 +185,9 @@ export default function ConfirmSetupModal({
               placeholder={pluginsDir ? `Subfolder inside ${pluginsDir}` : 'Plugin project folder name'}
               onChange={(e) => setPluginProject(e.target.value)}
             />
+            {hints.pluginProject && (
+              <div className="confirm-setup-inferred">{hints.pluginProject}</div>
+            )}
             {pluginsDir && (
               <div className="confirm-setup-hint">Inside: {pluginsDir}</div>
             )}
@@ -189,6 +205,9 @@ export default function ConfirmSetupModal({
               placeholder="Absolute path to script or folder"
               onChange={(e) => setScriptPath(e.target.value)}
             />
+            {hints.scriptPath && (
+              <div className="confirm-setup-inferred">{hints.scriptPath}</div>
+            )}
           </div>
         )}
 
@@ -206,6 +225,9 @@ export default function ConfirmSetupModal({
                 <option key={r.id} value={r.id}>{r.name}</option>
               ))}
             </select>
+            {hints.reviewerId && (
+              <div className="confirm-setup-inferred">{hints.reviewerId}</div>
+            )}
           </div>
         )}
       </div>

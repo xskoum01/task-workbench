@@ -5060,6 +5060,14 @@ body {
   white-space: nowrap;
 }
 
+/* Subtle label shown below a field when its value was auto-inferred */
+.confirm-setup-inferred {
+  font-size: 11px;
+  color: var(--color-text-muted);
+  font-style: italic;
+  opacity: 0.8;
+}
+
 .confirm-setup-footer {
   display: flex;
   gap: 8px;

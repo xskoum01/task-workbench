@@ -1316,6 +1316,7 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
         <ConfirmSetupModal
           task={task}
           customers={customers}
+          customer={customer}
           devTarget={heuristicDevTarget}
           pluginsDir={pluginsDir}
           scriptFolder={effectiveScriptFolder}
