@@ -607,62 +607,6 @@ Execute method built on the base stub above with task-specific logic replacing t
     })
 }
 
-/// Runs an AI code/work review on a task and optional draft content.
-/// Returns a structured AiReviewResult JSON object with summary, issues, suggestions, and passed.
-#[tauri::command]
-async fn ai_review_task(app: tauri::AppHandle, task: Value, customer: Value, draft: Value) -> Result<Value, String> {
-    let (api_key, model) = get_ai_settings(&app)?;
-
-    let title         = task["title"].as_str().unwrap_or("");
-    let task_type     = task["taskType"].as_str().unwrap_or("");
-    let message       = task["originalMessage"].as_str().unwrap_or("");
-    let analysis_cz   = task["analysisResult"]["summaryCz"].as_str().unwrap_or("");
-    let analysis_en   = task["analysisResult"]["summaryEn"].as_str().unwrap_or("");
-    let customer_name = customer["name"].as_str().unwrap_or("Unknown");
-    let draft_content = draft.as_str().unwrap_or("");
-
-    let draft_section = if draft_content.is_empty() {
-        "(no generated draft provided)".to_string()
-    } else {
-        let trimmed = if draft_content.len() > 3000 {
-            format!("{}…[truncated]", &draft_content[..3000])
-        } else {
-            draft_content.to_string()
-        };
-        format!("Generated draft / code:\n{trimmed}")
-    };
-
-    let instructions = "You are a senior Dynamics 365 / Dataverse developer doing a pre-delivery code review. \
-Return ONLY valid JSON — no markdown, no prose, no code fences.";
-
-    let prompt = format!(
-        "Review this developer task result before it is marked ready for delivery.\n\n\
-Task:\n- Title: {title}\n- Type: {task_type}\n- Customer: {customer_name}\n\
-- Original message: {message}\n\n\
-AI analysis summary (CZ): {analysis_cz}\n\
-AI analysis summary (EN): {analysis_en}\n\n\
-{draft_section}\n\n\
-Evaluate whether the work is complete, correct, and ready for the customer. \
-Return ONLY this exact JSON:\n\
-{{\"summary\":\"1-2 sentences on overall review outcome\",\
-\"issues\":[\"Issue 1\",\"Issue 2\"],\
-\"suggestions\":[\"Suggestion 1\"],\
-\"passed\":true}}\n\n\
-Rules:\n\
-- passed=true only when there are no blocking issues\n\
-- issues: list concrete problems found; empty array [] when none\n\
-- suggestions: improvement ideas even when passing\n\
-- Be concise and specific"
-    );
-
-    let text = call_openai(&api_key, &model, instructions, &prompt).await?;
-
-    serde_json::from_str(strip_fences(&text)).map_err(|e| {
-        let snippet = &text[..text.len().min(300)];
-        format!("Failed to parse AI review response: {e}. Response: {snippet}")
-    })
-}
-
 /// Reads a source file from disk and runs a configurable AI review against it.
 /// The API key is read from settings.json — never exposed to the frontend.
 /// `model_override` is used when non-empty; otherwise falls back to the global AI model.
@@ -3399,7 +3343,6 @@ pub fn run() {
             generate_reply,
             generate_skeleton_preview,
             save_generated_file,
-            ai_review_task,
             run_ai_file_review,
             create_plugin_project_from_template,
             classify_inbox_item,

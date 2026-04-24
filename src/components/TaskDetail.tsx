@@ -1,5 +1,5 @@
 ﻿import { useState, useEffect, useRef } from 'react';
-import type { Task, TaskStatus, PlanningBucket, SkeletonPreview, AiReviewResult } from '../types';
+import type { Task, TaskStatus, PlanningBucket, SkeletonPreview } from '../types';
 import TaskEmailContent from './TaskEmailContent';
 import TaskDevModePanel from './TaskDevModePanel';
 import { useApp } from '../context/AppContext';
@@ -20,7 +20,7 @@ interface TaskDetailProps {
   onClose: () => void;
 }
 
-type AiAction = 'analyze' | 'reply' | 'draft' | 'review';
+type AiAction = 'analyze' | 'reply' | 'draft';
 
 /**
  * Returns true only when the task clearly requests creating a brand-new plugin
@@ -354,8 +354,6 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
   // Plugin project folder names loaded when the Create Plugin Project modal opens.
   // Used to improve naming-convention auto-suggestions inside the modal.
   const [pluginProjectsForModal, setPluginProjectsForModal] = useState<string[]>([]);
-  // AI Review result
-  const [aiReview, setAiReview] = useState<AiReviewResult | null>(null);
   // Script Assistant imperative ref + draft-ready flag
   const scriptPanelRef = useRef<ScriptAssistantPanelHandle>(null);
   const [scriptHasDraft, setScriptHasDraft] = useState(false);
@@ -533,27 +531,6 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
       } finally {
         setAiLoading(null);
       }
-    }
-  }
-
-  async function handleAiReview() {
-    setAiLoading('review');
-    setAiError(null);
-    setAiReview(null);
-    try {
-      const draft = skeletonPreview?.content;
-      const result = await tauriApi.aiReviewTask(task, customer ?? null, draft);
-      setAiReview(result);
-      if (result.passed) {
-        await updateTask(task.id, { status: 'ready-for-review' });
-        setFeedback('AI Review passed — status set to Ready for Review');
-      } else {
-        setFeedback('AI Review found issues — see review results below');
-      }
-    } catch (e) {
-      setAiError(String(e));
-    } finally {
-      setAiLoading(null);
     }
   }
 
@@ -1123,53 +1100,7 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
                   <Icon name="folder" size={13} /> Create Plugin Project
                 </button>
               )}
-              <button
-                className="btn btn-secondary btn-sm"
-                onClick={handleAiReview}
-                disabled={!!aiLoading}
-                title="Run AI review. Sets status to Ready for Review when the review passes."
-              >
-                {aiLoading === 'review'
-                  ? <><span className="btn-spinner" /> Reviewing…</>
-                  : <><Icon name="check" size={13} /> AI Review</>}
-              </button>
             </div>
-
-            {/* AI Review results */}
-            {aiReview && (
-              <div className={`detail-ai-review${aiReview.passed ? ' detail-ai-review--pass' : ' detail-ai-review--fail'}`}>
-                <div className="detail-ai-review-summary">
-                  <Icon name={aiReview.passed ? 'check' : 'alert-circle'} size={13} />
-                  {aiReview.summary}
-                </div>
-                {aiReview.issues.length > 0 && (
-                  <div className="detail-ai-review-section">
-                    <div className="detail-ai-review-label">Issues</div>
-                    <ul className="detail-ai-review-list">
-                      {aiReview.issues.map((issue, i) => <li key={i}>{issue}</li>)}
-                    </ul>
-                  </div>
-                )}
-                {aiReview.suggestions.length > 0 && (
-                  <div className="detail-ai-review-section">
-                    <div className="detail-ai-review-label">Suggestions</div>
-                    <ul className="detail-ai-review-list">
-                      {aiReview.suggestions.map((s, i) => <li key={i}>{s}</li>)}
-                    </ul>
-                  </div>
-                )}
-                {!aiReview.passed && (
-                  <div style={{ marginTop: 4 }}>
-                    <button
-                      className="btn btn-ghost btn-sm"
-                      onClick={() => setAiReview(null)}
-                    >
-                      Dismiss
-                    </button>
-                  </div>
-                )}
-              </div>
-            )}
           </div>
 
           {/* SCRIPT ASSISTANT — shown only for script tasks with a resolvable script folder. */}

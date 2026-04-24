@@ -440,21 +440,6 @@ export interface AiFileReviewResult {
   markdown: string;
 }
 
-/**
- * Result of the AI Review action.
- * Returned by `ai_review_task`.
- */
-export interface AiReviewResult {
-  /** Short review summary (1-2 sentences). */
-  summary: string;
-  /** List of concrete issues found. Empty when none. */
-  issues: string[];
-  /** Suggested fixes or improvements. */
-  suggestions: string[];
-  /** True = ready for review; false = still needs work. */
-  passed: boolean;
-}
-
 /** Which planning time-box a task belongs to. */
 export type PlanningBucket =
   | 'now'

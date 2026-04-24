@@ -52,7 +52,7 @@ function buildSavePath(
   return null;
 }
 
-export default function SkeletonPreviewModal({ preview, customer, onClose, onCreateAndApply, resolvedPluginBase }: SkeletonPreviewModalProps) {
+export default function SkeletonPreviewModal({ preview, customer: _customer, onClose, onCreateAndApply, resolvedPluginBase }: SkeletonPreviewModalProps) {
   const [copied, setCopied]         = useState(false);
   const [saving, setSaving]         = useState(false);
   const [saved, setSaved]           = useState(false);
