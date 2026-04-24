@@ -442,7 +442,14 @@ export default forwardRef<TaskDevModePanelHandle, TaskDevModePanelProps>(functio
               {branchLoading ? (
                 <div className="detail-devmode-branch-current">Branch: <span className="detail-devmode-branch-name">…</span></div>
               ) : branchError ? (
-                <div className="detail-devmode-branch-error">{branchError}</div>
+                <div
+                  className="detail-devmode-branch-error"
+                  title={branchError}
+                >
+                  {/not a git repository/i.test(branchError)
+                    ? 'Git repository not detected for this path.'
+                    : branchError}
+                </div>
               ) : (
                 <>
                   <div className="detail-devmode-branch-current">
@@ -532,6 +539,12 @@ export default forwardRef<TaskDevModePanelHandle, TaskDevModePanelProps>(functio
             </div>
           )}
 
+          {!pluginProjectsLoading && pluginProjectsLoaded && pluginProjects.length > 0 && !selectedPlugin && (
+            <div className="detail-devmode-hint">
+              Select a plugin project to open or review code.
+            </div>
+          )}
+
           {pluginOpenHint && (
             <div className="detail-devmode-hint">{pluginOpenHint}</div>
           )}
@@ -560,17 +573,15 @@ export default forwardRef<TaskDevModePanelHandle, TaskDevModePanelProps>(functio
 
       {/* AI Review — shown when reviewer configs are available */}
       {allReviewers.length > 0 && (
-        <div className="detail-devmode-review-section">
-          <button
-            className="btn btn-ghost btn-sm detail-devmode-review-toggle"
-            onClick={handleOpenReviewModal}
-            disabled={reviewInferring}
-            type="button"
-          >
-            <Icon name="search" size={12} />
-            {reviewInferring ? 'Searching file…' : 'Run AI Review'}
-          </button>
-        </div>
+        <button
+          className="btn btn-secondary btn-sm btn-full"
+          onClick={handleOpenReviewModal}
+          disabled={reviewInferring}
+          type="button"
+        >
+          <Icon name="search" size={12} />
+          {reviewInferring ? 'Searching file…' : 'Run AI Review'}
+        </button>
       )}
         </>
       )}

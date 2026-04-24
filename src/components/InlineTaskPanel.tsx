@@ -175,24 +175,40 @@ export default function InlineTaskPanel({ task, onOpenDetail }: Props) {
 
           {/* Actions */}
           <div className="tip-section tip-section--actions">
-            <div className="tip-sec-label">Actions</div>
-            <div className="tip-action-list">
-              {adoUrl && (
-                <button className="tip-action-btn" onClick={() => openUrl(adoUrl)} title={adoUrl}>
-                  <Icon name="external-link" size={11} /> Open in DevOps
-                </button>
-              )}
-              {task.devopsTaskUrl && (
-                <button className="tip-action-btn" onClick={() => openUrl(task.devopsTaskUrl)} title={task.devopsTaskUrl}>
-                  <Icon name="external-link" size={11} /> DevOps task
-                </button>
-              )}
-              {task.ticketUrl && (
-                <button className="tip-action-btn" onClick={() => openUrl(task.ticketUrl)} title={task.ticketUrl}>
-                  <Icon name="external-link" size={11} /> Ticket
-                </button>
-              )}
-              {(hasRepo || hasVscodePath) && (
+
+            {/* External links */}
+            {(adoUrl || task.devopsTaskUrl || task.ticketUrl || showOpenRepo) && (
+              <div className="tip-action-group">
+                <div className="tip-group-label">Links</div>
+                <div className="tip-action-list">
+                  {adoUrl && (
+                    <button className="tip-action-btn" onClick={() => openUrl(adoUrl)} title={adoUrl}>
+                      <Icon name="external-link" size={11} /> Open in DevOps
+                    </button>
+                  )}
+                  {task.devopsTaskUrl && (
+                    <button className="tip-action-btn" onClick={() => openUrl(task.devopsTaskUrl)} title={task.devopsTaskUrl}>
+                      <Icon name="external-link" size={11} /> DevOps task
+                    </button>
+                  )}
+                  {task.ticketUrl && (
+                    <button className="tip-action-btn" onClick={() => openUrl(task.ticketUrl)} title={task.ticketUrl}>
+                      <Icon name="external-link" size={11} /> Ticket
+                    </button>
+                  )}
+                  {showOpenRepo && (
+                    <button className="tip-action-btn" onClick={() => tauriApi.openPath(repoRoot!).catch(() => {})} title={repoRoot}>
+                      <Icon name="folder" size={11} /> Open Repository
+                    </button>
+                  )}
+                </div>
+              </div>
+            )}
+
+            {/* Development */}
+            {(hasRepo || hasVscodePath) && (
+              <div className="tip-action-group">
+                <div className="tip-group-label">Development</div>
                 <TaskDevModePanel
                   task={task}
                   customer={customer}
@@ -208,12 +224,12 @@ export default function InlineTaskPanel({ task, onOpenDetail }: Props) {
                   }
                   reviewerConfigs={settings.aiReviewers}
                 />
-              )}
-              {showOpenRepo && (
-                <button className="tip-action-btn" onClick={() => tauriApi.openPath(repoRoot!).catch(() => {})} title={repoRoot}>
-                  <Icon name="folder" size={11} /> Open Repository
-                </button>
-              )}
+              </div>
+            )}
+
+            {/* Task actions */}
+            <div className="tip-action-group">
+              <div className="tip-group-label">Task</div>
               <div className="tip-primary-btns">
                 {task.status !== 'done' && (
                   <button
