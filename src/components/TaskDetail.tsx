@@ -15,6 +15,8 @@ import * as tauriApi from '../lib/tauriCommands';
 import { WorkflowStepper } from './WorkflowStepper';
 import { buildTaskWorkflowPlan } from '../lib/workflowPlan';
 import { resolveTaskDevTarget, getPluginsDir } from '../lib/resolveTaskDevTarget';
+import TaskModeSwitch from './TaskModeSwitch';
+import { inferTaskMode } from '../lib/taskMode';
 import { BUCKET_META, BUCKET_ORDER, computePlanning, effectiveBucket } from '../lib/planning';
 import { isOverdue, formatRelativeDate } from '../lib/dates';
 
@@ -341,6 +343,11 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
   // Centralized workflow plan — drives BPF stages, action labels, feature flags.
   // Pass the heuristic devTarget kind so tasks without confirmed setup still work.
   const plan = buildTaskWorkflowPlan(task, heuristicDevTarget.kind);
+  const { mode: effectiveMode } = inferTaskMode(task);
+
+  async function handleSetMode(mode: 'developer' | 'general') {
+    await updateTask(task.id, { taskMode: mode });
+  }
 
   // Selected plugin project: prefer confirmed setup, then persisted task field.
   const selectedPluginProject = task.workflowSetup?.pluginProject ?? task.selectedPluginProject ?? '';
@@ -1158,6 +1165,12 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
             );
           })()}
 
+          {/* MODE SWITCH */}
+          <div className="detail-action-group">
+            <div className="detail-action-group-label">Mode</div>
+            <TaskModeSwitch task={task} onSetMode={handleSetMode} />
+          </div>
+
           {/* FILESYSTEM — only rendered when the customer has at least one path */}
           {hasAnyPath && (
             <div className="detail-action-group">
@@ -1190,7 +1203,7 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
                 </button>
               )}
 
-              {(hasRepo || hasVscodePath) && plan.requiresDevTools && (
+              {effectiveMode === 'developer' && (hasRepo || hasVscodePath) && plan.requiresDevTools && (
                 <TaskDevModePanel
                   ref={devModePanelRef}
                   task={task}

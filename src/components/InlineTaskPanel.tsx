@@ -16,8 +16,10 @@ import Icon from './Icon';
 import * as tauriApi from '../lib/tauriCommands';
 import TaskEmailContent from './TaskEmailContent';
 import TaskDevModePanel from './TaskDevModePanel';
+import TaskModeSwitch from './TaskModeSwitch';
 import { resolveTaskDevTarget, getPluginsDir } from '../lib/resolveTaskDevTarget';
 import { buildTaskWorkflowPlan } from '../lib/workflowPlan';
+import { inferTaskMode } from '../lib/taskMode';
 
 interface Props {
   task: Task;
@@ -49,6 +51,10 @@ export default function InlineTaskPanel({ task, onOpenDetail }: Props) {
     if (notes !== (task.notes ?? '')) {
       await updateTask(task.id, { notes });
     }
+  }
+
+  async function handleSetMode(mode: 'developer' | 'general') {
+    await updateTask(task.id, { taskMode: mode });
   }
 
   function openUrl(url: string | undefined) {
@@ -99,6 +105,7 @@ export default function InlineTaskPanel({ task, onOpenDetail }: Props) {
   const hasVscodePath    = !!effectiveVscodePath;
   // Centralized workflow plan — pass heuristic kind for backward compat with unconfirmed tasks
   const plan = buildTaskWorkflowPlan(task, heuristicDevTarget.kind);
+  const { mode: effectiveMode } = inferTaskMode(task);
   // Use the same resolver as TaskDetail for consistent branching.
   const isScriptTask = devTarget.kind === 'script';
   const showOpenRepo = !!(repoRoot && isScriptTask);
@@ -207,8 +214,14 @@ export default function InlineTaskPanel({ task, onOpenDetail }: Props) {
               </div>
             )}
 
+            {/* Task mode switch */}
+            <div className="tip-action-group">
+              <div className="tip-group-label">Mode</div>
+              <TaskModeSwitch task={task} onSetMode={handleSetMode} />
+            </div>
+
             {/* Development */}
-            {(hasRepo || hasVscodePath) && plan.requiresDevTools && (
+            {effectiveMode === 'developer' && (hasRepo || hasVscodePath) && plan.requiresDevTools && (
               <div className="tip-action-group">
                 <div className="tip-group-label">Development</div>
                 <TaskDevModePanel

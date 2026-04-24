@@ -1,4 +1,5 @@
 ﻿import type { Task, TaskStatus, WorkflowSetup } from '../types';
+import { inferTaskMode } from './taskMode';
 
 export interface WorkflowStage {
   id: TaskStatus;
@@ -58,13 +59,24 @@ export function buildTaskWorkflowPlan(task: Task, heuristicKind?: DevKind): Task
   const devKind: DevKind = setup?.devTargetKind ?? heuristicKind ?? 'repo';
   const workIntent: WorkIntent = setup?.workIntent ?? 'update';
 
-  const isCode   = devKind === 'plugin' || devKind === 'script';
+  const { mode: taskMode } = inferTaskMode(task);
+
+  // A "code task" means we use the developer workflow branches.
+  // taskMode overrides: general forces non-code, developer forces code.
+  const isCodeByKind = devKind === 'plugin' || devKind === 'script';
+  const isCode = taskMode === 'general' ? false
+               : taskMode === 'developer' ? true
+               : isCodeByKind;
+
   const isCreate = workIntent === 'create';
   const isFix    = workIntent === 'fix';
   const isReview = workIntent === 'review';
+  // When developer mode but devKind is 'repo' (no plugin/script selected yet),
+  // use general dev workflow: New → Analyzed → In Progress → For Review → Done.
+  const isRepoOnly = isCode && !isCodeByKind;
 
   let workflowKind: WorkflowKind;
-  if (!isCode)      workflowKind = 'general';
+  if (!isCode)       workflowKind = 'general';
   else if (isCreate) workflowKind = 'dev-create';
   else if (isFix)    workflowKind = 'dev-fix';
   else if (isReview) workflowKind = 'dev-review';
@@ -101,6 +113,10 @@ export function buildTaskWorkflowPlan(task: Task, heuristicKind?: DevKind): Task
   const currentStage = stages.find((s) => s.id === task.status);
   const currentActionLabel = currentStage?.actionLabel ?? 'Analyze';
 
+  // Plugin/script-specific create flags are suppressed for repo-only or general tasks.
+  const requiresPluginCreate = devKind === 'plugin' && isCreate && !isRepoOnly;
+  const requiresScriptCreate = devKind === 'script' && isCreate && !isRepoOnly;
+
   return {
     stages,
     workflowKind,
@@ -108,12 +124,12 @@ export function buildTaskWorkflowPlan(task: Task, heuristicKind?: DevKind): Task
     currentAction,
     currentActionLabel,
     requiresDevTools:         isCode,
-    requiresDraftGeneration:  isCode && !isReview,
-    draftIsPrimaryAction:     isCode && isCreate,
+    requiresDraftGeneration:  isCode && !isReview && !isRepoOnly,
+    draftIsPrimaryAction:     isCode && isCreate && !isRepoOnly,
     requiresExistingArtifact: isCode && !isCreate,
-    requiresAiFileReview:     isCode,
-    requiresPluginCreate:     devKind === 'plugin' && isCreate,
-    requiresScriptCreate:     devKind === 'script' && isCreate,
-    shouldInferReviewFile:    isCode && !isCreate,
+    requiresAiFileReview:     isCode && !isRepoOnly,
+    requiresPluginCreate,
+    requiresScriptCreate,
+    shouldInferReviewFile:    isCode && !isCreate && !isRepoOnly,
   };
 }

@@ -141,6 +141,14 @@ export interface Task {
   workflowSetup?: WorkflowSetup;
 
   /**
+   * Explicit task mode override set by the user.
+   * - 'developer': show dev workflow, tools, repo/plugin/script setup.
+   * - 'general': simplified analysis-only workflow, no dev tools.
+   * - undefined: inferred from heuristics (ADO assignment → developer, etc.).
+   */
+  taskMode?: 'developer' | 'general';
+
+  /**
    * Sanitized HTML of the original email body with CID inline images resolved to data: URIs.
    * Only populated for email tasks imported via Microsoft Graph (get_outlook_message_full).
    * Used for display only — never fed into AI, prefilter, or text analysis.
