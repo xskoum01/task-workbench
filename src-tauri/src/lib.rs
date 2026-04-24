@@ -414,13 +414,50 @@ fn get_git_diff(repo_path: String, file_path: Option<String>) -> Result<String, 
         return Err(format!("'{repo_path}' is not a Git repository (no .git directory found)."));
     }
 
+    // Normalize repo_path: canonicalize slashes for comparison.
+    let repo_norm = repo_path.replace('\\', "/").trim_end_matches('/').to_string();
+    eprintln!("[get_git_diff] repo={repo_norm}");
+
+    // Resolve file_path to a repo-relative pathspec.
+    let relative_file: Option<String> = match file_path {
+        None => None,
+        Some(ref fp) => {
+            let fp_norm = fp.replace('\\', "/");
+            eprintln!("[get_git_diff] file={fp_norm}");
+
+            // If the path looks absolute (starts with / or drive letter like C:/)
+            let looks_absolute = fp_norm.starts_with('/') ||
+                fp_norm.get(1..3).map_or(false, |s| s == ":/");
+
+            if looks_absolute {
+                // Strip the repo prefix to produce a relative path.
+                let prefix = format!("{}/", repo_norm);
+                if let Some(rel) = fp_norm.strip_prefix(&prefix) {
+                    let rel = rel.to_string();
+                    eprintln!("[get_git_diff] relative={rel}");
+                    Some(rel)
+                } else if fp_norm == repo_norm {
+                    // Path IS the repo root — diff the whole repo.
+                    eprintln!("[get_git_diff] relative=(whole repo)");
+                    None
+                } else {
+                    return Err("Selected file is outside the Git repository.".to_string());
+                }
+            } else {
+                // Already relative — normalize slashes only.
+                eprintln!("[get_git_diff] relative={fp_norm} (already relative)");
+                Some(fp_norm)
+            }
+        }
+    };
+
     // Helper: run git diff with the given extra args and return raw stdout.
     let run_diff = |extra: &[&str]| -> Result<String, String> {
         let mut cmd = std::process::Command::new("git");
         cmd.arg("-C").arg(&repo_path).arg("diff");
         for a in extra { cmd.arg(a); }
-        if let Some(ref fp) = file_path {
-            cmd.arg("--").arg(fp);
+        if let Some(ref rel) = relative_file {
+            cmd.arg("--").arg(rel);
         }
         let out = cmd.output().map_err(|e| {
             if e.kind() == std::io::ErrorKind::NotFound {
@@ -432,7 +469,6 @@ fn get_git_diff(repo_path: String, file_path: Option<String>) -> Result<String, 
         if out.status.success() {
             Ok(String::from_utf8_lossy(&out.stdout).to_string())
         } else {
-            // Non-zero exit for diff usually means "not a repo" or bad args.
             let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
             Err(stderr)
         }
@@ -440,6 +476,7 @@ fn get_git_diff(repo_path: String, file_path: Option<String>) -> Result<String, 
 
     let unstaged = run_diff(&[])?;
     let staged   = run_diff(&["--cached"])?;
+    eprintln!("[get_git_diff] unstaged_len={} staged_len={}", unstaged.len(), staged.len());
 
     // Return combined diff when both halves have content, avoiding duplication.
     let diff = match (unstaged.is_empty(), staged.is_empty()) {

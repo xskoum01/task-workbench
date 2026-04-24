@@ -107,9 +107,10 @@ export default function CodeChangeReviewModal({
             fontSize: 12,
             color: 'var(--text-secondary)',
           }}>
-            Nebyly nalezeny žádné Git změny pro tento soubor.
-            Uložte soubor a klikněte na <strong>Načíst Git diff</strong>,
-            nebo vložte změněný kód či diff ručně níže.
+            {fileName
+              ? <>Žádné Git změny pro <strong>{fileName}</strong>. Ujistěte se, že soubor je uložen a patří do zvoleného repozitáře, pak klikněte na <strong>Načíst Git diff</strong>.</>
+              : <>Nebyly nalezeny žádné Git změny. Uložte soubor a klikněte na <strong>Načíst Git diff</strong>.</>}
+            {' '}Nebo vložte diff ručně níže.
           </div>
         )}
         <textarea
