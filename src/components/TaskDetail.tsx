@@ -571,8 +571,44 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
   /** Called when the user clicks Confirm & Analyze in the setup modal. */
   async function handleConfirmSetup(setup: WorkflowSetup) {
     setShowSetupModal(false);
+
+    // Validate whether the existing artifactPath is still meaningful under the new setup.
+    const existingArtifact = task.workflowSetup?.artifactPath;
+    let artifactPath: string | undefined = existingArtifact;
+
+    if (existingArtifact) {
+      const prevKind   = task.workflowSetup?.devTargetKind;
+      const prevIntent = task.workflowSetup?.workIntent;
+      const newKind    = setup.devTargetKind;
+      const newIntent  = setup.workIntent;
+
+      // Determine whether the artifact extension matches the new target kind.
+      const lower = existingArtifact.toLowerCase();
+      const matchesScript = lower.endsWith('.js') || lower.endsWith('.ts');
+      const matchesPlugin = lower.endsWith('.cs');
+
+      const kindChanged   = newKind !== prevKind;
+      const intentChanged = newIntent !== prevIntent;
+      const isNowCreate   = newIntent === 'create';
+
+      // Clear when:
+      //   - target kind changed (plugin ↔ script ↔ repo)
+      //   - the file extension no longer matches the new target kind
+      //   - workIntent changed away from 'create' (update/fix/review work on
+      //     pre-existing files; the created artifact path is irrelevant)
+      const extensionMismatch =
+        (newKind === 'script' && !matchesScript) ||
+        (newKind === 'plugin' && !matchesPlugin) ||
+        (newKind === 'repo'   && (matchesScript || matchesPlugin));
+
+      if (kindChanged || extensionMismatch || (intentChanged && !isNowCreate)) {
+        artifactPath = undefined;
+      }
+    }
+
+    const mergedSetup: WorkflowSetup = { ...setup, artifactPath };
     // Persist the confirmed setup, then run analyze.
-    await updateTask(task.id, { workflowSetup: setup });
+    await updateTask(task.id, { workflowSetup: mergedSetup });
     handleAnalyze();
   }
 
