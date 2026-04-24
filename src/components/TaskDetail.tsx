@@ -1252,6 +1252,18 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
                 </button>
               )}
 
+              {effectiveMode === 'developer' && plan.isDeveloperAwaitingSetup && (
+                <div className="detail-dev-setup-prompt">
+                  <span className="detail-dev-setup-text">Choose Plugin or Script target to enable developer tools.</span>
+                  <button
+                    className="btn btn-secondary btn-sm"
+                    onClick={() => setShowSetupModal(true)}
+                  >
+                    Confirm developer setup
+                  </button>
+                </div>
+              )}
+
               {effectiveMode === 'developer' && (hasRepo || hasVscodePath) && plan.requiresDevTools && (
                 <TaskDevModePanel
                   ref={devModePanelRef}

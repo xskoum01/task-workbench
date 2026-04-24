@@ -220,6 +220,19 @@ export default function InlineTaskPanel({ task, onOpenDetail }: Props) {
               <TaskModeSwitch task={task} onSetMode={handleSetMode} />
             </div>
 
+            {/* Developer awaiting setup prompt */}
+            {effectiveMode === 'developer' && plan.isDeveloperAwaitingSetup && (
+              <div className="tip-action-group">
+                <div className="tip-group-label">Development</div>
+                <div className="tip-dev-setup-prompt">
+                  <span className="tip-dev-setup-text">Choose Plugin or Script target to enable developer tools.</span>
+                  <button className="btn btn-secondary btn-sm" onClick={onOpenDetail}>
+                    Confirm developer setup →
+                  </button>
+                </div>
+              </div>
+            )}
+
             {/* Development */}
             {effectiveMode === 'developer' && (hasRepo || hasVscodePath) && plan.requiresDevTools && (
               <div className="tip-action-group">

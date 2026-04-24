@@ -64,7 +64,11 @@ export default function ConfirmSetupModal({
 
   // --- Form state pre-filled from inference ---
   const [workIntent, setWorkIntent] = useState<WorkflowSetup['workIntent']>(defaults.workIntent);
-  const [devKind, setDevKind]       = useState<'plugin' | 'script' | 'repo'>(defaults.devTargetKind);
+  // Normalize legacy 'repo' target to 'script' — 'repo' is no longer a selectable target.
+  const initDevKind = (defaults.devTargetKind === 'repo' || !defaults.devTargetKind)
+    ? 'script'
+    : defaults.devTargetKind;
+  const [devKind, setDevKind] = useState<'plugin' | 'script'>(initDevKind);
   const [customerId, setCustomerId] = useState<string>(defaults.customerId);
   const [pluginProject, setPluginProject] = useState<string>(defaults.pluginProject);
   const [scriptPath, setScriptPath]       = useState<string>(defaults.scriptPath);
@@ -83,12 +87,12 @@ export default function ConfirmSetupModal({
     '';
 
   // When target kind changes, update the reviewer to the best match for the new kind.
-  function handleKindChange(kind: typeof devKind) {
+  function handleKindChange(kind: 'plugin' | 'script') {
     setDevKind(kind);
     // Only auto-update reviewer when user hasn't manually locked one.
     if (!task.workflowSetup?.reviewerId) {
-      const match = kind === 'repo' ? undefined : allReviewers.find(
-        (r) => r.appliesTo.devTargetKinds?.includes(kind as 'plugin' | 'script'),
+      const match = allReviewers.find(
+        (r) => r.appliesTo.devTargetKinds?.includes(kind),
       );
       setReviewerId(match?.id ?? '');
     }
@@ -171,7 +175,7 @@ export default function ConfirmSetupModal({
           <div className="confirm-setup-row">
             <label className="form-label confirm-setup-label">Target kind</label>
             <div className="confirm-setup-kind-group">
-              {(['plugin', 'script', 'repo'] as const).map((kind) => (
+              {(['plugin', 'script'] as const).map((kind) => (
                 <button
                   key={kind}
                   type="button"
@@ -268,7 +272,7 @@ export default function ConfirmSetupModal({
         )}
 
         {/* Reviewer â€” developer + plugin/script only */}
-        {isDev && devKind !== 'repo' && allReviewers.length > 0 && (
+        {isDev && allReviewers.length > 0 && (
           <div className="confirm-setup-row">
             <label className="form-label confirm-setup-label">AI reviewer</label>
             <select

@@ -5372,3 +5372,17 @@ body {
   opacity: 0.55;
   letter-spacing: 0.03em;
 }
+
+/* ── Developer awaiting setup prompts ─────────────────────────────────────── */
+.tip-dev-setup-prompt,
+.detail-dev-setup-prompt {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.tip-dev-setup-text,
+.detail-dev-setup-text {
+  font-size: 11px;
+  color: var(--color-text-muted);
+  line-height: 1.4;
+}

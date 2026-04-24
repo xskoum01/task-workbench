@@ -39,6 +39,8 @@ export interface TaskWorkflowPlan {
   requiresPluginCreate: boolean;
   requiresScriptCreate: boolean;
   shouldInferReviewFile: boolean;
+  /** True when taskMode=developer but the user has not yet confirmed plugin or script target. */
+  isDeveloperAwaitingSetup: boolean;
 }
 
 type DevKind = NonNullable<WorkflowSetup['devTargetKind']>;
@@ -56,24 +58,35 @@ const S_DONE: WorkflowStage = { id: 'done', label: 'Done', actionLabel: 'Complet
 
 export function buildTaskWorkflowPlan(task: Task, heuristicKind?: DevKind): TaskWorkflowPlan {
   const setup = task.workflowSetup;
-  const devKind: DevKind = setup?.devTargetKind ?? heuristicKind ?? 'repo';
+  // Normalize legacy 'repo' devTargetKind to undefined — repo is no longer a workflow target.
+  const rawKind: DevKind = setup?.devTargetKind ?? heuristicKind ?? 'repo';
+  const devKind: DevKind = rawKind === 'repo' ? 'script' : rawKind;
+  const confirmedKind: 'plugin' | 'script' | undefined =
+    (setup?.devTargetKind && setup.devTargetKind !== 'repo')
+      ? (setup.devTargetKind as 'plugin' | 'script')
+      : undefined;
+
   const workIntent: WorkIntent = setup?.workIntent ?? 'update';
 
   const { mode: taskMode } = inferTaskMode(task);
 
-  // A "code task" means we use the developer workflow branches.
-  // taskMode overrides: general forces non-code, developer forces code.
-  const isCodeByKind = devKind === 'plugin' || devKind === 'script';
-  const isCode = taskMode === 'general' ? false
-               : taskMode === 'developer' ? true
-               : isCodeByKind;
+  // "code task": developer mode AND user has explicitly confirmed plugin or script target.
+  // taskMode = general → never code.
+  // taskMode = developer + no confirmed plugin/script → still not code until setup is done.
+  const isPluginOrScript = devKind === 'plugin' || devKind === 'script';
+  const isCode = taskMode === 'general'
+    ? false
+    : taskMode === 'developer'
+      ? isPluginOrScript && !!confirmedKind   // requires explicit user confirmation
+      : isPluginOrScript;
+
+  // For developer tasks where setup is not yet confirmed (no plugin/script chosen),
+  // use a minimal analyze-only stage.
+  const isDeveloperAwaitingSetup = taskMode === 'developer' && !confirmedKind;
 
   const isCreate = workIntent === 'create';
   const isFix    = workIntent === 'fix';
   const isReview = workIntent === 'review';
-  // When developer mode but devKind is 'repo' (no plugin/script selected yet),
-  // use general dev workflow: New → Analyzed → In Progress → For Review → Done.
-  const isRepoOnly = isCode && !isCodeByKind;
 
   let workflowKind: WorkflowKind;
   if (!isCode)       workflowKind = 'general';
@@ -113,23 +126,20 @@ export function buildTaskWorkflowPlan(task: Task, heuristicKind?: DevKind): Task
   const currentStage = stages.find((s) => s.id === task.status);
   const currentActionLabel = currentStage?.actionLabel ?? 'Analyze';
 
-  // Plugin/script-specific create flags are suppressed for repo-only or general tasks.
-  const requiresPluginCreate = devKind === 'plugin' && isCreate && !isRepoOnly;
-  const requiresScriptCreate = devKind === 'script' && isCreate && !isRepoOnly;
-
   return {
     stages,
     workflowKind,
-    targetKind: devKind as TargetKind,
+    targetKind: (confirmedKind ?? devKind) as TargetKind,
     currentAction,
     currentActionLabel,
     requiresDevTools:         isCode,
-    requiresDraftGeneration:  isCode && !isReview && !isRepoOnly,
-    draftIsPrimaryAction:     isCode && isCreate && !isRepoOnly,
+    requiresDraftGeneration:  isCode && !isReview,
+    draftIsPrimaryAction:     isCode && isCreate,
     requiresExistingArtifact: isCode && !isCreate,
-    requiresAiFileReview:     isCode && !isRepoOnly,
-    requiresPluginCreate,
-    requiresScriptCreate,
-    shouldInferReviewFile:    isCode && !isCreate && !isRepoOnly,
+    requiresAiFileReview:     isCode,
+    requiresPluginCreate:     confirmedKind === 'plugin' && isCreate,
+    requiresScriptCreate:     confirmedKind === 'script' && isCreate,
+    shouldInferReviewFile:    isCode && !isCreate,
+    isDeveloperAwaitingSetup,
   };
 }
