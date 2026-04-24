@@ -62,6 +62,15 @@ export default function ConfirmSetupModal({
 
   const isDev = effectiveMode === 'developer';
 
+  const allReviewers = reviewerConfigs
+    ? mergeWithDefaults(reviewerConfigs).filter((r) => r.enabled)
+    : [];
+
+  /** Returns the first enabled reviewer matching the given target kind. */
+  function selectReviewerByKind(kind: 'plugin' | 'script'): string {
+    return allReviewers.find((r) => r.appliesTo.devTargetKinds?.includes(kind))?.id ?? '';
+  }
+
   // --- Form state pre-filled from inference ---
   const [workIntent, setWorkIntent] = useState<WorkflowSetup['workIntent']>(defaults.workIntent);
   // Normalize legacy 'repo' target to 'script' — 'repo' is no longer a selectable target.
@@ -72,11 +81,11 @@ export default function ConfirmSetupModal({
   const [customerId, setCustomerId] = useState<string>(defaults.customerId);
   const [pluginProject, setPluginProject] = useState<string>(defaults.pluginProject);
   const [scriptPath, setScriptPath]       = useState<string>(defaults.scriptPath);
-  const [reviewerId, setReviewerId]       = useState<string>(defaults.reviewerId);
-
-  const allReviewers = reviewerConfigs
-    ? mergeWithDefaults(reviewerConfigs).filter((r) => r.enabled)
-    : [];
+  // Reviewer: prefer persisted value, then auto-match to the initial target kind.
+  const initReviewerId = defaults.reviewerId || selectReviewerByKind(initDevKind);
+  const [reviewerId, setReviewerId]       = useState<string>(initReviewerId);
+  // Track whether the user manually changed the reviewer in this session.
+  const [reviewerManuallySet, setReviewerManuallySet] = useState(false);
 
   // Compute a human-readable repo path hint for the selected customer.
   const selectedCustomer = customers.find((c) => c.id === customerId);
@@ -89,12 +98,9 @@ export default function ConfirmSetupModal({
   // When target kind changes, update the reviewer to the best match for the new kind.
   function handleKindChange(kind: 'plugin' | 'script') {
     setDevKind(kind);
-    // Only auto-update reviewer when user hasn't manually locked one.
-    if (!task.workflowSetup?.reviewerId) {
-      const match = allReviewers.find(
-        (r) => r.appliesTo.devTargetKinds?.includes(kind),
-      );
-      setReviewerId(match?.id ?? '');
+    // Only auto-update reviewer when user hasn't manually chosen one in this session.
+    if (!reviewerManuallySet) {
+      setReviewerId(selectReviewerByKind(kind));
     }
   }
 
@@ -278,7 +284,7 @@ export default function ConfirmSetupModal({
             <select
               className="form-select"
               value={reviewerId}
-              onChange={(e) => setReviewerId(e.target.value)}
+              onChange={(e) => { setReviewerId(e.target.value); setReviewerManuallySet(true); }}
             >
               <option value="">Auto-select</option>
               {allReviewers.map((r) => (
