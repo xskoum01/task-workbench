@@ -588,47 +588,45 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
   async function handleConfirmSetup(setup: WorkflowSetup) {
     setShowSetupModal(false);
 
-    // Validate whether the existing artifactPath is still meaningful under the new setup.
-    const existingArtifact = task.workflowSetup?.artifactPath;
-    let artifactPath: string | undefined = existingArtifact;
+    // When the modal provides an artifactPath (Update/Fix/Review — user chose an existing
+    // file), that selection wins unconditionally over any stale existing artifact.
+    // For Create workflows the modal sends artifactPath=undefined and we fall back to
+    // preserving the previously created file if the setup is still compatible.
+    let artifactPath: string | undefined = setup.artifactPath;
 
-    if (existingArtifact) {
-      const prevKind   = task.workflowSetup?.devTargetKind;
-      const prevIntent = task.workflowSetup?.workIntent;
-      const newKind    = setup.devTargetKind;
-      const newIntent  = setup.workIntent;
+    if (artifactPath === undefined) {
+      const existingArtifact = task.workflowSetup?.artifactPath;
+      if (existingArtifact) {
+        const newKind    = setup.devTargetKind;
+        const newIntent  = setup.workIntent;
+        const prevIntent = task.workflowSetup?.workIntent;
 
-      // Determine whether the artifact extension matches the new target kind.
-      const lower = existingArtifact.toLowerCase();
-      const matchesScript = lower.endsWith('.js') || lower.endsWith('.ts');
-      const matchesPlugin = lower.endsWith('.cs');
+        const lower = existingArtifact.toLowerCase();
+        const matchesScript = lower.endsWith('.js') || lower.endsWith('.ts');
+        const matchesPlugin = lower.endsWith('.cs');
+        const isNowCreate   = newIntent === 'create';
+        const intentChanged = newIntent !== prevIntent;
 
-      const kindChanged   = newKind !== prevKind;
-      const intentChanged = newIntent !== prevIntent;
-      const isNowCreate   = newIntent === 'create';
+        const extensionMismatch =
+          (newKind === 'script' && !matchesScript) ||
+          (newKind === 'plugin' && !matchesPlugin);
 
-      // Clear when:
-      //   - target kind changed (plugin ↔ script ↔ repo)
-      //   - the file extension no longer matches the new target kind
-      //   - workIntent changed away from 'create' (update/fix/review work on
-      //     pre-existing files; the created artifact path is irrelevant)
-      const extensionMismatch =
-        (newKind === 'script' && !matchesScript) ||
-        (newKind === 'plugin' && !matchesPlugin) ||
-        (newKind === 'repo'   && (matchesScript || matchesPlugin));
+        const kindChanged = newKind !== task.workflowSetup?.devTargetKind;
 
-      if (kindChanged || extensionMismatch || (intentChanged && !isNowCreate)) {
-        artifactPath = undefined;
+        // Keep existing artifact only when kind/extension still match and we are
+        // staying in Create intent (the artifact was produced by Apply Draft).
+        if (!kindChanged && !extensionMismatch && !(intentChanged && !isNowCreate)) {
+          artifactPath = existingArtifact;
+        }
       }
     }
 
     const mergedSetup: WorkflowSetup = { ...setup, artifactPath };
     // Persist the confirmed setup AND analysis result in one atomic updateTask call.
-    // Two separate calls would race on the stale tasks closure and the first write
-    // (workflowSetup) would be overwritten by the second (status + analysisResult).
     await handleAnalyzeWithSetup(mergedSetup);
   }
 
+      // Determine whether the artifact extension matches the new target kind.
   async function handleGenerateReply() {
     setAiLoading('reply');
     setAiError(null);

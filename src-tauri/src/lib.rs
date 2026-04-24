@@ -1614,6 +1614,71 @@ fn list_directory_files(dir: String, extension: String) -> Vec<String> {
     files
 }
 
+/// Lists files in `dir` matching any of `extensions`, returning `{name, path}` objects.
+/// When `recursive = false`, only the immediate directory is scanned (shallow).
+/// When `recursive = true`, the tree is walked and any entry whose name (lowercase)
+/// matches an entry in `excluded_dirs` is skipped entirely (e.g. "bin", "obj").
+/// Never fails — returns an empty array on any filesystem error.
+#[tauri::command]
+fn list_files_with_paths(
+    dir: String,
+    extensions: Vec<String>,
+    recursive: bool,
+    excluded_dirs: Vec<String>,
+) -> Vec<Value> {
+    let root = std::path::Path::new(&dir);
+    if !root.is_dir() { return vec![]; }
+
+    // Normalise extensions: lowercase, strip leading dot.
+    let exts: Vec<String> = extensions
+        .iter()
+        .map(|e| e.trim_start_matches('.').to_lowercase())
+        .collect();
+
+    let excluded: Vec<String> = excluded_dirs
+        .iter()
+        .map(|d| d.to_lowercase())
+        .collect();
+
+    let mut results: Vec<Value> = Vec::new();
+    collect_files(root, &exts, recursive, &excluded, &mut results);
+    results.sort_by(|a, b| {
+        a["name"].as_str().unwrap_or("").cmp(b["name"].as_str().unwrap_or(""))
+    });
+    results
+}
+
+/// Recursive helper for list_files_with_paths.
+fn collect_files(
+    dir: &std::path::Path,
+    exts: &[String],
+    recursive: bool,
+    excluded: &[String],
+    out: &mut Vec<Value>,
+) {
+    let entries = match fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+    for entry in entries.filter_map(|e| e.ok()) {
+        let path = entry.path();
+        let name_raw = entry.file_name().to_string_lossy().to_string();
+        if path.is_dir() {
+            if recursive && !excluded.contains(&name_raw.to_lowercase()) {
+                collect_files(&path, exts, recursive, excluded, out);
+            }
+        } else if path.is_file() {
+            let lower = name_raw.to_lowercase();
+            if exts.iter().any(|ext| lower.ends_with(&format!(".{ext}"))) {
+                let abs = path.to_string_lossy().replace('\\', "/");
+                out.push(serde_json::json!({ "name": name_raw, "path": abs }));
+            }
+        }
+    }
+}
+
+
+
 /// Writes content to the given absolute path, creating directories as needed.
 #[tauri::command]
 fn save_generated_file(path: String, content: String) -> Result<(), String> {
@@ -3491,6 +3556,7 @@ pub fn run() {
             get_teams_self_chat_messages,
             read_file_content,
             list_directory_files,
+            list_files_with_paths,
             infer_review_file_path,
             list_crm_folders,
             get_git_branch,

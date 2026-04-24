@@ -247,6 +247,32 @@ export function listDirectoryFiles(dir: string, extension: string): Promise<stri
   return invoke<string[]>('list_directory_files', { dir, extension });
 }
 
+export interface FileEntry {
+  /** Bare file name, e.g. "CustomerUpdate.js" */
+  name: string;
+  /** Absolute path with forward slashes, e.g. "C:/CRM/Customer/Scripts/CustomerUpdate.js" */
+  path: string;
+}
+
+/**
+ * Lists files under `dir` whose extension matches any entry in `extensions`.
+ * Returns `{ name, path }` objects so callers have both the display name and
+ * the absolute path without needing to reconstruct it.
+ *
+ * @param dir           Root directory to scan.
+ * @param extensions    Extensions without dots, e.g. ["js", "ts"].
+ * @param recursive     When true, descends into subdirectories.
+ * @param excludedDirs  Subdirectory names to skip (case-insensitive), e.g. ["bin", "obj"].
+ */
+export function listFilesWithPaths(
+  dir: string,
+  extensions: string[],
+  recursive: boolean,
+  excludedDirs: string[],
+): Promise<FileEntry[]> {
+  return invoke<FileEntry[]>('list_files_with_paths', { dir, extensions, recursive, excludedDirs });
+}
+
 /**
  * Searches `basePath` recursively for the best candidate file to review.
  * For plugin mode: looks for .cs files (IPlugin preferred).
