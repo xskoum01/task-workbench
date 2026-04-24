@@ -464,7 +464,7 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
 
   async function handleApplyDraft() {
     if (devTarget.kind === 'plugin') {
-      // Plugin: write the skeleton preview to disk.
+      // Plugin: write the skeleton preview to disk then complete the workflow.
       if (!skeletonPreview) {
         setFeedback('Generate a draft first before applying.');
         return;
@@ -484,21 +484,12 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
       const subPath = `${pluginsDir}/${selectedPluginProject}/${selectedPluginProject}/${skeletonPreview.fileName}`;
       try {
         await tauriApi.saveGeneratedFile(subPath, skeletonPreview.content);
-        // Persist the file path and the plugin project name so Open, AI Review and all
-        // future actions know exactly which project/file is in use.
-        await updateTask(task.id, {
-          selectedPluginProject,
-          workflowSetup: {
-            ...task.workflowSetup,
-            pluginProject: selectedPluginProject || undefined,
-            artifactPath:  subPath,
-          },
-        });
-        setFeedback(`Draft written: ${skeletonPreview.fileName}`);
-        setSkeletonPreview(null);
       } catch (e) {
         setFsError(String(e));
+        return; // file write failed — do not advance state
       }
+      // File saved — complete the rest of the workflow.
+      await completePluginDraft(selectedPluginProject, subPath);
     } else {
       // Script: delegate to the Script Assistant panel apply step.
       if (!scriptPanelRef.current) return;
@@ -518,6 +509,63 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
       } finally {
         setAiLoading(null);
       }
+    }
+  }
+
+  /**
+   * Tries to open the plugin project in Visual Studio (.sln) or VS Code (.csproj / folder).
+   * Resolves without throwing — call-sites handle open errors via the returned message.
+   */
+  async function openPluginProject(projectName: string): Promise<string | null> {
+    if (!pluginsDir) return 'No plugin folder configured.';
+    const solutionRoot = `${pluginsDir}/${projectName}`;
+    try {
+      const slns = await tauriApi.listDirectoryFiles(solutionRoot, 'sln').catch(() => [] as string[]);
+      if (slns.length > 0) {
+        await tauriApi.openWithShell(`${solutionRoot}/${slns[0]}`);
+        return null;
+      }
+      const projDir  = `${solutionRoot}/${projectName}`;
+      const csprojs  = await tauriApi.listDirectoryFiles(projDir, 'csproj').catch(() => [] as string[]);
+      if (csprojs.length > 0) {
+        await tauriApi.openInVscode(`${projDir}/${csprojs[0]}`);
+        return null;
+      }
+      await tauriApi.openInVscode(solutionRoot);
+      return null;
+    } catch (e) {
+      return String(e);
+    }
+  }
+
+  /**
+   * Completes the plugin draft apply workflow after the .cs file has been written.
+   * Updates task state, closes the skeleton modal, refreshes the dev panel, and
+   * opens the plugin project in Visual Studio or VS Code.
+   */
+  async function completePluginDraft(projectName: string, writtenFilePath: string) {
+    // Persist everything in one atomic update so React closures are never stale.
+    await updateTask(task.id, {
+      status: 'in-progress',
+      selectedPluginProject: projectName,
+      workflowSetup: {
+        ...task.workflowSetup,
+        devTargetKind: 'plugin',
+        pluginProject: projectName,
+        artifactPath:  writtenFilePath,
+      },
+    });
+    // Close the skeleton modal and clear preview state.
+    setSkeletonPreview(null);
+    setShowSkeleton(false);
+    // Refresh the dev panel so the dropdown picks up the project.
+    setDevPanelRefreshTick((t) => t + 1);
+    // Try to open the project — failure is non-fatal: file and state are already saved.
+    const openError = await openPluginProject(projectName);
+    if (openError) {
+      setFeedback(`Draft saved, opening failed: ${openError}`);
+    } else {
+      setFeedback(`Draft saved and plugin opened: ${projectName}`);
     }
   }
 
@@ -1480,6 +1528,13 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
               : undefined
           }
           onClose={() => { setShowSkeleton(false); }}
+          onSaved={(filePath) => {
+            // "Save to File" succeeded inside the modal — complete the full workflow.
+            // selectedPluginProject is guaranteed non-empty when resolvedPluginBase is provided.
+            if (selectedPluginProject) {
+              completePluginDraft(selectedPluginProject, filePath);
+            }
+          }}
           onCreateAndApply={
             // Offer "Create Project & Apply" only when no plugin project is selected yet
             // and we have both a pluginsDir and a customer to derive naming from.
@@ -1500,35 +1555,8 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
                   const targetFile = `${solutionRoot}/${projectName}/${skeletonPreview.fileName}`;
                   await tauriApi.saveGeneratedFile(targetFile, skeletonPreview.content);
 
-                  // Open the project in Visual Studio: prefer .sln, fall back to .csproj, then folder.
-                  const slns = await tauriApi.listDirectoryFiles(solutionRoot, 'sln').catch(() => [] as string[]);
-                  if (slns.length > 0) {
-                    await tauriApi.openWithShell(`${solutionRoot}/${slns[0]}`).catch(() => {});
-                  } else {
-                    const projDir = `${solutionRoot}/${projectName}`;
-                    const csprojs = await tauriApi.listDirectoryFiles(projDir, 'csproj').catch(() => [] as string[]);
-                    if (csprojs.length > 0) {
-                      await tauriApi.openInVscode(`${projDir}/${csprojs[0]}`).catch(() => {});
-                    } else {
-                      await tauriApi.openInVscode(solutionRoot).catch(() => {});
-                    }
-                  }
-
-                  // Persist the selection and artifact path so Open, AI Review and future
-                  // actions all know exactly which project and file to use.
-                  await updateTask(task.id, {
-                    selectedPluginProject: projectName,
-                    workflowSetup: {
-                      ...task.workflowSetup,
-                      pluginProject: projectName,
-                      artifactPath:  targetFile,
-                    },
-                  });
-
-                  setShowSkeleton(false);
-                  setSkeletonPreview(null);
-                  setDevPanelRefreshTick((t) => t + 1);
-                  setFeedback(`Plugin project created and draft applied: ${projectName}`);
+                  // Complete the workflow — persists state, closes modal, refreshes panel, opens project.
+                  await completePluginDraft(projectName, targetFile);
                 }
               : undefined
           }

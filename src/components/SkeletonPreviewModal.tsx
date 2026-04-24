@@ -9,6 +9,12 @@ interface SkeletonPreviewModalProps {
   customer?: Customer;
   onClose: () => void;
   /**
+   * Called after "Save to File" succeeds with the absolute path that was written.
+   * The parent should use this to complete the workflow (persist state, open project, etc.).
+   * When provided the modal closes itself after calling this callback.
+   */
+  onSaved?: (filePath: string) => void;
+  /**
    * When provided and no plugin folder is configured, a "Create Project & Apply" button
    * is shown instead of the disabled "Save to File" button.
    * The callback should create the plugin project and write the draft file.
@@ -52,7 +58,7 @@ function buildSavePath(
   return null;
 }
 
-export default function SkeletonPreviewModal({ preview, customer: _customer, onClose, onCreateAndApply, resolvedPluginBase }: SkeletonPreviewModalProps) {
+export default function SkeletonPreviewModal({ preview, customer: _customer, onClose, onSaved, onCreateAndApply, resolvedPluginBase }: SkeletonPreviewModalProps) {
   const [copied, setCopied]         = useState(false);
   const [saving, setSaving]         = useState(false);
   const [saved, setSaved]           = useState(false);
@@ -79,6 +85,12 @@ export default function SkeletonPreviewModal({ preview, customer: _customer, onC
     try {
       await tauriApi.saveGeneratedFile(savePath, preview.content);
       setSaved(true);
+      // When the parent has registered an onSaved handler, delegate post-save workflow to it
+      // and close the modal. Otherwise just show the "Saved" confirmation inline.
+      if (onSaved) {
+        onSaved(savePath);
+        onClose();
+      }
     } catch (e) {
       setSaveError(String(e));
     } finally {
