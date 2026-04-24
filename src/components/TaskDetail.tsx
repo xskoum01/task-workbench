@@ -1417,6 +1417,7 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
           pluginsDir={pluginsDir}
           scriptFolder={effectiveScriptFolder}
           reviewerConfigs={settings.aiReviewers}
+          effectiveMode={effectiveMode}
           onConfirm={handleConfirmSetup}
           onCancel={() => setShowSetupModal(false)}
         />

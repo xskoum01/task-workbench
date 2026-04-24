@@ -1,9 +1,12 @@
-/**
- * ConfirmSetupModal — shown when the user clicks Analyze on a New task.
+﻿/**
+ * ConfirmSetupModal â€” shown when the user clicks Analyze on a New task.
  *
  * All fields are pre-filled by inferWorkflowSetupDefaults(). If the task
  * already has a confirmed workflowSetup, those values take priority and new
  * inference does not override them.
+ *
+ * When effectiveMode = 'general', developer-specific fields (Target kind,
+ * Plugin project, Script path, AI reviewer) are hidden and cleared on confirm.
  */
 import { useState } from 'react';
 import type { Task, Customer, WorkflowSetup, AiReviewerConfig } from '../types';
@@ -23,6 +26,12 @@ interface ConfirmSetupModalProps {
   scriptFolder: string | undefined;
   /** AI reviewer configs from settings. */
   reviewerConfigs?: AiReviewerConfig[];
+  /**
+   * Effective task mode â€” controls which fields are visible.
+   * 'general' hides all developer-specific fields (target kind, plugin, script, reviewer).
+   * 'developer' shows the full developer setup.
+   */
+  effectiveMode: 'developer' | 'general';
   /** Called when the user clicks Confirm & Analyze. */
   onConfirm: (setup: WorkflowSetup) => void;
   onCancel: () => void;
@@ -36,10 +45,11 @@ export default function ConfirmSetupModal({
   pluginsDir,
   scriptFolder,
   reviewerConfigs,
+  effectiveMode,
   onConfirm,
   onCancel,
 }: ConfirmSetupModalProps) {
-  // Run inference once on mount — workflowSetup values win over guesses inside the helper.
+  // Run inference once on mount â€” workflowSetup values win over guesses inside the helper.
   const { defaults, hints } = inferWorkflowSetupDefaults({
     task,
     customer,
@@ -49,6 +59,8 @@ export default function ConfirmSetupModal({
     scriptFolder,
     reviewerConfigs,
   });
+
+  const isDev = effectiveMode === 'developer';
 
   // --- Form state pre-filled from inference ---
   const [workIntent, setWorkIntent] = useState<WorkflowSetup['workIntent']>(defaults.workIntent);
@@ -83,6 +95,24 @@ export default function ConfirmSetupModal({
   }
 
   function handleConfirm() {
+    if (!isDev) {
+      // General task â€” save only intent + customer; clear all dev-specific fields.
+      const setup: WorkflowSetup = {
+        workIntent,
+        customerId:     customerId || undefined,
+        // Explicitly clear dev fields so stale data does not survive a mode switch.
+        devTargetKind:  undefined,
+        repositoryRoot: undefined,
+        pluginProject:  undefined,
+        scriptPath:     undefined,
+        reviewerId:     undefined,
+        artifactPath:   undefined,
+        confirmedAt:    new Date().toISOString(),
+      };
+      onConfirm(setup);
+      return;
+    }
+
     const setup: WorkflowSetup = {
       workIntent,
       devTargetKind:  devKind,
@@ -98,7 +128,7 @@ export default function ConfirmSetupModal({
 
   return (
     <Modal
-      title="Confirm task setup"
+      title={isDev ? 'Confirm task setup' : 'Confirm task'}
       size="md"
       onClose={onCancel}
       footer={
@@ -134,25 +164,27 @@ export default function ConfirmSetupModal({
           )}
         </div>
 
-        {/* Target kind */}
-        <div className="confirm-setup-row">
-          <label className="form-label confirm-setup-label">Target kind</label>
-          <div className="confirm-setup-kind-group">
-            {(['plugin', 'script', 'repo'] as const).map((kind) => (
-              <button
-                key={kind}
-                type="button"
-                className={`btn btn-sm${devKind === kind ? ' btn-primary' : ' btn-secondary'}`}
-                onClick={() => handleKindChange(kind)}
-              >
-                {kind.charAt(0).toUpperCase() + kind.slice(1)}
-              </button>
-            ))}
+        {/* Target kind â€” developer mode only */}
+        {isDev && (
+          <div className="confirm-setup-row">
+            <label className="form-label confirm-setup-label">Target kind</label>
+            <div className="confirm-setup-kind-group">
+              {(['plugin', 'script', 'repo'] as const).map((kind) => (
+                <button
+                  key={kind}
+                  type="button"
+                  className={`btn btn-sm${devKind === kind ? ' btn-primary' : ' btn-secondary'}`}
+                  onClick={() => handleKindChange(kind)}
+                >
+                  {kind.charAt(0).toUpperCase() + kind.slice(1)}
+                </button>
+              ))}
+            </div>
+            {hints.devTargetKind && (
+              <div className="confirm-setup-inferred">{hints.devTargetKind}</div>
+            )}
           </div>
-          {hints.devTargetKind && (
-            <div className="confirm-setup-inferred">{hints.devTargetKind}</div>
-          )}
-        </div>
+        )}
 
         {/* Customer */}
         {customers.length > 1 && (
@@ -163,19 +195,19 @@ export default function ConfirmSetupModal({
               value={customerId}
               onChange={(e) => setCustomerId(e.target.value)}
             >
-              <option value="">— none —</option>
+              <option value="">â€” none â€”</option>
               {customers.map((c) => (
                 <option key={c.id} value={c.id}>{c.name}</option>
               ))}
             </select>
-            {repoHint && (
+            {isDev && repoHint && (
               <div className="confirm-setup-hint">{repoHint}</div>
             )}
           </div>
         )}
 
-        {/* Plugin project — only when kind = plugin */}
-        {devKind === 'plugin' && (
+        {/* Plugin project â€” developer + plugin only */}
+        {isDev && devKind === 'plugin' && (
           <div className="confirm-setup-row">
             <label className="form-label confirm-setup-label">
               {workIntent === 'create' ? 'New plugin project' : 'Existing plugin project'}
@@ -205,8 +237,8 @@ export default function ConfirmSetupModal({
           </div>
         )}
 
-        {/* Script path — only when kind = script */}
-        {devKind === 'script' && (
+        {/* Script path â€” developer + script only */}
+        {isDev && devKind === 'script' && (
           <div className="confirm-setup-row">
             <label className="form-label confirm-setup-label">
               {workIntent === 'create' ? 'Target script folder' : 'Existing script file or folder'}
@@ -233,8 +265,8 @@ export default function ConfirmSetupModal({
           </div>
         )}
 
-        {/* Reviewer — only for plugin/script tasks (not repo/general) */}
-        {devKind !== 'repo' && allReviewers.length > 0 && (
+        {/* Reviewer â€” developer + plugin/script only */}
+        {isDev && devKind !== 'repo' && allReviewers.length > 0 && (
           <div className="confirm-setup-row">
             <label className="form-label confirm-setup-label">AI reviewer</label>
             <select
@@ -242,7 +274,7 @@ export default function ConfirmSetupModal({
               value={reviewerId}
               onChange={(e) => setReviewerId(e.target.value)}
             >
-              <option value="">— auto-select —</option>
+              <option value="">â€” auto-select â€”</option>
               {allReviewers.map((r) => (
                 <option key={r.id} value={r.id}>{r.name}</option>
               ))}
