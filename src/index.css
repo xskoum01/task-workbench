@@ -5064,6 +5064,12 @@ body {
   white-space: nowrap;
 }
 
+.confirm-setup-hint--warn {
+  font-family: inherit;
+  color: var(--color-warning, #c4a000);
+  white-space: normal;
+}
+
 /* Subtle label shown below a field when its value was auto-inferred */
 .confirm-setup-inferred {
   font-size: 11px;

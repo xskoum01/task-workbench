@@ -1,202 +1,119 @@
-/**
- * workflowPlan.ts — centralized task workflow planner.
- *
- * buildTaskWorkflowPlan() derives the full workflow configuration from a task
- * and its confirmed WorkflowSetup. All components (TaskDetail, InlineTaskPanel,
- * WorkflowStepper) consume this plan instead of scattering logic.
- *
- * Three workflow shapes:
- *   1. repo/general  — simplified:  New → Analyzed → Done
- *   2. review intent + plugin/script — New → Analyzed → For Review → Done
- *   3. create/update/fix + plugin/script — full: New → Analyzed → In Progress → For Review → Done
- *
- * Backward compatibility: tasks without workflowSetup fall back to heuristics.
- */
-import type { Task, TaskStatus, WorkflowSetup } from '../types';
-
-// ---------------------------------------------------------------------------
-// Stage descriptor
-// ---------------------------------------------------------------------------
+﻿import type { Task, TaskStatus, WorkflowSetup } from '../types';
 
 export interface WorkflowStage {
   id: TaskStatus;
-  /** Short label shown in the BPF strip */
   label: string;
-  /** Label on the clickable action inside the current stage button */
   actionLabel: string;
-  /** Status to advance to when this stage's action is triggered. null = terminal. */
   next: TaskStatus | null;
 }
 
-// ---------------------------------------------------------------------------
-// Plan output
-// ---------------------------------------------------------------------------
+export type WorkflowKind =
+  | 'dev-create'
+  | 'dev-update'
+  | 'dev-fix'
+  | 'dev-review'
+  | 'general';
+
+export type TargetKind = 'plugin' | 'script' | 'repo';
+
+export type PlanAction =
+  | 'analyze'
+  | 'generate-draft'
+  | 'start-work'
+  | 'run-review'
+  | 'mark-done'
+  | 'none';
 
 export interface TaskWorkflowPlan {
-  /** Ordered stage definitions for the BPF strip */
   stages: WorkflowStage[];
-  /** Which action will be triggered when the BPF step is clicked */
+  workflowKind: WorkflowKind;
+  targetKind: TargetKind;
+  currentAction: PlanAction;
   currentActionLabel: string;
-  /** What the dispatcher should do for the current status */
-  currentAction: 'analyze' | 'generate-draft' | 'run-review' | 'mark-done' | 'none';
-  /** Show Script/Plugin dev tools (TaskDevModePanel) */
   requiresDevTools: boolean;
-  /** Generate Draft action is relevant for this task */
   requiresDraftGeneration: boolean;
-  /** AI file review action is relevant for this task */
+  draftIsPrimaryAction: boolean;
+  requiresExistingArtifact: boolean;
   requiresAiFileReview: boolean;
-  /** Create Plugin Project button is relevant */
   requiresPluginCreate: boolean;
-  /** Whether this is a "create new" intent (vs edit/fix/review existing) */
-  isCreateIntent: boolean;
+  requiresScriptCreate: boolean;
+  shouldInferReviewFile: boolean;
 }
-
-// ---------------------------------------------------------------------------
-// Stage library — we pick from these per workflow shape
-// ---------------------------------------------------------------------------
-
-const STAGE_NEW: WorkflowStage = {
-  id: 'new',
-  label: 'New',
-  actionLabel: 'Analyze',
-  next: 'analyzed',
-};
-
-const STAGE_ANALYZED_DRAFT: WorkflowStage = {
-  id: 'analyzed',
-  label: 'Analyzed',
-  actionLabel: 'Generate Draft',
-  next: 'in-progress',
-};
-
-const STAGE_ANALYZED_START: WorkflowStage = {
-  id: 'analyzed',
-  label: 'Analyzed',
-  actionLabel: 'Start Work',
-  next: 'in-progress',
-};
-
-const STAGE_ANALYZED_REVIEW: WorkflowStage = {
-  id: 'analyzed',
-  label: 'Analyzed',
-  actionLabel: 'Run Review',
-  next: 'ready-for-review',
-};
-
-const STAGE_ANALYZED_DONE: WorkflowStage = {
-  id: 'analyzed',
-  label: 'Analyzed',
-  actionLabel: 'Mark Done',
-  next: 'done',
-};
-
-const STAGE_IN_PROGRESS: WorkflowStage = {
-  id: 'in-progress',
-  label: 'In Progress',
-  actionLabel: 'Send for Review',
-  next: 'ready-for-review',
-};
-
-const STAGE_FOR_REVIEW: WorkflowStage = {
-  id: 'ready-for-review',
-  label: 'For Review',
-  actionLabel: 'Mark Done',
-  next: 'done',
-};
-
-const STAGE_DONE: WorkflowStage = {
-  id: 'done',
-  label: 'Done',
-  actionLabel: 'Completed',
-  next: null,
-};
-
-// ---------------------------------------------------------------------------
-// Shape helpers
-// ---------------------------------------------------------------------------
 
 type DevKind = NonNullable<WorkflowSetup['devTargetKind']>;
 type WorkIntent = NonNullable<WorkflowSetup['workIntent']>;
 
-/** Is the task targeting code (plugin or script)? */
-function isCodeTask(kind: DevKind): boolean {
-  return kind === 'plugin' || kind === 'script';
-}
-
-// ---------------------------------------------------------------------------
-// Main builder
-// ---------------------------------------------------------------------------
+const S_NEW: WorkflowStage = { id: 'new', label: 'New', actionLabel: 'Analyze', next: 'analyzed' };
+const S_ANA_DRAFT: WorkflowStage = { id: 'analyzed', label: 'Analyzed', actionLabel: 'Generate Draft', next: 'in-progress' };
+const S_ANA_START: WorkflowStage = { id: 'analyzed', label: 'Analyzed', actionLabel: 'Start Work', next: 'in-progress' };
+const S_ANA_FIX: WorkflowStage = { id: 'analyzed', label: 'Analyzed', actionLabel: 'Start Fixing', next: 'in-progress' };
+const S_ANA_REVIEW: WorkflowStage = { id: 'analyzed', label: 'Analyzed', actionLabel: 'Run Review', next: 'ready-for-review' };
+const S_ANA_DONE: WorkflowStage = { id: 'analyzed', label: 'Analyzed', actionLabel: 'Mark Done', next: 'done' };
+const S_IN_PROGRESS: WorkflowStage = { id: 'in-progress', label: 'In Progress', actionLabel: 'Send for Review', next: 'ready-for-review' };
+const S_FOR_REVIEW: WorkflowStage = { id: 'ready-for-review', label: 'For Review', actionLabel: 'Mark Done', next: 'done' };
+const S_DONE: WorkflowStage = { id: 'done', label: 'Done', actionLabel: 'Completed', next: null };
 
 export function buildTaskWorkflowPlan(task: Task, heuristicKind?: DevKind): TaskWorkflowPlan {
   const setup = task.workflowSetup;
-  // Confirmed setup wins; fall back to heuristic if no setup has been confirmed.
-  // When neither is available, default to 'repo' (simplified workflow).
   const devKind: DevKind = setup?.devTargetKind ?? heuristicKind ?? 'repo';
   const workIntent: WorkIntent = setup?.workIntent ?? 'update';
-  const isCreate = workIntent === 'create';
-  const isReview = workIntent === 'review';
-  const isCode   = isCodeTask(devKind);
 
-  // ── Stage list ─────────────────────────────────────────────────────────────
+  const isCode   = devKind === 'plugin' || devKind === 'script';
+  const isCreate = workIntent === 'create';
+  const isFix    = workIntent === 'fix';
+  const isReview = workIntent === 'review';
+
+  let workflowKind: WorkflowKind;
+  if (!isCode)      workflowKind = 'general';
+  else if (isCreate) workflowKind = 'dev-create';
+  else if (isFix)    workflowKind = 'dev-fix';
+  else if (isReview) workflowKind = 'dev-review';
+  else               workflowKind = 'dev-update';
 
   let stages: WorkflowStage[];
-  let currentAction: TaskWorkflowPlan['currentAction'] = 'none';
-
   if (!isCode) {
-    // Simplified: New → Analyzed → Done
-    stages = [STAGE_NEW, STAGE_ANALYZED_DONE, STAGE_DONE];
+    stages = [S_NEW, S_ANA_DONE, S_DONE];
   } else if (isReview) {
-    // Review path: skip draft generation
-    stages = [STAGE_NEW, STAGE_ANALYZED_REVIEW, STAGE_FOR_REVIEW, STAGE_DONE];
+    stages = [S_NEW, S_ANA_REVIEW, S_FOR_REVIEW, S_DONE];
   } else {
-    // Full dev path: New → Analyzed → In Progress → For Review → Done
-    const analyzedStage = isCreate ? STAGE_ANALYZED_DRAFT : STAGE_ANALYZED_START;
-    stages = [STAGE_NEW, analyzedStage, STAGE_IN_PROGRESS, STAGE_FOR_REVIEW, STAGE_DONE];
+    const mid = isCreate ? S_ANA_DRAFT : isFix ? S_ANA_FIX : S_ANA_START;
+    stages = [S_NEW, mid, S_IN_PROGRESS, S_FOR_REVIEW, S_DONE];
   }
 
-  // Current stage's action label
-  const currentStage = stages.find((s) => s.id === task.status);
-  const currentActionLabel = currentStage?.actionLabel ?? 'Analyze';
-
-  // Map task status to action dispatcher
+  let currentAction: PlanAction = 'none';
   switch (task.status) {
     case 'new':
-      currentAction = 'analyze';
-      break;
+      currentAction = 'analyze'; break;
     case 'analyzed':
-      if (!isCode) {
-        currentAction = 'mark-done';
-      } else if (isReview) {
-        currentAction = 'run-review';
-      } else {
-        currentAction = 'generate-draft';
-      }
+      if (!isCode)       currentAction = 'mark-done';
+      else if (isReview) currentAction = 'run-review';
+      else if (isCreate) currentAction = 'generate-draft';
+      else               currentAction = 'start-work';
       break;
     case 'in-progress':
-      currentAction = 'run-review';
-      break;
+      currentAction = 'run-review'; break;
     case 'ready-for-review':
-      currentAction = 'mark-done';
-      break;
+      currentAction = 'mark-done'; break;
     default:
       currentAction = 'none';
   }
 
-  // ── Feature flags ──────────────────────────────────────────────────────────
-
-  const requiresDevTools = isCode;
-  const requiresDraftGeneration = isCode && !isReview;
-  const requiresAiFileReview = isCode;
-  const requiresPluginCreate = devKind === 'plugin' && isCreate;
+  const currentStage = stages.find((s) => s.id === task.status);
+  const currentActionLabel = currentStage?.actionLabel ?? 'Analyze';
 
   return {
     stages,
-    currentActionLabel,
+    workflowKind,
+    targetKind: devKind as TargetKind,
     currentAction,
-    requiresDevTools,
-    requiresDraftGeneration,
-    requiresAiFileReview,
-    requiresPluginCreate,
-    isCreateIntent: isCreate,
+    currentActionLabel,
+    requiresDevTools:         isCode,
+    requiresDraftGeneration:  isCode && !isReview,
+    draftIsPrimaryAction:     isCode && isCreate,
+    requiresExistingArtifact: isCode && !isCreate,
+    requiresAiFileReview:     isCode,
+    requiresPluginCreate:     devKind === 'plugin' && isCreate,
+    requiresScriptCreate:     devKind === 'script' && isCreate,
+    shouldInferReviewFile:    isCode && !isCreate,
   };
 }

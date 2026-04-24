@@ -500,16 +500,45 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
   }
 
   /**
+   * Opens the code artifact for the task and advances to In Progress.
+   * Used for Update / Fix scenarios where the task works on an existing file.
+   */
+  async function handleStartWork() {
+    try {
+      if (devTarget.kind === 'plugin' && pluginsDir && selectedPluginProject) {
+        const pluginPath = `${pluginsDir}/${selectedPluginProject}`;
+        // Prefer .sln for Visual Studio, fall back to .csproj / folder.
+        const slns = await tauriApi.listDirectoryFiles(pluginPath, 'sln').catch(() => [] as string[]);
+        if (slns.length > 0) {
+          await tauriApi.openWithShell(`${pluginPath}/${slns[0]}`);
+        } else {
+          await tauriApi.openInVscode(pluginPath);
+        }
+      } else if (devTarget.kind === 'script' && effectiveScriptFolder) {
+        await tauriApi.openInVscode(effectiveScriptFolder);
+      } else if (effectiveVscodePath) {
+        await tauriApi.openInVscode(effectiveVscodePath);
+      }
+    } catch (e) {
+      setFsError(String(e));
+    }
+    // Advance status regardless — user may have already opened the file manually.
+    await handleStatusChange('in-progress');
+    setFeedback('Status set to In Progress — start working in the opened project');
+  }
+
+  /**
    * Single dispatcher for all stage-advancing actions.
    * Called by the BPF stepper and by right-panel buttons.
    * Uses the centralized workflow plan so the action matches the stage.
    */
   function runCurrentStageAction() {
     switch (plan.currentAction) {
-      case 'analyze':        openSetupModal();       break;
-      case 'generate-draft': handleGenerateDraft();  break;
-      case 'run-review':     handleSendForReview();  break;
-      case 'mark-done':      handleMarkDone();        break;
+      case 'analyze':        openSetupModal();      break;
+      case 'generate-draft': handleGenerateDraft(); break;
+      case 'start-work':     handleStartWork();     break;
+      case 'run-review':     handleSendForReview(); break;
+      case 'mark-done':      handleMarkDone();      break;
       default: break;
     }
   }
@@ -1007,33 +1036,55 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
                   ? <><span className="btn-spinner" /> Analysing…</>
                   : <><Icon name="search" size={13} /> Analyze</>}
               </button>
-              {plan.requiresDraftGeneration && (
-              <button
-                className="btn btn-secondary btn-sm"
-                onClick={handleGenerateDraft}
-                disabled={
-                  !!aiLoading ||
-                  (devTarget.kind !== 'plugin' && !effectiveScriptFolder)
-                }
-                title={devTarget.kind === 'plugin'
-                  ? 'Generate C# plugin class draft (preview before writing)'
-                  : !effectiveScriptFolder
-                    ? 'No script folder configured for this customer'
-                    : 'Use Script Assistant below to generate a draft'}
-              >
-                {aiLoading === 'draft'
-                  ? <><span className="btn-spinner" /> Generating…</>
-                  : <><Icon name="layers" size={13} /> Generate Draft</>}
-              </button>
+
+              {/* Start Work — update/fix scenarios: open existing artifact and advance */}
+              {(plan.currentAction === 'start-work' || plan.workflowKind === 'dev-update' || plan.workflowKind === 'dev-fix') &&
+               task.status === 'analyzed' && (
+                <button
+                  className="btn btn-primary btn-sm"
+                  onClick={handleStartWork}
+                  disabled={!!aiLoading}
+                  title={devTarget.kind === 'plugin'
+                    ? 'Open plugin project and start working'
+                    : 'Open script and start working'}
+                >
+                  <Icon name="terminal" size={13} />
+                  {plan.workflowKind === 'dev-fix' ? 'Start Fixing' : 'Start Work'}
+                </button>
               )}
-              {/* Apply Draft — shown for plugin (skeletonPreview ready) or script (scriptHasDraft) */}
+
+              {/* Generate Draft — primary for create; optional helper for update/fix */}
+              {plan.requiresDraftGeneration && (
+                <button
+                  className={`btn btn-sm ${plan.draftIsPrimaryAction ? 'btn-primary' : 'btn-secondary'}`}
+                  onClick={handleGenerateDraft}
+                  disabled={
+                    !!aiLoading ||
+                    (devTarget.kind !== 'plugin' && !effectiveScriptFolder)
+                  }
+                  title={devTarget.kind === 'plugin'
+                    ? plan.draftIsPrimaryAction
+                      ? 'Generate C# plugin class draft (preview before writing)'
+                      : 'Generate a draft patch or class skeleton (optional)'
+                    : !effectiveScriptFolder
+                      ? 'No script folder configured for this customer'
+                      : plan.draftIsPrimaryAction
+                        ? 'Generate a new script skeleton via Script Assistant'
+                        : 'Generate a draft script snippet (optional helper)'}
+                >
+                  {aiLoading === 'draft'
+                    ? <><span className="btn-spinner" /> Generating…</>
+                    : <><Icon name="layers" size={13} /> {plan.draftIsPrimaryAction ? 'Generate Draft' : 'Draft Snippet'}</>}
+                </button>
+              )}
+
+              {/* Apply Draft */}
               {plan.requiresDraftGeneration && (skeletonPreview || scriptHasDraft) && (
                 <button
                   className="btn btn-secondary btn-sm"
                   onClick={handleApplyDraft}
                   disabled={
                     !!aiLoading ||
-                    // Plugin draft requires a project selection before it can be written.
                     (devTarget.kind === 'plugin' && !!skeletonPreview && !selectedPluginProject)
                   }
                   title={
@@ -1047,12 +1098,12 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
                   <Icon name="check" size={13} /> Apply Draft
                 </button>
               )}
+
+              {/* Create Plugin Project — create + plugin only */}
               {devTarget.kind === 'plugin' && pluginsDir && plan.requiresPluginCreate && (
                 <button
                   className="btn btn-secondary btn-sm"
                   onClick={async () => {
-                    // Load existing plugin projects so the modal can use them for
-                    // naming-convention auto-suggestions.
                     const folders = await tauriApi.listSubfolders(pluginsDir).catch(() => [] as string[]);
                     setPluginProjectsForModal(folders);
                     setShowCreatePlugin(true);
@@ -1066,7 +1117,7 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
             </div>
           </div>
 
-          {/* SCRIPT ASSISTANT — shown only for script tasks with a resolvable script folder. */}
+          {/* SCRIPT ASSISTANT — for all script dev tasks (create writes new file, update/fix patches existing). */}
           {customer && effectiveScriptFolder && devTarget.kind !== 'plugin' && plan.requiresDraftGeneration && (
             <ScriptAssistantPanel
               ref={scriptPanelRef}

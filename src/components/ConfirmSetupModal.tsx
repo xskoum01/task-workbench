@@ -177,15 +177,17 @@ export default function ConfirmSetupModal({
         {/* Plugin project — only when kind = plugin */}
         {devKind === 'plugin' && (
           <div className="confirm-setup-row">
-            <label className="form-label confirm-setup-label">Plugin project</label>
+            <label className="form-label confirm-setup-label">
+              {workIntent === 'create' ? 'New plugin project' : 'Existing plugin project'}
+            </label>
             <input
               className="form-input"
               type="text"
               value={pluginProject}
               placeholder={
                 workIntent === 'create'
-                  ? 'New plugin project name (will be created)'
-                  : pluginsDir ? `Existing subfolder inside ${pluginsDir}` : 'Existing plugin project folder name'
+                  ? 'Name for the new plugin project (will be created)'
+                  : pluginsDir ? `Subfolder inside ${pluginsDir}` : 'Plugin project folder name'
               }
               onChange={(e) => setPluginProject(e.target.value)}
             />
@@ -195,22 +197,38 @@ export default function ConfirmSetupModal({
             {workIntent !== 'create' && pluginsDir && (
               <div className="confirm-setup-hint">Inside: {pluginsDir}</div>
             )}
+            {workIntent !== 'create' && !pluginProject && (
+              <div className="confirm-setup-hint confirm-setup-hint--warn">
+                Select or enter an existing project to enable AI Review.
+              </div>
+            )}
           </div>
         )}
 
         {/* Script path — only when kind = script */}
         {devKind === 'script' && (
           <div className="confirm-setup-row">
-            <label className="form-label confirm-setup-label">Script folder / file</label>
+            <label className="form-label confirm-setup-label">
+              {workIntent === 'create' ? 'Target script folder' : 'Existing script file or folder'}
+            </label>
             <input
               className="form-input"
               type="text"
               value={scriptPath}
-              placeholder="Absolute path to script or folder"
+              placeholder={
+                workIntent === 'create'
+                  ? 'Folder where the new script will be created'
+                  : 'Absolute path to existing .js / .ts file or folder'
+              }
               onChange={(e) => setScriptPath(e.target.value)}
             />
             {hints.scriptPath && (
               <div className="confirm-setup-inferred">{hints.scriptPath}</div>
+            )}
+            {workIntent !== 'create' && !scriptPath && (
+              <div className="confirm-setup-hint confirm-setup-hint--warn">
+                Select an existing file or folder to enable AI Review.
+              </div>
             )}
           </div>
         )}
