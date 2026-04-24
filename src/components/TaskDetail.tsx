@@ -528,10 +528,11 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
       const projDir  = `${solutionRoot}/${projectName}`;
       const csprojs  = await tauriApi.listDirectoryFiles(projDir, 'csproj').catch(() => [] as string[]);
       if (csprojs.length > 0) {
-        await tauriApi.openInVscode(`${projDir}/${csprojs[0]}`);
+        await tauriApi.openWithShell(`${projDir}/${csprojs[0]}`);
         return null;
       }
-      await tauriApi.openInVscode(solutionRoot);
+      // No .sln or .csproj — open the solution root folder with the OS default (Explorer).
+      await tauriApi.openWithShell(solutionRoot);
       return null;
     } catch (e) {
       return String(e);

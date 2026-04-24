@@ -336,13 +336,13 @@ export default forwardRef<TaskDevModePanelHandle, TaskDevModePanelProps>(functio
       const csprojs = await tauriApi.listDirectoryFiles(pluginPath, 'csproj');
       if (csprojs.length > 0) {
         const target = `${pluginPath}/${csprojs[0]}`;
-        console.log('[devTarget] final path=', target, '(from .csproj → VS Code)');
-        await tauriApi.openInVscode(target); return;
+        console.log('[devTarget] final path=', target, '(from .csproj → Visual Studio)');
+        await tauriApi.openWithShell(target); return;
       }
       const exists = await tauriApi.checkPathExists(pluginPath);
       if (!exists) { onError('Plugin not found on the current branch or path.'); return; }
       console.log('[devTarget] final path=', pluginPath, '(folder — no .sln/.csproj)');
-      await tauriApi.openInVscode(pluginPath);
+      await tauriApi.openWithShell(pluginPath);
     } catch (e) { onError(String(e)); }
   }
 
@@ -651,7 +651,7 @@ export default forwardRef<TaskDevModePanelHandle, TaskDevModePanelProps>(functio
             }
           >
             <Icon name="terminal" size={13} />{' '}
-            {pluginOpenHint?.startsWith('.sln') ? 'Open Plugin in Visual Studio' : 'Open Plugin in VS Code'}
+            {pluginOpenHint?.startsWith('.sln') || pluginOpenHint?.startsWith('.csproj') ? 'Open Plugin in Visual Studio' : 'Open Plugin Folder'}
           </button>
         </>
       ) : (

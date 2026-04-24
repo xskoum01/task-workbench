@@ -793,43 +793,120 @@ fn create_plugin_project_from_template(
         let proj_dir = dest.join(&project_name);
         fs::create_dir_all(&proj_dir).map_err(|e| format!("Failed to create project folder: {e}"))?;
 
+        // Properties/ subfolder (needed for AssemblyInfo.cs — required by the old MSBuild format)
+        let props_dir = proj_dir.join("Properties");
+        fs::create_dir_all(&props_dir).map_err(|e| format!("Failed to create Properties folder: {e}"))?;
+
         // Resolve the latest stable CrmSdk version from NuGet; fall back to a known-good version.
         let crmsdk_version = resolve_nuget_version("Microsoft.CrmSdk.CoreAssemblies", "9.0.2.49");
 
-        // Minimal .csproj (targets .NET Framework 4.6.2 — standard for Dataverse plugins)
+        // Generate a proper GUID for the project reference inside the .sln
+        let proj_guid = format!("{:08X}-{:04X}-{:04X}-{:04X}-{:012X}",
+            0xAABBCCDDu32, 0x1234u16, 0x5678u16, 0x9ABCu16, 0x0123456789ABu64);
+
+        // Old-style MSBuild .csproj — this is what Visual Studio recognises as
+        // "Class Library (.NET Framework)".  SDK-style projects targeting net462
+        // open differently and cannot carry the classic project type GUID.
         let csproj = format!(
-            r#"<Project Sdk="Microsoft.NET.Sdk">
+            r#"<?xml version="1.0" encoding="utf-8"?>
+<Project ToolsVersion="15.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <Import Project="$(MSBuildExtensionsPath)\$(MSBuildToolsVersion)\Microsoft.Common.props"
+          Condition="Exists('$(MSBuildExtensionsPath)\$(MSBuildToolsVersion)\Microsoft.Common.props')" />
   <PropertyGroup>
-    <TargetFramework>net462</TargetFramework>
-    <AssemblyName>{project_name}</AssemblyName>
+    <Configuration Condition=" '$(Configuration)' == '' ">Debug</Configuration>
+    <Platform Condition=" '$(Platform)' == '' ">AnyCPU</Platform>
+    <ProjectGuid>{{{proj_guid}}}</ProjectGuid>
+    <OutputType>Library</OutputType>
+    <AppDesignerFolder>Properties</AppDesignerFolder>
     <RootNamespace>{namespace}</RootNamespace>
-    <Nullable>disable</Nullable>
-    <GenerateAssemblyInfo>false</GenerateAssemblyInfo>
+    <AssemblyName>{project_name}</AssemblyName>
+    <TargetFrameworkVersion>v4.6.2</TargetFrameworkVersion>
+    <FileAlignment>512</FileAlignment>
+    <Deterministic>true</Deterministic>
+    <NuGetPackageImportStamp></NuGetPackageImportStamp>
+  </PropertyGroup>
+  <PropertyGroup Condition=" '$(Configuration)|$(Platform)' == 'Debug|AnyCPU' ">
+    <DebugSymbols>true</DebugSymbols>
+    <DebugType>full</DebugType>
+    <Optimize>false</Optimize>
+    <OutputPath>bin\Debug\</OutputPath>
+    <DefineConstants>DEBUG;TRACE</DefineConstants>
+    <ErrorReport>prompt</ErrorReport>
+    <WarningLevel>4</WarningLevel>
+  </PropertyGroup>
+  <PropertyGroup Condition=" '$(Configuration)|$(Platform)' == 'Release|AnyCPU' ">
+    <DebugType>pdbonly</DebugType>
+    <Optimize>true</Optimize>
+    <OutputPath>bin\Release\</OutputPath>
+    <DefineConstants>TRACE</DefineConstants>
+    <ErrorReport>prompt</ErrorReport>
+    <WarningLevel>4</WarningLevel>
   </PropertyGroup>
   <ItemGroup>
-    <PackageReference Include="Microsoft.CrmSdk.CoreAssemblies" Version="{crmsdk_version}" />
+    <Reference Include="System" />
+    <Reference Include="System.Core" />
+    <Reference Include="System.Xml" />
   </ItemGroup>
+  <ItemGroup>
+    <Compile Include="Properties\AssemblyInfo.cs" />
+  </ItemGroup>
+  <ItemGroup>
+    <PackageReference Include="Microsoft.CrmSdk.CoreAssemblies">
+      <Version>{crmsdk_version}</Version>
+    </PackageReference>
+  </ItemGroup>
+  <Import Project="$(MSBuildToolsPath)\Microsoft.CSharp.targets" />
 </Project>
 "#
         );
         fs::write(proj_dir.join(format!("{project_name}.csproj")), &csproj)
             .map_err(|e| format!("Failed to write .csproj: {e}"))?;
 
-        // .sln goes in the solution root; .csproj path is relative: <ProjectName>/<ProjectName>.csproj
-        let sln_guid = "FAE04EC0-301F-11D3-BF4B-00C04F79EFBC"; // C# project type GUID
-        let proj_guid = "00000000-0000-0000-0000-000000000001";
-        let sln = format!(
-            "Microsoft Visual Studio Solution File, Format Version 12.00\n\
-# Visual Studio Version 17\nVisualStudioVersion = 17.0.0.0\n\
-Project(\"{{{sln_guid}}}\") = \"{project_name}\", \"{project_name}\\{project_name}.csproj\", \"{{{proj_guid}}}\"\n\
-EndProject\nGlobal\n\
-\tGlobalSection(SolutionConfigurationPlatforms) = preSolution\n\
-\t\tDebug|Any CPU = Debug|Any CPU\n\
-\t\tRelease|Any CPU = Release|Any CPU\n\
-\tEndGlobalSection\n\
-EndGlobal\n"
+        // AssemblyInfo.cs — required by the old MSBuild project format.
+        let assembly_info = format!(
+            r#"using System.Reflection;
+using System.Runtime.InteropServices;
+
+[assembly: AssemblyTitle("{project_name}")]
+[assembly: AssemblyDescription("Dataverse plugin assembly")]
+[assembly: AssemblyConfiguration("")]
+[assembly: AssemblyCompany("")]
+[assembly: AssemblyProduct("{project_name}")]
+[assembly: AssemblyCopyright("")]
+[assembly: AssemblyTrademark("")]
+[assembly: ComVisible(false)]
+[assembly: AssemblyVersion("1.0.0.0")]
+[assembly: AssemblyFileVersion("1.0.0.0")]
+"#
         );
-        fs::write(dest.join(format!("{project_name}.sln")), &sln)
+        fs::write(props_dir.join("AssemblyInfo.cs"), assembly_info)
+            .map_err(|e| format!("Failed to write AssemblyInfo.cs: {e}"))?;
+
+        // C# project type GUID for the old-style MSBuild format
+        let cs_project_type_guid = "FAE04EC0-301F-11D3-BF4B-00C04F79EFBC";
+
+        // .sln goes in the solution root; .csproj path is relative: <ProjectName>\<ProjectName>.csproj
+        let sln = format!(
+            "\u{feff}\r\nMicrosoft Visual Studio Solution File, Format Version 12.00\r\n\
+# Visual Studio Version 17\r\n\
+VisualStudioVersion = 17.0.31903.59\r\n\
+MinimumVisualStudioVersion = 10.0.40219.1\r\n\
+Project(\"{{{cs_project_type_guid}}}\") = \"{project_name}\", \"{project_name}\\{project_name}.csproj\", \"{{{proj_guid}}}\"\r\n\
+EndProject\r\n\
+Global\r\n\
+\tGlobalSection(SolutionConfigurationPlatforms) = preSolution\r\n\
+\t\tDebug|Any CPU = Debug|Any CPU\r\n\
+\t\tRelease|Any CPU = Release|Any CPU\r\n\
+\tEndGlobalSection\r\n\
+\tGlobalSection(ProjectConfigurationPlatforms) = postSolution\r\n\
+\t\t{{{proj_guid}}}.Debug|Any CPU.ActiveCfg = Debug|Any CPU\r\n\
+\t\t{{{proj_guid}}}.Debug|Any CPU.Build.0 = Debug|Any CPU\r\n\
+\t\t{{{proj_guid}}}.Release|Any CPU.ActiveCfg = Release|Any CPU\r\n\
+\t\t{{{proj_guid}}}.Release|Any CPU.Build.0 = Release|Any CPU\r\n\
+\tEndGlobalSection\r\n\
+EndGlobal\r\n"
+        );
+        fs::write(dest.join(format!("{project_name}.sln")), sln.as_bytes())
             .map_err(|e| format!("Failed to write .sln: {e}"))?;
 
         if create_initial_class {
