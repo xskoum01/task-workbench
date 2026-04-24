@@ -46,6 +46,14 @@ export function openInVscode(path: string): Promise<void> {
   return invoke('open_in_vscode', { path });
 }
 
+/**
+ * Opens a VS Code workspace folder, and optionally also opens a specific file
+ * in the same VS Code instance. Runs: code "<workspacePath>" ["<filePath>"]
+ */
+export function openInVscodeWorkspace(workspacePath: string, filePath?: string): Promise<void> {
+  return invoke('open_in_vscode_workspace', { workspacePath, filePath: filePath ?? null });
+}
+
 /** Open a file/folder using the OS default application (file association). */
 export function openWithShell(path: string): Promise<void> {
   return invoke('open_with_shell', { path });

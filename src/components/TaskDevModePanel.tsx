@@ -104,6 +104,7 @@ export interface TaskDevModePanelHandle {
 
 export default forwardRef<TaskDevModePanelHandle, TaskDevModePanelProps>(function TaskDevModePanel({
   task,
+  customer,
   pluginsDir,
   repoRootForGit,
   defaultMode,
@@ -352,11 +353,40 @@ export default forwardRef<TaskDevModePanelHandle, TaskDevModePanelProps>(functio
   }
 
   async function handleOpenScript() {
-    // When a specific artifact was created (Create workflow), open the file directly.
-    const target = artifactPath ?? scriptOpenPath;
-    if (!target) { onError('No script path configured for this customer.'); return; }
-    try { await tauriApi.openInVscode(target); }
-    catch (e) { onError(String(e)); }
+    // Prefer the specific artifact file (created or selected), fall back to scriptOpenPath.
+    const filePath = artifactPath ?? scriptOpenPath;
+    if (!filePath) { onError('No script path configured for this customer.'); return; }
+
+    // Determine whether filePath is a concrete file or just a folder.
+    const norm = filePath.replace(/\\/g, '/');
+    const lower = norm.toLowerCase();
+    const isFile = lower.endsWith('.js') || lower.endsWith('.ts')
+                || lower.endsWith('.jsx') || lower.endsWith('.tsx');
+
+    try {
+      if (isFile) {
+        // File: open workspace root + the file so VS Code has full repo context.
+        const workspaceRoot =
+          customer?.resolvedRepositoryPath ??
+          customer?.repositoryRoot ??
+          (() => {
+            // Climb up from CRM_Code/Scripts/... to CRM_Code
+            const crmIdx = norm.toLowerCase().lastIndexOf('/crm_code/');
+            if (crmIdx !== -1) return norm.slice(0, crmIdx + '/crm_code'.length);
+            // Fall back to parent folder of the file.
+            const slash = norm.lastIndexOf('/');
+            return slash > 0 ? norm.slice(0, slash) : undefined;
+          })();
+        if (workspaceRoot) {
+          await tauriApi.openInVscodeWorkspace(workspaceRoot, filePath);
+        } else {
+          await tauriApi.openInVscode(filePath);
+        }
+      } else {
+        // It is already a folder — open it as-is.
+        await tauriApi.openInVscode(filePath);
+      }
+    } catch (e) { onError(String(e)); }
   }
 
   function handleRefreshPlugins() {

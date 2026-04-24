@@ -247,6 +247,51 @@ fn open_in_vscode(path: String) -> Result<(), String> {
     })
 }
 
+/// Opens a workspace folder in VS Code, and optionally also opens a specific file.
+/// Runs: code "<workspace_path>" ["<file_path>"]
+/// This keeps the workspace context while jumping to the file.
+#[tauri::command]
+fn open_in_vscode_workspace(workspace_path: String, file_path: Option<String>) -> Result<(), String> {
+    let wp = std::path::Path::new(&workspace_path);
+    if !wp.exists() {
+        return Err(format!("Workspace path not found: {workspace_path}"));
+    }
+
+    let mut args: Vec<String> = Vec::new();
+    args.push(workspace_path.clone());
+    if let Some(ref fp) = file_path {
+        let fp_path = std::path::Path::new(fp);
+        if fp_path.exists() {
+            args.push(fp.clone());
+        }
+    }
+
+    eprintln!("[open_in_vscode_workspace] code {:?}", args);
+
+    #[cfg(target_os = "windows")]
+    let result = {
+        let mut cmd = std::process::Command::new("cmd");
+        cmd.arg("/c").arg("code");
+        for a in &args { cmd.arg(a); }
+        cmd.spawn()
+    };
+    #[cfg(not(target_os = "windows"))]
+    let result = {
+        let mut cmd = std::process::Command::new("code");
+        for a in &args { cmd.arg(a); }
+        cmd.spawn()
+    };
+
+    result.map(|_| ()).map_err(|e| {
+        eprintln!("[open_in_vscode_workspace] failed: {e}");
+        if e.kind() == std::io::ErrorKind::NotFound {
+            "VS Code not found. Make sure 'code' is on PATH.".to_string()
+        } else {
+            format!("Failed to launch VS Code: {e}")
+        }
+    })
+}
+
 /// Open a file or folder using the OS default application (respects file
 /// associations, so .sln opens Visual Studio, .pdf opens a viewer, etc.).
 /// Uses `cmd /c start "" "path"` on Windows for correct association handling.
@@ -3800,6 +3845,7 @@ pub fn run() {
             save_settings,
             open_path,
             open_in_vscode,
+            open_in_vscode_workspace,
             open_with_shell,
             pick_folder,
             pick_file,

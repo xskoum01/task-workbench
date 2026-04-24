@@ -631,27 +631,64 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
   }
 
   /**
+   * Resolves the best VS Code workspace root for a script task.
+   * The workspace root is the repo or CRM folder — not the script file itself.
+   * Priority:
+   *   1. customer.resolvedRepositoryPath
+   *   2. customer.repositoryRoot
+   *   3. crmFolderPath (settings.crmBaseDirectory + customer.folderName)
+   *   4. Parent of CRM_Code folder (if script lives inside .../CRM_Code/...)
+   *   5. Parent folder of the script file itself
+   */
+  function resolveScriptWorkspaceRoot(scriptFilePath: string | undefined): string | undefined {
+    if (customer?.resolvedRepositoryPath) return customer.resolvedRepositoryPath;
+    if (customer?.repositoryRoot) return customer.repositoryRoot;
+    if (crmFolderPath) return crmFolderPath;
+    if (scriptFilePath) {
+      // If the file lives inside .../CRM_Code/... climb up to CRM_Code parent.
+      const norm = scriptFilePath.replace(/\\/g, '/');
+      const crmCodeIdx = norm.toLowerCase().lastIndexOf('/crm_code/');
+      if (crmCodeIdx !== -1) return norm.slice(0, crmCodeIdx + '/crm_code'.length);
+      // Last resort: parent directory of the file.
+      const lastSlash = norm.lastIndexOf('/');
+      if (lastSlash > 0) return norm.slice(0, lastSlash);
+    }
+    return undefined;
+  }
+
+  /**
    * Opens the code artifact for the task and advances to In Progress.
    * Used for Update / Fix scenarios where the task works on an existing file.
    */
   async function handleStartWork() {
-    const artifact = task.workflowSetup?.artifactPath;
+    const artifact = task.workflowSetup?.artifactPath ?? task.workflowSetup?.scriptPath;
     try {
-      if (artifact) {
-        // A file was already created by Apply Draft — open it directly.
-        await tauriApi.openInVscode(artifact);
-      } else if (devTarget.kind === 'plugin' && pluginsDir && selectedPluginProject) {        const pluginPath = `${pluginsDir}/${selectedPluginProject}`;
-        // Prefer .sln for Visual Studio, fall back to .csproj / folder.
-        const slns = await tauriApi.listDirectoryFiles(pluginPath, 'sln').catch(() => [] as string[]);
-        if (slns.length > 0) {
-          await tauriApi.openWithShell(`${pluginPath}/${slns[0]}`);
-        } else {
-          await tauriApi.openInVscode(pluginPath);
+      if (devTarget.kind === 'plugin') {
+        // Plugin: open .sln / .csproj / project folder (not a .cs file).
+        if (pluginsDir && selectedPluginProject) {
+          const pluginPath = `${pluginsDir}/${selectedPluginProject}`;
+          const slns = await tauriApi.listDirectoryFiles(pluginPath, 'sln').catch(() => [] as string[]);
+          if (slns.length > 0) {
+            await tauriApi.openWithShell(`${pluginPath}/${slns[0]}`);
+          } else {
+            await tauriApi.openInVscode(pluginPath);
+          }
+        } else if (task.workflowSetup?.artifactPath) {
+          await tauriApi.openWithShell(task.workflowSetup.artifactPath);
         }
-      } else if (devTarget.kind === 'script' && effectiveScriptFolder) {
-        await tauriApi.openInVscode(effectiveScriptFolder);
-      } else if (effectiveVscodePath) {
-        await tauriApi.openInVscode(effectiveVscodePath);
+      } else {
+        // Script (create or update/fix): open workspace root + file.
+        const scriptFilePath = artifact;
+        const workspaceRoot = resolveScriptWorkspaceRoot(scriptFilePath);
+        if (workspaceRoot) {
+          await tauriApi.openInVscodeWorkspace(workspaceRoot, scriptFilePath);
+        } else if (scriptFilePath) {
+          await tauriApi.openInVscode(scriptFilePath);
+        } else if (effectiveScriptFolder) {
+          await tauriApi.openInVscode(effectiveScriptFolder);
+        } else if (effectiveVscodePath) {
+          await tauriApi.openInVscode(effectiveVscodePath);
+        }
       }
     } catch (e) {
       setFsError(String(e));
