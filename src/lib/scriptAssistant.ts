@@ -1059,7 +1059,10 @@ var ${candidateFunctionName} = function (formContext) {
 export function resolveCustomerScriptFolder(customer: Customer): string | null {
   if (customer.scriptFolder) return customer.scriptFolder;
   const repo = customer.resolvedRepositoryPath ?? customer.repositoryRoot;
-  if (repo) return `${repo}/Scripts`;
+  if (repo) {
+    // Prefer CRM_Code/Scripts (common customer convention) over plain Scripts.
+    return `${repo}/CRM_Code/Scripts`;
+  }
   return null;
 }
 

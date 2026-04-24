@@ -224,7 +224,7 @@ interface ConfirmSetupModalProps {
   devTarget: DevTarget;
   /** Resolved plugin project directory (e.g. <repo>/Plugins). */
   pluginsDir: string | undefined;
-  /** Heuristic default script folder for pre-fill. */
+  /** Heuristic default script folder for pre-fill (used as final fallback). */
   scriptFolder: string | undefined;
   /** AI reviewer configs from settings. */
   reviewerConfigs?: AiReviewerConfig[];
@@ -234,6 +234,8 @@ interface ConfirmSetupModalProps {
    * 'developer' shows the full developer setup.
    */
   effectiveMode: 'developer' | 'general';
+  /** CRM base directory from app settings — used to probe candidate script folders. */
+  crmBaseDirectory?: string;
   /** Called when the user clicks Confirm & Analyze. */
   onConfirm: (setup: WorkflowSetup) => void;
   onCancel: () => void;
@@ -248,6 +250,7 @@ export default function ConfirmSetupModal({
   scriptFolder,
   reviewerConfigs,
   effectiveMode,
+  crmBaseDirectory,
   onConfirm,
   onCancel,
 }: ConfirmSetupModalProps) {
@@ -294,6 +297,9 @@ export default function ConfirmSetupModal({
   const [scriptSelectionSource, setScriptSelectionSource] = useState<'auto-high' | 'auto-low' | 'manual' | 'none'>(
     initSelectedFile ? 'manual' : 'none',
   );
+  // The actual resolved script folder (probed for existence, may differ from the prop).
+  const [resolvedScriptFolder, setResolvedScriptFolder] = useState<string | undefined>(scriptFolder);
+  const [scriptFolderResolving, setScriptFolderResolving] = useState(false);
   const [scriptFiles, setScriptFiles]               = useState<FileEntry[]>([]);
   const [scriptFilesLoading, setScriptFilesLoading] = useState(false);
   const [scriptFilesError, setScriptFilesError]     = useState<string | null>(null);
@@ -319,15 +325,71 @@ export default function ConfirmSetupModal({
     selectedCustomer?.repositoryRoot ??
     selectedCustomer?.folderName ?? '';
 
+  // --- Resolve the best existing script folder from a priority-ordered candidate list ---
+  useEffect(() => {
+    if (!isDev || devKind !== 'script' || !isEditMode) {
+      setResolvedScriptFolder(scriptFolder);
+      return;
+    }
+    const cust = selectedCustomer;
+    const candidates: string[] = [];
+
+    // 1. Explicit scriptFolder set by user on the customer record (highest trust).
+    if (cust?.scriptFolder) candidates.push(cust.scriptFolder);
+
+    // 2-5. Repo-relative paths: CRM_Code/Scripts first, then plain Scripts.
+    const repos = [
+      cust?.resolvedRepositoryPath,
+      cust?.repositoryRoot,
+    ].filter((r): r is string => !!r);
+    for (const r of repos) candidates.push(`${r}/CRM_Code/Scripts`);
+    for (const r of repos) candidates.push(`${r}/Scripts`);
+
+    // 6-7. Derived from crmBaseDirectory + folderName.
+    if (crmBaseDirectory && cust?.folderName) {
+      candidates.push(`${crmBaseDirectory}/${cust.folderName}/CRM_Code/Scripts`);
+      candidates.push(`${crmBaseDirectory}/${cust.folderName}/Scripts`);
+    }
+
+    // 8. Fallback: the pre-resolved scriptFolder prop (may duplicate earlier entries).
+    if (scriptFolder && !candidates.includes(scriptFolder)) {
+      candidates.push(scriptFolder);
+    }
+
+    if (candidates.length === 0) {
+      setResolvedScriptFolder(undefined);
+      return;
+    }
+
+    setScriptFolderResolving(true);
+    let cancelled = false;
+    (async () => {
+      for (const c of candidates) {
+        if (cancelled) return;
+        try {
+          const exists = await tauriApi.checkPathExists(c);
+          if (exists && !cancelled) {
+            setResolvedScriptFolder(c);
+            return;
+          }
+        } catch { /* skip non-existent or inaccessible */ }
+      }
+      // No candidate exists — fall back to first so user can see what was tried.
+      if (!cancelled) setResolvedScriptFolder(candidates[0]);
+    })().finally(() => { if (!cancelled) setScriptFolderResolving(false); });
+    return () => { cancelled = true; };
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isDev, devKind, workIntent, customerId, crmBaseDirectory, scriptFolder]);
+
   // --- File loading effects ---
 
   useEffect(() => {
-    if (!isDev || devKind !== 'script' || !isEditMode || !scriptFolder) {
+    if (!isDev || devKind !== 'script' || !isEditMode || !resolvedScriptFolder || scriptFolderResolving) {
       setScriptFiles([]); return;
     }
     setScriptFilesLoading(true);
     setScriptFilesError(null);
-    tauriApi.listFilesWithPaths(scriptFolder, ['js', 'ts'], false, [])
+    tauriApi.listFilesWithPaths(resolvedScriptFolder, ['js', 'ts'], false, ['node_modules', 'bin', 'obj', 'dist', 'build'])
       .then((files) => {
         setScriptFiles(files);
         // Only auto-select when no file is already chosen (e.g. from a previous confirmation).
@@ -342,7 +404,7 @@ export default function ConfirmSetupModal({
       .catch(() => setScriptFilesError('Could not read script folder.'))
       .finally(() => setScriptFilesLoading(false));
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [devKind, workIntent, scriptFolder]);
+  }, [devKind, workIntent, resolvedScriptFolder, scriptFolderResolving]);
 
   useEffect(() => {
     if (!isDev || devKind !== 'plugin' || !isEditMode || !pluginsDir) {
@@ -445,11 +507,11 @@ export default function ConfirmSetupModal({
         </div>
       );
     }
-    if (scriptFilesLoading) {
+    if (scriptFolderResolving || scriptFilesLoading) {
       return (
         <div className="confirm-setup-row">
           <label className="form-label confirm-setup-label">Existing script file</label>
-          <div className="confirm-setup-hint">Scanning script folder...</div>
+          <div className="confirm-setup-hint">{scriptFolderResolving ? 'Locating script folder…' : 'Scanning script folder…'}</div>
         </div>
       );
     }
@@ -459,13 +521,13 @@ export default function ConfirmSetupModal({
           <label className="form-label confirm-setup-label">Existing script file</label>
           {scriptFilesError
             ? <div className="confirm-setup-hint confirm-setup-hint--warn">{scriptFilesError}</div>
-            : !scriptFolder
+            : !resolvedScriptFolder
               ? <div className="confirm-setup-hint confirm-setup-hint--warn">No script folder configured for this customer.</div>
-              : <div className="confirm-setup-hint confirm-setup-hint--warn">No .js / .ts files found in {scriptFolder}.</div>}
+              : <div className="confirm-setup-hint confirm-setup-hint--warn">No .js / .ts files found in {resolvedScriptFolder}.</div>}
           <input
             className="form-input" type="text" value={selectedExistingFile}
             placeholder="Absolute path to existing .js / .ts file"
-            onChange={(e) => setSelectedExistingFile(e.target.value)}
+            onChange={(e) => { setSelectedExistingFile(e.target.value); setScriptSelectionSource('manual'); }}
           />
         </div>
       );
@@ -482,11 +544,11 @@ export default function ConfirmSetupModal({
               else { setSelectedExistingFile(v); setScriptSelectionSource('manual'); }
             }}
           >
-            <option value="">Select script file...</option>
+            <option value="">Select script file…</option>
             {scriptFiles.map((f) => <option key={f.path} value={f.path}>{f.name}</option>)}
-            <option value="__manual__">Enter path manually...</option>
+            <option value="__manual__">Enter path manually…</option>
           </select>
-          {scriptFolder && <div className="confirm-setup-hint">From: {scriptFolder}</div>}
+          {resolvedScriptFolder && <div className="confirm-setup-hint">From: {resolvedScriptFolder}</div>}
           {scriptSelectionSource === 'auto-high' && selectedExistingFile && (
             <div className="confirm-setup-hint confirm-setup-hint--success">
               Auto-selected from task text — {selectedExistingFile.replace(/\\/g, '/').split('/').pop()}

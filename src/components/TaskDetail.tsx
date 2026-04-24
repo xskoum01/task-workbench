@@ -1634,6 +1634,7 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
           scriptFolder={effectiveScriptFolder}
           reviewerConfigs={settings.aiReviewers}
           effectiveMode={effectiveMode}
+          crmBaseDirectory={settings?.crmBaseDirectory}
           onConfirm={handleConfirmSetup}
           onCancel={() => setShowSetupModal(false)}
         />
