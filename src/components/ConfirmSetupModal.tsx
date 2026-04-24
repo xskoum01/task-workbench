@@ -182,13 +182,17 @@ export default function ConfirmSetupModal({
               className="form-input"
               type="text"
               value={pluginProject}
-              placeholder={pluginsDir ? `Subfolder inside ${pluginsDir}` : 'Plugin project folder name'}
+              placeholder={
+                workIntent === 'create'
+                  ? 'New plugin project name (will be created)'
+                  : pluginsDir ? `Existing subfolder inside ${pluginsDir}` : 'Existing plugin project folder name'
+              }
               onChange={(e) => setPluginProject(e.target.value)}
             />
             {hints.pluginProject && (
               <div className="confirm-setup-inferred">{hints.pluginProject}</div>
             )}
-            {pluginsDir && (
+            {workIntent !== 'create' && pluginsDir && (
               <div className="confirm-setup-hint">Inside: {pluginsDir}</div>
             )}
           </div>
@@ -211,8 +215,8 @@ export default function ConfirmSetupModal({
           </div>
         )}
 
-        {/* Reviewer — only when reviewer configs are available */}
-        {allReviewers.length > 0 && (
+        {/* Reviewer — only for plugin/script tasks (not repo/general) */}
+        {devKind !== 'repo' && allReviewers.length > 0 && (
           <div className="confirm-setup-row">
             <label className="form-label confirm-setup-label">AI reviewer</label>
             <select

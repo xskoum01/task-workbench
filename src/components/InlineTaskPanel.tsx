@@ -17,6 +17,7 @@ import * as tauriApi from '../lib/tauriCommands';
 import TaskEmailContent from './TaskEmailContent';
 import TaskDevModePanel from './TaskDevModePanel';
 import { resolveTaskDevTarget, getPluginsDir } from '../lib/resolveTaskDevTarget';
+import { buildTaskWorkflowPlan } from '../lib/workflowPlan';
 
 interface Props {
   task: Task;
@@ -65,7 +66,6 @@ export default function InlineTaskPanel({ task, onOpenDetail }: Props) {
       setAnalyzing(false);
     }
   }
-
   // ── Analysis ────────────────────────────────────────────────────────────────
   const r           = task.analysisResult;
   const czSummary   = r?.summaryCz?.trim();
@@ -97,6 +97,8 @@ export default function InlineTaskPanel({ task, onOpenDetail }: Props) {
   const repoRootForGit   = customer?.resolvedRepositoryPath ?? customer?.repositoryRoot;
   const hasRepo          = !!repoRoot;
   const hasVscodePath    = !!effectiveVscodePath;
+  // Centralized workflow plan — pass heuristic kind for backward compat with unconfirmed tasks
+  const plan = buildTaskWorkflowPlan(task, heuristicDevTarget.kind);
   // Use the same resolver as TaskDetail for consistent branching.
   const isScriptTask = devTarget.kind === 'script';
   const showOpenRepo = !!(repoRoot && isScriptTask);
@@ -206,7 +208,7 @@ export default function InlineTaskPanel({ task, onOpenDetail }: Props) {
             )}
 
             {/* Development */}
-            {(hasRepo || hasVscodePath) && (
+            {(hasRepo || hasVscodePath) && plan.requiresDevTools && (
               <div className="tip-action-group">
                 <div className="tip-group-label">Development</div>
                 <TaskDevModePanel
@@ -217,12 +219,12 @@ export default function InlineTaskPanel({ task, onOpenDetail }: Props) {
                   defaultMode={devTarget.kind === 'plugin' ? 'plugin' : 'script'}
                   scriptOpenPath={task.workflowSetup?.scriptPath ?? customer?.scriptFolder ?? effectiveVscodePath}
                   onError={() => {}}
-                  autoCollapsed={devTarget.kind === 'repo'}
+                  autoCollapsed={false}
                   selectedPluginProject={task.workflowSetup?.pluginProject ?? task.selectedPluginProject}
                   onSelectedPluginChange={(plugin) =>
                     updateTask(task.id, { selectedPluginProject: plugin || undefined }).catch(() => {})
                   }
-                  reviewerConfigs={settings.aiReviewers}
+                  reviewerConfigs={plan.requiresAiFileReview ? settings.aiReviewers : undefined}
                 />
               </div>
             )}

@@ -13,7 +13,8 @@ import ConfirmSetupModal from './ConfirmSetupModal';
 import Icon from './Icon';
 import * as tauriApi from '../lib/tauriCommands';
 import { WorkflowStepper } from './WorkflowStepper';
-import { resolveTaskDevTarget, getPluginsDir, hintedPluginProject } from '../lib/resolveTaskDevTarget';
+import { buildTaskWorkflowPlan } from '../lib/workflowPlan';
+import { resolveTaskDevTarget, getPluginsDir } from '../lib/resolveTaskDevTarget';
 import { BUCKET_META, BUCKET_ORDER, computePlanning, effectiveBucket } from '../lib/planning';
 import { isOverdue, formatRelativeDate } from '../lib/dates';
 
@@ -23,32 +24,6 @@ interface TaskDetailProps {
 }
 
 type AiAction = 'analyze' | 'reply' | 'draft';
-
-/**
- * Returns true only when the task clearly requests creating a brand-new plugin
- * and there is no concrete existing plugin project already associated with it.
- *
- * Hiding criteria (returns false):
- *   - A plugin project is already selected on the task
- *   - ADO context yields a hinted existing project
- *   - Title or body contains typical edit/review/fix verbs
- *   - Task is not a feature type AND has no create-new signal
- */
-function isNewPluginTask(task: Task): boolean {
-  // Already linked to an existing project
-  if (task.selectedPluginProject) return false;
-  if (hintedPluginProject(task)) return false;
-
-  const text = `${task.title} ${task.originalMessage ?? ''}`.toLowerCase();
-
-  // Explicit edit / fix / review signals
-  const editPattern = /\b(fix|bug|review|update|modify|change|refactor|adjust|extend|edit|oprav|uprav|změ|kontrola|review)\b/;
-  if (editPattern.test(text)) return false;
-
-  // Must have at least one create-new signal
-  const createPattern = /\b(create|new|scaffold|nový|nová|nové|vytvořit|vytvořte|založ|nový plugin|new plugin)\b/;
-  return createPattern.test(text) || task.taskType === 'feature';
-}
 
 function formatEffort(hours: number): string {
   if (hours < 1) return `${Math.round(hours * 60)}m`;
@@ -363,6 +338,10 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
   // Reset script draft flag when switching tasks
   useEffect(() => { setScriptHasDraft(false); }, [task.id]);
 
+  // Centralized workflow plan — drives BPF stages, action labels, feature flags.
+  // Pass the heuristic devTarget kind so tasks without confirmed setup still work.
+  const plan = buildTaskWorkflowPlan(task, heuristicDevTarget.kind);
+
   // Selected plugin project: prefer confirmed setup, then persisted task field.
   const selectedPluginProject = task.workflowSetup?.pluginProject ?? task.selectedPluginProject ?? '';
   function handleSelectedPluginChange(plugin: string) {
@@ -522,15 +501,15 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
 
   /**
    * Single dispatcher for all stage-advancing actions.
-   * Called by the BPF stepper. Right-panel buttons also call these same
-   * handlers directly so the logic lives in one place per action.
+   * Called by the BPF stepper and by right-panel buttons.
+   * Uses the centralized workflow plan so the action matches the stage.
    */
   function runCurrentStageAction() {
-    switch (task.status) {
-      case 'new':              openSetupModal(); break;
-      case 'analyzed':         handleGenerateDraft(); break;
-      case 'in-progress':      handleSendForReview(); break;
-      case 'ready-for-review': handleMarkDone(); break;
+    switch (plan.currentAction) {
+      case 'analyze':        openSetupModal();       break;
+      case 'generate-draft': handleGenerateDraft();  break;
+      case 'run-review':     handleSendForReview();  break;
+      case 'mark-done':      handleMarkDone();        break;
       default: break;
     }
   }
@@ -680,6 +659,7 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
         {/* ---- Workflow BPF strip (always visible, never scrolls) ---- */}
         <WorkflowStepper
           status={task.status}
+          stages={plan.stages}
           onRunCurrentAction={runCurrentStageAction}
           isRunning={!!aiLoading}
         />
@@ -1027,6 +1007,7 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
                   ? <><span className="btn-spinner" /> Analysing…</>
                   : <><Icon name="search" size={13} /> Analyze</>}
               </button>
+              {plan.requiresDraftGeneration && (
               <button
                 className="btn btn-secondary btn-sm"
                 onClick={handleGenerateDraft}
@@ -1044,8 +1025,9 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
                   ? <><span className="btn-spinner" /> Generating…</>
                   : <><Icon name="layers" size={13} /> Generate Draft</>}
               </button>
+              )}
               {/* Apply Draft — shown for plugin (skeletonPreview ready) or script (scriptHasDraft) */}
-              {(skeletonPreview || scriptHasDraft) && (
+              {plan.requiresDraftGeneration && (skeletonPreview || scriptHasDraft) && (
                 <button
                   className="btn btn-secondary btn-sm"
                   onClick={handleApplyDraft}
@@ -1065,7 +1047,7 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
                   <Icon name="check" size={13} /> Apply Draft
                 </button>
               )}
-              {devTarget.kind === 'plugin' && pluginsDir && isNewPluginTask(task) && (
+              {devTarget.kind === 'plugin' && pluginsDir && plan.requiresPluginCreate && (
                 <button
                   className="btn btn-secondary btn-sm"
                   onClick={async () => {
@@ -1085,7 +1067,7 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
           </div>
 
           {/* SCRIPT ASSISTANT — shown only for script tasks with a resolvable script folder. */}
-          {customer && effectiveScriptFolder && devTarget.kind !== 'plugin' && (
+          {customer && effectiveScriptFolder && devTarget.kind !== 'plugin' && plan.requiresDraftGeneration && (
             <ScriptAssistantPanel
               ref={scriptPanelRef}
               task={task}
@@ -1157,7 +1139,7 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
                 </button>
               )}
 
-              {(hasRepo || hasVscodePath) && (
+              {(hasRepo || hasVscodePath) && plan.requiresDevTools && (
                 <TaskDevModePanel
                   ref={devModePanelRef}
                   task={task}
@@ -1167,11 +1149,11 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
                   defaultMode={devTarget.kind === 'plugin' ? 'plugin' : 'script'}
                   scriptOpenPath={task.workflowSetup?.scriptPath ?? customer?.scriptFolder ?? effectiveVscodePath}
                   onError={setFsError}
-                  autoCollapsed={devTarget.kind === 'repo'}
+                  autoCollapsed={false}
                   selectedPluginProject={selectedPluginProject}
                   onSelectedPluginChange={handleSelectedPluginChange}
                   pluginRefreshTick={devPanelRefreshTick}
-                  reviewerConfigs={settings.aiReviewers}
+                  reviewerConfigs={plan.requiresAiFileReview ? settings.aiReviewers : undefined}
                 />
               )}
 
