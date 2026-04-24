@@ -320,17 +320,24 @@ body {
 }
 
 .detail-panel-header {
-  padding: 14px var(--gap-lg) 12px;
   border-bottom: 1px solid var(--border);
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 0;
+  flex-shrink: 0;
+  background: var(--bg-overlay);
+  overflow: hidden;
+  position: relative;
+  z-index: 1;
+}
+
+/* Top row: Back + title content + Edit/Delete */
+.detail-panel-header-top {
   display: flex;
   align-items: flex-start;
   gap: var(--gap-sm);
-  flex-shrink: 0;
-  background: var(--bg-overlay);
-  /* Allow native <select> dropdown to render beyond the header bounds */
-  overflow: visible;
-  position: relative;
-  z-index: 1;
+  padding: 14px var(--gap-lg) 10px;
 }
 
 .detail-panel-header-content {
@@ -5085,119 +5092,171 @@ body {
 }
 
 
-/* === Workflow Stepper (BPF-style) ======================================== */
-
-.workflow-stepper {
-  display: flex;
-  align-items: center;
-  flex-shrink: 0;
-  align-self: center;
-}
+/* === Workflow BPF Stepper ================================================ */
 
 /*
- * Each step is a chevron-shaped pill.
- * Steps overlap by the tip width (8 px) so the arrow of one
- * step appears to point into the next.
+ * Container: full-width strip inside the detail-panel-header.
+ * Steps are equal-width chevrons that together fill the bar.
  */
-.workflow-step {
-  position: relative;
-  display: inline-flex;
-  align-items: center;
-  gap: 3px;
-  height: 22px;
-  padding: 0 10px 0 18px;
-  font-size: 10px;
-  font-weight: 500;
-  letter-spacing: 0.02em;
-  border: none;
-  cursor: pointer;
-  white-space: nowrap;
-  transition: opacity 0.12s, filter 0.12s;
-  /* Chevron shape: notch on left, arrow on right */
-  clip-path: polygon(
-    0 0,
-    calc(100% - 8px) 0,
-    100% 50%,
-    calc(100% - 8px) 100%,
-    0 100%,
-    8px 50%
-  );
-  margin-right: -1px;
-  z-index: 1;
-  color: #6e7681;
-  background: #1c2128;
+.workflow-bpf {
+  display: flex;
+  align-items: stretch;
+  width: 100%;
+  height: 50px;
+  overflow: hidden;
 }
 
-/* First step: flat left edge, no left notch */
-.workflow-step:first-child {
-  padding-left: 12px;
+/* --- Individual step --- */
+.workflow-bpf-step {
+  position: relative;
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  align-items: flex-start;
+  /* Left padding compensates for the incoming notch (tip width = 16px) */
+  padding: 0 22px 0 28px;
+  border: none;
+  cursor: pointer;
+  text-align: left;
+  background: #181e26;
+  color: #6e7681;
+  transition: filter 0.12s, opacity 0.12s;
+  /* Chevron: notch on left, arrow on right */
   clip-path: polygon(
     0 0,
-    calc(100% - 8px) 0,
+    calc(100% - 16px) 0,
     100% 50%,
-    calc(100% - 8px) 100%,
+    calc(100% - 16px) 100%,
+    0 100%,
+    16px 50%
+  );
+  /* Overlap so chevrons connect seamlessly */
+  margin-right: -1px;
+  z-index: 1;
+}
+
+/* First step: flat left edge */
+.workflow-bpf-step:first-child {
+  padding-left: 16px;
+  clip-path: polygon(
+    0 0,
+    calc(100% - 16px) 0,
+    100% 50%,
+    calc(100% - 16px) 100%,
     0 100%
   );
   border-radius: 3px 0 0 3px;
 }
 
-/* Last step: flat right edge, no arrow tip */
-.workflow-step:last-child {
+/* Last step: flat right edge */
+.workflow-bpf-step:last-child {
   clip-path: polygon(
     0 0,
     100% 0,
     100% 100%,
     0 100%,
-    8px 50%
+    16px 50%
   );
   border-radius: 0 3px 3px 0;
 }
 
-.workflow-step:not([disabled]):hover {
-  opacity: 0.85;
-  filter: brightness(1.15);
+.workflow-bpf-step:not([disabled]):hover {
+  filter: brightness(1.2);
 }
 
-/* -- Completed -- */
-.workflow-step--completed {
-  background: color-mix(in srgb, var(--color-done) 20%, #1c2128);
-  color: color-mix(in srgb, var(--color-done) 70%, #fff);
+/* Stage name: small label at the top */
+.workflow-bpf-stage-name {
+  display: block;
+  font-size: 10px;
+  font-weight: 500;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  line-height: 1;
+  margin-bottom: 4px;
+  opacity: 0.65;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 100%;
+}
+
+/* Action label: the prominent CTA text */
+.workflow-bpf-action-label {
+  display: block;
+  font-size: 12px;
+  font-weight: 500;
+  line-height: 1;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 100%;
+}
+
+.workflow-bpf-check {
+  font-size: 9px;
+  opacity: 0.8;
+}
+
+.workflow-bpf-action-arrow {
+  font-size: 14px;
+  font-weight: 700;
+  line-height: 0;
+  vertical-align: middle;
+  margin-right: 1px;
+}
+
+/* --- Completed --- */
+.workflow-bpf-step--completed {
+  background: color-mix(in srgb, var(--color-done) 14%, #181e26);
+  color: color-mix(in srgb, var(--color-done) 65%, #8b949e);
   z-index: 2;
 }
+.workflow-bpf-step--completed .workflow-bpf-action-label {
+  font-weight: 400;
+  font-size: 11px;
+  opacity: 0.7;
+}
 
-/* -- Active -- */
-.workflow-step--active {
+/* --- Active --- */
+.workflow-bpf-step--active {
   z-index: 3;
   color: #fff;
-  font-weight: 600;
 }
-.workflow-step--active.workflow-step--new              { background: var(--color-new); }
-.workflow-step--active.workflow-step--analyzed         { background: var(--color-analyzed); }
-.workflow-step--active.workflow-step--in-progress      { background: var(--color-in-progress); }
-.workflow-step--active.workflow-step--ready-for-review { background: var(--color-ready-for-review); }
-.workflow-step--active.workflow-step--done             { background: var(--color-done); }
+.workflow-bpf-step--active .workflow-bpf-stage-name  { opacity: 0.8; }
+.workflow-bpf-step--active .workflow-bpf-action-label { font-size: 13px; font-weight: 600; }
 
-/* -- Upcoming -- */
-.workflow-step--upcoming {
-  opacity: 0.38;
+/* Active color per stage */
+.workflow-bpf-step--active.workflow-bpf-step--new              { background: var(--color-new); }
+.workflow-bpf-step--active.workflow-bpf-step--analyzed         { background: var(--color-analyzed); }
+.workflow-bpf-step--active.workflow-bpf-step--in-progress      { background: var(--color-in-progress); }
+.workflow-bpf-step--active.workflow-bpf-step--ready-for-review { background: var(--color-ready-for-review); }
+.workflow-bpf-step--active.workflow-bpf-step--done             { background: var(--color-done); }
+
+/* --- Upcoming --- */
+.workflow-bpf-step--upcoming {
+  opacity: 0.32;
   z-index: 0;
 }
 
-.workflow-step-check {
-  font-size: 9px;
-  line-height: 1;
-  opacity: 0.85;
-}
-
-/* Blocked badge — shown after the steps when status === 'blocked' */
-.workflow-step-blocked-badge {
-  margin-left: 8px;
-  padding: 2px 7px;
-  border-radius: 3px;
-  font-size: 10px;
+/* --- Blocked badge --- */
+.workflow-bpf-blocked {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 0 14px;
+  font-size: 11px;
   font-weight: 600;
-  letter-spacing: 0.03em;
-  background: color-mix(in srgb, var(--color-blocked) 16%, transparent);
+  letter-spacing: 0.04em;
+  border-radius: 3px;
+  background: color-mix(in srgb, var(--color-blocked) 14%, #181e26);
   color: var(--color-blocked);
-  border: 1px solid color-mix(in srgb, var(--color-blocked) 30%, transparent);
+  flex-shrink: 0;
+}
+.workflow-bpf-blocked-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--color-blocked);
+  flex-shrink: 0;
 }

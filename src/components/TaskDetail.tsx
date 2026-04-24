@@ -569,63 +569,66 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
 
         {/* ---- Header ---- */}
         <div className="detail-panel-header">
-          <button
-            className="detail-panel-back"
-            onClick={onClose}
-            title="Back to list"
-          >
-            <Icon name="arrow-left" size={14} /> Back
-          </button>
+          {/* Top row: navigation + title + actions */}
+          <div className="detail-panel-header-top">
+            <button
+              className="detail-panel-back"
+              onClick={onClose}
+              title="Back to list"
+            >
+              <Icon name="arrow-left" size={14} /> Back
+            </button>
 
-          <div className="detail-panel-header-content">
-            <div className="detail-panel-title">{task.title}</div>
-
-            <div style={{ marginTop: 5, display: 'flex', gap: 6, alignItems: 'center' }}>
-              <TypeBadge type={task.taskType} />
-              {task.analysisResult && (
-                <span className="detail-ai-badge">AI</span>
-              )}
+            <div className="detail-panel-header-content">
+              <div className="detail-panel-title">{task.title}</div>
+              <div style={{ marginTop: 4, display: 'flex', gap: 6, alignItems: 'center' }}>
+                <TypeBadge type={task.taskType} />
+                {task.analysisResult && (
+                  <span className="detail-ai-badge">AI</span>
+                )}
+              </div>
             </div>
+
+            <button
+              className="detail-panel-edit"
+              onClick={() => setShowEditForm(true)}
+              title="Edit task"
+            >
+              <Icon name="pencil" size={14} />
+            </button>
+            {confirmDelete ? (
+              <>
+                <button
+                  className="btn btn-danger btn-sm"
+                  onClick={handleDelete}
+                  title="Confirm delete"
+                >
+                  Delete
+                </button>
+                <button
+                  className="btn btn-ghost btn-sm"
+                  onClick={() => setConfirmDelete(false)}
+                  title="Cancel delete"
+                >
+                  Cancel
+                </button>
+              </>
+            ) : (
+              <button
+                className="detail-panel-delete"
+                onClick={() => setConfirmDelete(true)}
+                title="Delete task"
+              >
+                <Icon name="trash-2" size={14} />
+              </button>
+            )}
           </div>
 
+          {/* BPF row: full-width workflow stepper */}
           <WorkflowStepper
             status={task.status}
             onChange={handleStatusChange}
           />
-
-          <button
-            className="detail-panel-edit"
-            onClick={() => setShowEditForm(true)}
-            title="Edit task"
-          >
-            <Icon name="pencil" size={14} />
-          </button>
-          {confirmDelete ? (
-            <>
-              <button
-                className="btn btn-danger btn-sm"
-                onClick={handleDelete}
-                title="Confirm delete"
-              >
-                Delete
-              </button>
-              <button
-                className="btn btn-ghost btn-sm"
-                onClick={() => setConfirmDelete(false)}
-                title="Cancel delete"
-              >
-                Cancel
-              </button>
-            </>
-          ) : (
-            <button
-              className="detail-panel-delete"
-              onClick={() => setConfirmDelete(true)}
-              title="Delete task"
-            >
-              <Icon name="trash-2" size={14} />
-            </button>
-          )}
         </div>
 
         {/* ---- Two-column inner layout ---- */}
