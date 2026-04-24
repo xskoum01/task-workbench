@@ -6,7 +6,8 @@
  *   2. ADO work-item or PR assignment → developer
  *   3. workflowSetup.devTargetKind = plugin | script → developer
  *   4. devopsTaskUrl present → developer
- *   5. default → general
+ *   5. Text-based heuristic: plugin/script/Dataverse technical keywords → developer
+ *   6. default → general
  */
 import type { Task } from '../types';
 
@@ -17,6 +18,32 @@ export interface ResolvedTaskMode {
   /** True when the mode is derived from heuristics, false when user-set. */
   isAuto: boolean;
 }
+
+/**
+ * Plugin/script technical keywords that reliably indicate a developer task.
+ * Requires a meaningful technical signal — generic words like "update" or "fix" are excluded.
+ */
+const DEVELOPER_KEYWORDS = [
+  // Plugin / C# / Dataverse
+  /\bplugin\b/i,
+  /\biplugin\b/i,
+  /dataverse/i,
+  /\bcrm plugin\b/i,
+  /preoperation|postoperation/i,
+  /\.csproj\b|\.cs\b/i,
+  /\bstatecode\b|\bstatuscode\b/i,
+  // Entity / record context (technical usage)
+  /\bentita\b|\bentitě\b|\bentiě\b/i,   // Czech: entita je, na entitě
+  /\bentity\b/i,                          // English: entity is, for entity
+  /\bIOrganizationService\b|\bIPlugin\b|\bITracingService\b/i,
+  /\battribute\b.*field|\bfield\b.*attribute/i,
+  // Script / JS / WebResource
+  /\bscript\b.*\b(crm|d365|dynamics|dataverse|xrm)\b|\b(xrm|formcontext)\b/i,
+  /\bwebresource\b|\bonchange\b|\bonload\b|\bonsave\b/i,
+  /\bribbon\b.*\b(script|button|action)/i,
+  /\bformcontext\b|\bxrm\.page\b/i,
+  /\.js\b.*crm|crm.*\.js\b|\.ts\b.*crm|crm.*\.ts\b/i,
+];
 
 /**
  * Returns the effective task mode and whether it is heuristically inferred.
@@ -47,6 +74,15 @@ export function inferTaskMode(task: Task): ResolvedTaskMode {
   const devKind = task.workflowSetup?.devTargetKind;
   if (devKind === 'plugin' || devKind === 'script' || devKind === 'repo') {
     return { mode: 'developer', isAuto: true };
+  }
+
+  // Text-based heuristic: scan title + originalMessage for technical developer signals.
+  // Requires at least one strong keyword match — generic task words are intentionally excluded.
+  const textToScan = `${task.title} ${task.originalMessage ?? ''} ${task.analysisResult?.summary ?? ''}`;
+  for (const kw of DEVELOPER_KEYWORDS) {
+    if (kw.test(textToScan)) {
+      return { mode: 'developer', isAuto: true };
+    }
   }
 
   return { mode: 'general', isAuto: true };

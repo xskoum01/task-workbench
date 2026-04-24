@@ -43,6 +43,12 @@ export interface TaskDevModePanelProps {
    */
   onSelectedPluginChange?: (plugin: string) => void;
   /**
+   * Called when the filesystem refresh detects that a persisted plugin project
+   * folder no longer exists on disk. The parent should clear workflowSetup.pluginProject
+   * and task.selectedPluginProject, preserving the name as desiredPluginProject.
+   */
+  onPluginProjectMissing?: (projectName: string) => void;
+  /**
    * Persisted selected plugin project for this task (from task model).
    * When set, takes priority over the heuristic auto-selection on mount/reset.
    */
@@ -93,6 +99,7 @@ export default forwardRef<TaskDevModePanelHandle, TaskDevModePanelProps>(functio
   onError,
   autoCollapsed = false,
   onSelectedPluginChange,
+  onPluginProjectMissing,
   selectedPluginProject: persistedSelectedPlugin,
   pluginRefreshTick = 0,
   reviewerConfigs,
@@ -132,6 +139,8 @@ export default forwardRef<TaskDevModePanelHandle, TaskDevModePanelProps>(functio
   const [pluginOpenHint, setPluginOpenHint]               = useState<string | null>(null);
   // ADO-hinted project name that was not found in the folder listing on the current branch.
   const [hintedProjectMissing, setHintedProjectMissing]   = useState<string | null>(null);
+  // Persisted plugin project that was not found on disk after a refresh.
+  const [persistedProjectMissing, setPersistedProjectMissing] = useState<string | null>(null);
 
   // --- branch (V2) ---
   const [currentBranch, setBranch]          = useState<string | null>(null);
@@ -163,6 +172,7 @@ export default forwardRef<TaskDevModePanelHandle, TaskDevModePanelProps>(functio
     setPluginProjectsLoaded(false);
     setPluginOpenHint(null);
     setHintedProjectMissing(null);
+    setPersistedProjectMissing(null);
     setBranch(null);
     setBranches([]);
     setSelectedBranch('');
@@ -191,6 +201,7 @@ export default forwardRef<TaskDevModePanelHandle, TaskDevModePanelProps>(functio
     setSelectedPlugin('');
     setPluginOpenHint(null);
     setHintedProjectMissing(null);
+    setPersistedProjectMissing(null);
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [pluginRefreshTick]);
 
@@ -216,6 +227,20 @@ export default forwardRef<TaskDevModePanelHandle, TaskDevModePanelProps>(functio
         if (persistedSelectedPlugin && folders.includes(persistedSelectedPlugin)) {
           updateSelectedPlugin(persistedSelectedPlugin);
           setHintedProjectMissing(null);
+          setPersistedProjectMissing(null);
+        } else if (persistedSelectedPlugin && !folders.includes(persistedSelectedPlugin)) {
+          // The persisted project no longer exists on disk — notify parent to clear it.
+          setPersistedProjectMissing(persistedSelectedPlugin);
+          onPluginProjectMissing?.(persistedSelectedPlugin);
+          // Let heuristic/single-folder fallback take over below.
+          const hint = hintedPluginProject(task);
+          if (hint && folders.includes(hint)) {
+            updateSelectedPlugin(hint);
+            setHintedProjectMissing(null);
+          } else {
+            setHintedProjectMissing(null);
+            if (folders.length === 1) updateSelectedPlugin(folders[0]);
+          }
         } else {
           const hint = hintedPluginProject(task);
           if (hint && folders.includes(hint)) {
@@ -587,6 +612,13 @@ export default forwardRef<TaskDevModePanelHandle, TaskDevModePanelProps>(functio
           {/* Plugin project listing */}
           {pluginProjectsLoading && (
             <div className="detail-devmode-hint">Loading plugin projects…</div>
+          )}
+
+          {!pluginProjectsLoading && pluginProjectsLoaded && persistedProjectMissing && (
+            <div className="detail-devmode-hint" style={{ color: 'var(--color-warning, #d29922)' }}>
+              Plugin project <strong>{persistedProjectMissing}</strong> was not found on disk.
+              Create it again or select another project.
+            </div>
           )}
 
           {!pluginProjectsLoading && pluginProjectsLoaded && hintedProjectMissing && (

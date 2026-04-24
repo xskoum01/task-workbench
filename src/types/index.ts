@@ -179,6 +179,12 @@ export interface WorkflowSetup {
   repositoryRoot?: string;
   /** Plugin project subfolder name within the plugins directory. */
   pluginProject?: string;
+  /**
+   * The intended plugin project name for a Create+Plugin workflow.
+   * Preserved when the project folder is deleted so the Create Plugin Project
+   * modal can be prefilled with the previous name after a missing-folder reset.
+   */
+  desiredPluginProject?: string;
   /** Script file or folder path. */
   scriptPath?: string;
   /** ID of the AI reviewer profile to default to. */

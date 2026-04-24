@@ -63,6 +63,10 @@ function toPascalCase(s: string): string {
 /**
  * Ordered keyword → broader area name table (Czech + English, longer patterns first).
  * First match wins.
+ *
+ * NOTE: "zákazník/zakaznik/customer" are intentionally NOT mapped to Account here.
+ * Those words describe the customer context (who commissioned the work), NOT the
+ * Dataverse Account entity/table. Only unambiguous entity/table terms trigger Account.
  */
 const AREA_KEYWORDS: [RegExp, string][] = [
   [/bpf|business process/i,                      'Workflow'],
@@ -82,16 +86,76 @@ const AREA_KEYWORDS: [RegExp, string][] = [
   [/product|produkt/i,                           'Product'],
   [/pricelevel|ceník|cenik/i,                    'PriceList'],
   [/calendar|schůzk/i,                           'Calendar'],
-  [/account\b|zákazník|zakaznik|firma\b/i,       'Account'],
-  [/contact\b|kontakt/i,                         'Contact'],
-  [/lead\b/i,                                    'Lead'],
-  [/email\b|mail\b/i,                            'Email'],
+  // "account" only when used as entity/table term — NOT matched by zákazník/customer/firma alone.
+  [/\baccount\b/i,                               'Account'],
+  [/\bcontact\b|\bkontakt\b/i,                   'Contact'],
+  [/\blead\b/i,                                  'Lead'],
+  [/\bemail\b|\bmail\b/i,                        'Email'],
   [/notification|oznámen/i,                      'Notification'],
   [/integration|integrac/i,                      'Integration'],
-  [/import\b/i,                                  'Import'],
-  [/report\b|sestav/i,                           'Report'],
+  [/\bimport\b/i,                                'Import'],
+  [/\breport\b|sestav/i,                         'Report'],
   [/configurati|konfigurac/i,                    'Configuration'],
 ];
+
+/**
+ * Dataverse logical entity name → PascalCase area mapping.
+ * Used by explicit entity detection to normalise detected entity names.
+ */
+const ENTITY_AREA_MAP: Record<string, string> = {
+  contact:       'Contact',
+  account:       'Account',
+  opportunity:   'Opportunity',
+  lead:          'Lead',
+  incident:      'Incident',
+  case:          'Incident',
+  quote:         'Quote',
+  salesorder:    'SalesOrder',
+  order:         'SalesOrder',
+  invoice:       'Invoice',
+  product:       'Product',
+  task:          'Task',
+  activity:      'Activity',
+  email:         'Email',
+  phonecall:     'PhoneCall',
+  appointment:   'Appointment',
+  contract:      'Contract',
+  campaign:      'Campaign',
+  pricelevel:    'PriceList',
+};
+
+/**
+ * Attempts to extract an explicitly declared Dataverse entity from the text.
+ * Matches Czech and English patterns such as:
+ *   "entita je Contact" / "Entity is Contact" / "na entitě Account" / "For entity Lead"
+ * Returns the PascalCase area name (e.g. "Contact") or null if nothing detected.
+ */
+function detectExplicitEntity(text: string): { area: string; reason: string } | null {
+  // Czech and English entity declaration patterns — entity name follows the keyword
+  const patterns = [
+    /\bentit[ay]\s+je\s+(\w+)/i,          // "entita je Contact"
+    /\bentit[au]:\s*(\w+)/i,              // "entita: Contact"
+    /\bna\s+entit[ěe]\s+(\w+)/i,         // "na entitě Contact"
+    /\bpro\s+entitu\s+(\w+)/i,           // "pro entitu Contact"
+    /\bu\s+entity\s+(\w+)/i,             // "u entity Contact"
+    /\bentity\s+is\s+(\w+)/i,            // "entity is Contact"
+    /\bentity:\s*(\w+)/i,                // "entity: Contact"
+    /\bfor\s+entity\s+(\w+)/i,           // "for entity Contact"
+    /\bon\s+(\w+)\s+entity/i,            // "on Contact entity"
+    /\b(\w+)\s+entity\b/i,              // "Contact entity" (looser)
+  ];
+  for (const re of patterns) {
+    const m = re.exec(text);
+    if (!m) continue;
+    const detected = m[1].toLowerCase();
+    const mapped = ENTITY_AREA_MAP[detected];
+    if (mapped) return { area: mapped, reason: `explicit entity: ${mapped}` };
+    // Unknown entity — PascalCase it as-is
+    const pascal = detected.charAt(0).toUpperCase() + detected.slice(1);
+    return { area: pascal, reason: `explicit entity: ${pascal}` };
+  }
+  return null;
+}
 
 /** Extract the area segment from a Navertica.* project name, or return null. */
 function areaFromNaverticaProject(projectName: string): string | null {
@@ -104,9 +168,9 @@ function areaFromNaverticaProject(projectName: string): string | null {
  *
  * Priority:
  *   1. Already-selected plugin project on the task (strong existing context)
- *   2. Keyword in task title
- *   3. Keyword in full task body
- *   4. Existing plugin project list matched by keyword
+ *   2. Explicit entity declaration in text ("entita je Contact", "entity is X", etc.)
+ *   3. Keyword match in title
+ *   4. Keyword match in full body — with existing-project reuse
  *   5. Customer namespace base
  *   6. Generic Navertica.<PascalCustomerName>
  */
@@ -114,7 +178,7 @@ function inferPluginSuggestions(
   task: Task,
   customer: Customer,
   existingProjects: string[],
-): { projectName: string; namespace: string } {
+): { projectName: string; namespace: string; suggestionReason: string } {
   const fullText = `${task.title} ${task.originalMessage ?? ''}`;
 
   // 1. Use existing selection on the task when it already follows the convention
@@ -122,42 +186,57 @@ function inferPluginSuggestions(
     const area = areaFromNaverticaProject(task.selectedPluginProject);
     if (area) {
       const name = `Navertica.${area}`;
-      return { projectName: name, namespace: name };
+      return { projectName: name, namespace: name, suggestionReason: 'existing project selection' };
     }
   }
 
-  // 2. Title keyword
+  // 2. Explicit entity declaration — highest-confidence signal, beats keyword matches.
+  //    Check title first, then full body.
+  const explicitTitle = detectExplicitEntity(task.title);
+  const explicitBody  = detectExplicitEntity(fullText);
+  const explicit = explicitTitle ?? explicitBody;
+  if (explicit) {
+    // Prefer an existing project with this area if one exists
+    const existing = existingProjects.find((p) => {
+      const a = areaFromNaverticaProject(p);
+      return a && a.toLowerCase() === explicit.area.toLowerCase();
+    });
+    const resolvedArea = existing ? areaFromNaverticaProject(existing)! : explicit.area;
+    const name = `Navertica.${resolvedArea}`;
+    return { projectName: name, namespace: name, suggestionReason: explicit.reason };
+  }
+
+  // 3. Title keyword
   for (const [pattern, area] of AREA_KEYWORDS) {
     if (pattern.test(task.title)) {
       const name = `Navertica.${area}`;
-      return { projectName: name, namespace: name };
+      return { projectName: name, namespace: name, suggestionReason: 'task title keyword' };
     }
   }
 
-  // 3. Full body keyword — also try to reuse an existing project folder with that area
+  // 4. Full body keyword — also try to reuse an existing project folder with that area
   for (const [pattern, area] of AREA_KEYWORDS) {
     if (pattern.test(fullText)) {
-      // Prefer an already-present project folder for this area to avoid naming drift
       const existing = existingProjects.find((p) => {
         const a = areaFromNaverticaProject(p);
         return a && a.toLowerCase() === area.toLowerCase();
       });
       const resolvedArea = existing ? areaFromNaverticaProject(existing)! : area;
       const name = `Navertica.${resolvedArea}`;
-      return { projectName: name, namespace: name };
+      return { projectName: name, namespace: name, suggestionReason: existing ? 'existing project' : 'task keywords' };
     }
   }
 
-  // 4. Customer namespace without trailing ".Plugins"
+  // 5. Customer namespace without trailing ".Plugins"
   if (customer.namespace) {
     const base = customer.namespace.replace(/\.Plugins$/i, '');
-    return { projectName: base, namespace: base };
+    return { projectName: base, namespace: base, suggestionReason: 'customer namespace' };
   }
 
-  // 5. Generic fallback
+  // 6. Generic fallback
   const safeName = toPascalCase(customer.name) || 'Plugin';
   const name = `Navertica.${safeName}`;
-  return { projectName: name, namespace: name };
+  return { projectName: name, namespace: name, suggestionReason: 'customer name' };
 }
 
 export default function CreatePluginProjectModal({
@@ -279,6 +358,9 @@ export default function CreatePluginProjectModal({
           Convention: <code>Navertica.&lt;BroaderArea&gt;</code>. Used for the solution folder name,
           .sln, .csproj, and the <code>__PROJECT_NAME__</code> placeholder.
           Standard VS layout: <code>{sanitize(form.projectName) || 'ProjectName'}/{sanitize(form.projectName) || 'ProjectName'}/</code>.
+        </div>
+        <div style={{ fontSize: 10, color: 'var(--text-muted)', marginTop: 3 }}>
+          Suggested from {suggested.suggestionReason}
         </div>
       </div>
 
