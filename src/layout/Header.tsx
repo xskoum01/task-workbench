@@ -3,6 +3,7 @@ import type { NavPage } from '../types';
 const PAGE_LABELS: Record<NavPage, string> = {
   inbox:     'Inbox',
   tasks:     'Tasks',
+  'week-log':'Week Log',
   customers: 'Customers',
   settings:  'Settings',
 };
@@ -10,6 +11,7 @@ const PAGE_LABELS: Record<NavPage, string> = {
 const PAGE_SUBTITLES: Record<NavPage, string> = {
   inbox:     'Incoming work items pending classification',
   tasks:     'All tracked work items',
+  'week-log':'Daily notes and completed tasks by week',
   customers: 'Client repository and project mappings',
   settings:  'Application configuration',
 };

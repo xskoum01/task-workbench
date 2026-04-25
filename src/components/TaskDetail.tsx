@@ -6,7 +6,12 @@ import { useApp } from '../context/AppContext';
 import { TypeBadge, SourceBadge } from './StatusBadge';
 import ReplyModal from './ReplyModal';
 import SkeletonPreviewModal from './SkeletonPreviewModal';
-import ScriptAssistantPanel, { type ScriptAssistantPanelHandle } from './ScriptAssistantPanel';
+import {
+  analyzeScriptTask,
+  buildScriptPlan,
+  generateSkeleton,
+  buildScriptPreview,
+} from '../lib/scriptAssistant';
 import TaskForm from './TaskForm';
 import CreatePluginProjectModal, { inferPluginSuggestions, sanitize } from './CreatePluginProjectModal';
 import ConfirmSetupModal from './ConfirmSetupModal';
@@ -293,9 +298,15 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
 
   // Resolved script folder: prefer confirmed scriptPath, then explicit scriptFolder, then fallback.
   // Must be consistent with resolveCustomerScriptFolder in scriptAssistant.ts.
+  // When scriptPath is a specific file (ends .js/.ts), extract the parent folder.
   const repoFallback = customer?.resolvedRepositoryPath ?? customer?.repositoryRoot;
+  const rawScriptPath = devTarget.kind === 'script' ? task.workflowSetup?.scriptPath : undefined;
+  const scriptPathIsFile = !!rawScriptPath && /\.(js|ts)$/i.test(rawScriptPath);
+  const scriptPathFolder = scriptPathIsFile
+    ? rawScriptPath.replace(/\\/g, '/').replace(/\/[^/]+$/, '')
+    : rawScriptPath;
   const effectiveScriptFolder =
-    (devTarget.kind === 'script' ? task.workflowSetup?.scriptPath : undefined) ??
+    scriptPathFolder ??
     customer?.scriptFolder ??
     (repoFallback ? `${repoFallback}/Scripts` : undefined) ??
     (devTarget.kind !== 'plugin' ? effectiveVscodePath : undefined);
@@ -326,10 +337,9 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
   // Plugin project folder names loaded when the Create Plugin Project modal opens.
   // Used to improve naming-convention auto-suggestions inside the modal.
   const [pluginProjectsForModal, setPluginProjectsForModal] = useState<string[]>([]);
-  // Script Assistant imperative ref + draft-ready flag
-  const scriptPanelRef = useRef<ScriptAssistantPanelHandle>(null);
+  // Absolute path of the generated script file — set after generateScriptDraft, cleared on apply.
+  const [scriptDraftPath, setScriptDraftPath] = useState<string | null>(null);
   const devModePanelRef  = useRef<TaskDevModePanelHandle>(null);
-  const [scriptHasDraft, setScriptHasDraft] = useState(false);
   // Refresh counter for the Dev panel — increment after creating a new plugin project.
   const [devPanelRefreshTick, setDevPanelRefreshTick] = useState(0);
   // Edit task form
@@ -340,8 +350,8 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
   const [notes, setNotes] = useState(task.notes ?? '');
   // Keep notes in sync when task changes (e.g. different task selected)
   useEffect(() => { setNotes(task.notes ?? ''); }, [task.id, task.notes]);
-  // Reset script draft flag when switching tasks
-  useEffect(() => { setScriptHasDraft(false); }, [task.id]);
+  // Clear script draft path when switching tasks.
+  useEffect(() => { setScriptDraftPath(null); }, [task.id]);
   // AI Code Review — modal state for viewing a saved review
   const [showSavedReviewModal, setShowSavedReviewModal] = useState(false);
   const latestReview = task.aiFileReviews?.[0];
@@ -469,32 +479,84 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
         const preview = await tauriApi.generateSkeletonPreview(task, customer ?? null);
         setSkeletonPreview(preview);
         setShowSkeleton(true);
-        await updateTask(task.id, { status: 'in-progress' });
-        setFeedback('Draft generated — status set to In Progress');
+        // Do NOT advance status here — status moves to In Progress only after Apply Draft.
       } catch (e) {
         setAiError(String(e));
       } finally {
         setAiLoading(null);
       }
     } else {
-      // Script: delegate to the Script Assistant panel (runs full Analyze→Plan→Skeleton→Preview chain).
-      if (!scriptPanelRef.current) {
-        setAiError('Script Assistant panel is not available for this task.');
+      // Script (Create or Update/Fix): generate via scriptAssistant service directly.
+      // No visible Script Assistant panel required — logic runs inline.
+      if (!effectiveScriptFolder) {
+        setAiError('No script folder configured for this customer.');
+        return;
+      }
+      // For Create + Script: require that Confirm Setup has set a specific target file.
+      // workflowSetup.scriptPath will be the full path (e.g. .../Scripts/nvr_account_events.js).
+      const confirmedScriptFile = task.workflowSetup?.scriptPath;
+      const scriptFileIsConfirmed =
+        !!confirmedScriptFile &&
+        /\.(js|ts)$/i.test(confirmedScriptFile);
+      const isCreateWorkflow = task.workflowSetup?.workIntent === 'create';
+      if (isCreateWorkflow && !scriptFileIsConfirmed) {
+        setAiError('Confirm target script file first — open Confirm Setup to choose the file name.');
         return;
       }
       setAiLoading('draft');
       setAiError(null);
       try {
-        await scriptPanelRef.current.generateDraft();
-        await updateTask(task.id, { status: 'in-progress' });
-        setFeedback('Draft generated — status set to In Progress');
-        // setScriptHasDraft is driven by onDraftChange callback from the panel.
+        const analysis = analyzeScriptTask(task, customer ?? null);
+        const plan_ = await buildScriptPlan(
+          analysis,
+          effectiveScriptFolder,
+          () => tauriApi.listDirectoryFiles(effectiveScriptFolder, 'js'),
+          (path: string) => tauriApi.readFileContent(path),
+          // For Create workflows pass the confirmed file path so generation targets it.
+          scriptFileIsConfirmed ? confirmedScriptFile : undefined,
+        );
+        const skeleton = generateSkeleton(analysis, plan_);
+        const preview = await buildScriptPreview(
+          analysis, plan_, skeleton,
+          (path: string) => tauriApi.readFileContent(path),
+        );
+        // Store as SkeletonPreview for the modal, and keep full target path for Apply.
+        setSkeletonPreview({ fileName: preview.targetFileName, content: preview.newContent, targetPath: '' });
+        setScriptDraftPath(preview.targetFile);
+        setShowSkeleton(true);
+        // Status stays at Analyzed until Apply Draft succeeds.
       } catch (e) {
         setAiError(String(e));
       } finally {
         setAiLoading(null);
       }
     }
+  }
+
+  /**
+   * Completes the script draft apply workflow after the .js file has been written.
+   * Persists task state, closes the skeleton modal, and opens the file in VS Code.
+   */
+  async function completeScriptDraft(writtenFilePath: string) {
+    await updateTask(task.id, {
+      status: 'in-progress',
+      workflowSetup: {
+        ...task.workflowSetup,
+        scriptPath:  writtenFilePath,
+        artifactPath: writtenFilePath,
+      },
+    });
+    setSkeletonPreview(null);
+    setShowSkeleton(false);
+    setScriptDraftPath(null);
+    // Open workspace + new file in VS Code (non-fatal if it fails).
+    const workspaceRoot = resolveScriptWorkspaceRoot(writtenFilePath);
+    if (workspaceRoot) {
+      tauriApi.openInVscodeWorkspace(workspaceRoot, writtenFilePath).catch(() => {});
+    } else {
+      tauriApi.openInVscode(writtenFilePath).catch(() => {});
+    }
+    setFeedback('Script draft saved — status set to In Progress');
   }
 
   async function handleApplyDraft() {
@@ -526,24 +588,25 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
       // File saved — complete the rest of the workflow.
       await completePluginDraft(selectedPluginProject, subPath);
     } else {
-      // Script: delegate to the Script Assistant panel apply step.
-      if (!scriptPanelRef.current) return;
+      // Script: save the draft content to the resolved target file path.
+      // scriptDraftPath is set by handleGenerateDraft when using the service path.
+      // For legacy callers the path can also be inferred from the skeletonPreview context.
+      const targetPath = scriptDraftPath;
+      if (!skeletonPreview || !targetPath) {
+        setFeedback('Generate a draft first before applying.');
+        return;
+      }
       setAiLoading('draft');
       setAiError(null);
       try {
-        const writtenPath = await scriptPanelRef.current.applyDraft();
-        // Persist the created file path so subsequent Open/AI Review can use it directly.
-        if (writtenPath) {
-          await updateTask(task.id, {
-            workflowSetup: { ...task.workflowSetup, artifactPath: writtenPath },
-          });
-        }
-        setFeedback('Script draft applied.');
+        await tauriApi.saveGeneratedFile(targetPath, skeletonPreview.content);
       } catch (e) {
-        setAiError(String(e));
-      } finally {
+        setFsError(String(e));
         setAiLoading(null);
+        return;
       }
+      setAiLoading(null);
+      await completeScriptDraft(targetPath);
     }
   }
 
@@ -1360,19 +1423,14 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
                 <button
                   className={`btn btn-sm ${plan.draftIsPrimaryAction ? 'btn-primary' : 'btn-secondary'}`}
                   onClick={handleGenerateDraft}
-                  disabled={
-                    !!aiLoading ||
-                    (devTarget.kind !== 'plugin' && !effectiveScriptFolder)
-                  }
+                  disabled={!!aiLoading}
                   title={devTarget.kind === 'plugin'
                     ? plan.draftIsPrimaryAction
                       ? 'Generate C# plugin class draft (preview before writing)'
                       : 'Generate a draft patch or class skeleton (optional)'
-                    : !effectiveScriptFolder
-                      ? 'No script folder configured for this customer'
-                      : plan.draftIsPrimaryAction
-                        ? 'Generate a new script skeleton via Script Assistant'
-                        : 'Generate a draft script snippet (optional helper)'}
+                    : plan.draftIsPrimaryAction
+                      ? 'Generate a new script skeleton and preview before saving'
+                      : 'Generate a draft script snippet (optional helper)'}
                 >
                   {aiLoading === 'draft'
                     ? <><span className="btn-spinner" /> Generating…</>
@@ -1381,7 +1439,7 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
               )}
 
               {/* Apply Draft */}
-              {plan.requiresDraftGeneration && (skeletonPreview || scriptHasDraft) && (
+              {plan.requiresDraftGeneration && skeletonPreview && (
                 <button
                   className="btn btn-secondary btn-sm"
                   onClick={handleApplyDraft}
@@ -1419,16 +1477,7 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
             </div>
           </div>
 
-          {/* SCRIPT ASSISTANT — for all script dev tasks (create writes new file, update/fix patches existing). */}
-          {customer && effectiveScriptFolder && devTarget.kind !== 'plugin' && plan.requiresDraftGeneration && (
-            <ScriptAssistantPanel
-              ref={scriptPanelRef}
-              task={task}
-              customer={customer}
-              onDraftChange={setScriptHasDraft}
-              scriptFolderOverride={effectiveScriptFolder}
-            />
-          )}
+          {/* SCRIPT ASSISTANT panel removed — draft generation now runs via service directly */}
 
           {/* AZURE DEVOPS — shown for ADO PR comment/review tasks with an extracted deep link */}
           {(() => {
@@ -1614,50 +1663,64 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
         />
       )}
 
-      {/* Skeleton preview modal */}
+      {/* Skeleton preview modal — used for both plugin (.cs) and script (.js) drafts */}
       {showSkeleton && skeletonPreview && (
-        <SkeletonPreviewModal
-          preview={skeletonPreview}
-          customer={customer}
-          resolvedPluginBase={
-            (pluginsDir && selectedPluginProject)
-              ? `${pluginsDir}/${selectedPluginProject}`
-              : undefined
-          }
-          onClose={() => { setShowSkeleton(false); }}
-          onSaved={(filePath) => {
-            // "Save to File" succeeded inside the modal — complete the full workflow.
-            // selectedPluginProject is guaranteed non-empty when resolvedPluginBase is provided.
-            if (selectedPluginProject) {
-              completePluginDraft(selectedPluginProject, filePath);
+        devTarget.kind === 'plugin' ? (
+          <SkeletonPreviewModal
+            preview={skeletonPreview}
+            customer={customer}
+            resolvedPluginBase={
+              (pluginsDir && selectedPluginProject)
+                ? `${pluginsDir}/${selectedPluginProject}`
+                : undefined
             }
-          }}
-          onCreateAndApply={
-            // Offer "Create Project & Apply" only when no plugin project is selected yet
-            // and we have both a pluginsDir and a customer to derive naming from.
-            (!selectedPluginProject && pluginsDir && customer)
-              ? async () => {
-                  const folders = await tauriApi.listSubfolders(pluginsDir).catch(() => [] as string[]);
-                  const suggested = inferPluginSuggestions(task, customer, folders);
-                  const projectName = sanitize(suggested.projectName);
-                  if (!projectName) throw new Error('Could not infer a project name from this task.');
+            onClose={() => { setShowSkeleton(false); }}
+            onSaved={(filePath) => {
+              // "Save to File" succeeded inside the modal — complete the full workflow.
+              // selectedPluginProject is guaranteed non-empty when resolvedPluginBase is provided.
+              if (selectedPluginProject) {
+                completePluginDraft(selectedPluginProject, filePath);
+              }
+            }}
+            onCreateAndApply={
+              // Offer "Create Project & Apply" only when no plugin project is selected yet
+              // and we have both a pluginsDir and a customer to derive naming from.
+              (!selectedPluginProject && pluginsDir && customer)
+                ? async () => {
+                    const folders = await tauriApi.listSubfolders(pluginsDir).catch(() => [] as string[]);
+                    const suggested = inferPluginSuggestions(task, customer, folders);
+                    const projectName = sanitize(suggested.projectName);
+                    if (!projectName) throw new Error('Could not infer a project name from this task.');
 
-                  // Create the built-in scaffold (empty templateDir triggers the built-in path).
-                  const solutionRoot = await tauriApi.createPluginProjectFromTemplate(
-                    '', pluginsDir, projectName, suggested.namespace, false,
-                  );
+                    // Create the built-in scaffold (empty templateDir triggers the built-in path).
+                    const solutionRoot = await tauriApi.createPluginProjectFromTemplate(
+                      '', pluginsDir, projectName, suggested.namespace, false,
+                    );
 
-                  // Write the generated .cs into the nested project subfolder:
-                  //   <solutionRoot>/<projectName>/<fileName>
-                  const targetFile = `${solutionRoot}/${projectName}/${skeletonPreview.fileName}`;
-                  await tauriApi.saveGeneratedFile(targetFile, skeletonPreview.content);
+                    // Write the generated .cs into the nested project subfolder:
+                    //   <solutionRoot>/<projectName>/<fileName>
+                    const targetFile = `${solutionRoot}/${projectName}/${skeletonPreview.fileName}`;
+                    await tauriApi.saveGeneratedFile(targetFile, skeletonPreview.content);
 
-                  // Complete the workflow — persists state, closes modal, refreshes panel, opens project.
-                  await completePluginDraft(projectName, targetFile);
-                }
-              : undefined
-          }
-        />
+                    // Complete the workflow — persists state, closes modal, refreshes panel, opens project.
+                    await completePluginDraft(projectName, targetFile);
+                  }
+                : undefined
+            }
+          />
+        ) : (
+          // Script draft preview modal — overrideSavePath directs save to the script folder.
+          <SkeletonPreviewModal
+            preview={skeletonPreview}
+            customer={customer}
+            overrideSavePath={scriptDraftPath ?? undefined}
+            onClose={() => { setShowSkeleton(false); setScriptDraftPath(null); }}
+            onSaved={(filePath) => {
+              // "Save to File" in the modal succeeded — complete the script draft workflow.
+              completeScriptDraft(filePath);
+            }}
+          />
+        )
       )}
 
       {/* Confirm Setup modal — shown when user clicks Analyze on a New task */}

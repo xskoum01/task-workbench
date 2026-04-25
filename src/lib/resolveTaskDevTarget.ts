@@ -63,6 +63,18 @@ function isPluginTask(task: Task, customer: Customer | undefined): boolean {
 const SCRIPT_KEYWORDS = [
   '.js', 'onload', 'onsave', 'onchange', 'ribbon',
   'webresource', 'web resource', 'script',
+  // CRM form / UI / visibility — strong client-side dev signals
+  'sekce', 'sekci', 'formulář', 'záložka', 'skrývání', 'skrýt', 'skryj', 'zobrazit',
+  // Field / section change context — onChange handler implication
+  'změně pole', 'změna pole', 'při změně',
+  // Custom field prefixes — unambiguous Dataverse developer signal
+  'nvr_', 'cr_',
+  // Power Apps Component Framework
+  'pcf',
+  // XRM / formContext references
+  'formcontext', 'xrm.',
+  // CRM platform
+  'power apps', 'dynamics', 'd365',
 ];
 
 function isScriptTask(task: Task, customer: Customer | undefined): boolean {

@@ -107,6 +107,9 @@ interface AppContextValue {
   // Settings operations
   updateSettings: (updates: Partial<AppSettings>) => Promise<void>;
 
+  // Week log
+  updateWeeklyNote: (date: string, note: string) => Promise<void>;
+
   // Convenience lookup
   getCustomerById: (id: string) => Customer | undefined;
 }
@@ -333,7 +336,17 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
 
   const updateTask = useCallback(
     async (id: string, updates: Partial<Task>) => {
-      const updated = tasks.map((t) => (t.id === id ? { ...t, ...updates } : t));
+      const updated = tasks.map((t) => {
+        if (t.id !== id) return t;
+        const merged = { ...t, ...updates };
+        // Track completion timestamp automatically.
+        if (updates.status === 'done' && t.status !== 'done') {
+          merged.completedAt = new Date().toISOString();
+        } else if (updates.status && updates.status !== 'done' && t.status === 'done') {
+          merged.completedAt = undefined;
+        }
+        return merged;
+      });
       setTasks(updated);
       try {
         await api.saveTasks(updated);
@@ -942,6 +955,18 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     [settings],
   );
 
+  // --- Week log ---
+
+  const updateWeeklyNote = useCallback(
+    async (date: string, note: string) => {
+      const notes = { ...(settings.weeklyNotes ?? {}), [date]: note };
+      // Remove empty notes to keep storage clean
+      if (!note.trim()) delete notes[date];
+      await updateSettings({ weeklyNotes: notes });
+    },
+    [settings, updateSettings],
+  );
+
   // --- Repository rescan ---
 
   const rescanRepositories = useCallback(
@@ -1048,6 +1073,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
         rescanRepositories,
         createRepositoryFromTemplate,
         updateSettings,
+        updateWeeklyNote,
         getCustomerById,
       }}
     >

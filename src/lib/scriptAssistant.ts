@@ -124,6 +124,16 @@ const ENTITY_KEYWORDS: [string, string][] = [
   ['aktivita',             'nvr_generalactivity'],
   ['activity',             'nvr_generalactivity'],
   ['interaction',          'nvr_interaction'],
+  // Czech locative / genitive / accusative inflections
+  ['accountu',             'account'],
+  ['accountem',            'account'],
+  ['contactu',             'contact'],
+  ['contactem',            'contact'],
+  ['projektu',             'project'],
+  ['projektem',            'project'],
+  ['projekt',              'project'],
+  ['incidentu',            'incident'],
+  ['opportunitou',         'opportunity'],
 ];
 
 // ---------------------------------------------------------------------------
@@ -169,6 +179,14 @@ const NVR_FIELD_EXCLUSIONS = new Set([
   'nvr_unit',
   'nvr_currency',
 ]);
+
+/**
+ * Context words that indicate the following nvr_ token is a UI element
+ * (section, field, column, tab, etc.) — NOT an entity logical name.
+ * Used to skip false-positive entity detection from section/field names.
+ */
+const NVR_CONTEXT_EXCLUSION_PATTERN =
+  /(?:sekci|sekce|section|pole|field|column|sloupci|sloupce|tab|panel|záložce)\s+(?:s\s+názvem\s+)?(nvr_[a-z_][a-z0-9_]*)/gi;
 
 // ---------------------------------------------------------------------------
 // Trigger patterns
@@ -239,42 +257,54 @@ const FIELD_EXCLUSION_WORDS = new Set([
  * Extract the most likely Dataverse entity logical name from task text.
  *
  * Priority order:
- * 1. Explicit nvr_<entity> tokens (excluding known field names)
- * 2. Standard entity names (word-boundary match, longest first)
- * 3. Czech / English keyword → entity mapping (longest keyword first)
+ * 1. Standard entity names (word-boundary match, longest first)
+ * 2. Czech / English keyword → entity mapping (longest keyword first)
+ * 3. Explicit nvr_<entity> tokens (excluding known field names and section/field context)
  * 4. File name hints in the text (e.g. nvr_account_events.js)
  * 5. Default fallback: 'account'
+ *
+ * Note: nvr_ tokens preceded by section/field context words (sekci, pole, field…)
+ * are skipped to prevent section/field names from being mistaken for entity names.
  */
 export function extractEntityFromText(text: string): string {
   const lower = text.toLowerCase();
 
-  // Trigger/event words that must never form part of an entity logical name.
-  // e.g. "nvr_solution_onchange" → entity is "nvr_solution", not "nvr_solution_onchange".
-  const TRIGGER_SUFFIXES = /[_](onchange|onload|onsave|handler|events)$/i;
-
-  // 1. nvr_ prefixed tokens — skip excluded field names; limit segment count
-  for (const m of lower.matchAll(/\bnvr_([a-z][a-z0-9]*(?:_[a-z0-9]+)*)\b/g)) {
-    // Strip trailing trigger/event suffix before treating as entity name.
-    const bare = m[1].replace(TRIGGER_SUFFIXES, '');
-    const full = `nvr_${bare}`;
-    if (NVR_FIELD_EXCLUSIONS.has(full)) continue;
-    const segmentCount = bare.split('_').length;
-    if (segmentCount > 3) continue; // likely a compound field, not an entity
-    return full;
+  // Build a set of nvr_ tokens that appear in section/field context — these
+  // should never be treated as entity logical names.
+  const contextExcluded = new Set<string>();
+  for (const m of text.matchAll(NVR_CONTEXT_EXCLUSION_PATTERN)) {
+    contextExcluded.add(m[1].toLowerCase());
   }
 
-  // 2. Standard entity names — already sorted longest-first at module level
+  // Trigger/event words that must never form part of an entity logical name.
+  const TRIGGER_SUFFIXES = /[_](onchange|onload|onsave|handler|events)$/i;
+
+  // 1. Standard entity names — checked first to catch "AccountU", "Contactu" etc.
+  //    via keyword mapping before nvr_ scanning can grab a section/field name.
   for (const entity of STANDARD_ENTITIES) {
     if (new RegExp(`\\b${entity}\\b`, 'i').test(text)) {
       return entity;
     }
   }
 
-  // 3. Czech / English keyword mapping (longest keyword first)
+  // 2. Czech / English keyword mapping (longest keyword first).
+  //    Catches Czech inflections like "accountu", "contactu", "projektu".
   for (const [keyword, entity] of ENTITY_KEYWORDS) {
     if (lower.includes(keyword)) {
       return entity;
     }
+  }
+
+  // 3. nvr_ prefixed tokens — skip context-excluded tokens (section/field names)
+  //    and well-known field name exclusions; limit segment count to avoid compound fields.
+  for (const m of lower.matchAll(/\bnvr_([a-z][a-z0-9]*(?:_[a-z0-9]+)*)\b/g)) {
+    const bare = m[1].replace(TRIGGER_SUFFIXES, '');
+    const full = `nvr_${bare}`;
+    if (NVR_FIELD_EXCLUSIONS.has(full)) continue;
+    if (contextExcluded.has(full)) continue; // preceded by "sekci", "pole", etc.
+    const segmentCount = bare.split('_').length;
+    if (segmentCount > 3) continue; // likely a compound field, not an entity
+    return full;
   }
 
   // 4. File name hints
@@ -729,8 +759,59 @@ export async function buildScriptPlan(
   scriptFolder: string,
   getJsFiles: () => Promise<string[]>,
   getFileContent: (path: string) => Promise<string>,
+  /** When set to an absolute .js/.ts file path, skips file resolution entirely.
+   *  The plan will target this specific file (create it if missing, extend if it exists). */
+  overrideTargetFile?: string,
 ): Promise<ScriptPlan> {
   const { entityLogicalName, triggerType, triggerField } = analysis;
+
+  // When caller provides an explicit target file (confirmed during Confirm Setup),
+  // skip the resolution logic and use it directly.
+  if (overrideTargetFile && /\.(js|ts)$/i.test(overrideTargetFile)) {
+    const normalOverride = overrideTargetFile.replace(/\\/g, '/');
+    const overrideName = normalOverride.split('/').pop() ?? overrideTargetFile;
+    // Probe whether the file exists by trying to read it.
+    let fileExists = false;
+    let inspection: ScriptFileInspection | undefined;
+    let existingHandlerName: string | undefined;
+    try {
+      const content = await getFileContent(overrideTargetFile);
+      fileExists = true;
+      inspection = inspectScriptFile(content, overrideTargetFile, overrideName);
+      existingHandlerName = findBestExistingHandler(inspection, triggerType, triggerField, entityLogicalName);
+      inspection = { ...inspection, existingHandlerName };
+    } catch { /* file does not exist yet — will be created */ }
+
+    const operationType = determineOperationType(triggerType, fileExists, inspection, existingHandlerName, triggerField);
+    const reuseExistingHandler = !!existingHandlerName;
+    const createNewHandler = operationType === 'new_onchange_handler' || operationType === 'new_file_scaffold';
+    const createNewHelper = operationType !== 'extend_existing_helper';
+    const candidateLower = analysis.candidateFunctionName.toLowerCase();
+    const similarHelperFound = inspection?.helpers.some(h =>
+      h.toLowerCase().startsWith(candidateLower.slice(0, Math.max(5, candidateLower.length - 3)))
+    ) ?? false;
+    const recommendedAction = buildRecommendedAction(
+      operationType, entityLogicalName, triggerType, triggerField,
+      overrideName, existingHandlerName, analysis.candidateFunctionName,
+    );
+    return {
+      targetFile: overrideTargetFile,
+      targetFileName: overrideName,
+      resolvedBy: fileExists ? 'canonical' : 'none',
+      fileExists,
+      entity: entityLogicalName,
+      triggerType,
+      triggerField,
+      operationType,
+      reuseExistingHandler,
+      existingHandlerName,
+      createNewHelper,
+      createNewHandler,
+      similarHelperFound,
+      recommendedAction,
+      inspection,
+    };
+  }
 
   let jsFiles: string[] = [];
   try {

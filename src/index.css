@@ -5400,3 +5400,233 @@ body {
   color: var(--color-text-muted);
   line-height: 1.4;
 }
+
+/* ===========================================================================
+   Week Log page
+   =========================================================================== */
+
+.wl-root {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  overflow: hidden;
+}
+
+.wl-nav-controls {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+}
+
+/* Content area — grid + optional detail panel side by side */
+.wl-content {
+  display: flex;
+  flex: 1;
+  overflow: hidden;
+  gap: 0;
+}
+
+/* 7-day grid */
+.wl-grid {
+  display: grid;
+  grid-template-columns: repeat(7, 1fr);
+  gap: 8px;
+  padding: var(--gap-md);
+  overflow-y: auto;
+  flex: 1;
+  min-width: 0;
+  align-content: start;
+}
+
+/* Responsive: fewer columns on smaller windows */
+@media (max-width: 1200px) {
+  .wl-grid {
+    grid-template-columns: repeat(4, 1fr);
+  }
+}
+
+@media (max-width: 800px) {
+  .wl-grid {
+    grid-template-columns: repeat(2, 1fr);
+  }
+}
+
+@media (max-width: 480px) {
+  .wl-grid {
+    grid-template-columns: 1fr;
+  }
+}
+
+/* Day card */
+.wl-day-card {
+  background: var(--bg-surface);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-md);
+  padding: 10px 10px 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  min-height: 140px;
+}
+
+.wl-day-card--today {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 1px color-mix(in srgb, var(--accent) 30%, transparent);
+  background: color-mix(in srgb, var(--accent) 5%, var(--bg-surface));
+}
+
+/* Card header */
+.wl-day-header {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.wl-day-name {
+  font-size: 11px;
+  font-weight: 700;
+  color: var(--text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+}
+
+.wl-day-date {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-primary);
+}
+
+.wl-today-badge {
+  font-size: 9px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 15%, transparent);
+  border: 1px solid color-mix(in srgb, var(--accent) 40%, transparent);
+  border-radius: 3px;
+  padding: 0 5px;
+  line-height: 16px;
+}
+
+/* Note textarea */
+.wl-note-wrap {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+}
+
+.wl-note-textarea {
+  width: 100%;
+  min-height: 60px;
+  resize: vertical;
+  background: var(--bg-overlay);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-sm);
+  color: var(--text-primary);
+  font-size: 12px;
+  font-family: inherit;
+  line-height: 1.5;
+  padding: 6px 8px;
+  box-sizing: border-box;
+  transition: border-color 0.15s;
+}
+
+.wl-note-textarea:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+
+.wl-note-textarea::placeholder {
+  color: var(--text-muted);
+}
+
+.wl-note-saving {
+  font-size: 10px;
+  color: var(--text-muted);
+  margin-top: 2px;
+  align-self: flex-end;
+}
+
+/* Completed task section */
+.wl-tasks {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.wl-tasks-label {
+  font-size: 10px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.07em;
+  color: var(--text-muted);
+  margin-bottom: 2px;
+}
+
+.wl-task-row {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  width: 100%;
+  text-align: left;
+  background: var(--bg-overlay);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-sm);
+  padding: 5px 8px;
+  cursor: pointer;
+  transition: background 0.12s, border-color 0.12s;
+}
+
+.wl-task-row:hover {
+  background: var(--bg-hover);
+  border-color: var(--border);
+}
+
+.wl-task-title {
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--text-primary);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  display: block;
+}
+
+.wl-task-meta {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  flex-wrap: wrap;
+}
+
+.wl-task-customer {
+  font-size: 10px;
+  color: var(--text-muted);
+}
+
+/* Empty state */
+.wl-empty {
+  font-size: 11px;
+  color: var(--text-muted);
+  font-style: italic;
+  padding: 2px 0;
+}
+
+/* Detail panel (right side) */
+.wl-detail-panel {
+  width: 680px;
+  flex-shrink: 0;
+  border-left: 1px solid var(--border);
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+}
+
+.wl-detail-panel .detail-panel {
+  /* TaskDetail uses 'aside.detail-panel'; remove absolute positioning override */
+  position: relative;
+  height: 100%;
+  width: 100%;
+}

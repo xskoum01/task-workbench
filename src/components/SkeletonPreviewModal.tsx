@@ -27,6 +27,12 @@ interface SkeletonPreviewModalProps {
    * always matches the project actually selected in the Dev panel.
    */
   resolvedPluginBase?: string;
+  /**
+   * Explicit absolute save path override — used for script drafts where the target
+   * is a flat file in the scripts folder, not a nested plugin project layout.
+   * When provided, bypasses the pluginFolder-based buildSavePath logic entirely.
+   */
+  overrideSavePath?: string;
 }
 
 /** Builds the absolute save path for the .cs file.
@@ -58,7 +64,7 @@ function buildSavePath(
   return null;
 }
 
-export default function SkeletonPreviewModal({ preview, customer: _customer, onClose, onSaved, onCreateAndApply, resolvedPluginBase }: SkeletonPreviewModalProps) {
+export default function SkeletonPreviewModal({ preview, customer: _customer, onClose, onSaved, onCreateAndApply, resolvedPluginBase, overrideSavePath }: SkeletonPreviewModalProps) {
   const [copied, setCopied]         = useState(false);
   const [saving, setSaving]         = useState(false);
   const [saved, setSaved]           = useState(false);
@@ -66,7 +72,8 @@ export default function SkeletonPreviewModal({ preview, customer: _customer, onC
   const [creating, setCreating]     = useState(false);
   const [createError, setCreateError] = useState<string | null>(null);
 
-  const savePath = buildSavePath(preview, resolvedPluginBase);
+  // overrideSavePath wins (script drafts); otherwise derive from plugin project base.
+  const savePath = overrideSavePath ?? buildSavePath(preview, resolvedPluginBase);
 
   async function handleCopy() {
     try {

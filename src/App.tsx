@@ -4,6 +4,7 @@ import { AppProvider, useApp } from './context/AppContext';
 import AppLayout from './layout/AppLayout';
 import InboxPage from './pages/InboxPage';
 import TasksPage from './pages/TasksPage';
+import WeekLogPage from './pages/WeekLogPage';
 import CustomersPage from './pages/CustomersPage';
 import SettingsPage from './pages/SettingsPage';
 
@@ -11,6 +12,7 @@ function renderPage(page: NavPage) {
   switch (page) {
     case 'inbox':     return <InboxPage />;
     case 'tasks':     return <TasksPage />;
+    case 'week-log':  return <WeekLogPage />;
     case 'customers': return <CustomersPage />;
     case 'settings':  return <SettingsPage />;
   }

@@ -197,6 +197,12 @@ export interface WorkflowSetup {
    * actions can navigate directly to the created artifact.
    */
   artifactPath?: string;
+  /**
+   * Desired target script file name (just the base name, e.g. "nvr_account_events.js").
+   * Set during Confirm Setup for Create+Script workflows so Generate Draft uses the
+   * confirmed name instead of re-inferring it from the task text.
+   */
+  desiredScriptFile?: string;
 }
 
 /**

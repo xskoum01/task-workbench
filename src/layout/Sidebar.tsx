@@ -12,6 +12,7 @@ interface NavItem {
 const NAV_ITEMS: NavItem[] = [
   { page: 'inbox',     label: 'Inbox',     icon: 'inbox'         },
   { page: 'tasks',     label: 'Tasks',     icon: 'check-square'  },
+  { page: 'week-log',  label: 'Week Log',  icon: 'calendar'      },
   { page: 'customers', label: 'Customers', icon: 'building'      },
   { page: 'settings',  label: 'Settings',  icon: 'settings'      },
 ];

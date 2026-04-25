@@ -284,7 +284,15 @@ export default function ConfirmSetupModal({
   const [customerId, setCustomerId]   = useState<string>(defaults.customerId);
   const [pluginProject, setPluginProject] = useState<string>(defaults.pluginProject);
   // Script folder path — used only for Create workflow.
-  const [scriptCreateFolder, setScriptCreateFolder] = useState<string>(defaults.scriptPath);
+  // When scriptPath is a file path (ends .js/.ts), extract the parent folder.
+  const initScriptFolder = (() => {
+    const sp = defaults.scriptPath;
+    if (sp && /\.(js|ts)$/i.test(sp)) {
+      return sp.replace(/\\/g, '/').replace(/\/[^/]+$/, '');
+    }
+    return sp;
+  })();
+  const [scriptCreateFolder] = useState<string>(initScriptFolder ?? '');
   const initReviewerId = defaults.reviewerId || selectReviewerByKind(initDevKind);
   const [reviewerId, setReviewerId]   = useState<string>(initReviewerId);
   const [reviewerManuallySet, setReviewerManuallySet] = useState(false);
@@ -324,6 +332,18 @@ export default function ConfirmSetupModal({
     selectedCustomer?.resolvedRepositoryPath ??
     selectedCustomer?.repositoryRoot ??
     selectedCustomer?.folderName ?? '';
+
+  // --- Create + Script file name state ---
+  // File name (base name only) for the new script file in Create + Script workflow.
+  const [createScriptFileName, setCreateScriptFileName] = useState<string>(
+    defaults.desiredScriptFile ?? task.workflowSetup?.desiredScriptFile ?? 'nvr_account_events.js',
+  );
+  const [createScriptFileSource] = useState<string>(hints.desiredScriptFileSource ?? '');
+  // Existing files in the script folder — used for "extend existing" option in Create + Script.
+  const [createScriptFiles, setCreateScriptFiles] = useState<FileEntry[]>([]);
+  const [createScriptFilesLoading, setCreateScriptFilesLoading] = useState(false);
+  // 'new' = user wants to create a new file; 'existing' = extend existing file
+  const [createScriptMode, setCreateScriptMode] = useState<'new' | 'existing'>('new');
 
   // --- Resolve the best existing script folder from a priority-ordered candidate list ---
   useEffect(() => {
@@ -435,6 +455,19 @@ export default function ConfirmSetupModal({
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [devKind, workIntent, pluginsDir, pluginProject]);
 
+  // Load existing script files for Create + Script (to allow "extend existing" option).
+  useEffect(() => {
+    if (!isDev || devKind !== 'script' || isEditMode || !scriptCreateFolder) {
+      setCreateScriptFiles([]); return;
+    }
+    setCreateScriptFilesLoading(true);
+    tauriApi.listFilesWithPaths(scriptCreateFolder, ['js', 'ts'], false, ['node_modules', 'bin', 'obj', 'dist', 'build'])
+      .then(setCreateScriptFiles)
+      .catch(() => setCreateScriptFiles([]))
+      .finally(() => setCreateScriptFilesLoading(false));
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isDev, devKind, workIntent, scriptCreateFolder]);
+
   // --- Handlers ---
 
   function handleKindChange(kind: 'plugin' | 'script') {
@@ -473,6 +506,25 @@ export default function ConfirmSetupModal({
       return;
     }
     const chosenFile = isEditMode ? (selectedExistingFile.trim() || undefined) : undefined;
+
+    // For Create + Script: build full absolute path from folder + file name.
+    let createScriptPath: string | undefined;
+    let desiredScriptFile: string | undefined;
+    if (!isEditMode && devKind === 'script') {
+      const folder = scriptCreateFolder.trim();
+      // When "extend existing" mode, createScriptFileName may be a full path already.
+      const rawName = createScriptFileName.trim();
+      const baseName = rawName
+        ? (rawName.replace(/\\/g, '/').split('/').pop() ?? rawName)
+        : '';
+      if (folder && baseName) {
+        createScriptPath = `${folder.replace(/[/\\]+$/, '')}/${baseName}`;
+      } else if (folder) {
+        createScriptPath = folder;
+      }
+      if (baseName) desiredScriptFile = baseName;
+    }
+
     const setup: WorkflowSetup = {
       workIntent,
       devTargetKind:  devKind,
@@ -480,8 +532,9 @@ export default function ConfirmSetupModal({
       repositoryRoot: repoHint   || undefined,
       pluginProject:  devKind === 'plugin' ? (pluginProject.trim() || undefined) : undefined,
       scriptPath: devKind === 'script'
-        ? (isEditMode ? chosenFile : (scriptCreateFolder.trim() || undefined))
+        ? (isEditMode ? chosenFile : createScriptPath)
         : undefined,
+      desiredScriptFile: devKind === 'script' && !isEditMode ? desiredScriptFile : undefined,
       reviewerId:   reviewerId || undefined,
       // artifactPath is set here for Update/Fix/Review (the chosen existing file).
       // For Create it stays undefined until Apply Draft creates the file.
@@ -495,15 +548,62 @@ export default function ConfirmSetupModal({
   function renderScriptField() {
     if (!isDev || devKind !== 'script') return null;
     if (!isEditMode) {
+      // Create + Script: show target file picker with entity-based suggestion.
       return (
         <div className="confirm-setup-row">
-          <label className="form-label confirm-setup-label">Target script folder</label>
-          <input
-            className="form-input" type="text" value={scriptCreateFolder}
-            placeholder="Folder where the new script will be created"
-            onChange={(e) => setScriptCreateFolder(e.target.value)}
-          />
-          {hints.scriptPath && <div className="confirm-setup-inferred">{hints.scriptPath}</div>}
+          <label className="form-label confirm-setup-label">Target script file</label>
+          {/* Toggle: new file vs. extend existing */}
+          <div className="confirm-setup-kind-group" style={{ marginBottom: 6 }}>
+            <button type="button"
+              className={`btn btn-sm${createScriptMode === 'new' ? ' btn-primary' : ' btn-secondary'}`}
+              onClick={() => setCreateScriptMode('new')}>
+              New file
+            </button>
+            <button type="button"
+              className={`btn btn-sm${createScriptMode === 'existing' ? ' btn-primary' : ' btn-secondary'}`}
+              onClick={() => setCreateScriptMode('existing')}>
+              Extend existing
+            </button>
+          </div>
+
+          {createScriptMode === 'new' ? (
+            <>
+              <input
+                className="form-input" type="text" value={createScriptFileName}
+                placeholder="e.g. nvr_account_events.js"
+                onChange={(e) => setCreateScriptFileName(e.target.value)}
+              />
+              {createScriptFileSource && (
+                <div className="confirm-setup-inferred">{createScriptFileSource}</div>
+              )}
+            </>
+          ) : (
+            createScriptFilesLoading ? (
+              <div className="confirm-setup-hint">Scanning script folder…</div>
+            ) : createScriptFiles.length > 0 ? (
+              <select
+                className="form-select"
+                value={createScriptFileName}
+                onChange={(e) => setCreateScriptFileName(e.target.value.replace(/\\/g, '/').split('/').pop() ?? e.target.value)}
+              >
+                <option value="">Select script file to extend…</option>
+                {createScriptFiles.map((f) => (
+                  <option key={f.path} value={f.path}>{f.name}</option>
+                ))}
+              </select>
+            ) : (
+              <div className="confirm-setup-hint confirm-setup-hint--warn">No script files found — switch to New file.</div>
+            )
+          )}
+
+          {scriptCreateFolder && (
+            <div className="confirm-setup-hint">
+              Scripts folder: {scriptCreateFolder}
+            </div>
+          )}
+          {!scriptCreateFolder && hints.scriptPath && (
+            <div className="confirm-setup-inferred">{hints.scriptPath}</div>
+          )}
         </div>
       );
     }

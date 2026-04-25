@@ -9,6 +9,7 @@ import type { Task, Customer, WorkflowSetup, AiReviewerConfig } from '../types';
 import type { DevTarget } from './resolveTaskDevTarget';
 import { hintedPluginProject } from './resolveTaskDevTarget';
 import { mergeWithDefaults } from './aiReviewers';
+import { extractEntityFromText } from './scriptAssistant';
 
 // ---------------------------------------------------------------------------
 // Work intent inference
@@ -16,7 +17,10 @@ import { mergeWithDefaults } from './aiReviewers';
 
 const FIX_PATTERNS    = /\b(fix|bug|error|broken|crash|issue|nefunguje|chyba|opravit|neopravuje)\b/i;
 const REVIEW_PATTERNS = /\b(review|code review|zkontroluj|kontrola|přezkoumej)\b/i;
-const CREATE_PATTERNS = /\b(create|new|scaffold|generate|založ|vytvoř|nový|nová|nové|vytvořit|vytvořte)\b/i;
+// NOTE: Czech words ending in non-ASCII chars (ř, ž, á …) break JS \b after them.
+// Use prefix-only \b and skip the trailing boundary for Czech verb/adjective forms.
+// nov[aáéýiou] covers nominative/accusative/genitive forms: nová, nový, nové, novou, novi…
+const CREATE_PATTERNS = /\b(create|new|scaffold|generate)\b|\bzalož|\bvytvoř|\bnov[aáéýiou]|\bnovou/i;
 const UPDATE_PATTERNS = /\b(update|change|modify|extend|adjust|uprav|změň|doplň|přidej|rozšiř)\b/i;
 
 function inferWorkIntent(task: Task): NonNullable<WorkflowSetup['workIntent']> {
@@ -66,6 +70,31 @@ function inferScriptPath(
   return '';
 }
 
+/**
+ * Suggests a target JS file name for a Create + Script workflow.
+ *
+ * Priority:
+ * 1. Already confirmed desiredScriptFile on the task
+ * 2. Entity detected from task text → nvr_<entity>_events.js
+ * 3. Fallback: 'nvr_account_events.js'
+ *
+ * Returns { fileName, source } where source is a short UI hint string.
+ */
+export function inferDesiredScriptFileName(
+  task: Task,
+): { fileName: string; source: string } {
+  // 1. Already confirmed
+  if (task.workflowSetup?.desiredScriptFile) {
+    return { fileName: task.workflowSetup.desiredScriptFile, source: 'Confirmed in previous setup' };
+  }
+  const text = `${task.title} ${task.originalMessage ?? ''}`;
+  const entity = extractEntityFromText(text);
+  const bare = entity.startsWith('nvr_') ? entity.slice(4) : entity;
+  const fileName = `nvr_${bare}_events.js`;
+  const displayEntity = bare.charAt(0).toUpperCase() + bare.slice(1);
+  return { fileName, source: `Suggested from entity: ${displayEntity}` };
+}
+
 // ---------------------------------------------------------------------------
 // Reviewer inference
 // ---------------------------------------------------------------------------
@@ -100,6 +129,10 @@ export interface SetupInferenceHints {
   pluginProject?: string;
   scriptPath?: string;
   reviewerId?: string;
+  /** Suggested target JS file name for Create + Script (base name only). */
+  desiredScriptFile?: string;
+  /** Human-readable explanation of where the suggestion came from. */
+  desiredScriptFileSource?: string;
 }
 
 // ---------------------------------------------------------------------------
@@ -117,8 +150,10 @@ export interface InferWorkflowSetupInput {
 }
 
 export interface InferWorkflowSetupResult {
-  defaults: Required<Omit<WorkflowSetup, 'confirmedAt' | 'repositoryRoot' | 'artifactPath' | 'desiredPluginProject'>> & {
+  defaults: Required<Omit<WorkflowSetup, 'confirmedAt' | 'repositoryRoot' | 'artifactPath' | 'desiredPluginProject' | 'desiredScriptFile'>> & {
     customerId: string;
+    /** Inferred target JS file name for Create + Script (base name only). */
+    desiredScriptFile?: string;
   };
   hints: SetupInferenceHints;
 }
@@ -137,6 +172,12 @@ export function inferWorkflowSetupDefaults({
   const scriptPath    = inferScriptPath(task, customer, scriptFolder);
   const reviewerId    = inferReviewerId(task, devKind, reviewerConfigs);
   const customerId    = task.workflowSetup?.customerId ?? task.customerId ?? '';
+
+  // Infer the target script file name for Create + Script workflows.
+  const { fileName: desiredScriptFile, source: desiredScriptFileSource } =
+    (workIntent === 'create' && devKind === 'script')
+      ? inferDesiredScriptFileName(task)
+      : { fileName: undefined, source: undefined };
 
   // Build hint labels for the UI
   const hints: SetupInferenceHints = {};
@@ -168,6 +209,11 @@ export function inferWorkflowSetupDefaults({
     hints.reviewerId = 'Matched by target kind';
   }
 
+  if (desiredScriptFile) {
+    hints.desiredScriptFile = desiredScriptFile;
+    hints.desiredScriptFileSource = desiredScriptFileSource;
+  }
+
   return {
     defaults: {
       workIntent,
@@ -176,6 +222,7 @@ export function inferWorkflowSetupDefaults({
       pluginProject,
       scriptPath,
       reviewerId,
+      desiredScriptFile,
     },
     hints,
   };
