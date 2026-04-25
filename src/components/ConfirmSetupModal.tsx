@@ -238,6 +238,8 @@ interface ConfirmSetupModalProps {
   crmBaseDirectory?: string;
   /** Called when the user clicks Confirm & Analyze. */
   onConfirm: (setup: WorkflowSetup) => void;
+  /** Called when the user clicks Confirm only (no AI analysis). */
+  onConfirmOnly?: (setup: WorkflowSetup) => void;
   onCancel: () => void;
 }
 
@@ -252,6 +254,7 @@ export default function ConfirmSetupModal({
   effectiveMode,
   crmBaseDirectory,
   onConfirm,
+  onConfirmOnly,
   onCancel,
 }: ConfirmSetupModalProps) {
   // Run inference once on mount - workflowSetup values win over guesses inside the helper.
@@ -504,25 +507,21 @@ export default function ConfirmSetupModal({
     return null;
   })();
 
-  function handleConfirm() {
-    if (confirmError) return;
+  function buildSetup(): WorkflowSetup | null {
+    if (confirmError) return null;
     if (!isDev) {
-      onConfirm({
+      return {
         customerId: customerId || undefined,
         workIntent: undefined, devTargetKind: undefined, repositoryRoot: undefined,
         pluginProject: undefined, scriptPath: undefined, reviewerId: undefined,
         artifactPath: undefined, confirmedAt: new Date().toISOString(),
-      });
-      return;
+      };
     }
     const chosenFile = isEditMode ? (selectedExistingFile.trim() || undefined) : undefined;
-
-    // For Create + Script: build full absolute path from folder + file name.
     let createScriptPath: string | undefined;
     let desiredScriptFile: string | undefined;
     if (!isEditMode && devKind === 'script') {
       const folder = scriptCreateFolder.trim();
-      // When "extend existing" mode, createScriptFileName may be a full path already.
       const rawName = createScriptFileName.trim();
       const baseName = rawName
         ? (rawName.replace(/\\/g, '/').split('/').pop() ?? rawName)
@@ -534,8 +533,7 @@ export default function ConfirmSetupModal({
       }
       if (baseName) desiredScriptFile = baseName;
     }
-
-    const setup: WorkflowSetup = {
+    return {
       workIntent,
       devTargetKind:  devKind,
       customerId:     customerId || undefined,
@@ -546,12 +544,39 @@ export default function ConfirmSetupModal({
         : undefined,
       desiredScriptFile: devKind === 'script' && !isEditMode ? desiredScriptFile : undefined,
       reviewerId:   reviewerId || undefined,
-      // artifactPath is set here for Update/Fix/Review (the chosen existing file).
-      // For Create it stays undefined until Apply Draft creates the file.
       artifactPath: chosenFile,
       confirmedAt:  new Date().toISOString(),
     };
-    onConfirm(setup);
+  }
+
+  function handleConfirm() {
+    if (confirmError) return;
+    if (!isDev) {
+      onConfirm({
+        customerId: customerId || undefined,
+        workIntent: undefined, devTargetKind: undefined, repositoryRoot: undefined,
+        pluginProject: undefined, scriptPath: undefined, reviewerId: undefined,
+        artifactPath: undefined, confirmedAt: new Date().toISOString(),
+      });
+      return;
+    }
+    const setup = buildSetup();
+    if (setup) onConfirm(setup);
+  }
+
+  function handleConfirmOnly() {
+    if (confirmError) return;
+    if (!isDev) {
+      onConfirmOnly?.({
+        customerId: customerId || undefined,
+        workIntent: undefined, devTargetKind: undefined, repositoryRoot: undefined,
+        pluginProject: undefined, scriptPath: undefined, reviewerId: undefined,
+        artifactPath: undefined, confirmedAt: new Date().toISOString(),
+      });
+      return;
+    }
+    const setup = buildSetup();
+    if (setup) onConfirmOnly?.(setup);
   }
   // --- Render helpers ---
 
@@ -814,6 +839,15 @@ export default function ConfirmSetupModal({
             <span className="confirm-setup-validation-error">{confirmError}</span>
           )}
           <button className="btn btn-secondary btn-sm" onClick={onCancel} type="button">Cancel</button>
+          {onConfirmOnly && (
+            <button
+              className="btn btn-secondary btn-sm"
+              onClick={handleConfirmOnly}
+              disabled={!!confirmError}
+              title={confirmError ?? 'Save setup without running AI analysis'}
+              type="button"
+            >Confirm</button>
+          )}
           <button
             className="btn btn-primary btn-sm"
             onClick={handleConfirm}

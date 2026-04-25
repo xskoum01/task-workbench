@@ -80,21 +80,25 @@ export interface TaskDevModePanelProps {
   initialReview?: AiFileReviewResult;
   /**
    * Called after a successful review so the parent can persist the result to the task.
+   * Used when review runs from the panel's own modal (no status advance follows).
    */
   onReviewSaved?: (review: AiFileReviewResult) => void;
   /**
    * Called after a git-diff change review completes successfully inside the diff modal.
-   * Use this to advance task status to ready-for-review in the parent.
+   * Carries the review result so the parent can persist it and advance status in one
+   * atomic updateTask call (avoids stale-closure overwrite).
    */
-  onChangeReviewComplete?: () => void;
+  onChangeReviewComplete?: (review: AiFileReviewResult) => void;
 }
 
 export interface TaskDevModePanelHandle {
   /**
    * Runs the AI file review using the currently configured file path and reviewer.
-   * Returns true when the review completes successfully, false on error or missing config.
+   * Returns the review result when the review completes successfully so the caller
+   * can persist it and advance status in one atomic update.
+   * Returns false on error, missing config, or when a diff modal was opened instead.
    */
-  runReview(): Promise<boolean>;
+  runReview(): Promise<AiFileReviewResult | false>;
   /**
    * Opens the AI review modal with the current file/reviewer prefilled.
    * Does NOT immediately run the review — user presses Run inside the modal.
@@ -613,11 +617,14 @@ export default forwardRef<TaskDevModePanelHandle, TaskDevModePanelProps>(functio
         reviewMode:   'change',
         reviewedAt:   new Date().toISOString(),
       };
-      onReviewSaved?.(persisted);
+      // Pass the review to onChangeReviewComplete so the parent can persist it and
+      // advance status in a SINGLE updateTask call. Do NOT call onReviewSaved separately
+      // here — that would cause two updateTask calls and the second (status) would
+      // overwrite aiFileReviews due to stale closure capture.
       setDiffModalOpen(false);
       // Show the review result in the normal review modal.
       setReviewModalOpen(true);
-      onChangeReviewComplete?.();
+      onChangeReviewComplete?.(persisted);
     } catch (err) {
       setReviewError(String(err));
     } finally {
@@ -625,7 +632,7 @@ export default forwardRef<TaskDevModePanelHandle, TaskDevModePanelProps>(functio
     }
   }
 
-  async function handleRunReview(): Promise<boolean> {
+  async function handleRunReview(calledFromHandle = false): Promise<AiFileReviewResult | false> {
     // Update / Fix workflows: review only the git diff, not the whole file.
     if (isDiffWorkflow) {
       // Ensure review file path is resolved before loading the diff.
@@ -636,7 +643,7 @@ export default forwardRef<TaskDevModePanelHandle, TaskDevModePanelProps>(functio
       const diff = await handleLoadGitDiff();
       setDiffContent(diff);
       setDiffModalOpen(true);
-      // Return false — status advance happens via onChangeReviewComplete when the modal completes.
+      // Return false — status advance + persistence happen via onChangeReviewComplete.
       return false;
     }
 
@@ -659,7 +666,6 @@ export default forwardRef<TaskDevModePanelHandle, TaskDevModePanelProps>(functio
       );
       if (result.structured) setReviewStructured(result.structured);
       if (result.markdown)   setReviewMarkdown(result.markdown);
-      // Persist the result on the task via the parent callback.
       const persisted: AiFileReviewResult = {
         ...result,
         id: crypto.randomUUID(),
@@ -669,8 +675,13 @@ export default forwardRef<TaskDevModePanelHandle, TaskDevModePanelProps>(functio
         reviewMode:   'file',
         reviewedAt:   new Date().toISOString(),
       };
-      onReviewSaved?.(persisted);
-      return true;
+      if (!calledFromHandle) {
+        // Called from the modal Run button directly (e.g. "Spustit znovu") — no status advance
+        // will follow, so persist immediately via the callback.
+        onReviewSaved?.(persisted);
+      }
+      // Always return the review so the imperative handle can combine it with status advance.
+      return persisted;
     } catch (err) {
       setReviewError(String(err));
       return false;
@@ -684,7 +695,8 @@ export default forwardRef<TaskDevModePanelHandle, TaskDevModePanelProps>(functio
     runReview: async () => {
       if (isDiffWorkflow) {
         // Diff workflow: handleRunReview opens diffModalOpen itself.
-        return handleRunReview();
+        // Returns false — parent waits for onChangeReviewComplete to combine save + status.
+        return handleRunReview(true);
       }
       // Full-file workflow: open the review modal so the user sees the results.
       const effectivePath = reviewFilePath.trim() || (artifactPath ?? '');
@@ -693,7 +705,9 @@ export default forwardRef<TaskDevModePanelHandle, TaskDevModePanelProps>(functio
         setReviewFilePath((prev) => prev || defaultPath);
       }
       setReviewModalOpen(true);
-      return handleRunReview();
+      // Pass calledFromHandle=true so onReviewSaved is NOT called inside handleRunReview.
+      // The returned review is used by the parent to combine aiFileReviews + status in one updateTask.
+      return handleRunReview(true);
     },
     openReviewModal: async () => {
       await handleOpenReviewModal();
@@ -961,7 +975,7 @@ export default forwardRef<TaskDevModePanelHandle, TaskDevModePanelProps>(functio
               {/* Run button */}
               <button
                 className="btn btn-primary btn-sm"
-                onClick={handleRunReview}
+                onClick={() => handleRunReview(false)}
                 disabled={reviewRunning || reviewInferring || !effectiveReviewFilePath || !getActiveReviewer()}
                 type="button"
               >

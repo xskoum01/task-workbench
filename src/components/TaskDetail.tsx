@@ -680,12 +680,18 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
       setFeedback('Status set to Ready for Review');
       return;
     }
-    const ok = await devModePanelRef.current.runReview();
-    if (ok) {
-      await handleStatusChange('ready-for-review');
+    const review = await devModePanelRef.current.runReview();
+    if (review !== false) {
+      // Full-file review completed — combine aiFileReviews + status in ONE updateTask so the
+      // second call does not overwrite the first due to stale closure capture in AppContext.
+      const existing = task.aiFileReviews ?? [];
+      await updateTask(task.id, {
+        aiFileReviews: [review, ...existing].slice(0, 5),
+        status: 'ready-for-review',
+      });
       setFeedback('AI review complete — status set to Ready for Review');
     }
-    // On failure, reviewError is shown inside the dev panel — status unchanged.
+    // For diff workflow, review === false — persistence + status happen via onChangeReviewComplete.
   }
 
   async function handleMarkDone() {
@@ -769,10 +775,14 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
   function runCurrentStageAction() {
     switch (plan.currentAction) {
       case 'analyze':
-        // Developer-awaiting-setup tasks never reach this branch (they use 'confirm-setup').
-        // For general tasks and re-opened developer tasks: open setup modal on first run,
-        // then analyze directly on subsequent runs.
-        if (!task.workflowSetup?.confirmedAt) {
+        // For developer workflows (any non-general workflowKind) with status 'new':
+        // always show the setup modal so the user can re-confirm the target before analyzing.
+        // This handles the case where status was reset to 'new' after a previous confirm.
+        // For general tasks, or developer tasks past 'new' (e.g. re-analyze on 'analyzed'):
+        // show the modal only if setup was never confirmed; otherwise analyze directly.
+        if (plan.workflowKind !== 'general' && task.status === 'new') {
+          setShowSetupModal(true);
+        } else if (!task.workflowSetup?.confirmedAt) {
           setShowSetupModal(true);
         } else {
           handleAnalyze();
@@ -793,6 +803,28 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
       case 'mark-done':      handleMarkDone();          break;
       default: break;
     }
+  }
+
+  /** Called when the user clicks Confirm only (no AI analysis) in the setup modal. */
+  async function handleConfirmSetupOnly(setup: WorkflowSetup) {
+    setShowSetupModal(false);
+    // Persist the setup as-is without running analysis.
+    // Preserve existing artifact when it is still compatible with the new setup.
+    let artifactPath: string | undefined = setup.artifactPath;
+    if (artifactPath === undefined) {
+      const existingArtifact = task.workflowSetup?.artifactPath;
+      if (existingArtifact) {
+        const lower = existingArtifact.toLowerCase();
+        const matchesScript = lower.endsWith('.js') || lower.endsWith('.ts');
+        const matchesPlugin = lower.endsWith('.cs');
+        const extensionMismatch =
+          (setup.devTargetKind === 'script' && !matchesScript) ||
+          (setup.devTargetKind === 'plugin' && !matchesPlugin);
+        if (!extensionMismatch) artifactPath = existingArtifact;
+      }
+    }
+    await updateTask(task.id, { workflowSetup: { ...setup, artifactPath }, status: 'analyzed' });
+    setFeedback('Setup confirmed — status set to Analyzed');
   }
 
   /** Called when the user clicks Confirm & Analyze in the setup modal. */
@@ -1587,8 +1619,14 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
                   artifactPath={task.workflowSetup?.artifactPath}
                   initialReview={task.aiFileReviews?.[0]}
                   onReviewSaved={handleReviewSaved}
-                  onChangeReviewComplete={async () => {
-                    await handleStatusChange('ready-for-review');
+                  onChangeReviewComplete={async (review) => {
+                    // Diff review completed — combine aiFileReviews + status in ONE updateTask
+                    // to avoid stale closure overwrite in AppContext.
+                    const existing = task.aiFileReviews ?? [];
+                    await updateTask(task.id, {
+                      aiFileReviews: [review, ...existing].slice(0, 5),
+                      status: 'ready-for-review',
+                    });
                     setFeedback('AI review complete — status set to Ready for Review');
                   }}
                 />
@@ -1747,6 +1785,7 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
           effectiveMode={effectiveMode}
           crmBaseDirectory={settings?.crmBaseDirectory}
           onConfirm={handleConfirmSetup}
+          onConfirmOnly={handleConfirmSetupOnly}
           onCancel={() => setShowSetupModal(false)}
         />
       )}
