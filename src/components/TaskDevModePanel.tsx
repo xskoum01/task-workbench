@@ -606,8 +606,12 @@ export default forwardRef<TaskDevModePanelHandle, TaskDevModePanelProps>(functio
       const persisted: AiFileReviewResult = {
         ...result,
         id: crypto.randomUUID(),
-        reviewerId: reviewer.id,
-        reviewedAt: new Date().toISOString(),
+        reviewerId:   reviewer.id,
+        reviewerName: reviewer.name,
+        // Use the full resolved path when available; fall back to base file name.
+        filePath:     path || fileName,
+        reviewMode:   'change',
+        reviewedAt:   new Date().toISOString(),
       };
       onReviewSaved?.(persisted);
       setDiffModalOpen(false);
@@ -659,8 +663,11 @@ export default forwardRef<TaskDevModePanelHandle, TaskDevModePanelProps>(functio
       const persisted: AiFileReviewResult = {
         ...result,
         id: crypto.randomUUID(),
-        reviewerId: reviewer.id,
-        reviewedAt: new Date().toISOString(),
+        reviewerId:   reviewer.id,
+        reviewerName: reviewer.name,
+        filePath:     path,
+        reviewMode:   'file',
+        reviewedAt:   new Date().toISOString(),
       };
       onReviewSaved?.(persisted);
       return true;

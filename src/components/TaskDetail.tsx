@@ -1257,7 +1257,16 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
                   })()}
                 </div>
                 {/* Meta row */}
-                <div style={{ fontSize: 11, color: 'var(--text-muted)', display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+                <div style={{ fontSize: 11, color: 'var(--text-muted)', display: 'flex', gap: 8, flexWrap: 'wrap', alignItems: 'center' }}>
+                  {latestReview.reviewMode && (
+                    <span style={{
+                      fontSize: 10, fontWeight: 600, padding: '1px 5px', borderRadius: 3,
+                      letterSpacing: '0.04em', border: '1px solid var(--border-subtle)',
+                      color: 'var(--text-muted)', background: 'var(--bg-surface)',
+                    }}>
+                      {latestReview.reviewMode === 'file' ? 'File review' : 'Change review'}
+                    </span>
+                  )}
                   <span>Recenzent: {latestReview.reviewerName}</span>
                   {latestReview.structured?.comments?.length != null && (
                     <span>{latestReview.structured.comments.length} komentářů</span>
@@ -1714,9 +1723,11 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
             preview={skeletonPreview}
             customer={customer}
             overrideSavePath={scriptDraftPath ?? undefined}
+            modalTitle={`Draft: ${skeletonPreview.fileName}`}
             onClose={() => { setShowSkeleton(false); setScriptDraftPath(null); }}
             onSaved={(filePath) => {
               // "Save to File" in the modal succeeded — complete the script draft workflow.
+              // The modal already wrote the file; completeScriptDraft only persists state and opens VS Code.
               completeScriptDraft(filePath);
             }}
           />

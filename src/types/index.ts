@@ -541,6 +541,11 @@ export interface AiFileReviewResult {
   filePath: string;
   /** ISO timestamp of when the review was run. */
   reviewedAt?: string;
+  /**
+   * 'file'   — full-file review (Create workflow; Apply Draft + Run AI Review).
+   * 'change' — git-diff review (Update / Fix workflow).
+   */
+  reviewMode?: 'file' | 'change';
   /** Parsed structured review. Present when JSON parsing succeeded. */
   structured?: AiStructuredReview;
   /** Raw markdown fallback. Present when JSON parsing failed. */

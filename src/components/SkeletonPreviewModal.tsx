@@ -33,6 +33,11 @@ interface SkeletonPreviewModalProps {
    * When provided, bypasses the pluginFolder-based buildSavePath logic entirely.
    */
   overrideSavePath?: string;
+  /**
+   * Override the modal title. Defaults to "Skeleton: <fileName>".
+   * Use "Draft: <fileName>" for script drafts.
+   */
+  modalTitle?: string;
 }
 
 /** Builds the absolute save path for the .cs file.
@@ -64,7 +69,7 @@ function buildSavePath(
   return null;
 }
 
-export default function SkeletonPreviewModal({ preview, customer: _customer, onClose, onSaved, onCreateAndApply, resolvedPluginBase, overrideSavePath }: SkeletonPreviewModalProps) {
+export default function SkeletonPreviewModal({ preview, customer: _customer, onClose, onSaved, onCreateAndApply, resolvedPluginBase, overrideSavePath, modalTitle }: SkeletonPreviewModalProps) {
   const [copied, setCopied]         = useState(false);
   const [saving, setSaving]         = useState(false);
   const [saved, setSaved]           = useState(false);
@@ -154,7 +159,7 @@ export default function SkeletonPreviewModal({ preview, customer: _customer, onC
   );
 
   return (
-    <Modal title={`Skeleton: ${preview.fileName}`} onClose={onClose} footer={footer} size="lg">
+    <Modal title={modalTitle ?? `Skeleton: ${preview.fileName}`} onClose={onClose} footer={footer} size="lg">
       {/* Save path info */}
       <div className="skeleton-path-row">
         <span className="skeleton-path-label">Target</span>

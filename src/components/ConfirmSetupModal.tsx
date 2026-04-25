@@ -491,6 +491,16 @@ export default function ConfirmSetupModal({
         return 'Select the existing script file that will be updated.';
       }
     }
+    if (!isEditMode && devKind === 'script') {
+      const folder = scriptCreateFolder.trim();
+      if (!folder) return 'Target Scripts folder is not resolved. Configure a script folder for this customer.';
+      const rawName = createScriptFileName.trim();
+      const baseName = rawName ? (rawName.replace(/\\/g, '/').split('/').pop() ?? rawName) : '';
+      if (!baseName) return 'Confirm target script file name first.';
+      if (!baseName.toLowerCase().endsWith('.js') && !baseName.toLowerCase().endsWith('.ts')) {
+        return 'Confirm target script file name first — file must end with .js or .ts.';
+      }
+    }
     return null;
   })();
 
