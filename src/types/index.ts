@@ -135,6 +135,9 @@ export interface Task {
    */
   classificationState?: ClassificationState;
 
+  /** ISO timestamp of when this task was moved to 'done' status. */
+  completedAt?: string;
+
   /** Free-text notes the user can write on this task. */
   notes?: string;
 
@@ -437,6 +440,9 @@ export interface AppSettings {
   /** Plugin and Script templates managed in Settings → Templates. */
   templates?: AppTemplate[];
 
+  /** Daily notes keyed by YYYY-MM-DD local date string. */
+  weeklyNotes?: Record<string, string>;
+
   /**
    * Teams chat used as the task intake inbox.
    * Populated by the Teams Intake setting in Settings.
@@ -663,7 +669,7 @@ export interface ScriptApplyResult {
   bytesWritten: number;
 }
 
-export type NavPage = 'inbox' | 'tasks' | 'customers' | 'settings';
+export type NavPage = 'inbox' | 'tasks' | 'week-log' | 'customers' | 'settings';
 
 // ── Microsoft import types ────────────────────────────────────────────────────
 

@@ -150,6 +150,14 @@ export default function WeekLogPage() {
 
   const [weekStart, setWeekStart] = useState<Date>(() => getMondayOf(new Date()));
   const [selectedTaskId, setSelectedTaskId] = useState<string | null>(null);
+  const detailRef = useRef<HTMLDivElement>(null);
+
+  // Clear selection when the task is deleted or no longer in the list.
+  useEffect(() => {
+    if (selectedTaskId && !tasks.find((t) => t.id === selectedTaskId)) {
+      setSelectedTaskId(null);
+    }
+  }, [tasks, selectedTaskId]);
 
   const today = todayYmd();
   const weekRange = fmtWeekRange(weekStart);
@@ -199,6 +207,13 @@ export default function WeekLogPage() {
 
   const selectedTask = selectedTaskId ? (tasks.find((t) => t.id === selectedTaskId) ?? null) : null;
 
+  // Scroll detail into view whenever a task is selected.
+  useEffect(() => {
+    if (selectedTask && detailRef.current) {
+      detailRef.current.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+    }
+  }, [selectedTask]);
+
   return (
     <div className="wl-root">
       {/* Header row */}
@@ -220,7 +235,7 @@ export default function WeekLogPage() {
         </div>
       </div>
 
-      {/* Content area: grid + optional detail panel */}
+      {/* Content area: grid stacked, detail below */}
       <div className="wl-content">
         {/* 7-day grid */}
         <div className="wl-grid">
@@ -255,7 +270,7 @@ export default function WeekLogPage() {
                         key={t.id}
                         task={t}
                         customerName={getCustomerById(t.customerId)?.name}
-                        onClick={() => setSelectedTaskId(t.id)}
+                        onClick={() => setSelectedTaskId(t.id === selectedTaskId ? null : t.id)}
                       />
                     ))}
                   </div>
@@ -270,9 +285,9 @@ export default function WeekLogPage() {
           })}
         </div>
 
-        {/* Task detail side panel */}
+        {/* Task detail block below the week grid */}
         {selectedTask && (
-          <div className="wl-detail-panel">
+          <div className="wl-detail-block" ref={detailRef}>
             <TaskDetail
               task={selectedTask}
               onClose={() => setSelectedTaskId(null)}
