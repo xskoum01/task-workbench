@@ -137,6 +137,10 @@ export default function OutlookImport({ clientId, onClose, onImport, onForceCrea
 
   /** Lazy-fetch full body for one message, then hand off to the import pipeline. */
   async function handleImportWithFullFetch(msg: OutlookMessage, force = false) {
+    if (force) {
+      const existingState = results[msg.id]?.existingState;
+      console.debug(`[import] force-create from import panel: msgId=${msg.id.slice(0, 12)} existingState=${existingState ?? 'none'}`);
+    }
     setStates((prev) => ({ ...prev, [msg.id]: 'importing' }));
     setItemErrors((prev) => { const n = { ...prev }; delete n[msg.id]; return n; });
     try {
@@ -291,11 +295,29 @@ export default function OutlookImport({ clientId, onClose, onImport, onForceCrea
                       </button>
                     </span>
                   )}
-                  {state === 'duplicate' && (
-                    <span className="ms-import-state ms-import-state--duplicate">
-                      <Icon name="check-square" size={12} /> {duplicateLabel(msg.id)}
-                    </span>
-                  )}
+                  {state === 'duplicate' && (() => {
+                    const existingState = results[msg.id]?.existingState;
+                    if (existingState === 'rejected') {
+                      console.debug(`[import] duplicate-rejected detected in panel: msgId=${msg.id.slice(0, 12)}`);
+                      return (
+                        <span className="ms-import-state ms-import-state--duplicate" style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                          <Icon name="check-square" size={12} /> Previously rejected
+                          <button
+                            className="btn btn-secondary btn-sm"
+                            style={{ marginLeft: 4 }}
+                            onClick={() => handleImportWithFullFetch(msg, true)}
+                          >
+                            Create Task
+                          </button>
+                        </span>
+                      );
+                    }
+                    return (
+                      <span className="ms-import-state ms-import-state--duplicate">
+                        <Icon name="check-square" size={12} /> {duplicateLabel(msg.id)}
+                      </span>
+                    );
+                  })()}
                 </div>
               </li>
             );

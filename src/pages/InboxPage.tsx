@@ -185,6 +185,8 @@ export default function InboxPage() {
         heuristicBucket:     adoBucket,
         heuristicPriority:   adoPriority,
         heuristicReason:     adoParsed.classificationLabel,
+        // ADO work items and PR comments are deterministic — AI enriches but must not gatekeep.
+        captureMode:         'explicit',
         emailBodyHtml:       msg.bodyHtml,
         forceCreate,
       });

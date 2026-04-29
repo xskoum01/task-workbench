@@ -258,11 +258,39 @@ export default function TeamsImport({ clientId, intakeChatId, onClose, onImport,
                       </button>
                     </span>
                   )}
-                  {state === 'duplicate' && (
-                    <span className="ms-import-state ms-import-state--duplicate">
-                      <Icon name="check-square" size={12} /> {duplicateLabel(item.id)}
-                    </span>
-                  )}
+                  {state === 'duplicate' && (() => {
+                    const existingState = results[item.id]?.existingState;
+                    if (existingState === 'rejected') {
+                      console.debug(`[import] duplicate-rejected detected in teams panel: msgId=${item.id.slice(0, 12)}`);
+                      return (
+                        <span className="ms-import-state ms-import-state--duplicate" style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                          <Icon name="check-square" size={12} /> Previously rejected
+                          <button
+                            className="btn btn-secondary btn-sm"
+                            style={{ marginLeft: 4 }}
+                            onClick={async () => {
+                              setStates((prev) => ({ ...prev, [item.id]: 'importing' }));
+                              try {
+                                const [chat, msg] = toImportArgs(item);
+                                const r = await onForceCreate(chat, msg);
+                                setResults((prev) => ({ ...prev, [item.id]: r }));
+                                setStates((prev) => ({ ...prev, [item.id]: r.outcome }));
+                              } catch {
+                                setStates((prev) => ({ ...prev, [item.id]: 'duplicate' }));
+                              }
+                            }}
+                          >
+                            Create Task
+                          </button>
+                        </span>
+                      );
+                    }
+                    return (
+                      <span className="ms-import-state ms-import-state--duplicate">
+                        <Icon name="check-square" size={12} /> {duplicateLabel(item.id)}
+                      </span>
+                    );
+                  })()}
                 </div>
               </li>
             );
