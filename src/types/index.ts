@@ -578,7 +578,9 @@ export type PlanningBucket =
   | 'today'
   | 'tomorrow'
   | 'this_week'
-  | 'later';
+  | 'later'
+  | 'queue'
+  | 'waiting';
 
 // ── Script Assistant types ────────────────────────────────────────────────────
 

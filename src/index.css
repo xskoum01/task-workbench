@@ -3027,6 +3027,8 @@ body {
 .planning-bucket-pill--tomorrow  { color: var(--color-analyzed);         background: color-mix(in srgb, var(--color-analyzed) 14%, transparent);         border-color: color-mix(in srgb, var(--color-analyzed) 25%, transparent); }
 .planning-bucket-pill--this_week { color: var(--color-new);              background: color-mix(in srgb, var(--color-new) 14%, transparent);              border-color: color-mix(in srgb, var(--color-new) 25%, transparent); }
 .planning-bucket-pill--later     { color: var(--text-secondary);         background: var(--bg-overlay);                                                    border-color: var(--border); }
+.planning-bucket-pill--queue     { color: var(--color-ready-for-review); background: color-mix(in srgb, var(--color-ready-for-review) 14%, transparent); border-color: color-mix(in srgb, var(--color-ready-for-review) 25%, transparent); }
+.planning-bucket-pill--waiting   { color: var(--color-overdue);          background: color-mix(in srgb, var(--color-overdue) 14%, transparent);          border-color: color-mix(in srgb, var(--color-overdue) 25%, transparent); }
 
 .detail-planning-suggestion {
   font-size: 10px;

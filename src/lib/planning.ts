@@ -33,6 +33,8 @@ export const BUCKET_META: Record<PlanningBucket, { label: string; icon: IconName
   tomorrow:  { label: 'Tomorrow',  icon: 'arrow-right'   },
   this_week: { label: 'This Week', icon: 'calendar'      },
   later:     { label: 'Later',     icon: 'clock'         },
+  queue:     { label: 'Queue',     icon: 'layers'        },
+  waiting:   { label: 'Waiting',   icon: 'pause'         },
 };
 
 export const BUCKET_ORDER: PlanningBucket[] = [
@@ -41,6 +43,8 @@ export const BUCKET_ORDER: PlanningBucket[] = [
   'tomorrow',
   'this_week',
   'later',
+  'queue',
+  'waiting',
 ];
 
 // ---------------------------------------------------------------------------
@@ -157,7 +161,7 @@ export function effectiveBucket(task: Task): PlanningBucket {
  */
 export function groupByBucket(tasks: Task[]): Record<PlanningBucket, Task[]> {
   const groups: Record<PlanningBucket, Task[]> = {
-    now: [], today: [], tomorrow: [], this_week: [], later: [],
+    now: [], today: [], tomorrow: [], this_week: [], later: [], queue: [], waiting: [],
   };
 
   for (const task of tasks) {

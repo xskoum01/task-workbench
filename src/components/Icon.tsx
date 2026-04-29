@@ -57,7 +57,8 @@ export type IconName =
   | 'arrow-left'    // back
   | 'trash-2'        // delete
   | 'external-link'  // open external URL
-  | 'log-in';        // reconnect / sign in
+  | 'log-in'         // reconnect / sign in
+  | 'pause';         // waiting bucket
 
 // ---------------------------------------------------------------------------
 // SVG path definitions (24×24 viewBox, Lucide-style)
@@ -282,6 +283,11 @@ const ICON_PATHS: Record<IconName, string[]> = {
     'M15 3h4a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2h-4',
     'M10 17l5-5-5-5',
     'M15 12H3',
+  ],
+
+  // Pause — two vertical bars (waiting state)
+  'pause': [
+    'M6 4h4v16H6zM14 4h4v16h-4z',
   ],
 };
 

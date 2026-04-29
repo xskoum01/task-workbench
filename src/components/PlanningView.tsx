@@ -168,6 +168,8 @@ const QUICK_BUCKETS: { bucket: PlanningBucket; label: string }[] = [
   { bucket: 'today',    label: 'Today'    },
   { bucket: 'tomorrow', label: 'Tomorrow' },
   { bucket: 'later',    label: 'Later'    },
+  { bucket: 'queue',    label: 'Queue'    },
+  { bucket: 'waiting',  label: 'Waiting'  },
 ];
 
 interface PlanningTaskRowProps {
