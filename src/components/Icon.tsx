@@ -56,7 +56,8 @@ export type IconName =
   | 'message-square'// Teams chats
   | 'arrow-left'    // back
   | 'trash-2'        // delete
-  | 'external-link'; // open external URL
+  | 'external-link'  // open external URL
+  | 'log-in';        // reconnect / sign in
 
 // ---------------------------------------------------------------------------
 // SVG path definitions (24×24 viewBox, Lucide-style)
@@ -274,6 +275,13 @@ const ICON_PATHS: Record<IconName, string[]> = {
     'M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6',
     'M15 3h6v6',
     'M10 14L21 3',
+  ],
+
+  // Log-in / reconnect — door with arrow entering
+  'log-in': [
+    'M15 3h4a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2h-4',
+    'M10 17l5-5-5-5',
+    'M15 12H3',
   ],
 };
 
