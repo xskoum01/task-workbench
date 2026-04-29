@@ -398,6 +398,42 @@ body {
   color: var(--text-primary);
 }
 
+/* Completed date editing */
+.detail-completed-date-value {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  cursor: pointer;
+  border-radius: var(--radius-sm);
+  padding: 1px 3px;
+  margin: -1px -3px;
+}
+.detail-completed-date-value:hover {
+  background: var(--bg-hover);
+}
+.detail-completed-date-edit-icon {
+  color: var(--text-muted);
+  opacity: 0;
+  transition: opacity 0.1s;
+}
+.detail-completed-date-value:hover .detail-completed-date-edit-icon {
+  opacity: 1;
+}
+.detail-completed-date-empty {
+  color: var(--text-muted);
+  font-style: italic;
+}
+.detail-completed-date-input {
+  background: var(--bg-base);
+  border: 1px solid var(--border-focus, var(--accent));
+  border-radius: var(--radius-sm);
+  color: var(--text-primary);
+  font-size: 13px;
+  padding: 2px 6px;
+  outline: none;
+  color-scheme: dark;
+}
+
 /* Notes textarea */
 .detail-notes-textarea {
   width: 100%;

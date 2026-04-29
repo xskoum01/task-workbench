@@ -407,6 +407,18 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
     await updateTask(task.id, { status });
   }
 
+  // --- Completed date edit ---
+
+  const [editingCompletedAt, setEditingCompletedAt] = useState(false);
+  useEffect(() => { setEditingCompletedAt(false); }, [task.id]);
+
+  async function handleCompletedAtChange(value: string) {
+    // value is YYYY-MM-DD from the date input; convert to ISO with noon UTC to stay on the correct day
+    const iso = value ? new Date(`${value}T12:00:00`).toISOString() : undefined;
+    await updateTask(task.id, { completedAt: iso });
+    setEditingCompletedAt(false);
+  }
+
   // --- Delete ---
 
   async function handleDelete() {
@@ -1026,6 +1038,33 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
                 {formatDate(task.receivedAt)}
               </span>
             </div>
+
+            {task.status === 'done' && (
+              <div className="detail-section">
+                <span className="detail-section-label">Completed</span>
+                {editingCompletedAt ? (
+                  <input
+                    type="date"
+                    className="detail-completed-date-input"
+                    defaultValue={task.completedAt ? new Date(task.completedAt).toISOString().slice(0, 10) : ''}
+                    autoFocus
+                    onBlur={(e) => handleCompletedAtChange(e.target.value)}
+                    onChange={(e) => { if (e.target.value) handleCompletedAtChange(e.target.value); }}
+                  />
+                ) : (
+                  <span
+                    className="detail-section-value detail-completed-date-value"
+                    title="Click to edit completion date"
+                    onClick={() => setEditingCompletedAt(true)}
+                  >
+                    {task.completedAt
+                      ? new Date(task.completedAt).toLocaleDateString()
+                      : <span className="detail-completed-date-empty">not set — click to set</span>}
+                    <Icon name="pencil" size={11} className="detail-completed-date-edit-icon" />
+                  </span>
+                )}
+              </div>
+            )}
 
             <div className="detail-section">
               <span className="detail-section-label">Customer</span>
