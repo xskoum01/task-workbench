@@ -66,7 +66,7 @@ function CustomerPicker({ customers, crmFolders, onSelect }: CustomerPickerProps
 }
 
 export default function InboxPage() {
-  const { tasks, customers, crmFolders, settings, getCustomerById, updateTask, importMessage, resolveOrCreateCustomerByFolder } = useApp();
+  const { tasks, customers, crmFolders, settings, getCustomerById, updateTask, importMessage, resolveOrCreateCustomerByFolder, updateSettings } = useApp();
   const [selectedId, setSelectedId]     = useState<string | null>(null);
   const [showTaskForm, setShowTaskForm] = useState(false);
   const [showOutlook, setShowOutlook]   = useState(false);
@@ -89,6 +89,23 @@ export default function InboxPage() {
 
   const isConnected = settings?.microsoftConnectionStatus === 'connected';
   const clientId    = settings?.microsoftClientId ?? '';
+
+  /**
+   * Called when the Outlook/Teams panel detects that the Microsoft refresh token
+   * is expired or invalid (MICROSOFT_RECONNECT_REQUIRED). Clears the connection
+   * status in persisted settings so Settings page reflects the expired state.
+   */
+  async function handleReconnectRequired() {
+    try {
+      await updateSettings({
+        microsoftConnectionStatus: 'disconnected',
+        outlookStatus:  'not_configured',
+        teamsStatus:    'not_configured',
+      });
+    } catch (e) {
+      console.warn('[InboxPage] failed to update microsoftConnectionStatus after reconnect required:', e);
+    }
+  }
 
   async function handleOutlookImport(msg: OutlookMessage, forceCreate = false): Promise<ImportResult> {
     // Prefer the full body (HTML-stripped) when available; fall back to bodyPreview.
@@ -323,6 +340,7 @@ export default function InboxPage() {
             onClose={() => setShowOutlook(false)}
             onImport={handleOutlookImport}
             onForceCreate={(msg) => handleOutlookImport(msg, true)}
+            onReconnectRequired={handleReconnectRequired}
           />
         )}
         {showTeams && (

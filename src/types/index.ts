@@ -322,6 +322,24 @@ export type MicrosoftConnectionStatus =
  */
 export type M365ConnectionStatus = 'not_configured' | 'configured' | 'connected' | 'error';
 
+/**
+ * Structured error codes surfaced by Rust Tauri commands as string prefixes.
+ * The Rust command returns `Err("MICROSOFT_RECONNECT_REQUIRED: <detail>")` etc.
+ * The frontend parses the prefix via `parseMicrosoftError()` in tauriCommands.ts.
+ *
+ * - MICROSOFT_RECONNECT_REQUIRED  refresh token expired/invalid — must sign in again
+ * - MICROSOFT_NOT_CONNECTED       no token cache at all
+ * - MICROSOFT_PERMISSION_MISSING  Graph returned 403 / Authorization_RequestDenied
+ * - GRAPH_HTTP_ERROR              other non-2xx Graph response
+ * - UNKNOWN_ERROR                 anything else
+ */
+export type CommandErrorCode =
+  | 'MICROSOFT_RECONNECT_REQUIRED'
+  | 'MICROSOFT_NOT_CONNECTED'
+  | 'MICROSOFT_PERMISSION_MISSING'
+  | 'GRAPH_HTTP_ERROR'
+  | 'UNKNOWN_ERROR';
+
 /** Options that override the global settings for a single repository creation call. */
 export interface CreateRepoOptions {
   /** Override settings.initializeGitOnCreate */

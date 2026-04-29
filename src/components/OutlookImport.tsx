@@ -2,15 +2,29 @@ import { useEffect, useRef, useState } from 'react';
 import type { OutlookMessage } from '../types';
 import type { ImportResult, ImportOutcome } from '../context/AppContext';
 import * as tauriApi from '../lib/tauriCommands';
+import { parseMicrosoftError } from '../lib/tauriCommands';
 import Icon from './Icon';
 
 /** Classify a Graph/Outlook error string into a user-visible message and icon. */
 function classifyOutlookError(err: string): { label: string; icon: string } {
-  if (err.includes('Missing Microsoft permissions') || err.includes('AccessDenied') || err.includes('Authorization_RequestDenied')) {
-    return { label: `Missing Outlook permissions — the app may not be granted Mail.Read in Azure. Details: ${err}`, icon: 'shield-off' };
+  if (
+    err.includes('Missing Microsoft permissions') ||
+    err.includes('AccessDenied') ||
+    err.includes('Authorization_RequestDenied') ||
+    err.includes('HTTP 403') ||
+    err.includes('Mail.Read permission may be missing')
+  ) {
+    return { label: `Missing Outlook permissions — Mail.Read may not be granted in Azure. Details: ${err}`, icon: 'shield-off' };
   }
-  if (err.includes('connection expired') || err.includes('InvalidAuthenticationToken') || err.includes('AuthenticationError')) {
-    return { label: 'Microsoft connection expired. Disconnect and reconnect in Settings.', icon: 'log-in' };
+  if (
+    err.includes('connection expired') ||
+    err.includes('InvalidAuthenticationToken') ||
+    err.includes('AuthenticationError') ||
+    err.includes('HTTP 401') ||
+    err.includes('Outlook authorization failed') ||
+    err.includes('Please reconnect Microsoft')
+  ) {
+    return { label: 'Microsoft connection expired or unauthorized. Disconnect and reconnect in Settings.', icon: 'log-in' };
   }
   if (err.includes('Not authenticated') || err.includes('Please sign in')) {
     return { label: 'Not signed in to Microsoft. Connect your account in Settings.', icon: 'log-in' };
@@ -26,6 +40,8 @@ interface Props {
   onClose: () => void;
   onImport: (msg: OutlookMessage) => Promise<ImportResult>;
   onForceCreate: (msg: OutlookMessage) => Promise<ImportResult>;
+  /** Called when the backend discovers the refresh token is expired/invalid and has cleared the cache. */
+  onReconnectRequired?: () => void;
 }
 
 type MessageState = 'idle' | 'importing' | ImportOutcome;
@@ -39,12 +55,13 @@ const RECENCY_OPTIONS: { label: string; days: number }[] = [
 ];
 const DEFAULT_DAYS_BACK = 14;
 
-export default function OutlookImport({ clientId, onClose, onImport, onForceCreate }: Props) {
+export default function OutlookImport({ clientId, onClose, onImport, onForceCreate, onReconnectRequired }: Props) {
   const [messages, setMessages] = useState<OutlookMessage[]>([]);
   const [fetchedCount, setFetchedCount] = useState(0);
   const [daysBack, setDaysBack] = useState(DEFAULT_DAYS_BACK);
   const [loading, setLoading]   = useState(true);
   const [error, setError]       = useState<string | null>(null);
+  const [reconnectRequired, setReconnectRequired] = useState(false);
   const [states, setStates]     = useState<Record<string, MessageState>>({});
   const [results, setResults]   = useState<Record<string, ImportResult>>({});
   const [itemErrors, setItemErrors] = useState<Record<string, string>>({});
@@ -85,7 +102,15 @@ export default function OutlookImport({ clientId, onClose, onImport, onForceCrea
       setFetchedCount(fetched);
       console.debug(`[outlook-load] completed requestId=${requestId} count=${result.length}`);
     } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
+      const parsed = parseMicrosoftError(err);
+      if (parsed.code === 'MICROSOFT_RECONNECT_REQUIRED' || parsed.code === 'MICROSOFT_NOT_CONNECTED') {
+        console.warn('[outlook-load] reconnect required — token expired or missing');
+        setReconnectRequired(true);
+        setError(null);
+        onReconnectRequired?.();
+      } else {
+        setError(parsed.detail);
+      }
     } finally {
       inFlightRef.current = false;
       setLoading(false);
@@ -100,6 +125,7 @@ export default function OutlookImport({ clientId, onClose, onImport, onForceCrea
 
   function handleRefresh() {
     inFlightRef.current = false;
+    setReconnectRequired(false);
     fetchMessages('refresh');
   }
 
@@ -183,6 +209,16 @@ export default function OutlookImport({ clientId, onClose, onImport, onForceCrea
           </div>
         );
       })()}
+
+      {reconnectRequired && (
+        <div className="ms-import-error ms-import-reconnect">
+          <Icon name="log-in" size={14} />
+          <span>
+            Microsoft authorization expired. The session has been cleared.{' '}
+            <strong>Please reconnect Microsoft in Settings.</strong>
+          </span>
+        </div>
+      )}
 
       {/* Scope note: source is flagged emails only */}
       <div className="ms-import-scope-note">

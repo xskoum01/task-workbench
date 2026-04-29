@@ -4213,6 +4213,19 @@ body {
   margin-bottom: 4px;
 }
 
+/* Reconnect-required banner — amber/warning tone instead of hard error red */
+.ms-import-error.ms-import-reconnect {
+  color: var(--color-warning, #e09a30);
+  background: color-mix(in srgb, var(--color-warning, #e09a30) 8%, transparent);
+  border-radius: 4px;
+  margin: 4px 12px;
+  padding: 10px 12px;
+  align-items: flex-start;
+  gap: 10px;
+  font-size: 13px;
+  line-height: 1.45;
+}
+
 /* Compact disclaimer bar below the panel header */
 .ms-import-scope-note {
   padding: 4px 14px;

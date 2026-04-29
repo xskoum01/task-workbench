@@ -546,3 +546,44 @@ export function getTeamsIntakeMessages(clientId: string, chatId: string): Promis
 export function getTeamsSelfChatMessages(clientId: string): Promise<TeamsFlatMessage[]> {
   return invoke('get_teams_self_chat_messages', { clientId });
 }
+
+// ---------------------------------------------------------------------------
+// Microsoft error code helpers
+// ---------------------------------------------------------------------------
+
+/**
+ * Parse the structured error code from a Tauri command error string.
+ * The Rust backend returns errors prefixed with `MICROSOFT_RECONNECT_REQUIRED: `,
+ * `MICROSOFT_NOT_CONNECTED: `, etc. so the frontend can route them correctly.
+ */
+export function parseMicrosoftError(err: unknown): {
+  code: import('../types').CommandErrorCode;
+  detail: string;
+} {
+  const msg = err instanceof Error ? err.message : String(err ?? '');
+  if (msg.startsWith('MICROSOFT_RECONNECT_REQUIRED:')) {
+    return { code: 'MICROSOFT_RECONNECT_REQUIRED', detail: msg.replace(/^MICROSOFT_RECONNECT_REQUIRED:\s*/, '') };
+  }
+  if (msg.startsWith('MICROSOFT_NOT_CONNECTED:')) {
+    return { code: 'MICROSOFT_NOT_CONNECTED', detail: msg.replace(/^MICROSOFT_NOT_CONNECTED:\s*/, '') };
+  }
+  // Map well-known unstructured error strings from Graph error handling.
+  if (
+    msg.includes('HTTP 403') ||
+    msg.includes('Authorization_RequestDenied') ||
+    msg.includes('AccessDenied') ||
+    msg.includes('Mail.Read permission may be missing')
+  ) {
+    return { code: 'MICROSOFT_PERMISSION_MISSING', detail: msg };
+  }
+  if (msg.includes('HTTP ') || msg.includes('Graph request failed')) {
+    return { code: 'GRAPH_HTTP_ERROR', detail: msg };
+  }
+  return { code: 'UNKNOWN_ERROR', detail: msg };
+}
+
+/** Returns true when the error requires the user to reconnect Microsoft. */
+export function isMicrosoftReconnectRequired(err: unknown): boolean {
+  const { code } = parseMicrosoftError(err);
+  return code === 'MICROSOFT_RECONNECT_REQUIRED' || code === 'MICROSOFT_NOT_CONNECTED';
+}

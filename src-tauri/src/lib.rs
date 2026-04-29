@@ -2206,6 +2206,43 @@ struct TokenResponse {
     id_token: Option<String>,
 }
 
+/// Parse a raw MSAL token-endpoint error body into a user-friendly message.
+/// MSAL returns JSON like `{"error":"invalid_grant","error_description":"..."}` on failure.
+/// Never logs or returns token values.
+fn msal_error_from_body(body: &str, status: u16, operation: &str) -> String {
+    if let Ok(json) = serde_json::from_str::<Value>(body) {
+        let code = json["error"].as_str().unwrap_or("unknown");
+        let desc = json["error_description"].as_str().unwrap_or("no detail");
+        // Truncate the description — MSAL descriptions can be very long.
+        let preview: String = desc.chars().take(200).collect();
+        let friendly = match code {
+            "invalid_grant" | "interaction_required" =>
+                format!(
+                    "InvalidAuthenticationToken — Microsoft connection expired ({code}). \
+                     Please reconnect in Settings. Detail: {preview}"
+                ),
+            "invalid_client" | "unauthorized_client" =>
+                format!(
+                    "Outlook authorization failed (HTTP {status}, {code}): invalid client ID or \
+                     the app is not authorised for this tenant. Detail: {preview}"
+                ),
+            _ =>
+                format!(
+                    "MSAL {operation} failed (HTTP {status}, {code}): {preview}"
+                ),
+        };
+        eprintln!("[token] MSAL error during {operation}: code={code} HTTP={status}");
+        return friendly;
+    }
+    // Body is not JSON (e.g. HTML error page from a proxy/firewall).
+    let preview: String = body.chars().take(200).collect();
+    eprintln!("[token] MSAL {operation} non-JSON error HTTP={status}: {preview}");
+    format!(
+        "Outlook authorization failed (HTTP {status}) during {operation}. \
+         Please reconnect Microsoft in Settings."
+    )
+}
+
 async fn exchange_code_for_tokens(
     client: &Client,
     client_id: &str,
@@ -2223,15 +2260,21 @@ async fn exchange_code_for_tokens(
         ("code_verifier", verifier),
         ("scope", SCOPES),
     ];
-    let resp: TokenResponse = client
+    let raw_resp = client
         .post(format!("{authority}/oauth2/v2.0/token"))
         .form(&params)
         .send()
         .await
-        .map_err(|e| e.to_string())?
-        .json()
-        .await
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| format!("Token exchange network error: {e}"))?;
+
+    let status = raw_resp.status();
+    let body_text = raw_resp.text().await.unwrap_or_default();
+    eprintln!("[token] exchange_code HTTP {status}");
+    if !status.is_success() {
+        return Err(msal_error_from_body(&body_text, status.as_u16(), "code exchange"));
+    }
+    let resp: TokenResponse = serde_json::from_str(&body_text)
+        .map_err(|e| format!("Failed to parse token exchange response: {e}"))?;
 
     Ok(TokenCache {
         access_token: resp.access_token,
@@ -2255,15 +2298,21 @@ async fn refresh_access_token(
         ("refresh_token", refresh_token),
         ("scope", SCOPES),
     ];
-    let resp: TokenResponse = client
+    let raw_resp = client
         .post(format!("{authority}/oauth2/v2.0/token"))
         .form(&params)
         .send()
         .await
-        .map_err(|e| e.to_string())?
-        .json()
-        .await
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| format!("Token refresh network error: {e}"))?;
+
+    let status = raw_resp.status();
+    let body_text = raw_resp.text().await.unwrap_or_default();
+    eprintln!("[token] refresh_access_token HTTP {status}");
+    if !status.is_success() {
+        return Err(msal_error_from_body(&body_text, status.as_u16(), "token refresh"));
+    }
+    let resp: TokenResponse = serde_json::from_str(&body_text)
+        .map_err(|e| format!("Failed to parse token refresh response: {e}"))?;
 
     Ok(TokenCache {
         access_token: resp.access_token,
@@ -2281,7 +2330,11 @@ async fn refresh_access_token(
 // ── Graph helpers ────────────────────────────────────────────────────────────
 
 async fn graph_get(url: &str, access_token: &str) -> Result<Value, String> {
-    eprintln!("[Graph] GET {url}");
+    // Strip query string from the logged URL so the log line is concise and
+    // does not contain any sensitive filter values.
+    let url_base = url.split('?').next().unwrap_or(url);
+    eprintln!("[Graph] GET {url_base}");
+
     // 20-second timeout so the UI never hangs indefinitely if Graph is slow.
     let client = reqwest::ClientBuilder::new()
         .timeout(std::time::Duration::from_secs(20))
@@ -2295,10 +2348,69 @@ async fn graph_get(url: &str, access_token: &str) -> Result<Value, String> {
         .map_err(|e| format!("Network request failed: {e}"))?;
 
     let status = resp.status();
-    let body: Value = resp.json().await.map_err(|e| format!("Failed to parse Graph response: {e}"))?;
+    let content_type = resp
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_owned();
 
-    // Graph API returns structured errors as JSON even on non-200 status codes.
-    // Surfacing them here prevents silent empty results from masking real failures.
+    // ── Non-2xx: read the body as TEXT first ─────────────────────────────────
+    // IMPORTANT: calling `.json()` before checking the status is the root cause
+    // of "error decoding response body" — Graph sometimes returns HTML or an
+    // empty body on 401/403/503, which cannot be decoded as JSON.
+    // Reading as text lets us surface the real HTTP status and a body preview.
+    if !status.is_success() {
+        let raw = resp.text().await.unwrap_or_default();
+        let preview: String = raw.chars().take(300).collect();
+
+        eprintln!(
+            "[Graph] HTTP {status} from {url_base} | content-type: {content_type} | body: {preview}"
+        );
+
+        // Try to extract a structured Graph error from the text body.
+        if let Ok(json) = serde_json::from_str::<Value>(&raw) {
+            if let Some(err_obj) = json.get("error") {
+                let code = err_obj["code"].as_str().unwrap_or("unknown");
+                let msg  = err_obj["message"].as_str().unwrap_or("no detail");
+                let friendly = match code {
+                    "Authorization_RequestDenied" | "Unauthorized" | "AccessDenied" =>
+                        format!("Missing Microsoft permissions ({code}): {msg}. Make sure Mail.Read is granted in Azure."),
+                    "InvalidAuthenticationToken" | "AuthenticationError" =>
+                        format!("InvalidAuthenticationToken — Microsoft connection expired. Please reconnect in Settings."),
+                    _ =>
+                        format!("Microsoft Graph API error [{status}] {code}: {msg}"),
+                };
+                eprintln!("[Graph] Structured error: {friendly}");
+                return Err(friendly);
+            }
+        }
+
+        // No structured JSON error — produce a clear plain-text error.
+        let friendly = match status.as_u16() {
+            401 => format!(
+                "Outlook authorization failed (HTTP 401). Please reconnect Microsoft in Settings. \
+                 Endpoint: {url_base}"
+            ),
+            403 => format!(
+                "Access denied (HTTP 403) — Mail.Read permission may be missing from your Azure app registration. \
+                 Endpoint: {url_base}"
+            ),
+            _ => format!(
+                "Microsoft Graph request failed with HTTP {status} from {url_base}. \
+                 Content-Type: {content_type}. Body preview: {preview}"
+            ),
+        };
+        return Err(friendly);
+    }
+
+    // ── 2xx: parse JSON ───────────────────────────────────────────────────────
+    let body: Value = resp
+        .json()
+        .await
+        .map_err(|e| format!("Failed to parse Graph JSON response from {url_base}: {e}"))?;
+
+    // Graph occasionally returns 200 with an error object in the body.
     if let Some(err_obj) = body.get("error") {
         let code = err_obj["code"].as_str().unwrap_or("unknown");
         let msg  = err_obj["message"].as_str().unwrap_or("no detail");
@@ -2306,33 +2418,44 @@ async fn graph_get(url: &str, access_token: &str) -> Result<Value, String> {
             "Authorization_RequestDenied" | "Unauthorized" | "AccessDenied" =>
                 format!("Missing Microsoft permissions ({code}): {msg}"),
             "InvalidAuthenticationToken" | "AuthenticationError" =>
-                format!("Microsoft connection expired — please reconnect ({code})"),
+                format!("InvalidAuthenticationToken — Microsoft connection expired. Please reconnect in Settings."),
             _ =>
                 format!("Microsoft Graph API error [{status}] {code}: {msg}"),
         };
-        eprintln!("[Graph] Error response: {friendly}");
+        eprintln!("[Graph] In-body error: {friendly}");
         return Err(friendly);
-    }
-
-    if !status.is_success() {
-        let err = format!("Microsoft Graph request failed with HTTP {status}");
-        eprintln!("[Graph] {err}");
-        return Err(err);
     }
 
     Ok(body)
 }
 
 /// Resolve a potentially-expired token cache: refresh if needed, return access token.
+/// On refresh failure (invalid_grant, etc.) the cached tokens are cleared so subsequent
+/// calls don't spin-retry with a dead token. Returns a prefixed error so callers can
+/// surface a targeted "please reconnect" message instead of a generic decode error.
 async fn ensure_valid_token(app: &tauri::AppHandle, client_id: &str) -> Result<String, String> {
-    let cache = load_token_cache(app).ok_or("Not authenticated. Please sign in first.")?;
+    let cache = load_token_cache(app).ok_or(
+        "MICROSOFT_NOT_CONNECTED: Not authenticated. Please sign in via Settings."
+    )?;
     if now_unix() < cache.expires_at {
         return Ok(cache.access_token);
     }
+    eprintln!("[token] ensure_valid_token: token expired, attempting refresh");
     let client = Client::new();
-    let new_cache = refresh_access_token(&client, client_id, &cache.tenant_id, &cache.refresh_token).await?;
-    save_token_cache(app, &new_cache)?;
-    Ok(new_cache.access_token)
+    match refresh_access_token(&client, client_id, &cache.tenant_id, &cache.refresh_token).await {
+        Ok(new_cache) => {
+            save_token_cache(app, &new_cache)?;
+            Ok(new_cache.access_token)
+        }
+        Err(refresh_err) => {
+            // Refresh failed — the refresh token is invalid/expired.
+            // Clear the cache so we don't attempt to use a dead token on the next call.
+            eprintln!("[token] ensure_valid_token: refresh failed — clearing token cache");
+            let _ = clear_token_cache(app);
+            // Prefix with a recognizable code so the frontend can route to a reconnect flow.
+            Err(format!("MICROSOFT_RECONNECT_REQUIRED: {refresh_err}"))
+        }
+    }
 }
 
 // ── Microsoft account info types ─────────────────────────────────────────────
@@ -2562,6 +2685,7 @@ async fn get_outlook_flagged_list(
     const MAX_FETCH: usize = 300;
     const SHOW_LIMIT: usize = 50;
 
+    eprintln!("[outlook-import] get_outlook_flagged_list v2 — days_back={days_back}");
     let token = ensure_valid_token(&app, &client_id).await?;
 
     // Build the OData $filter expression.
