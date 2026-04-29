@@ -67,6 +67,8 @@ export interface Task {
   dueAt?: string;
   /** Rough effort estimate in hours. */
   estimatedEffort?: number;
+  /** Budget: number of hours estimated for this task (explicit, user-editable). */
+  budget?: number;
   /** The bucket the user explicitly chose; overrides the suggestion when set. */
   planningBucket?: PlanningBucket;
   /** Computed recommended bucket (never user-editable directly). */

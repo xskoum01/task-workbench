@@ -142,20 +142,112 @@ export function isTeamsMessageActionable(content: string): boolean {
   );
 }
 
+// ---------------------------------------------------------------------------
+// Czech title generation
+// ---------------------------------------------------------------------------
+
+/** Matches pricing/estimation language in Czech and English. */
+const PRICING_RE =
+  /nacen[ěe]n[íi]|nacenit|nacenil[ai]?|odhad(nout)?(\s+ceny)?|kalkulac[ei]|estimate[ds]?|estimation|pricing|quotes?|quotation|budget/i;
+
 /**
- * Generates an action-oriented task title from a Teams message.
- *
- * Format: "{SenderName}: {first meaningful sentence}"
+ * Returns true if the text contains pricing or estimation language
+ * that warrants a "Nacenění: " prefix on the task title.
+ */
+export function isPricingRequest(text: string): boolean {
+  return PRICING_RE.test(text);
+}
+
+// Ordered English→Czech phrase substitutions for common Teams request patterns.
+// Applied left-to-right; earlier rules take priority.
+const PHRASE_SUBS: Array<[RegExp, string]> = [
+  // Strip common polite openers
+  [/\bcan\s+you\s+(please\s+)?/gi, ''],
+  [/\bcould\s+you\s+(please\s+)?/gi, ''],
+  [/\bwould\s+you\s+(please\s+)?/gi, ''],
+  [/\bplease\s+/gi, ''],
+  [/\bi\s+(would\s+like(\s+to)?|want\s+to|need\s+to)\s+/gi, ''],
+  [/\bi\s+need\s+(a\s+)?(an\s+)?/gi, ''],
+  // Multi-word action phrases (longer first to prevent partial matches)
+  [/\badd\s+or\s+change\b/gi, 'přidat nebo upravit'],
+  [/\badd\s+option\s+to\s+change\b/gi, 'upravit možnost změny'],
+  [/\badd\s+confirmation\s+message\b/gi, 'přidat potvrzovací hlášku'],
+  [/\bchange\s+date\s+of\s+the\s+done\s+of\s+the\s+task\b/gi, 'změny data dokončení úkolu'],
+  [/\bdone\s+of\s+the\s+task\b/gi, 'dokončení úkolu'],
+  [/\bdone\s+task\b/gi, 'dokončení úkolu'],
+  [/\bafter\s+button\s+press\b/gi, 'po stisknutí tlačítka'],
+  // Single-word/short phrases
+  [/\bconfirmation\s+message\b/gi, 'potvrzovací hlášku'],
+  [/\bbutton\s+press\b/gi, 'stisknutí tlačítka'],
+  [/\bchange\s+date\b/gi, 'změny data'],
+  [/\bbutton\b/gi, 'tlačítko'],
+  [/\bconfirmation\b/gi, 'potvrzení'],
+  [/\bdone\b/gi, 'dokončení'],
+];
+
+/** Returns true when the string contains Czech-specific diacritics. */
+function hasCzechChars(s: string): boolean {
+  return /[áčďéěíňóřšťúůýžÁČĎÉĚÍŇÓŘŠŤÚŮÝŽ]/.test(s);
+}
+
+/**
+ * Heuristic: does the string look like English?
+ * Checks for absence of Czech diacritics and presence of common English words.
+ */
+function looksEnglish(s: string): boolean {
+  if (hasCzechChars(s)) return false;
+  return /\b(can|you|add|change|the|of|after|please|button|done|message|date|option|request|need|want|would|could|like|have|make|get|set|fix|update|create|delete|remove|show|hide|send|use|with|for|that|this|it|to|is|are|was|were|be|been|do|does|did|will|should|may|might|must|shall)\b/i.test(s);
+}
+
+/** Apply phrase substitution table to `text`. */
+function applyPhraseSubs(text: string): string {
+  let result = text;
+  for (const [pattern, replacement] of PHRASE_SUBS) {
+    result = result.replace(pattern, replacement);
+  }
+  return result.replace(/\s{2,}/g, ' ').trim();
+}
+
+function capitalize(s: string): string {
+  if (!s) return s;
+  return s.charAt(0).toUpperCase() + s.slice(1);
+}
+
+/** Strip the pricing verb/noun from the beginning of a sentence to get the actual work description. */
+function stripPricingTrigger(text: string): string {
+  return text
+    .replace(/\bpotřebuju?\s+(nacen[ěe]n[íi]|nacenit)\b\s*/i, '')
+    .replace(/\bplease\s+(estimate|quote)\s*/i, '')
+    .replace(/\b(estimate|estimation|pricing|quote|quotation)\s+for\s+/i, '')
+    .replace(/\b(nacen[ěe]n[íi]|nacenit)\s+/i, '')
+    .replace(/^(estimate|pricing|quote|quotation)\s*/i, '')
+    .trim();
+}
+
+/**
+ * Generates a Czech action-oriented task title from a Teams message.
  *
  * Rules:
  *  - Strip the "From: / Chat:" prefix lines added by the import wrapper
- *  - Take the first non-trivial sentence or line
- *  - Keep it under ~100 chars
- *  - Include sender name when available
+ *  - Detect pricing requests → "Nacenění: <popis práce>"
+ *  - Apply English→Czech phrase substitutions for known patterns
+ *  - Keep it under 100 chars
+ *  - Never include the sender name as a prefix
+ *  - Fall back to "Teams: nový úkol" if nothing useful can be extracted
+ *
+ * Test cases (verified manually):
+ *  "can you add option to change date of the Done of the task?"
+ *    → "Upravit možnost změny data dokončení úkolu"
+ *  "add or change confirmation message after button press"
+ *    → "Přidat nebo upravit potvrzovací hlášku po stisknutí tlačítka"
+ *  "potřebuju nacenění úpravy pluginu"
+ *    → "Nacenění: úprava pluginu"
+ *  "please estimate add confirmation message after button press"
+ *    → "Nacenění: přidat potvrzovací hlášku po stisknutí tlačítka"
  */
-export function generateTeamsTitle(senderName: string, content: string): string {
+export function generateTeamsTitle(_senderName: string, content: string): string {
   // Remove the "From: ... / Chat: ..." header lines added by handleTeamsImport
-  const stripped = content
+  const cleaned = content
     .split('\n')
     .filter((line) => {
       const l = line.trim();
@@ -165,26 +257,58 @@ export function generateTeamsTitle(senderName: string, content: string): string 
     .trim();
 
   // Find the first meaningful sentence or line
-  const firstChunk = stripped
-    .split(/[\n]+/)
-    .map((s) => s.trim())
-    .find((s) => s.length > 8)
-    ?? content.slice(0, 80);
+  const firstChunk =
+    cleaned
+      .split(/[\n]+/)
+      .map((s) => s.trim())
+      .find((s) => s.length > 8) ?? content.slice(0, 80);
 
-  // Further split by sentence-ending punctuation if the line is long
   const firstSentence =
     firstChunk.length > 60
       ? (firstChunk.split(/[.!?]/).map((s) => s.trim()).find((s) => s.length > 8) ?? firstChunk)
       : firstChunk;
 
-  const capped =
-    firstSentence.length > 95
-      ? `${firstSentence.slice(0, 92)}…`
-      : firstSentence;
+  const rawText = firstSentence.trim();
+  if (!rawText) return 'Teams: nový úkol';
 
-  const prefix = senderName?.trim() ? `${senderName.trim()}: ` : '';
-  return `${prefix}${capped}`;
+  // --- Pricing path ---
+  if (isPricingRequest(rawText)) {
+    const work = stripPricingTrigger(rawText);
+    const suffix = work.length > 4 ? work : rawText;
+    let translatedSuffix = applyPhraseSubs(suffix);
+    // Avoid "Nacenění: nacenění ..."
+    translatedSuffix = translatedSuffix.replace(/^nacen[ěe]n[íi]\s*:?\s*/i, '').trim();
+    const cap = translatedSuffix.length > 85 ? `${translatedSuffix.slice(0, 82)}…` : translatedSuffix;
+    const title = `Nacenění: ${cap}`;
+    console.debug(`[teams-title] pricing path: "${rawText}" → "${title}"`);
+    return title.length > 100 ? `${title.slice(0, 97)}…` : title;
+  }
+
+  // --- English substitution path ---
+  if (looksEnglish(rawText)) {
+    const translated = applyPhraseSubs(rawText);
+    if (translated !== rawText || hasCzechChars(translated)) {
+      const title = capitalize(translated);
+      console.debug(`[teams-title] en→cz path: "${rawText}" → "${title}"`);
+      return title.length > 100 ? `${title.slice(0, 97)}…` : title;
+    }
+    // No useful substitution — keep original with no-op capping, AI will have a chance
+    const title = rawText.length > 100 ? `${rawText.slice(0, 97)}…` : rawText;
+    console.debug(`[teams-title] english fallback (no subs): "${title}"`);
+    return title;
+  }
+
+  // --- Already Czech or other language ---
+  const title = rawText.length > 100 ? `${rawText.slice(0, 97)}…` : rawText;
+  console.debug(`[teams-title] czech/other: "${title}"`);
+  return title || 'Teams: nový úkol';
 }
+
+/**
+ * Returns true when the string contains Czech diacritics.
+ * Exported for use in AppContext title policy.
+ */
+export { hasCzechChars };
 
 // ---------------------------------------------------------------------------
 // Body cleaning

@@ -766,13 +766,21 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
       // it adds real value by extracting a clean action-oriented summary from messy bodies.
       const isPrComment = input.adoContext?.type === 'pr-comment';
       const isEmail     = input.source === 'email';
+      const isTeams     = input.source === 'teams';
       // Title policy:
-      //   ADO PR comment  → input.title is the normalized email subject (the natural heading)
-      //   Generic email   → input.title is the original email subject
-      //   Teams / other   → AI-generated title preferred, subject as fallback
-      const resolvedTitle = (isPrComment || isEmail)
-        ? input.title
-        : title || input.title;
+      //   ADO PR comment  → deterministic subject always wins
+      //   Generic email   → deterministic subject always wins
+      //   Teams           → prefer deterministic Czech title; allow AI title only when it looks Czech
+      //   Other           → AI-generated title preferred, input title as fallback
+      const aiTitleHasCzech = /[áčďéěíňóřšťúůýžÁČĎÉĚÍŇÓŘŠŤÚŮÝŽ]/.test(title ?? '');
+      const deterministicIsNaceneni = /^Nacen[ěe]n[íi]:/i.test(input.title ?? '');
+      const resolvedTitle =
+        (isPrComment || isEmail)
+          ? input.title
+          : isTeams
+            // Keep deterministic Czech title when: it has a "Nacenění:" prefix, or AI title looks English
+            ? (deterministicIsNaceneni || !aiTitleHasCzech ? input.title : title || input.title)
+            : title || input.title;
       console.log(
         `[title-route] finalTitle="${resolvedTitle?.slice(0, 70)}"`,
         `source=${isPrComment ? 'deterministic_pr' : isEmail ? 'email_subject' : 'ai'}`,

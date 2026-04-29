@@ -1348,7 +1348,8 @@ Field rules:\n\
 - skipReason: brief reason if isTask=false, else null\n\
 - suggestedReply: 1-2 sentence acknowledgement if a reply is appropriate, else null\n\
 - ALL bilingual fields (summaryCz, summaryEn, *Cz, *En) are MANDATORY when isTask=true\n\
-- *Cz fields: natural Czech. *En fields: natural English."
+- *Cz fields: natural Czech. *En fields: natural English.\n\
+- title: must be in Czech for Teams messages. Use an action-oriented noun phrase (e.g. 'Upravit možnost změny data dokončení úkolu')."
             );
 
             let text_result = call_openai(&api_key, &model, instructions, &prompt).await;
