@@ -1,4 +1,4 @@
-import type { TaskStatus, TaskSource, TaskType, ClassificationState } from '../types';
+import type { Task, TaskStatus, TaskSource, TaskType, ClassificationState, TaskAttentionState, TaskWaitingState } from '../types';
 
 // --- Status badge ----------------------------------------------------------
 
@@ -20,6 +20,43 @@ export function StatusBadge({ status }: StatusBadgeProps) {
     <span className={`badge badge-status-${status}`}>
       {STATUS_LABELS[status]}
     </span>
+  );
+}
+
+// --- Waiting / attention badges -------------------------------------------
+
+export const WAITING_LABELS: Record<TaskWaitingState, string> = {
+  'pricing-approval': 'Waiting for estimate approval',
+  'code-review':      'Waiting for code review',
+};
+
+export const ATTENTION_LABELS: Record<TaskAttentionState, string> = {
+  'pr-comments': 'PR comments',
+};
+
+export function WaitingBadge({ state }: { state: TaskWaitingState }) {
+  return (
+    <span className={`badge badge-waiting-${state}`}>
+      {WAITING_LABELS[state]}
+    </span>
+  );
+}
+
+export function AttentionBadge({ state }: { state: TaskAttentionState }) {
+  return (
+    <span className={`badge badge-attention-${state}`}>
+      {ATTENTION_LABELS[state]}
+    </span>
+  );
+}
+
+export function TaskStateBadges({ task }: { task: Task }) {
+  return (
+    <>
+      <StatusBadge status={task.status} />
+      {task.waitingState && <WaitingBadge state={task.waitingState} />}
+      {task.attentionState && <AttentionBadge state={task.attentionState} />}
+    </>
   );
 }
 

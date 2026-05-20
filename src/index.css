@@ -902,6 +902,9 @@ body {
 .badge-status-ready-for-review  { color: var(--color-ready-for-review); background: color-mix(in srgb, var(--color-ready-for-review) 15%, transparent); border-color: color-mix(in srgb, var(--color-ready-for-review) 28%, transparent); }
 .badge-status-done              { color: var(--color-done);             background: color-mix(in srgb, var(--color-done) 15%, transparent);             border-color: color-mix(in srgb, var(--color-done) 28%, transparent); }
 .badge-status-blocked           { color: var(--color-blocked);          background: color-mix(in srgb, var(--color-blocked) 15%, transparent);          border-color: color-mix(in srgb, var(--color-blocked) 28%, transparent); }
+.badge-waiting-pricing-approval,
+.badge-waiting-code-review      { color: var(--color-warning, #d29922); background: color-mix(in srgb, var(--color-warning, #d29922) 14%, transparent); border-color: color-mix(in srgb, var(--color-warning, #d29922) 26%, transparent); }
+.badge-attention-pr-comments    { color: var(--color-blocked);          background: color-mix(in srgb, var(--color-blocked) 12%, transparent);          border-color: color-mix(in srgb, var(--color-blocked) 24%, transparent); }
 
 /* Type badges */
 .badge-type-bug-fix     { color: var(--color-bug);        background: color-mix(in srgb, var(--color-bug) 12%, transparent);        border-color: color-mix(in srgb, var(--color-bug) 22%, transparent); }
@@ -4076,6 +4079,13 @@ body {
 .tip-action-btn:hover {
   color: var(--text-primary);
   background: var(--bg-hover);
+}
+
+.tip-phase-select {
+  width: 100%;
+  min-height: 28px;
+  font-size: 12px;
+  background: var(--bg-base);
 }
 
 /* Primary buttons — Done, Detail, Delete */

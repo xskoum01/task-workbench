@@ -7,7 +7,7 @@
 
 import type { Task, PlanningBucket } from '../types';
 import { useApp } from '../context/AppContext';
-import { StatusBadge, SourceBadge, TypeBadge } from './StatusBadge';
+import { TaskStateBadges, SourceBadge, TypeBadge } from './StatusBadge';
 import Icon from './Icon';
 import InlineTaskPanel from './InlineTaskPanel';
 import {
@@ -30,9 +30,11 @@ import { isOverdue, formatRelativeDate } from '../lib/dates';
  *   overdue — tasks past their due date
  *   today   — tasks in the Today bucket
  *   blocked — blocked status
+ *   waiting — tasks waiting on someone else
+ *   pr-comments — active PR comments loop
  *   locked  — manually locked bucket
  */
-export type PlanningFilter = 'focus' | 'overdue' | 'today' | 'blocked' | 'locked' | null;
+export type PlanningFilter = 'focus' | 'overdue' | 'today' | 'blocked' | 'waiting' | 'pr-comments' | 'locked' | null;
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -64,6 +66,8 @@ function passesFilter(task: Task, filter: PlanningFilter): boolean {
     case 'overdue': return overdue;
     case 'today':   return bucket === 'today';
     case 'blocked': return task.status === 'blocked';
+    case 'waiting': return !!task.waitingState || bucket === 'waiting';
+    case 'pr-comments': return task.attentionState === 'pr-comments';
     case 'locked':  return !!task.isPlanningLocked;
   }
 }
@@ -84,11 +88,15 @@ function SummaryBar({ tasks }: SummaryBarProps) {
     return b === 'today' || b === 'now';
   });
   const blocked = active.filter((t) => t.status === 'blocked');
+  const waiting = active.filter((t) => t.waitingState);
+  const prComments = active.filter((t) => t.attentionState === 'pr-comments');
   const done    = tasks.filter((t) => t.status === 'done');
 
   const items: { label: string; count: number; cls?: string }[] = [];
   if (overdue.length > 0) items.push({ label: 'overdue', count: overdue.length, cls: 'summary-item--overdue' });
   if (today.length > 0)   items.push({ label: 'today',   count: today.length                                 });
+  if (prComments.length > 0) items.push({ label: 'PR comments', count: prComments.length, cls: 'summary-item--blocked' });
+  if (waiting.length > 0) items.push({ label: 'waiting', count: waiting.length });
   if (blocked.length > 0) items.push({ label: 'blocked', count: blocked.length, cls: 'summary-item--blocked' });
   if (done.length > 0)    items.push({ label: 'done',    count: done.length,    cls: 'summary-item--done'    });
 
@@ -257,7 +265,7 @@ function PlanningTaskRow({ task, selected, onSelect }: PlanningTaskRowProps) {
 
       {/* Right side — mirrors task-list-item-side: status badge + score */}
       <div className="planning-task-side">
-        <StatusBadge status={task.status} />
+        <TaskStateBadges task={task} />
         {overdue && <span className="overdue-badge">overdue</span>}
         <span
           className={`planning-score-pill ${sc}`}

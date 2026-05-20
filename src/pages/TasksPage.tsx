@@ -1,7 +1,7 @@
 import { useState } from 'react';
 import type { TaskStatus } from '../types';
 import { useApp } from '../context/AppContext';
-import { StatusBadge, TypeBadge, SourceBadge } from '../components/StatusBadge';
+import { TaskStateBadges, TypeBadge, SourceBadge } from '../components/StatusBadge';
 import Icon from '../components/Icon';
 import TaskDetail from '../components/TaskDetail';
 import InlineTaskPanel from '../components/InlineTaskPanel';
@@ -22,6 +22,8 @@ const PLANNING_FILTERS: { value: PlanningFilter; label: string; title: string }[
   { value: 'overdue', label: 'Overdue', title: 'Tasks past their due date'   },
   { value: 'today',   label: 'Today',   title: 'Tasks in the Today bucket'   },
   { value: 'blocked', label: 'Blocked', title: 'Blocked tasks'               },
+  { value: 'waiting', label: 'Waiting', title: 'Tasks waiting on someone else'},
+  { value: 'pr-comments', label: 'PR Comments', title: 'Tasks with review comments to handle' },
   { value: 'locked',  label: 'Locked',  title: 'Manually locked bucket'      },
 ];
 
@@ -81,6 +83,8 @@ export default function TasksPage() {
   const overdueCount = activeTasks.filter((t) => t.dueAt && isOverdue(t.dueAt, t.status)).length;
   const todayCount   = activeTasks.filter((t) => effectiveBucket(t) === 'today').length;
   const blockedCount = activeTasks.filter((t) => t.status === 'blocked').length;
+  const waitingCount = activeTasks.filter((t) => t.waitingState || effectiveBucket(t) === 'waiting').length;
+  const prCommentsCount = activeTasks.filter((t) => t.attentionState === 'pr-comments').length;
   const lockedCount  = activeTasks.filter((t) => t.isPlanningLocked).length;
   const focusCount   = activeTasks.filter((t) =>
     (t.dueAt && isOverdue(t.dueAt, t.status)) ||
@@ -93,6 +97,8 @@ export default function TasksPage() {
     overdue: overdueCount,
     today:   todayCount,
     blocked: blockedCount,
+    waiting: waitingCount,
+    'pr-comments': prCommentsCount,
     locked:  lockedCount,
   };
 
@@ -255,7 +261,7 @@ export default function TasksPage() {
                       </div>
                     </div>
                     <div className="task-list-item-side">
-                      <StatusBadge status={task.status} />
+                      <TaskStateBadges task={task} />
                       <span className="task-list-item-confidence">
                         {task.confidence}%
                       </span>
@@ -267,7 +273,7 @@ export default function TasksPage() {
                           <button
                             className="tli-action-btn tli-action-btn--done"
                             title="Mark as done"
-                            onClick={() => updateTask(task.id, { status: 'done' })}
+                            onClick={() => updateTask(task.id, { status: 'done', waitingState: null, attentionState: null })}
                           >
                             <Icon name="check" size={12} />
                           </button>

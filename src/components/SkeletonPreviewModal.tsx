@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import type { SkeletonPreview, Customer } from '../types';
 import Modal from './Modal';
 import * as tauriApi from '../lib/tauriCommands';
@@ -10,17 +10,9 @@ interface SkeletonPreviewModalProps {
   onClose: () => void;
   /**
    * Called after "Save to File" succeeds with the absolute path that was written.
-   * The parent should use this to complete the workflow (persist state, open project, etc.).
-   * When provided the modal closes itself after calling this callback.
+   * The parent should persist metadata only; workflow state and IDE opening remain explicit.
    */
   onSaved?: (filePath: string) => void;
-  /**
-   * When provided and no plugin folder is configured, a "Create Project & Apply" button
-   * is shown instead of the disabled "Save to File" button.
-   * The callback should create the plugin project and write the draft file.
-   * Throwing from the callback surfaces an error message in the modal.
-   */
-  onCreateAndApply?: () => Promise<void>;
   /**
    * Explicit plugin project base path (e.g. pluginsDir/selectedPluginProject).
    * When set, takes priority over customer.pluginFolder so the save path
@@ -28,57 +20,53 @@ interface SkeletonPreviewModalProps {
    */
   resolvedPluginBase?: string;
   /**
-   * Explicit absolute save path override — used for script drafts where the target
+   * Explicit absolute save path override, used for script drafts where the target
    * is a flat file in the scripts folder, not a nested plugin project layout.
-   * When provided, bypasses the pluginFolder-based buildSavePath logic entirely.
    */
   overrideSavePath?: string;
-  /**
-   * Override the modal title. Defaults to "Skeleton: <fileName>".
-   * Use "Draft: <fileName>" for script drafts.
-   */
+  /** Override the modal title. Defaults to "Skeleton: <fileName>". */
   modalTitle?: string;
 }
 
-/** Builds the absolute save path for the .cs file.
- *
- * Requires `resolvedPluginBase` (<pluginsDir>/<projectName>) to be provided.
- * The .cs file lives in the nested C# project folder which has the same name
- * as the solution root:
- *   <resolvedPluginBase>/<projectName>/<fileName>
- *
- * Returns null when no project is selected, so the Save to File button is
- * disabled and the user is directed to pick a project in the Dev panel.
- * This matches the path built by TaskDetail.handleApplyDraft.
- */
 function buildSavePath(
   preview: SkeletonPreview,
   resolvedPluginBase?: string,
 ): string | null {
   if (resolvedPluginBase) {
-    // Extract project name from last path segment of the solution root.
-    // Convention (matches TaskDetail.handleApplyDraft):
-    //   <pluginsDir>/<project>/<project>/<fileName>
     const projectName = resolvedPluginBase.replace(/\\/g, '/').split('/').filter(Boolean).pop() ?? '';
     return `${resolvedPluginBase}/${projectName}/${preview.fileName}`;
   }
-  // No project selected — return null so "Save to File" is disabled.
-  // The AI-supplied targetPath is not reliable for plugin folder layout and
-  // would produce a path inconsistent with handleApplyDraft in TaskDetail.
-  // Users must either select a project in the Dev panel or use "Apply Draft (Create Project)".
   return null;
 }
 
-export default function SkeletonPreviewModal({ preview, customer: _customer, onClose, onSaved, onCreateAndApply, resolvedPluginBase, overrideSavePath, modalTitle }: SkeletonPreviewModalProps) {
-  const [copied, setCopied]         = useState(false);
-  const [saving, setSaving]         = useState(false);
-  const [saved, setSaved]           = useState(false);
-  const [saveError, setSaveError]   = useState<string | null>(null);
-  const [creating, setCreating]     = useState(false);
-  const [createError, setCreateError] = useState<string | null>(null);
+export default function SkeletonPreviewModal({
+  preview,
+  customer: _customer,
+  onClose,
+  onSaved,
+  resolvedPluginBase,
+  overrideSavePath,
+  modalTitle,
+}: SkeletonPreviewModalProps) {
+  const [copied, setCopied] = useState(false);
+  const [saving, setSaving] = useState(false);
+  const [saved, setSaved] = useState(false);
+  const [saveError, setSaveError] = useState<string | null>(null);
+  const [targetExists, setTargetExists] = useState<boolean | null>(null);
+  const [conflictPath, setConflictPath] = useState<string | null>(null);
 
-  // overrideSavePath wins (script drafts); otherwise derive from plugin project base.
   const savePath = overrideSavePath ?? buildSavePath(preview, resolvedPluginBase);
+
+  useEffect(() => {
+    let cancelled = false;
+    setTargetExists(null);
+    setConflictPath(null);
+    if (!savePath) return;
+    tauriApi.checkPathExists(savePath)
+      .then((exists) => { if (!cancelled) setTargetExists(exists); })
+      .catch(() => { if (!cancelled) setTargetExists(null); });
+    return () => { cancelled = true; };
+  }, [savePath]);
 
   async function handleCopy() {
     try {
@@ -86,23 +74,29 @@ export default function SkeletonPreviewModal({ preview, customer: _customer, onC
       setCopied(true);
       setTimeout(() => setCopied(false), 2500);
     } catch {
-      // Clipboard unavailable — silently ignore
+      // Clipboard unavailable; preview is still visible for manual copy.
     }
   }
 
-  async function handleSave() {
-    if (!savePath) return;
+  function buildSaveAsPath(path: string): string {
+    const norm = path.replace(/\\/g, '/');
+    const slash = norm.lastIndexOf('/');
+    const dir = slash >= 0 ? norm.slice(0, slash + 1) : '';
+    const file = slash >= 0 ? norm.slice(slash + 1) : norm;
+    const dot = file.lastIndexOf('.');
+    const stem = dot > 0 ? file.slice(0, dot) : file;
+    const ext = dot > 0 ? file.slice(dot) : '';
+    return `${dir}${stem}.draft-${Date.now()}${ext}`;
+  }
+
+  async function writeDraft(path: string) {
     setSaving(true);
     setSaveError(null);
     try {
-      await tauriApi.saveGeneratedFile(savePath, preview.content);
+      await tauriApi.saveGeneratedFile(path, preview.content);
       setSaved(true);
-      // When the parent has registered an onSaved handler, delegate post-save workflow to it
-      // and close the modal. Otherwise just show the "Saved" confirmation inline.
-      if (onSaved) {
-        onSaved(savePath);
-        onClose();
-      }
+      onSaved?.(path);
+      onClose();
     } catch (e) {
       setSaveError(String(e));
     } finally {
@@ -110,57 +104,74 @@ export default function SkeletonPreviewModal({ preview, customer: _customer, onC
     }
   }
 
-  async function handleCreateAndApply() {
-    if (!onCreateAndApply) return;
-    setCreating(true);
-    setCreateError(null);
-    try {
-      await onCreateAndApply();
-      // Parent closes the modal on success — no local state update needed.
-    } catch (e) {
-      setCreateError(String(e));
-    } finally {
-      setCreating(false);
+  async function handleSave() {
+    if (!savePath) return;
+    const exists = targetExists ?? await tauriApi.checkPathExists(savePath).catch(() => false);
+    if (exists) {
+      setConflictPath(savePath);
+      return;
     }
+    await writeDraft(savePath);
+  }
+
+  async function handleOverwrite() {
+    if (!conflictPath) return;
+    const path = conflictPath;
+    setConflictPath(null);
+    await writeDraft(path);
+  }
+
+  async function handleSaveAsNew() {
+    if (!conflictPath) return;
+    const nextPath = buildSaveAsPath(conflictPath);
+    setConflictPath(null);
+    await writeDraft(nextPath);
   }
 
   const footer = (
     <>
-      {copied && <span className="reply-copy-success">✓ Copied</span>}
-      {saved  && <span className="reply-copy-success">✓ Saved to {preview.fileName}</span>}
-      <button className="btn btn-ghost btn-sm" onClick={handleCopy} disabled={saving || creating}>
+      {copied && <span className="reply-copy-success">Copied</span>}
+      {saved && <span className="reply-copy-success">Saved to {preview.fileName}</span>}
+      {conflictPath && (
+        <span className="detail-devmode-hint" style={{ color: 'var(--color-warning, #d29922)' }}>
+          Target exists
+        </span>
+      )}
+      <button className="btn btn-ghost btn-sm" onClick={handleCopy} disabled={saving}>
         Copy
       </button>
-      {savePath ? (
+      {conflictPath ? (
+        <>
+          <button className="btn btn-danger btn-sm" onClick={handleOverwrite} disabled={saving}>
+            Overwrite
+          </button>
+          <button className="btn btn-secondary btn-sm" onClick={handleSaveAsNew} disabled={saving}>
+            Save as New
+          </button>
+          <button className="btn btn-ghost btn-sm" onClick={() => setConflictPath(null)} disabled={saving}>
+            Cancel
+          </button>
+        </>
+      ) : savePath ? (
         <button
           className="btn btn-primary btn-sm"
           onClick={handleSave}
-          disabled={saving || saved || creating}
+          disabled={saving || saved}
           title={`Save to: ${savePath}`}
         >
-          {saving ? 'Saving…' : saved ? 'Saved' : 'Save to File'}
-        </button>
-      ) : onCreateAndApply ? (
-        <button
-          className="btn btn-primary btn-sm"
-          onClick={handleCreateAndApply}
-          disabled={creating || saving}
-          title="Create a new plugin project from the inferred naming convention and write this draft into it"
-        >
-          {creating ? 'Creating…' : 'Apply Draft (Create Project)'}
+          {saving ? 'Saving...' : saved ? 'Saved' : 'Save to File'}
         </button>
       ) : (
         <button className="btn btn-secondary btn-sm" disabled title="Select a plugin project in the Dev panel first">
           Save to File
         </button>
       )}
-      <button className="btn btn-ghost btn-sm" onClick={onClose} disabled={creating || saving}>Cancel</button>
+      <button className="btn btn-ghost btn-sm" onClick={onClose} disabled={saving}>Cancel</button>
     </>
   );
 
   return (
     <Modal title={modalTitle ?? `Skeleton: ${preview.fileName}`} onClose={onClose} footer={footer} size="lg">
-      {/* Save path info */}
       <div className="skeleton-path-row">
         <span className="skeleton-path-label">Target</span>
         <span className="skeleton-path-value">
@@ -171,12 +182,17 @@ export default function SkeletonPreviewModal({ preview, customer: _customer, onC
           )}
         </span>
       </div>
-
-      {(saveError || createError) && (
-        <div className="detail-fs-error">⚠ {saveError ?? createError}</div>
+      {savePath && (
+        <div className="skeleton-path-row">
+          <span className="skeleton-path-label">Exists</span>
+          <span className="skeleton-path-value">
+            {targetExists === null ? 'Checking...' : targetExists ? 'Yes - choose Overwrite or Save as New' : 'No'}
+          </span>
+        </div>
       )}
-
-      {/* Code preview */}
+      {saveError && (
+        <div className="detail-fs-error">! {saveError}</div>
+      )}
       <pre className="skeleton-code-preview">{preview.content}</pre>
     </Modal>
   );

@@ -361,6 +361,42 @@ export async function resolvePluginOpenTargetFromFile(
   return { path: fileDir, kind: 'folder' };
 }
 
+/**
+ * Resolves the primary open target for a selected plugin project folder.
+ *
+ * Search order:
+ *   1. .sln in <pluginsDir>/<selectedPluginProject>, preferring a solution
+ *      whose basename matches the selected project folder name.
+ *   2. The selected plugin project folder itself.
+ *
+ * Returns null when the inputs are missing or the selected project folder does
+ * not exist.
+ */
+export async function resolveSelectedPluginOpenTarget(
+  pluginsDir: string | undefined,
+  selectedPluginProject: string | undefined,
+): Promise<{ path: string; kind: 'sln' | 'folder' } | null> {
+  const projectName = selectedPluginProject?.trim();
+  if (!pluginsDir || !projectName) return null;
+
+  const pluginPath = `${pluginsDir.replace(/[\\/]+$/, '').replace(/\\/g, '/')}/${projectName}`;
+  const exists = await checkPathExists(pluginPath).catch(() => false);
+  if (!exists) return null;
+
+  const slns = await listDirectoryFiles(pluginPath, 'sln').catch(() => [] as string[]);
+  if (slns.length > 0) {
+    const sorted = [...slns].sort((a, b) => a.localeCompare(b, undefined, { sensitivity: 'base' }));
+    const projectKey = projectName.toLowerCase();
+    const matching =
+      sorted.find((file) => file.replace(/\.sln$/i, '').toLowerCase() === projectKey) ??
+      sorted.find((file) => file.toLowerCase().startsWith(projectKey));
+    const chosen = matching ?? sorted[0];
+    return { path: `${pluginPath}/${chosen}`, kind: 'sln' };
+  }
+
+  return { path: pluginPath, kind: 'folder' };
+}
+
 // ---------------------------------------------------------------------------
 // Git helpers
 // ---------------------------------------------------------------------------

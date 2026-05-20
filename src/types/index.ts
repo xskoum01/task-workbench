@@ -6,6 +6,13 @@ export type TaskStatus =
   | 'done'
   | 'blocked';
 
+export type TaskWaitingState =
+  | 'pricing-approval'
+  | 'code-review';
+
+export type TaskAttentionState =
+  | 'pr-comments';
+
 export type TaskSource = 'email' | 'teams' | 'manual';
 
 export type TaskType =
@@ -79,6 +86,10 @@ export interface Task {
   priorityReason?: string;
   /** When true, planning bucket will not be overwritten by auto-recompute. */
   isPlanningLocked?: boolean;
+  /** Passive waiting state: task is waiting on someone else. */
+  waitingState?: TaskWaitingState | null;
+  /** Active attention state: task needs work from me even if it came from a review loop. */
+  attentionState?: TaskAttentionState | null;
 
   // --- AI-generated content ---
   /** Persisted result from the AI Analyze action. */

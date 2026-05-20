@@ -102,6 +102,14 @@ export function computePlanning(task: Task): PlanningResult {
     score += 10;
     reasons.push('in progress');
   }
+  if (task.waitingState) {
+    score -= 35;
+    reasons.push(task.waitingState === 'code-review' ? 'waiting for code review' : 'waiting for estimate approval');
+  }
+  if (task.attentionState === 'pr-comments') {
+    score += 35;
+    reasons.push('PR comments');
+  }
   if (isBlocked) {
     score -= 50;
     reasons.push('blocked');
@@ -113,7 +121,11 @@ export function computePlanning(task: Task): PlanningResult {
   // --- Bucket suggestion ---
   let bucket: PlanningBucket;
 
-  if (isBlocked) {
+  if (task.waitingState) {
+    bucket = 'waiting';
+  } else if (task.attentionState === 'pr-comments') {
+    bucket = 'now';
+  } else if (isBlocked) {
     // Blocked tasks always go to later regardless of due date
     bucket = 'later';
   } else if (taskOverdue) {
@@ -150,6 +162,8 @@ export function computePlanning(task: Task): PlanningResult {
  * `suggestedPlanningBucket`, then computes on the fly.
  */
 export function effectiveBucket(task: Task): PlanningBucket {
+  if (task.waitingState) return 'waiting';
+  if (task.attentionState === 'pr-comments') return 'now';
   if (task.planningBucket) return task.planningBucket;
   if (task.suggestedPlanningBucket) return task.suggestedPlanningBucket;
   return computePlanning(task).suggestedPlanningBucket;

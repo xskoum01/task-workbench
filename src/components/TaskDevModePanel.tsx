@@ -85,8 +85,8 @@ export interface TaskDevModePanelProps {
   onReviewSaved?: (review: AiFileReviewResult) => void;
   /**
    * Called after a git-diff change review completes successfully inside the diff modal.
-   * Carries the review result so the parent can persist it and advance status in one
-   * atomic updateTask call (avoids stale-closure overwrite).
+   * Carries the review result so the parent can persist it. Workflow state changes
+   * remain explicit buttons outside the review tool.
    */
   onChangeReviewComplete?: (review: AiFileReviewResult) => void;
 }
@@ -311,20 +311,21 @@ export default forwardRef<TaskDevModePanelHandle, TaskDevModePanelProps>(functio
       .finally(() => setBranchLoading(false));
   }, [devMode, effectiveRepoRoot, currentBranch]);
 
-  // Scan selected plugin folder for .sln / .csproj.
+  // Scan selected plugin folder for a Visual Studio solution.
   useEffect(() => {
     if (!selectedPlugin || !pluginsDir) { setPluginOpenHint(null); return; }
-    const pluginPath = `${pluginsDir}/${selectedPlugin}`;
-    tauriApi.listDirectoryFiles(pluginPath, 'sln')
-      .then((slns) => {
-        if (slns.length > 0) { setPluginOpenHint(`.sln found: ${slns[0]}`); return; }
-        return tauriApi.listDirectoryFiles(pluginPath, 'csproj').then((csprojs) => {
-          setPluginOpenHint(
-            csprojs.length > 0
-              ? `.csproj found: ${csprojs[0]}`
-              : 'No .sln or .csproj found in this plugin folder.',
-          );
-        });
+    tauriApi.resolveSelectedPluginOpenTarget(pluginsDir, selectedPlugin)
+      .then((target) => {
+        if (!target) {
+          setPluginOpenHint('Plugin project folder was not found.');
+          return;
+        }
+        if (target.kind === 'sln') {
+          const fileName = target.path.replace(/\\/g, '/').split('/').pop() ?? target.path;
+          setPluginOpenHint(`.sln found: ${fileName}`);
+        } else {
+          setPluginOpenHint('No .sln found in this plugin folder.');
+        }
       })
       .catch(() => setPluginOpenHint(null));
   }, [selectedPlugin, pluginsDir]);
@@ -401,6 +402,15 @@ export default forwardRef<TaskDevModePanelHandle, TaskDevModePanelProps>(functio
   }
 
   async function handleOpenPlugin() {
+    if (pluginsDir && selectedPlugin) {
+      try {
+        const target = await tauriApi.resolveSelectedPluginOpenTarget(pluginsDir, selectedPlugin);
+        if (!target) { onError('Plugin not found on the current branch or path.'); return; }
+        console.log('[devTarget] final path=', target.path, `(selected plugin ${target.kind})`);
+        await tauriApi.openWithShell(target.path);
+        return;
+      } catch (e) { onError(String(e)); return; }
+    }
     if (!pluginsDir || !selectedPlugin) { onError('Select a plugin project first.'); return; }
     // Always open the plugin project/solution in Visual Studio — never a raw .cs file.
     // artifactPath is used for AI Review file selection only, not for opening the project.
@@ -819,7 +829,7 @@ export default forwardRef<TaskDevModePanelHandle, TaskDevModePanelProps>(functio
           {!pluginProjectsLoading && pluginProjectsLoaded && hintedProjectMissing && (
             <div className="detail-devmode-hint">
               ADO-hinted project <strong>{hintedProjectMissing}</strong> not found on this branch.
-              Switch branches or use Create Plugin Project in the Workflow section.
+              Switch branches, create it manually, or use the optional Create Plugin Project helper.
             </div>
           )}
 
@@ -872,13 +882,10 @@ export default forwardRef<TaskDevModePanelHandle, TaskDevModePanelProps>(functio
           <button
             className="btn btn-secondary btn-sm btn-full"
             onClick={handleOpenPlugin}
-            disabled={
-              !selectedPlugin ||
-              pluginOpenHint === 'No .sln or .csproj found in this plugin folder.'
-            }
+            disabled={!selectedPlugin}
           >
             <Icon name="terminal" size={13} />{' '}
-            {pluginOpenHint?.startsWith('.sln') || pluginOpenHint?.startsWith('.csproj') ? 'Open Plugin in Visual Studio' : 'Open Plugin Folder'}
+            {pluginOpenHint?.startsWith('.sln') ? 'Open Plugin in Visual Studio' : 'Open Plugin Folder'}
           </button>
         </>
       ) : (

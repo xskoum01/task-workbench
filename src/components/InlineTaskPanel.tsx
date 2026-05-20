@@ -28,6 +28,55 @@ interface Props {
 
 const MSG_PREVIEW_LINES = 8;
 
+type TaskPhase =
+  | 'new'
+  | 'analyzed'
+  | 'development'
+  | 'waiting-estimate-approval'
+  | 'waiting-review'
+  | 'pr-comments'
+  | 'done';
+
+const PHASE_OPTIONS: { value: TaskPhase; label: string }[] = [
+  { value: 'new',            label: 'New' },
+  { value: 'analyzed',       label: 'Analyzed' },
+  { value: 'development',    label: 'Development' },
+  { value: 'waiting-estimate-approval', label: 'Waiting for estimate approval' },
+  { value: 'waiting-review', label: 'Waiting for code review' },
+  { value: 'pr-comments',    label: 'PR comments' },
+  { value: 'done',           label: 'Done' },
+];
+
+function phaseFromTask(task: Task): TaskPhase {
+  if (task.attentionState === 'pr-comments') return 'pr-comments';
+  if (task.waitingState === 'pricing-approval') return 'waiting-estimate-approval';
+  if (task.waitingState === 'code-review') return 'waiting-review';
+  if (task.status === 'in-progress') return 'development';
+  if (task.status === 'ready-for-review') return 'waiting-review';
+  if (task.status === 'done') return 'done';
+  if (task.status === 'analyzed') return 'analyzed';
+  return 'new';
+}
+
+function updatesForPhase(phase: TaskPhase): Partial<Task> {
+  switch (phase) {
+    case 'new':
+      return { status: 'new', waitingState: null, attentionState: null };
+    case 'analyzed':
+      return { status: 'analyzed', waitingState: null, attentionState: null };
+    case 'development':
+      return { status: 'in-progress', waitingState: null, attentionState: null };
+    case 'waiting-estimate-approval':
+      return { status: 'analyzed', waitingState: 'pricing-approval', attentionState: null };
+    case 'waiting-review':
+      return { status: 'ready-for-review', waitingState: 'code-review', attentionState: null };
+    case 'pr-comments':
+      return { status: 'in-progress', waitingState: null, attentionState: 'pr-comments', planningBucket: 'now', isPlanningLocked: false };
+    case 'done':
+      return { status: 'done', waitingState: null, attentionState: null };
+  }
+}
+
 export default function InlineTaskPanel({ task, onOpenDetail }: Props) {
   const { updateTask, getCustomerById, deleteTask, settings } = useApp();
   const customer = getCustomerById(task.customerId);
@@ -57,6 +106,10 @@ export default function InlineTaskPanel({ task, onOpenDetail }: Props) {
     await updateTask(task.id, { taskMode: mode });
   }
 
+  async function handleSetPhase(phase: TaskPhase) {
+    await updateTask(task.id, updatesForPhase(phase));
+  }
+
   function openUrl(url: string | undefined) {
     if (!url) return;
     const href = /^https?:\/\//i.test(url) ? url : `https://${url}`;
@@ -67,7 +120,7 @@ export default function InlineTaskPanel({ task, onOpenDetail }: Props) {
     setAnalyzing(true);
     try {
       const result = await tauriApi.analyzeTask(task, customer ?? null);
-      await updateTask(task.id, { analysisResult: result, status: 'analyzed' });
+      await updateTask(task.id, { analysisResult: result, status: 'analyzed', waitingState: null, attentionState: null });
     } finally {
       setAnalyzing(false);
     }
@@ -106,6 +159,7 @@ export default function InlineTaskPanel({ task, onOpenDetail }: Props) {
   // Centralized workflow plan — pass heuristic kind for backward compat with unconfirmed tasks
   const plan = buildTaskWorkflowPlan(task, heuristicDevTarget.kind);
   const { mode: effectiveMode } = inferTaskMode(task);
+  const taskPhase = phaseFromTask(task);
   // Use the same resolver as TaskDetail for consistent branching.
   const isScriptTask = devTarget.kind === 'script';
   const showOpenRepo = !!(repoRoot && isScriptTask);
@@ -220,6 +274,21 @@ export default function InlineTaskPanel({ task, onOpenDetail }: Props) {
               <TaskModeSwitch task={task} onSetMode={handleSetMode} />
             </div>
 
+            {/* Phase selector */}
+            <div className="tip-action-group">
+              <div className="tip-group-label">Task phase</div>
+              <select
+                className="form-select tip-phase-select"
+                value={taskPhase}
+                onChange={(e) => handleSetPhase(e.target.value as TaskPhase)}
+                title="Set task lifecycle phase"
+              >
+                {PHASE_OPTIONS.map((option) => (
+                  <option key={option.value} value={option.value}>{option.label}</option>
+                ))}
+              </select>
+            </div>
+
             {/* Developer awaiting setup prompt */}
             {effectiveMode === 'developer' && plan.isDeveloperAwaitingSetup && (
               <div className="tip-action-group">
@@ -234,9 +303,21 @@ export default function InlineTaskPanel({ task, onOpenDetail }: Props) {
             )}
 
             {/* Development */}
-            {effectiveMode === 'developer' && (hasRepo || hasVscodePath) && plan.requiresDevTools && (
+            {effectiveMode === 'developer' && !plan.isDeveloperAwaitingSetup && (hasRepo || hasVscodePath) && plan.requiresDevTools && (
               <div className="tip-action-group">
                 <div className="tip-group-label">Development</div>
+                {plan.requiresDraftGeneration && (
+                  <div className="tip-action-list">
+                    <button
+                      className="tip-action-btn"
+                      onClick={onOpenDetail}
+                      title="Open full detail to generate and preview safely"
+                    >
+                      <Icon name="layers" size={11} />
+                      {plan.draftIsPrimaryAction ? 'Generate Draft' : 'Patch Suggestion'}
+                    </button>
+                  </div>
+                )}
                 <TaskDevModePanel
                   task={task}
                   customer={customer}
@@ -284,10 +365,18 @@ export default function InlineTaskPanel({ task, onOpenDetail }: Props) {
             <div className="tip-action-group">
               <div className="tip-group-label">Task</div>
               <div className="tip-primary-btns">
+                {task.waitingState === 'pricing-approval' && (
+                  <button
+                    className="btn btn-primary btn-sm"
+                    onClick={() => updateTask(task.id, { status: 'in-progress', waitingState: null, attentionState: null })}
+                  >
+                    <Icon name="play" size={12} /> Development
+                  </button>
+                )}
                 {task.status !== 'done' && (
                   <button
                     className="btn btn-accent btn-sm"
-                    onClick={() => updateTask(task.id, { status: 'done' })}
+                    onClick={() => updateTask(task.id, { status: 'done', waitingState: null, attentionState: null })}
                   >
                     <Icon name="check" size={12} /> Done
                   </button>

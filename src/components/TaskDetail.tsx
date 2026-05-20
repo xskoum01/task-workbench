@@ -1,10 +1,9 @@
 ﻿import { useState, useEffect, useRef } from 'react';
-import type { Task, TaskStatus, PlanningBucket, SkeletonPreview, WorkflowSetup, AiFileReviewResult } from '../types';
+import type { Task, TaskStatus, SkeletonPreview, WorkflowSetup, AiFileReviewResult } from '../types';
 import TaskEmailContent from './TaskEmailContent';
 import TaskDevModePanel, { type TaskDevModePanelHandle } from './TaskDevModePanel';
 import { useApp } from '../context/AppContext';
-import { TypeBadge, SourceBadge } from './StatusBadge';
-import ReplyModal from './ReplyModal';
+import { TypeBadge, SourceBadge, TaskStateBadges } from './StatusBadge';
 import SkeletonPreviewModal from './SkeletonPreviewModal';
 import {
   analyzeScriptTask,
@@ -13,7 +12,7 @@ import {
   buildScriptPreview,
 } from '../lib/scriptAssistant';
 import TaskForm from './TaskForm';
-import CreatePluginProjectModal, { inferPluginSuggestions, sanitize } from './CreatePluginProjectModal';
+import CreatePluginProjectModal from './CreatePluginProjectModal';
 import ConfirmSetupModal from './ConfirmSetupModal';
 import Icon from './Icon';
 import Modal from './Modal';
@@ -25,7 +24,7 @@ import { buildTaskWorkflowPlan } from '../lib/workflowPlan';
 import { resolveTaskDevTarget, getPluginsDir } from '../lib/resolveTaskDevTarget';
 import TaskModeSwitch from './TaskModeSwitch';
 import { inferTaskMode } from '../lib/taskMode';
-import { BUCKET_META, BUCKET_ORDER, computePlanning, effectiveBucket } from '../lib/planning';
+import { BUCKET_META, computePlanning, effectiveBucket } from '../lib/planning';
 import { isOverdue, formatRelativeDate } from '../lib/dates';
 
 interface TaskDetailProps {
@@ -33,7 +32,7 @@ interface TaskDetailProps {
   onClose: () => void;
 }
 
-type AiAction = 'analyze' | 'reply' | 'draft';
+type AiAction = 'analyze' | 'draft';
 
 function formatEffort(hours: number): string {
   if (hours < 1) return `${Math.round(hours * 60)}m`;
@@ -326,9 +325,6 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
   const [aiLoading, setAiLoading] = useState<AiAction | null>(null);
   // Confirm setup modal (shown for New tasks before Analyze)
   const [showSetupModal, setShowSetupModal] = useState(false);
-  // Reply modal
-  const [showReply, setShowReply]         = useState(false);
-  const [generatedReply, setGeneratedReply] = useState<string | null>(null);
   // Draft (plugin skeleton or script preview)
   const [showSkeleton, setShowSkeleton]       = useState(false);
   const [skeletonPreview, setSkeletonPreview] = useState<SkeletonPreview | null>(null);
@@ -355,6 +351,8 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
   // AI Code Review — modal state for viewing a saved review
   const [showSavedReviewModal, setShowSavedReviewModal] = useState(false);
   const latestReview = task.aiFileReviews?.[0];
+  const isCreateIntent = task.workflowSetup?.workIntent === 'create';
+  const isPluginCreate = isCreateIntent && devTarget.kind === 'plugin';
 
   // Persists a new AI review result on the task (newest first, capped at 5).
   async function handleReviewSaved(review: AiFileReviewResult) {
@@ -381,8 +379,8 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
   /**
    * Called by TaskDevModePanel when a refresh reveals the persisted plugin project
    * folder no longer exists on disk.
-   * Preserves the project name as desiredPluginProject so the Create Plugin Project
-   * modal can be prefilled, and resets the workflow back to "Create Plugin Project".
+   * Preserves the project name as desiredPluginProject so helper actions can
+   * prefill suggestions without turning project creation into a workflow gate.
    */
   async function handlePluginProjectMissing(projectName: string) {
     const currentArtifact = task.workflowSetup?.artifactPath;
@@ -397,14 +395,19 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
         artifactPath:         artifactInsideProject ? undefined : currentArtifact,
       },
     });
-    setFeedback(`Plugin project '${projectName}' not found on disk — reset to Create state.`);
+    setFeedback(`Plugin project '${projectName}' was not found. Create it manually, then refresh projects.`);
   }
 
 
   // --- Status change ---
 
-  async function handleStatusChange(status: TaskStatus) {
-    await updateTask(task.id, { status });
+  async function handleStatusChange(status: TaskStatus, extra: Partial<Task> = {}) {
+    await updateTask(task.id, {
+      waitingState: null,
+      attentionState: null,
+      ...extra,
+      status,
+    });
   }
 
   // --- Completed date edit ---
@@ -459,6 +462,8 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
       await updateTask(task.id, {
         ...(extraSetup !== undefined ? { workflowSetup: extraSetup } : {}),
         status:         'analyzed',
+        waitingState:   null,
+        attentionState: null,
         analysisResult: result,
         confidence:     result.confidence,
       });
@@ -472,13 +477,12 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
 
   async function handleGenerateDraft() {
     if (devTarget.kind === 'plugin') {
-      // For Create+Plugin: verify the project folder exists before generating.
-      // This prevents draft generation from silently targeting a missing project.
-      if (plan.requiresPluginCreate === false && selectedPluginProject && pluginsDir) {
+      // If a project is selected, verify it still exists before generating.
+      if (selectedPluginProject && pluginsDir) {
         const projectPath = `${pluginsDir}/${selectedPluginProject}`;
         const exists = await tauriApi.checkPathExists(projectPath).catch(() => false);
         if (!exists) {
-          // Project folder was deleted — reset workflow back to Create Plugin Project.
+          // Project folder was deleted — clear selection so helper tools can guide recovery.
           await handlePluginProjectMissing(selectedPluginProject);
           setAiError(`Plugin project '${selectedPluginProject}' no longer exists. Create it again first.`);
           return;
@@ -491,7 +495,7 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
         const preview = await tauriApi.generateSkeletonPreview(task, customer ?? null);
         setSkeletonPreview(preview);
         setShowSkeleton(true);
-        // Do NOT advance status here — status moves to In Progress only after Apply Draft.
+        // Do not write files, open IDEs, or advance status here; Apply/Start are explicit.
       } catch (e) {
         setAiError(String(e));
       } finally {
@@ -536,7 +540,7 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
         setSkeletonPreview({ fileName: preview.targetFileName, content: preview.newContent, targetPath: '' });
         setScriptDraftPath(preview.targetFile);
         setShowSkeleton(true);
-        // Status stays at Analyzed until Apply Draft succeeds.
+        // Status is not changed by generation; Start Development is explicit.
       } catch (e) {
         setAiError(String(e));
       } finally {
@@ -547,11 +551,10 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
 
   /**
    * Completes the script draft apply workflow after the .js file has been written.
-   * Persists task state, closes the skeleton modal, and opens the file in VS Code.
+   * Persists the artifact path only. State changes and IDE opening stay explicit.
    */
   async function completeScriptDraft(writtenFilePath: string) {
     await updateTask(task.id, {
-      status: 'in-progress',
       workflowSetup: {
         ...task.workflowSetup,
         scriptPath:  writtenFilePath,
@@ -561,103 +564,26 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
     setSkeletonPreview(null);
     setShowSkeleton(false);
     setScriptDraftPath(null);
-    // Open workspace + new file in VS Code (non-fatal if it fails).
-    const workspaceRoot = resolveScriptWorkspaceRoot(writtenFilePath);
-    if (workspaceRoot) {
-      tauriApi.openInVscodeWorkspace(workspaceRoot, writtenFilePath).catch(() => {});
-    } else {
-      tauriApi.openInVscode(writtenFilePath).catch(() => {});
-    }
-    setFeedback('Script draft saved — status set to In Progress');
+    setFeedback('Script draft saved. Use Start Development or Open Work when ready.');
   }
 
-  async function handleApplyDraft() {
-    if (devTarget.kind === 'plugin') {
-      // Plugin: write the skeleton preview to disk then complete the workflow.
-      if (!skeletonPreview) {
-        setFeedback('Generate a draft first before applying.');
-        return;
-      }
-      if (!pluginsDir) {
-        setFsError('No plugin folder configured for this customer.');
-        return;
-      }
-      if (!selectedPluginProject) {
-        setFsError('Select a plugin project in the Dev panel before applying the draft.');
-        return;
-      }
-      // The VS solution layout is always:
-      //   <pluginsDir>/<selectedProject>/          ← solution root
-      //   <pluginsDir>/<selectedProject>/<selectedProject>/  ← C# project folder (where .cs lives)
-      // Ignore AI-supplied targetPath for the subfolder — it is unreliable.
-      const subPath = `${pluginsDir}/${selectedPluginProject}/${selectedPluginProject}/${skeletonPreview.fileName}`;
-      try {
-        await tauriApi.saveGeneratedFile(subPath, skeletonPreview.content);
-      } catch (e) {
-        setFsError(String(e));
-        return; // file write failed — do not advance state
-      }
-      // File saved — complete the rest of the workflow.
-      await completePluginDraft(selectedPluginProject, subPath);
-    } else {
-      // Script: save the draft content to the resolved target file path.
-      // scriptDraftPath is set by handleGenerateDraft when using the service path.
-      // For legacy callers the path can also be inferred from the skeletonPreview context.
-      const targetPath = scriptDraftPath;
-      if (!skeletonPreview || !targetPath) {
-        setFeedback('Generate a draft first before applying.');
-        return;
-      }
-      setAiLoading('draft');
-      setAiError(null);
-      try {
-        await tauriApi.saveGeneratedFile(targetPath, skeletonPreview.content);
-      } catch (e) {
-        setFsError(String(e));
-        setAiLoading(null);
-        return;
-      }
-      setAiLoading(null);
-      await completeScriptDraft(targetPath);
+  function handleApplyDraft() {
+    if (!skeletonPreview) {
+      setFeedback('Generate a draft first before applying.');
+      return;
     }
-  }
-
-  /**
-   * Tries to open the plugin project in Visual Studio (.sln) or VS Code (.csproj / folder).
-   * Resolves without throwing — call-sites handle open errors via the returned message.
-   */
-  async function openPluginProject(projectName: string): Promise<string | null> {
-    if (!pluginsDir) return 'No plugin folder configured.';
-    const solutionRoot = `${pluginsDir}/${projectName}`;
-    try {
-      const slns = await tauriApi.listDirectoryFiles(solutionRoot, 'sln').catch(() => [] as string[]);
-      if (slns.length > 0) {
-        await tauriApi.openWithShell(`${solutionRoot}/${slns[0]}`);
-        return null;
-      }
-      const projDir  = `${solutionRoot}/${projectName}`;
-      const csprojs  = await tauriApi.listDirectoryFiles(projDir, 'csproj').catch(() => [] as string[]);
-      if (csprojs.length > 0) {
-        await tauriApi.openWithShell(`${projDir}/${csprojs[0]}`);
-        return null;
-      }
-      // No .sln or .csproj — open the solution root folder with the OS default (Explorer).
-      await tauriApi.openWithShell(solutionRoot);
-      return null;
-    } catch (e) {
-      return String(e);
-    }
+    setShowSkeleton(true);
+    setFeedback('Review the target path in the preview, then choose Save to File.');
   }
 
   /**
    * Completes the plugin draft apply workflow after the .cs file has been written.
-   * Updates task state, closes the skeleton modal, refreshes the dev panel, and
-   * opens the plugin project in Visual Studio or VS Code.
+   * Persists the artifact path and refreshes the dev panel. State changes and
+   * opening Visual Studio remain explicit user actions.
    */
   async function completePluginDraft(projectName: string, writtenFilePath: string) {
     // Persist everything in one atomic update so React closures are never stale.
     await updateTask(task.id, {
-      status: 'in-progress',
       selectedPluginProject: projectName,
       workflowSetup: {
         ...task.workflowSetup,
@@ -672,39 +598,10 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
     setShowSkeleton(false);
     // Refresh the dev panel so the dropdown picks up the project.
     setDevPanelRefreshTick((t) => t + 1);
-    // Try to open the project — failure is non-fatal: file and state are already saved.
-    const openError = await openPluginProject(projectName);
-    if (openError) {
-      setFeedback(`Draft saved, opening failed: ${openError}`);
-    } else {
-      setFeedback(`Draft saved and plugin opened: ${projectName}`);
-    }
+    setFeedback(`Plugin draft saved: ${projectName}. Use Open Plugin when ready.`);
   }
 
-  // --- Communication ---
-
-  async function handleSendForReview() {
-    // Run the AI file review via the dev panel's imperative handle.
-    // Status advances only if the review succeeds.
-    if (!devModePanelRef.current) {
-      // Dev panel not mounted (e.g. no repo path configured) — fall back to direct status change.
-      await handleStatusChange('ready-for-review');
-      setFeedback('Status set to Ready for Review');
-      return;
-    }
-    const review = await devModePanelRef.current.runReview();
-    if (review !== false) {
-      // Full-file review completed — combine aiFileReviews + status in ONE updateTask so the
-      // second call does not overwrite the first due to stale closure capture in AppContext.
-      const existing = task.aiFileReviews ?? [];
-      await updateTask(task.id, {
-        aiFileReviews: [review, ...existing].slice(0, 5),
-        status: 'ready-for-review',
-      });
-      setFeedback('AI review complete — status set to Ready for Review');
-    }
-    // For diff workflow, review === false — persistence + status happen via onChangeReviewComplete.
-  }
+  // --- Workflow status actions ---
 
   async function handleMarkDone() {
     await handleStatusChange('done');
@@ -737,23 +634,21 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
     return undefined;
   }
 
-  /**
-   * Opens the code artifact for the task and advances to In Progress.
-   * Used for Update / Fix scenarios where the task works on an existing file.
-   */
-  async function handleStartWork() {
+  /** Opens the code artifact for the task without changing workflow state. */
+  async function handleOpenWork() {
     const artifact = task.workflowSetup?.artifactPath ?? task.workflowSetup?.scriptPath;
     try {
       if (devTarget.kind === 'plugin') {
-        // Plugin: open .sln / .csproj / project folder (not a .cs file).
+        // Plugin: open the selected project's .sln in Visual Studio, or the
+        // selected project folder if no solution file exists.
         if (pluginsDir && selectedPluginProject) {
-          const pluginPath = `${pluginsDir}/${selectedPluginProject}`;
-          const slns = await tauriApi.listDirectoryFiles(pluginPath, 'sln').catch(() => [] as string[]);
-          if (slns.length > 0) {
-            await tauriApi.openWithShell(`${pluginPath}/${slns[0]}`);
-          } else {
-            await tauriApi.openInVscode(pluginPath);
+          const target = await tauriApi.resolveSelectedPluginOpenTarget(pluginsDir, selectedPluginProject);
+          if (!target) {
+            setFsError(`Plugin project '${selectedPluginProject}' was not found.`);
+            return;
           }
+          console.log('[devTarget] final path=', target.path, `(selected plugin ${target.kind})`);
+          await tauriApi.openWithShell(target.path);
         } else if (task.workflowSetup?.artifactPath) {
           await tauriApi.openWithShell(task.workflowSetup.artifactPath);
         }
@@ -774,9 +669,21 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
     } catch (e) {
       setFsError(String(e));
     }
-    // Advance status regardless — user may have already opened the file manually.
+  }
+
+  async function handleStartDevelopment() {
     await handleStatusChange('in-progress');
-    setFeedback('Status set to In Progress — start working in the opened project');
+    setFeedback('Status set to Development');
+  }
+
+  async function handleMarkWaitingForReview() {
+    await handleStatusChange('ready-for-review', { waitingState: 'code-review' });
+    setFeedback('Marked as Waiting for code review');
+  }
+
+  async function handleMarkPrComments() {
+    await handleStatusChange('in-progress', { attentionState: 'pr-comments', planningBucket: 'now', isPlanningLocked: false });
+    setFeedback('Marked as PR comments — back to Development');
   }
 
   /**
@@ -801,17 +708,8 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
         }
         break;
       case 'confirm-setup':          setShowSetupModal(true);  break;
-      case 'create-plugin-project':  {
-        // Open CreatePluginProjectModal — first load existing folders for naming suggestions.
-        tauriApi.listSubfolders(pluginsDir ?? '').catch(() => [] as string[]).then((folders) => {
-          setPluginProjectsForModal(folders);
-          setShowCreatePlugin(true);
-        });
-        break;
-      }
-      case 'generate-draft':         handleGenerateDraft();     break;
-      case 'start-work':     handleStartWork();         break;
-      case 'run-review':     handleSendForReview();     break;
+      case 'start-development': handleStartDevelopment(); break;
+      case 'mark-waiting-review': handleMarkWaitingForReview(); break;
       case 'mark-done':      handleMarkDone();          break;
       default: break;
     }
@@ -835,7 +733,7 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
         if (!extensionMismatch) artifactPath = existingArtifact;
       }
     }
-    await updateTask(task.id, { workflowSetup: { ...setup, artifactPath }, status: 'analyzed' });
+    await updateTask(task.id, { workflowSetup: { ...setup, artifactPath }, status: 'analyzed', waitingState: null, attentionState: null });
     setFeedback('Setup confirmed — status set to Analyzed');
   }
 
@@ -879,44 +777,6 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
     const mergedSetup: WorkflowSetup = { ...setup, artifactPath };
     // Persist the confirmed setup AND analysis result in one atomic updateTask call.
     await handleAnalyzeWithSetup(mergedSetup);
-  }
-
-      // Determine whether the artifact extension matches the new target kind.
-  async function handleGenerateReply() {
-    setAiLoading('reply');
-    setAiError(null);
-    try {
-      const draft = await tauriApi.generateReply(task, customer ?? null);
-      await updateTask(task.id, { generatedReply: draft });
-      setGeneratedReply(draft);
-    } catch (e) {
-      // Fall back to local template — open modal anyway
-      setGeneratedReply(null);
-      setAiError(String(e));
-    } finally {
-      setAiLoading(null);
-      setShowReply(true);
-    }
-  }
-
-  // --- Planning actions ---
-
-  async function handleSetBucket(bucket: PlanningBucket) {
-    const planning = computePlanning(task);
-    await updateTask(task.id, {
-      planningBucket:          bucket,
-      suggestedPlanningBucket: planning.suggestedPlanningBucket,
-      priorityScore:           planning.priorityScore,
-      priorityReason:          planning.priorityReason,
-      isPlanningLocked:        true,
-    });
-    setFeedback(`Planned for: ${BUCKET_META[bucket].label}`);
-  }
-
-  async function handleToggleLock() {
-    const next = !task.isPlanningLocked;
-    await updateTask(task.id, { isPlanningLocked: next });
-    setFeedback(next ? 'Planning locked to manual choice' : 'Planning unlocked — auto-suggest active');
   }
 
   // --- URL actions ---
@@ -970,6 +830,7 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
             <div className="detail-panel-title">{task.title}</div>
             <div style={{ marginTop: 4, display: 'flex', gap: 6, alignItems: 'center' }}>
               <TypeBadge type={task.taskType} />
+              <TaskStateBadges task={task} />
               {task.analysisResult && (
                 <span className="detail-ai-badge">AI</span>
               )}
@@ -1471,76 +1332,157 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
           <div className="detail-action-group">
             <div className="detail-action-group-label">Workflow</div>
             <div className="detail-action-grid">
-              <button
-                className="btn btn-primary btn-sm"
-                onClick={handleAnalyze}
-                disabled={!!aiLoading}
-                title="Analyse task with AI and set status to Analyzed"
-              >
-                {aiLoading === 'analyze'
-                  ? <><span className="btn-spinner" /> Analysing…</>
-                  : <><Icon name="search" size={13} /> Analyze</>}
-              </button>
-
-              {/* Start Work — update/fix scenarios: open existing artifact and advance */}
-              {(plan.currentAction === 'start-work' || plan.workflowKind === 'dev-update' || plan.workflowKind === 'dev-fix') &&
-               task.status === 'analyzed' && (
+              {task.status === 'new' && (
                 <button
                   className="btn btn-primary btn-sm"
-                  onClick={handleStartWork}
+                  onClick={runCurrentStageAction}
                   disabled={!!aiLoading}
-                  title={devTarget.kind === 'plugin'
-                    ? 'Open plugin project and start working'
-                    : 'Open script and start working'}
+                  title={plan.isDeveloperAwaitingSetup ? 'Confirm developer setup before analysis' : 'Analyze task with AI'}
                 >
-                  <Icon name="terminal" size={13} />
-                  {plan.workflowKind === 'dev-fix' ? 'Start Fixing' : 'Start Work'}
+                  {aiLoading === 'analyze'
+                    ? <><span className="btn-spinner" /> Analysing…</>
+                    : <><Icon name="search" size={13} /> {plan.isDeveloperAwaitingSetup ? 'Confirm Setup' : 'Analyze'}</>}
+                </button>
+              )}
+              {task.status !== 'new' && task.status !== 'done' && (
+                <button
+                  className="btn btn-secondary btn-sm"
+                  onClick={handleAnalyze}
+                  disabled={!!aiLoading}
+                  title="Run AI analysis again"
+                >
+                  {aiLoading === 'analyze'
+                    ? <><span className="btn-spinner" /> Analysing…</>
+                    : <><Icon name="search" size={13} /> Analyze</>}
                 </button>
               )}
 
-              {/* Generate Draft — primary for create; optional helper for update/fix */}
-              {plan.requiresDraftGeneration && (
+              {effectiveMode === 'developer' && task.status !== 'done' && (
+                <button
+                  className="btn btn-secondary btn-sm"
+                  onClick={() => setShowSetupModal(true)}
+                  disabled={!!aiLoading}
+                  title="Review or adjust workflow setup"
+                >
+                  <Icon name="settings" size={13} /> Confirm Setup
+                </button>
+              )}
+
+              {task.status === 'analyzed' && plan.workflowKind !== 'general' && (
+                <button
+                  className="btn btn-primary btn-sm"
+                  onClick={handleStartDevelopment}
+                  disabled={!!aiLoading}
+                  title="Move the task into Development without opening external tools"
+                >
+                  <Icon name="play" size={13} /> Start Development
+                </button>
+              )}
+
+              {task.status === 'in-progress' && (
+                <button
+                  className="btn btn-primary btn-sm"
+                  onClick={handleMarkWaitingForReview}
+                  disabled={!!aiLoading}
+                  title="Mark this task as waiting for code review"
+                >
+                  <Icon name="pause" size={13} /> Waiting for Code Review
+                </button>
+              )}
+
+              {task.status !== 'done' && (
+                <>
+                  <button
+                    className="btn btn-secondary btn-sm"
+                    onClick={handleMarkPrComments}
+                    disabled={!!aiLoading}
+                    title="Mark review comments as active work"
+                  >
+                    <Icon name="message-square" size={13} /> PR Comments
+                  </button>
+                  <button
+                    className="btn btn-secondary btn-sm"
+                    onClick={handleMarkDone}
+                    disabled={!!aiLoading}
+                    title="Mark task as done"
+                  >
+                    <Icon name="check" size={13} /> Done
+                  </button>
+                </>
+              )}
+            </div>
+          </div>
+
+          {/* ASSISTANT TOOLS */}
+          {effectiveMode === 'developer' && plan.requiresDevTools && (
+            <div className="detail-action-group">
+              <div className="detail-action-group-label">Assistant Tools</div>
+              <div className="detail-action-grid">
                 <button
                   className={`btn btn-sm ${plan.draftIsPrimaryAction ? 'btn-primary' : 'btn-secondary'}`}
                   onClick={handleGenerateDraft}
                   disabled={!!aiLoading}
                   title={devTarget.kind === 'plugin'
-                    ? plan.draftIsPrimaryAction
-                      ? 'Generate C# plugin class draft (preview before writing)'
-                      : 'Generate a draft patch or class skeleton (optional)'
+                    ? 'Generate C# plugin class draft and open a preview'
                     : plan.draftIsPrimaryAction
-                      ? 'Generate a new script skeleton and preview before saving'
-                      : 'Generate a draft script snippet (optional helper)'}
+                      ? 'Generate a script draft and open a preview'
+                      : 'Generate a patch suggestion and open a preview'}
                 >
                   {aiLoading === 'draft'
                     ? <><span className="btn-spinner" /> Generating…</>
-                    : <><Icon name="layers" size={13} /> {plan.draftIsPrimaryAction ? 'Generate Draft' : 'Draft Snippet'}</>}
+                    : <><Icon name="layers" size={13} /> {plan.draftIsPrimaryAction ? 'Generate Draft' : 'Patch Suggestion'}</>}
                 </button>
-              )}
 
-              {/* Apply Draft */}
-              {plan.requiresDraftGeneration && skeletonPreview && (
+                {skeletonPreview && (
+                  <button
+                    className="btn btn-secondary btn-sm"
+                    onClick={handleApplyDraft}
+                    disabled={!!aiLoading}
+                    title="Open the draft preview where Save to File is explicit"
+                  >
+                    <Icon name="check" size={13} /> Preview / Apply Draft
+                  </button>
+                )}
+
                 <button
                   className="btn btn-secondary btn-sm"
-                  onClick={handleApplyDraft}
-                  disabled={
-                    !!aiLoading ||
-                    (devTarget.kind === 'plugin' && !!skeletonPreview && !selectedPluginProject)
-                  }
-                  title={
-                    devTarget.kind === 'plugin' && skeletonPreview && !selectedPluginProject
-                      ? 'Select a plugin project in the Dev panel first'
-                      : devTarget.kind === 'plugin' && skeletonPreview
-                        ? `Write draft to disk: ${skeletonPreview.fileName}`
-                        : 'Apply script draft to repository'
-                  }
+                  onClick={handleOpenWork}
+                  disabled={!!aiLoading}
+                  title="Open the configured script, plugin, or folder without changing status"
                 >
-                  <Icon name="check" size={13} /> Apply Draft
+                  <Icon name="terminal" size={13} /> Open Work
                 </button>
-              )}
 
-              {/* Create Plugin Project — create + plugin only */}
-              {devTarget.kind === 'plugin' && pluginsDir && plan.requiresPluginCreate && (
+                <button
+                  className="btn btn-secondary btn-sm"
+                  onClick={() => devModePanelRef.current?.openReviewModal()}
+                  disabled={!!aiLoading}
+                  title="Open AI review tools without changing workflow state"
+                >
+                  <Icon name="search" size={13} /> Run AI Review
+                </button>
+
+              </div>
+            </div>
+          )}
+
+          {/* SCRIPT ASSISTANT panel removed — draft generation now runs via service directly */}
+
+          {isPluginCreate && pluginsDir && (
+            <div className="detail-action-group">
+              <div className="detail-action-group-label">Plugin Project Helper</div>
+              {!selectedPluginProject && (
+                <div className="detail-devmode-hint" style={{ color: 'var(--color-warning, #d29922)', marginBottom: 6 }}>
+                  Plugin project was not found. Create it manually or use the helper below.
+                </div>
+              )}
+              <div className="detail-action-grid">
+                <button
+                  className="btn btn-secondary btn-sm"
+                  onClick={() => handleOpenPath(pluginsDir, 'plugins folder')}
+                >
+                  <Icon name="folder" size={13} /> Open Plugins Folder
+                </button>
                 <button
                   className="btn btn-secondary btn-sm"
                   onClick={async () => {
@@ -1548,16 +1490,12 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
                     setPluginProjectsForModal(folders);
                     setShowCreatePlugin(true);
                   }}
-                  disabled={!!aiLoading}
-                  title="Create a new plugin project from a local template folder"
                 >
                   <Icon name="folder" size={13} /> Create Plugin Project
                 </button>
-              )}
+              </div>
             </div>
-          </div>
-
-          {/* SCRIPT ASSISTANT panel removed — draft generation now runs via service directly */}
+          )}
 
           {/* AZURE DEVOPS — shown for ADO PR comment/review tasks with an extracted deep link */}
           {(() => {
@@ -1659,14 +1597,13 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
                   initialReview={task.aiFileReviews?.[0]}
                   onReviewSaved={handleReviewSaved}
                   onChangeReviewComplete={async (review) => {
-                    // Diff review completed — combine aiFileReviews + status in ONE updateTask
-                    // to avoid stale closure overwrite in AppContext.
+                    // Diff review completed — save the review only. Waiting for code review
+                    // is an explicit workflow state button.
                     const existing = task.aiFileReviews ?? [];
                     await updateTask(task.id, {
                       aiFileReviews: [review, ...existing].slice(0, 5),
-                      status: 'ready-for-review',
                     });
-                    setFeedback('AI review complete — status set to Ready for Review');
+                    setFeedback('AI review complete');
                   }}
                 />
               )}
@@ -1683,71 +1620,9 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
             <div className="detail-fs-error">! {fsError}</div>
           )}
 
-          {/* COMMUNICATION */}
-          <div className="detail-action-group">
-            <div className="detail-action-group-label">Communication</div>
-            <button
-              className="btn btn-secondary btn-sm btn-full"
-              onClick={handleGenerateReply}
-              disabled={!!aiLoading}
-            >
-              {aiLoading === 'reply'
-                ? <><span className="btn-spinner" /> Drafting…</>
-                : <><Icon name="mail" size={13} /> Generate Reply</>}
-            </button>
-          </div>
-
-          {/* PLANNING — quick bucket assignment */}
-          {task.status !== 'done' && (
-            <div className="detail-action-group">
-              <div className="detail-action-group-label">
-                Plan for
-                {task.isPlanningLocked && (
-                  <span className="planning-lock-badge">
-                    <Icon name="pin" size={10} /> locked
-                  </span>
-                )}
-              </div>
-              <div className="detail-plan-grid">
-                {BUCKET_ORDER.map((b) => {
-                  const active = effectiveBucket(task) === b;
-                  return (
-                    <button
-                      key={b}
-                      className={`btn btn-sm${active ? ' btn-primary' : ' btn-secondary'} planning-bucket-btn`}
-                      onClick={() => handleSetBucket(b)}
-                      title={BUCKET_META[b].label}
-                    >
-                      <Icon name={BUCKET_META[b].icon} size={12} />
-                      {BUCKET_META[b].label}
-                    </button>
-                  );
-                })}
-              </div>
-              <button
-                className="btn btn-ghost btn-sm planning-lock-toggle"
-                onClick={handleToggleLock}
-              >
-                {task.isPlanningLocked
-                  ? <><Icon name="unlock" size={12} /> Unlock (use auto-suggest)</>
-                  : <><Icon name="lock" size={12} /> Lock manual choice</>}
-              </button>
-            </div>
-          )}
-
         </div>
         </div>{/* end detail-panel-inner */}
       </aside>
-
-      {/* Reply modal */}
-      {showReply && (
-        <ReplyModal
-          task={task}
-          customer={customer}
-          onClose={() => { setShowReply(false); setGeneratedReply(null); }}
-          initialText={generatedReply ?? task.generatedReply ?? undefined}
-        />
-      )}
 
       {/* Skeleton preview modal — used for both plugin (.cs) and script (.js) drafts */}
       {showSkeleton && skeletonPreview && (
@@ -1762,37 +1637,12 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
             }
             onClose={() => { setShowSkeleton(false); }}
             onSaved={(filePath) => {
-              // "Save to File" succeeded inside the modal — complete the full workflow.
+              // "Save to File" succeeded inside the modal — persist artifact metadata only.
               // selectedPluginProject is guaranteed non-empty when resolvedPluginBase is provided.
               if (selectedPluginProject) {
                 completePluginDraft(selectedPluginProject, filePath);
               }
             }}
-            onCreateAndApply={
-              // Offer "Create Project & Apply" only when no plugin project is selected yet
-              // and we have both a pluginsDir and a customer to derive naming from.
-              (!selectedPluginProject && pluginsDir && customer)
-                ? async () => {
-                    const folders = await tauriApi.listSubfolders(pluginsDir).catch(() => [] as string[]);
-                    const suggested = inferPluginSuggestions(task, customer, folders);
-                    const projectName = sanitize(suggested.projectName);
-                    if (!projectName) throw new Error('Could not infer a project name from this task.');
-
-                    // Create the built-in scaffold (empty templateDir triggers the built-in path).
-                    const solutionRoot = await tauriApi.createPluginProjectFromTemplate(
-                      '', pluginsDir, projectName, suggested.namespace, false,
-                    );
-
-                    // Write the generated .cs into the nested project subfolder:
-                    //   <solutionRoot>/<projectName>/<fileName>
-                    const targetFile = `${solutionRoot}/${projectName}/${skeletonPreview.fileName}`;
-                    await tauriApi.saveGeneratedFile(targetFile, skeletonPreview.content);
-
-                    // Complete the workflow — persists state, closes modal, refreshes panel, opens project.
-                    await completePluginDraft(projectName, targetFile);
-                  }
-                : undefined
-            }
           />
         ) : (
           // Script draft preview modal — overrideSavePath directs save to the script folder.
@@ -1803,8 +1653,7 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
             modalTitle={`Draft: ${skeletonPreview.fileName}`}
             onClose={() => { setShowSkeleton(false); setScriptDraftPath(null); }}
             onSaved={(filePath) => {
-              // "Save to File" in the modal succeeded — complete the script draft workflow.
-              // The modal already wrote the file; completeScriptDraft only persists state and opens VS Code.
+              // The modal already wrote the file; persist artifact metadata only.
               completeScriptDraft(filePath);
             }}
           />
