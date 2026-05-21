@@ -3,7 +3,6 @@
  * filesystem commands. Maps 1-to-1 with the Rust commands in lib.rs.
  */
 import { invoke } from '@tauri-apps/api/core';
-import { openUrl as openerOpen } from '@tauri-apps/plugin-opener';
 import type { Task, Customer, AppSettings, TaskAnalysis, SkeletonPreview, GitInitStatus, OutlookMessage, OutlookFlaggedListResult, TeamsChat, TeamsChatMessage, TeamsFlatMessage, ClassificationResult, AiFileReviewResult, AiStructuredReview } from '../types';
 
 export type { ClassificationResult };
@@ -59,12 +58,21 @@ export function openWithShell(path: string): Promise<void> {
   return invoke('open_with_shell', { path });
 }
 
-/**
- * Opens a URL in the system default browser.
- * Uses the Tauri opener plugin — window.open is blocked inside the WebView.
- */
-export function openUrl(url: string): Promise<void> {
-  return openerOpen(url);
+/** Opens an external web URL in Microsoft Edge. */
+export function openExternalUrl(url: string): Promise<void> {
+  const trimmed = url.trim();
+  if (!trimmed) {
+    return Promise.reject(new Error('No URL provided.'));
+  }
+  if (/^[a-z][a-z0-9+.-]*:/i.test(trimmed) && !/^https?:\/\//i.test(trimmed)) {
+    return Promise.reject(new Error('Only http:// and https:// URLs can be opened.'));
+  }
+  const href = /^https?:\/\//i.test(trimmed) ? trimmed : `https://${trimmed}`;
+  return invoke('open_url_in_edge', { url: href });
+}
+
+export function isExternalWebUrl(value: string | undefined): boolean {
+  return !!value && /^https?:\/\//i.test(value.trim());
 }
 
 /**

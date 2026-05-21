@@ -781,13 +781,14 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
 
   // --- URL actions ---
 
-  function handleOpenUrl(url: string | undefined) {
+  async function handleOpenUrl(url: string | undefined) {
     if (!url) return;
-    const href = /^https?:\/\//i.test(url) ? url : `https://${url}`;
-    tauriApi.openUrl(href).catch((err) => {
-      console.warn('openUrl failed, falling back to window.open:', err);
-      window.open(href, '_blank', 'noopener,noreferrer');
-    });
+    setFsError(null);
+    try {
+      await tauriApi.openExternalUrl(url);
+    } catch (err) {
+      setFsError(String(err));
+    }
   }
 
   // --- Filesystem actions ---
@@ -802,6 +803,18 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
     } catch (e) {
       setFsError(String(e));
     }
+  }
+
+  async function handleOpenRepository(path: string | undefined) {
+    if (!path) {
+      setFsError('No repository root configured for this customer.');
+      return;
+    }
+    if (tauriApi.isExternalWebUrl(path)) {
+      await handleOpenUrl(path);
+      return;
+    }
+    await handleOpenPath(path, 'repository root');
   }
 
   // Determine which filesystem buttons are relevant
@@ -1258,7 +1271,7 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
           )}
 
           {/* Tracking section — only rendered when at least one field is set */}
-          {(task.ticketUrl || task.devopsTaskUrl || task.budgetHours !== undefined || task.budgetNote) && (
+          {(task.ticketUrl || task.devopsTaskUrl || task.sourceUrl || task.budgetHours !== undefined || task.budgetNote) && (
             <div className="detail-section">
               <span className="detail-section-label">Tracking</span>
               <div className="detail-tracking-block">
@@ -1283,6 +1296,18 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
                       title={task.devopsTaskUrl}
                     >
                       Open DevOps Task â†—
+                    </button>
+                  </div>
+                )}
+                {task.sourceUrl && (
+                  <div className="detail-tracking-row">
+                    <span className="detail-tracking-label">Source</span>
+                    <button
+                      className="detail-tracking-link"
+                      onClick={() => handleOpenUrl(task.sourceUrl)}
+                      title={task.sourceUrl}
+                    >
+                      Open Source Message ↗
                     </button>
                   </div>
                 )}
@@ -1541,7 +1566,7 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
               {hasRepo && (
                 <button
                   className="btn btn-secondary btn-sm btn-full"
-                  onClick={() => handleOpenPath(customer?.repositoryRoot, 'repository root')}
+                  onClick={() => handleOpenRepository(customer?.repositoryRoot)}
                 >
                   <Icon name="folder" size={13} /> Open Repository
                 </button>

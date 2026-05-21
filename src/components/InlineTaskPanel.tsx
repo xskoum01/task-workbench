@@ -85,11 +85,13 @@ export default function InlineTaskPanel({ task, onOpenDetail }: Props) {
   const [msgExpanded, setMsgExpanded] = useState(false);
   const [analyzing, setAnalyzing]     = useState(false);
   const [confirmDelete, setConfirmDelete] = useState(false);
+  const [linkError, setLinkError] = useState<string | null>(null);
 
   useEffect(() => {
     setNotes(task.notes ?? '');
     setMsgExpanded(false);
     setConfirmDelete(false);
+    setLinkError(null);
   }, [task.id]);
 
   useEffect(() => {
@@ -110,10 +112,14 @@ export default function InlineTaskPanel({ task, onOpenDetail }: Props) {
     await updateTask(task.id, updatesForPhase(phase));
   }
 
-  function openUrl(url: string | undefined) {
+  async function handleOpenExternalUrl(url: string | undefined) {
     if (!url) return;
-    const href = /^https?:\/\//i.test(url) ? url : `https://${url}`;
-    tauriApi.openUrl(href).catch(() => window.open(href, '_blank', 'noopener,noreferrer'));
+    setLinkError(null);
+    try {
+      await tauriApi.openExternalUrl(url);
+    } catch (err) {
+      setLinkError(String(err));
+    }
   }
 
   async function handleAnalyze() {
@@ -162,7 +168,7 @@ export default function InlineTaskPanel({ task, onOpenDetail }: Props) {
   const taskPhase = phaseFromTask(task);
   // Use the same resolver as TaskDetail for consistent branching.
   const isScriptTask = devTarget.kind === 'script';
-  const showOpenRepo = !!(repoRoot && isScriptTask);
+  const showOpenRepo = !!(repoRoot && (isScriptTask || tauriApi.isExternalWebUrl(repoRoot)));
   // Is this an email-sourced task that should use rich email rendering?
   const isEmailTask = !!(task.emailBodyHtml || task.senderName || task.senderEmail);
 
@@ -240,31 +246,51 @@ export default function InlineTaskPanel({ task, onOpenDetail }: Props) {
           <div className="tip-section tip-section--actions">
 
             {/* External links */}
-            {(adoUrl || task.devopsTaskUrl || task.ticketUrl || showOpenRepo) && (
+            {(adoUrl || task.devopsTaskUrl || task.ticketUrl || task.sourceUrl || showOpenRepo) && (
               <div className="tip-action-group">
                 <div className="tip-group-label">Links</div>
                 <div className="tip-action-list">
                   {adoUrl && (
-                    <button className="tip-action-btn" onClick={() => openUrl(adoUrl)} title={adoUrl}>
+                    <button className="tip-action-btn" onClick={() => handleOpenExternalUrl(adoUrl)} title={adoUrl}>
                       <Icon name="external-link" size={11} /> Open in DevOps
                     </button>
                   )}
                   {task.devopsTaskUrl && (
-                    <button className="tip-action-btn" onClick={() => openUrl(task.devopsTaskUrl)} title={task.devopsTaskUrl}>
+                    <button className="tip-action-btn" onClick={() => handleOpenExternalUrl(task.devopsTaskUrl)} title={task.devopsTaskUrl}>
                       <Icon name="external-link" size={11} /> DevOps task
                     </button>
                   )}
                   {task.ticketUrl && (
-                    <button className="tip-action-btn" onClick={() => openUrl(task.ticketUrl)} title={task.ticketUrl}>
+                    <button className="tip-action-btn" onClick={() => handleOpenExternalUrl(task.ticketUrl)} title={task.ticketUrl}>
                       <Icon name="external-link" size={11} /> Ticket
                     </button>
                   )}
+                  {task.sourceUrl && (
+                    <button className="tip-action-btn" onClick={() => handleOpenExternalUrl(task.sourceUrl)} title={task.sourceUrl}>
+                      <Icon name="external-link" size={11} /> Source message
+                    </button>
+                  )}
                   {showOpenRepo && (
-                    <button className="tip-action-btn" onClick={() => tauriApi.openPath(repoRoot!).catch(() => {})} title={repoRoot}>
+                    <button
+                      className="tip-action-btn"
+                      onClick={() => {
+                        if (tauriApi.isExternalWebUrl(repoRoot)) {
+                          handleOpenExternalUrl(repoRoot);
+                        } else {
+                          tauriApi.openPath(repoRoot!).catch((err) => setLinkError(String(err)));
+                        }
+                      }}
+                      title={repoRoot}
+                    >
                       <Icon name="folder" size={11} /> Open Repository
                     </button>
                   )}
                 </div>
+                {linkError && (
+                  <div className="detail-devmode-hint" style={{ color: 'var(--color-blocked)' }}>
+                    {linkError}
+                  </div>
+                )}
               </div>
             )}
 

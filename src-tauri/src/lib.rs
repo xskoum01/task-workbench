@@ -323,6 +323,42 @@ fn open_with_shell(path: String) -> Result<(), String> {
     }
 }
 
+/// Opens an external web URL in Microsoft Edge.
+/// Only http/https URLs are accepted, and the URL is passed as a single process
+/// argument so no shell command can be injected through it.
+#[tauri::command]
+fn open_url_in_edge(url: String) -> Result<(), String> {
+    let trimmed = url.trim().to_string();
+    let lower = trimmed.to_ascii_lowercase();
+    if !(lower.starts_with("http://") || lower.starts_with("https://")) {
+        return Err("Only http:// and https:// URLs can be opened.".to_string());
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        let edge_paths = [
+            "msedge",
+            r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
+            r"C:\Program Files\Microsoft\Edge\Application\msedge.exe",
+        ];
+
+        for edge_path in edge_paths {
+            match std::process::Command::new(edge_path).arg(&trimmed).spawn() {
+                Ok(_) => return Ok(()),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(_) => continue,
+            }
+        }
+
+        Err("Microsoft Edge could not be started.".to_string())
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        Err("Microsoft Edge could not be started.".to_string())
+    }
+}
+
 // --- Git helpers -----------------------------------------------------------
 
 /// Helper: run a git command in repo_path; return trimmed stdout or an error string.
@@ -4009,6 +4045,7 @@ pub fn run() {
             open_in_vscode,
             open_in_vscode_workspace,
             open_with_shell,
+            open_url_in_edge,
             pick_folder,
             pick_file,
             check_path_exists,

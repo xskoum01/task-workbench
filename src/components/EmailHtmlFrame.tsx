@@ -7,8 +7,8 @@
  *  - Safety: email-embedded <script> tags are stripped before rendering; only
  *    our own injected inline script runs (for resize + link interception).
  *  - Link handling: anchor clicks are intercepted inside the iframe and
- *    forwarded to the parent via postMessage → tauriApi.openUrl so the OS
- *    default browser opens them (window.open is blocked inside Tauri WebView).
+ *    forwarded to the parent via postMessage → tauriApi.openExternalUrl so
+ *    Microsoft Edge opens them.
  *  - Auto-resize: the iframe reports its scrollHeight after load and after any
  *    DOM mutation, so no scrollbar appears inside the email reader.
  */
@@ -134,6 +134,7 @@ ${IFRAME_BRIDGE}
 export default function EmailHtmlFrame({ html }: EmailHtmlFrameProps) {
   const iframeRef = useRef<HTMLIFrameElement>(null);
   const [height, setHeight] = useState(200);
+  const [openError, setOpenError] = useState<string | null>(null);
 
   // Listen for messages from the sandboxed iframe.
   useEffect(() => {
@@ -146,10 +147,9 @@ export default function EmailHtmlFrame({ html }: EmailHtmlFrameProps) {
       }
 
       if (e.data.type === 'email-open-url' && typeof e.data.url === 'string') {
-        tauriApi.openUrl(e.data.url).catch((err) => {
-          console.warn('[email-html] openUrl failed, falling back:', err);
-          // window.open is blocked inside Tauri WebView but this is a safe fallback.
-          window.open(e.data.url, '_blank');
+        setOpenError(null);
+        tauriApi.openExternalUrl(e.data.url).catch((err) => {
+          setOpenError(String(err));
         });
       }
     }
@@ -161,27 +161,32 @@ export default function EmailHtmlFrame({ html }: EmailHtmlFrameProps) {
   const srcDoc = buildSrcDoc(html);
 
   return (
-    <iframe
-      ref={iframeRef}
-      srcDoc={srcDoc}
-      /**
-       * Sandbox permissions:
-       *  allow-same-origin — required so our injected script can read
-       *    document.documentElement.scrollHeight and attach event listeners.
-       *  allow-scripts     — required for the injected bridge script to run.
-       *
-       * Intentionally NOT granted:
-       *  allow-forms, allow-popups, allow-top-navigation, allow-modals
-       */
-      sandbox="allow-same-origin allow-scripts"
-      style={{
-        display: 'block',
-        width: '100%',
-        height: `${height}px`,
-        border: 'none',
-        overflow: 'hidden',
-      }}
-      title="Email content"
-    />
+    <>
+      <iframe
+        ref={iframeRef}
+        srcDoc={srcDoc}
+        /**
+         * Sandbox permissions:
+         *  allow-same-origin — required so our injected script can read
+         *    document.documentElement.scrollHeight and attach event listeners.
+         *  allow-scripts     — required for the injected bridge script to run.
+         *
+         * Intentionally NOT granted:
+         *  allow-forms, allow-popups, allow-top-navigation, allow-modals
+         */
+        sandbox="allow-same-origin allow-scripts"
+        style={{
+          display: 'block',
+          width: '100%',
+          height: `${height}px`,
+          border: 'none',
+          overflow: 'hidden',
+        }}
+        title="Email content"
+      />
+      {openError && (
+        <div className="detail-fs-error">! {openError}</div>
+      )}
+    </>
   );
 }
