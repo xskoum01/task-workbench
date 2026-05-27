@@ -414,6 +414,16 @@ export function getGitBranch(repoPath: string): Promise<string> {
   return invoke<string>('get_git_branch', { repoPath });
 }
 
+/**
+ * Returns the current branch name by reading `.git/HEAD` directly — no git
+ * process is spawned so this is instantaneous. Use this for the initial panel
+ * load where latency is visible to the user. Falls back to an abbreviated SHA
+ * in detached-HEAD state.
+ */
+export function getGitBranchQuick(repoPath: string): Promise<string> {
+  return invoke<string>('get_git_branch_quick', { repoPath });
+}
+
 /** Returns sorted list of local branch names. */
 export function listGitBranches(repoPath: string): Promise<string[]> {
   return invoke<string[]>('list_git_branches', { repoPath });

@@ -19,6 +19,10 @@ import { hintedPluginProject } from '../lib/resolveTaskDevTarget';
 import { mergeWithDefaults, selectReviewer } from '../lib/aiReviewers';
 import AiReviewResultView from './AiReviewResultView';
 import CodeChangeReviewModal from './CodeChangeReviewModal';
+import {
+  getCachedPluginProjects, setCachedPluginProjects, invalidatePluginProjects,
+  getCachedBranchInfo, setCachedBranchInfo, invalidateBranchInfo,
+} from '../lib/devTargetCache';
 
 export interface TaskDevModePanelProps {
   task: Task;
@@ -190,6 +194,61 @@ export default forwardRef<TaskDevModePanelHandle, TaskDevModePanelProps>(functio
   const [reviewInferring, setReviewInferring]           = useState(false);
   const [reviewInferError, setReviewInferError]         = useState<string | null>(null);
 
+  // ---------------------------------------------------------------------------
+  // Helpers — plugin project loading
+  // ---------------------------------------------------------------------------
+
+  // Apply a resolved folder listing: sets plugin state and resolves the initial
+  // selection using the persisted > hinted > single-folder priority.
+  function applyPluginFolders(folders: string[]) {
+    setPluginProjects(folders);
+    if (persistedSelectedPlugin && folders.includes(persistedSelectedPlugin)) {
+      updateSelectedPlugin(persistedSelectedPlugin);
+      setHintedProjectMissing(null);
+      setPersistedProjectMissing(null);
+    } else if (persistedSelectedPlugin && !folders.includes(persistedSelectedPlugin)) {
+      // The persisted project no longer exists on disk — notify parent to clear it.
+      setPersistedProjectMissing(persistedSelectedPlugin);
+      onPluginProjectMissing?.(persistedSelectedPlugin);
+      const hint = hintedPluginProject(task);
+      if (hint && folders.includes(hint)) {
+        updateSelectedPlugin(hint);
+        setHintedProjectMissing(null);
+      } else {
+        setHintedProjectMissing(null);
+        if (folders.length === 1) updateSelectedPlugin(folders[0]);
+      }
+    } else {
+      const hint = hintedPluginProject(task);
+      if (hint && folders.includes(hint)) {
+        updateSelectedPlugin(hint);
+        setHintedProjectMissing(null);
+      } else if (hint && !folders.includes(hint)) {
+        // The ADO context points to a project not present on the current branch.
+        setHintedProjectMissing(hint);
+        if (folders.length === 1) updateSelectedPlugin(folders[0]);
+      } else {
+        setHintedProjectMissing(null);
+        if (folders.length === 1) updateSelectedPlugin(folders[0]);
+      }
+    }
+  }
+
+  // Trigger a plugin project reload.
+  // force=true clears the session cache so the loading effect fetches fresh data.
+  function loadPluginProjects(force = false) {
+    if (force && pluginsDir) invalidatePluginProjects(pluginsDir);
+    setPluginProjects([]);
+    setPluginProjectsLoaded(false);
+    updateSelectedPlugin('');
+    setPluginOpenHint(null);
+    setHintedProjectMissing(null);
+    setPersistedProjectMissing(null);
+  }
+
+  // (loadBranchInfo removed — branch refresh is now an explicit async handler
+  //  that does a full load inline; initial/reset loads use setBranch(null) directly)
+
   // Reset all state when the viewed task changes.
   useEffect(() => {
     setExpanded(!autoCollapsed);
@@ -197,6 +256,7 @@ export default forwardRef<TaskDevModePanelHandle, TaskDevModePanelProps>(functio
     updateSelectedPlugin('');
     setPluginProjects([]);
     setPluginProjectsLoaded(false);
+    setPluginProjectsLoading(false);
     setPluginOpenHint(null);
     setHintedProjectMissing(null);
     setPersistedProjectMissing(null);
@@ -204,6 +264,7 @@ export default forwardRef<TaskDevModePanelHandle, TaskDevModePanelProps>(functio
     setBranches([]);
     setSelectedBranch('');
     setBranchDirty(false);
+    setBranchLoading(false);
     setBranchError(null);
     // Reset review state
     setReviewModalOpen(false);
@@ -224,6 +285,9 @@ export default forwardRef<TaskDevModePanelHandle, TaskDevModePanelProps>(functio
   // Re-scan plugin projects when the parent signals a refresh (e.g. after creating a new project).
   useEffect(() => {
     if (!pluginRefreshTick) return; // skip initial mount (tick = 0)
+    // A new project was just created — discard the cached folder listing so the
+    // loading effect fetches the current state from the filesystem.
+    if (pluginsDir) invalidatePluginProjects(pluginsDir);
     setPluginProjects([]);
     setPluginProjectsLoaded(false);
     // Use setSelectedPlugin (not updateSelectedPlugin) so the parent's persisted project name
@@ -247,68 +311,92 @@ export default forwardRef<TaskDevModePanelHandle, TaskDevModePanelProps>(functio
   }, [artifactPath, reviewPathUserEdited]);
 
   // Load plugin project subfolders when mode = plugin.
+  // Hydrates from the session cache immediately when available (no loading spinner,
+  // no Tauri call). Falls back to a filesystem scan on a cache miss.
+  // The cancelled flag prevents stale async results from updating state after the
+  // task changes or the component unmounts.
   useEffect(() => {
     if (devMode !== 'plugin' || !pluginsDir || pluginProjectsLoaded) return;
+
+    // Cache hit — apply synchronously, skip the loading spinner entirely.
+    const cached = getCachedPluginProjects(pluginsDir);
+    if (cached) {
+      applyPluginFolders(cached.folders);
+      setPluginProjectsLoaded(true);
+      return;
+    }
+
+    // Cache miss — scan the filesystem.
+    let cancelled = false;
     setPluginProjectsLoading(true);
+
     tauriApi.listSubfolders(pluginsDir)
       .then((folders) => {
-        setPluginProjects(folders);
-        // Selection priority: persisted value → heuristic hint → single folder
-        if (persistedSelectedPlugin && folders.includes(persistedSelectedPlugin)) {
-          updateSelectedPlugin(persistedSelectedPlugin);
-          setHintedProjectMissing(null);
-          setPersistedProjectMissing(null);
-        } else if (persistedSelectedPlugin && !folders.includes(persistedSelectedPlugin)) {
-          // The persisted project no longer exists on disk — notify parent to clear it.
-          setPersistedProjectMissing(persistedSelectedPlugin);
-          onPluginProjectMissing?.(persistedSelectedPlugin);
-          // Let heuristic/single-folder fallback take over below.
-          const hint = hintedPluginProject(task);
-          if (hint && folders.includes(hint)) {
-            updateSelectedPlugin(hint);
-            setHintedProjectMissing(null);
-          } else {
-            setHintedProjectMissing(null);
-            if (folders.length === 1) updateSelectedPlugin(folders[0]);
-          }
-        } else {
-          const hint = hintedPluginProject(task);
-          if (hint && folders.includes(hint)) {
-            updateSelectedPlugin(hint);
-            setHintedProjectMissing(null);
-          } else if (hint && !folders.includes(hint)) {
-            // The ADO context points to a project that is not present on the current branch.
-            setHintedProjectMissing(hint);
-            if (folders.length === 1) updateSelectedPlugin(folders[0]);
-          } else {
-            setHintedProjectMissing(null);
-            if (folders.length === 1) updateSelectedPlugin(folders[0]);
-          }
-        }
+        if (cancelled) return;
+        setCachedPluginProjects(pluginsDir, folders);
+        applyPluginFolders(folders);
         setPluginProjectsLoaded(true);
       })
-      .catch(() => { setPluginProjects([]); setPluginProjectsLoaded(true); })
-      .finally(() => setPluginProjectsLoading(false));
+      .catch(() => {
+        if (cancelled) return;
+        setPluginProjects([]);
+        setPluginProjectsLoaded(true);
+      })
+      .finally(() => {
+        if (!cancelled) setPluginProjectsLoading(false);
+      });
+
+    return () => { cancelled = true; };
   }, [devMode, pluginsDir, pluginProjectsLoaded, task]);
 
   // Load branch info when mode = plugin.
+  // On cache hit: hydrates synchronously (no loading spinner, no git call).
+  // On cache miss: runs a QUICK load — reads .git/HEAD directly for the branch
+  // name and calls `git branch --list` for the list. `gitHasUncommitted` is
+  // intentionally skipped here because `git status` scans the whole working tree
+  // and freezes the UI on first open of large repos. The dirty state is only
+  // refreshed when the user explicitly clicks the refresh button.
   useEffect(() => {
     if (devMode !== 'plugin' || !effectiveRepoRoot || currentBranch !== null) return;
+
+    // Cache hit — apply synchronously, no loading spinner.
+    const cached = getCachedBranchInfo(effectiveRepoRoot);
+    if (cached) {
+      setBranch(cached.currentBranch);
+      setSelectedBranch(cached.currentBranch);
+      setBranches(cached.branches);
+      // Only update dirty when the cache has a checked value (quick-loaded
+      // entries omit `dirty` so we leave the existing false default in place).
+      if (cached.dirty !== undefined) setBranchDirty(cached.dirty);
+      return;
+    }
+
+    // Cache miss — quick load (branch name + list; no dirty check).
+    let cancelled = false;
     setBranchLoading(true);
     setBranchError(null);
+
     Promise.all([
-      tauriApi.getGitBranch(effectiveRepoRoot),
+      tauriApi.getGitBranchQuick(effectiveRepoRoot),
       tauriApi.listGitBranches(effectiveRepoRoot),
-      tauriApi.gitHasUncommitted(effectiveRepoRoot),
     ])
-      .then(([branch, branchList, dirty]) => {
+      .then(([branch, branchList]) => {
+        if (cancelled) return;
+        // Store without dirty — dirty is checked only on explicit refresh.
+        setCachedBranchInfo(effectiveRepoRoot, { currentBranch: branch, branches: branchList });
         setBranch(branch);
         setSelectedBranch(branch);
         setBranches(branchList);
-        setBranchDirty(dirty);
       })
-      .catch((err) => setBranchError(String(err)))
-      .finally(() => setBranchLoading(false));
+      .catch((err) => {
+        if (cancelled) return;
+        setBranchError(String(err));
+      })
+      .finally(() => {
+        if (!cancelled) setBranchLoading(false);
+      });
+
+    return () => { cancelled = true; };
   }, [devMode, effectiveRepoRoot, currentBranch]);
 
   // Scan selected plugin folder for a Visual Studio solution.
@@ -345,11 +433,12 @@ export default forwardRef<TaskDevModePanelHandle, TaskDevModePanelProps>(functio
       }
       await tauriApi.gitCheckoutBranch(effectiveRepoRoot, selectedBranch);
       const newBranch = await tauriApi.getGitBranch(effectiveRepoRoot);
+      // Keep cache consistent: update branch entry, invalidate plugin folders
+      // because different branches can have different plugin project directories.
+      setCachedBranchInfo(effectiveRepoRoot, { currentBranch: newBranch, branches, dirty: false });
       setBranch(newBranch);
       setBranchDirty(false);
-      setPluginProjectsLoaded(false);
-      updateSelectedPlugin('');
-      setPluginOpenHint(null);
+      loadPluginProjects(true);
     } catch (err) {
       setBranchError(String(err));
     } finally {
@@ -395,10 +484,33 @@ export default forwardRef<TaskDevModePanelHandle, TaskDevModePanelProps>(functio
   }
 
   function handleRefreshPlugins() {
-    setPluginProjectsLoaded(false);
-    setPluginProjects([]);
-    updateSelectedPlugin('');
-    setPluginOpenHint(null);
+    loadPluginProjects(true);
+  }
+
+  // Full refresh: re-reads branch, branch list, AND dirty state from git.
+  // This is the only path that calls gitHasUncommitted — kept here on an explicit
+  // user action so latency is expected and acceptable.
+  async function handleRefreshBranch() {
+    if (!effectiveRepoRoot) return;
+    invalidateBranchInfo(effectiveRepoRoot);
+    setBranchLoading(true);
+    setBranchError(null);
+    try {
+      const [branch, branchList, dirty] = await Promise.all([
+        tauriApi.getGitBranch(effectiveRepoRoot),
+        tauriApi.listGitBranches(effectiveRepoRoot),
+        tauriApi.gitHasUncommitted(effectiveRepoRoot),
+      ]);
+      setCachedBranchInfo(effectiveRepoRoot, { currentBranch: branch, branches: branchList, dirty });
+      setBranch(branch);
+      setSelectedBranch(branch);
+      setBranches(branchList);
+      setBranchDirty(dirty);
+    } catch (err) {
+      setBranchError(String(err));
+    } finally {
+      setBranchLoading(false);
+    }
   }
 
   async function handleOpenPlugin() {
@@ -762,54 +874,59 @@ export default forwardRef<TaskDevModePanelHandle, TaskDevModePanelProps>(functio
           {/* Branch panel */}
           {effectiveRepoRoot && (
             <div className="detail-devmode-branch">
-              {branchLoading ? (
-                <div className="detail-devmode-branch-current">Branch: <span className="detail-devmode-branch-name">…</span></div>
-              ) : branchError ? (
-                <div
-                  className="detail-devmode-branch-error"
-                  title={branchError}
+              {/* Always-visible row: branch name (or loading placeholder) + refresh button */}
+              <div className="detail-devmode-branch-current" style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
+                <span>Branch:{' '}</span>
+                <span className="detail-devmode-branch-name">
+                  {branchLoading ? '…' : (currentBranch ?? 'unknown')}
+                </span>
+                {branchDirty && !branchLoading && (
+                  <span className="detail-devmode-branch-dirty" title="Uncommitted changes present">
+                    {' '}(dirty)
+                  </span>
+                )}
+                <button
+                  className="btn btn-ghost btn-sm"
+                  onClick={handleRefreshBranch}
+                  disabled={branchLoading || branchSwitching}
+                  title="Refresh branch info"
+                  style={{ marginLeft: 'auto', padding: '0 4px' }}
                 >
+                  <Icon name="refresh-cw" size={11} />
+                </button>
+              </div>
+
+              {/* Error row */}
+              {branchError && (
+                <div className="detail-devmode-branch-error" title={branchError}>
                   {/not a git repository/i.test(branchError)
                     ? 'Git repository not detected for this path.'
                     : branchError}
                 </div>
-              ) : (
-                <>
-                  <div className="detail-devmode-branch-current">
-                    Branch:{' '}
-                    <span className="detail-devmode-branch-name">
-                      {currentBranch ?? 'unknown'}
-                    </span>
-                    {branchDirty && (
-                      <span className="detail-devmode-branch-dirty" title="Uncommitted changes present">
-                        {' '}(dirty)
-                      </span>
-                    )}
-                  </div>
+              )}
 
-                  {branches.length > 1 && (
-                    <div className="detail-devmode-branch-row">
-                      <select
-                        className="form-select detail-devmode-branch-select"
-                        value={selectedBranch}
-                        onChange={(e) => setSelectedBranch(e.target.value)}
-                        disabled={branchSwitching}
-                      >
-                        {branches.map((b) => (
-                          <option key={b} value={b}>{b}</option>
-                        ))}
-                      </select>
-                      <button
-                        className="btn btn-secondary btn-sm"
-                        onClick={handleSwitchBranch}
-                        disabled={branchSwitching || !selectedBranch || selectedBranch === currentBranch}
-                        title="Switch to selected branch"
-                      >
-                        {branchSwitching ? <><span className="btn-spinner" /> Switching…</> : 'Switch'}
-                      </button>
-                    </div>
-                  )}
-                </>
+              {/* Branch switch row — only when multiple branches are available */}
+              {!branchLoading && !branchError && branches.length > 1 && (
+                <div className="detail-devmode-branch-row">
+                  <select
+                    className="form-select detail-devmode-branch-select"
+                    value={selectedBranch}
+                    onChange={(e) => setSelectedBranch(e.target.value)}
+                    disabled={branchSwitching}
+                  >
+                    {branches.map((b) => (
+                      <option key={b} value={b}>{b}</option>
+                    ))}
+                  </select>
+                  <button
+                    className="btn btn-secondary btn-sm"
+                    onClick={handleSwitchBranch}
+                    disabled={branchSwitching || !selectedBranch || selectedBranch === currentBranch}
+                    title="Switch to selected branch"
+                  >
+                    {branchSwitching ? <><span className="btn-spinner" /> Switching…</> : 'Switch'}
+                  </button>
+                </div>
               )}
             </div>
           )}

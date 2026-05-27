@@ -402,6 +402,27 @@ fn get_git_branch(repo_path: String) -> Result<String, String> {
     }
 }
 
+/// Returns the name of the currently checked-out branch by reading `.git/HEAD`
+/// directly — no git process is spawned, so this is instantaneous even on
+/// large repositories. Falls back to a short SHA prefix when HEAD is detached.
+#[tauri::command]
+fn get_git_branch_quick(repo_path: String) -> Result<String, String> {
+    let head_path = std::path::Path::new(&repo_path).join(".git").join("HEAD");
+    if !head_path.exists() {
+        return Err(format!("Not a git repository (no .git/HEAD): {repo_path}"));
+    }
+    let content = fs::read_to_string(&head_path)
+        .map_err(|e| format!("Cannot read .git/HEAD: {e}"))?;
+    let content = content.trim();
+    if let Some(branch) = content.strip_prefix("ref: refs/heads/") {
+        Ok(branch.to_string())
+    } else {
+        // Detached HEAD — show abbreviated SHA so the UI shows something useful.
+        let sha = content.get(..8).unwrap_or(content);
+        Ok(format!("(detached {})", sha))
+    }
+}
+
 /// Returns a sorted list of local branch names (the `*` marker is stripped).
 #[tauri::command]
 fn list_git_branches(repo_path: String) -> Result<Vec<String>, String> {
@@ -415,11 +436,12 @@ fn list_git_branches(repo_path: String) -> Result<Vec<String>, String> {
     Ok(branches)
 }
 
-/// Returns true when the working tree has uncommitted changes.
-/// Untracked files are included (same as `git status --short`).
+/// Returns true when the working tree has uncommitted changes (staged or unstaged).
+/// Untracked files are intentionally excluded (`-uno`) to avoid the expensive
+/// untracked-file scan that makes `git status --short` slow on large repos.
 #[tauri::command]
 fn git_has_uncommitted(repo_path: String) -> Result<bool, String> {
-    let out = git_run(&repo_path, &["status", "--short"])?;
+    let out = git_run(&repo_path, &["status", "--porcelain=v1", "-uno"])?;
     Ok(!out.is_empty())
 }
 
@@ -4079,6 +4101,7 @@ pub fn run() {
             infer_review_file_path,
             list_crm_folders,
             get_git_branch,
+            get_git_branch_quick,
             list_git_branches,
             git_has_uncommitted,
             git_checkout_branch,

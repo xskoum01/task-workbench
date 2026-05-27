@@ -18,7 +18,12 @@ export interface CachedPluginProjects {
 export interface CachedBranchInfo {
   currentBranch: string;
   branches: string[];
-  dirty: boolean;
+  /**
+   * Whether the working tree has uncommitted changes.
+   * `undefined` means the dirty state has not been checked yet (initial quick-load
+   * does not run git status so the flag stays absent until an explicit refresh).
+   */
+  dirty?: boolean;
 }
 
 // Keyed by normalized pluginsDir path.
