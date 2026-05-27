@@ -105,27 +105,32 @@ fn save_customers(app: tauri::AppHandle, customers: Value) -> Result<(), String>
 /// Lists immediate subdirectory names under base_dir.
 /// Returns an empty list (not an error) when base_dir is empty, does not exist,
 /// or is not a directory. Hidden folders (starting with '.') are excluded.
+/// Runs on a blocking thread so it never stalls the Tauri main thread.
 #[tauri::command]
-fn list_crm_folders(base_dir: String) -> Vec<String> {
-    if base_dir.is_empty() {
-        return vec![];
-    }
-    let path = std::path::Path::new(&base_dir);
-    if !path.is_dir() {
-        return vec![];
-    }
-    let mut folders: Vec<String> = std::fs::read_dir(path)
-        .map(|entries| {
-            entries
-                .filter_map(|e| e.ok())
-                .filter(|e| e.path().is_dir())
-                .filter_map(|e| e.file_name().to_str().map(|s| s.to_owned()))
-                .filter(|name| !name.starts_with('.'))
-                .collect()
-        })
-        .unwrap_or_default();
-    folders.sort();
-    folders
+async fn list_crm_folders(base_dir: String) -> Vec<String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        if base_dir.is_empty() {
+            return vec![];
+        }
+        let path = std::path::Path::new(&base_dir);
+        if !path.is_dir() {
+            return vec![];
+        }
+        let mut folders: Vec<String> = std::fs::read_dir(path)
+            .map(|entries| {
+                entries
+                    .filter_map(|e| e.ok())
+                    .filter(|e| e.path().is_dir())
+                    .filter_map(|e| e.file_name().to_str().map(|s| s.to_owned()))
+                    .filter(|name| !name.starts_with('.'))
+                    .collect()
+            })
+            .unwrap_or_default();
+        folders.sort();
+        folders
+    })
+    .await
+    .unwrap_or_default()
 }
 
 // --- Settings --------------------------------------------------------------
@@ -392,14 +397,19 @@ fn git_run(repo_path: &str, args: &[&str]) -> Result<String, String> {
 
 /// Returns the name of the currently checked-out branch.
 /// Fails when the path is not a git repository or git is not available.
+/// Runs on a blocking thread so it never stalls the Tauri main thread.
 #[tauri::command]
-fn get_git_branch(repo_path: String) -> Result<String, String> {
-    let branch = git_run(&repo_path, &["rev-parse", "--abbrev-ref", "HEAD"])?;
-    if branch.is_empty() {
-        Err("Could not determine current branch.".to_string())
-    } else {
-        Ok(branch)
-    }
+async fn get_git_branch(repo_path: String) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let branch = git_run(&repo_path, &["rev-parse", "--abbrev-ref", "HEAD"])?;
+        if branch.is_empty() {
+            Err("Could not determine current branch.".to_string())
+        } else {
+            Ok(branch)
+        }
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 /// Returns the name of the currently checked-out branch by reading `.git/HEAD`
@@ -424,32 +434,47 @@ fn get_git_branch_quick(repo_path: String) -> Result<String, String> {
 }
 
 /// Returns a sorted list of local branch names (the `*` marker is stripped).
+/// Runs on a blocking thread so it never stalls the Tauri main thread.
 #[tauri::command]
-fn list_git_branches(repo_path: String) -> Result<Vec<String>, String> {
-    let raw = git_run(&repo_path, &["branch", "--list"])?;
-    let mut branches: Vec<String> = raw
-        .lines()
-        .map(|l| l.trim_start_matches('*').trim().to_string())
-        .filter(|s| !s.is_empty())
-        .collect();
-    branches.sort();
-    Ok(branches)
+async fn list_git_branches(repo_path: String) -> Result<Vec<String>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let raw = git_run(&repo_path, &["branch", "--list"])?;
+        let mut branches: Vec<String> = raw
+            .lines()
+            .map(|l| l.trim_start_matches('*').trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+        branches.sort();
+        Ok(branches)
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 /// Returns true when the working tree has uncommitted changes (staged or unstaged).
 /// Untracked files are intentionally excluded (`-uno`) to avoid the expensive
 /// untracked-file scan that makes `git status --short` slow on large repos.
+/// Runs on a blocking thread so it never stalls the Tauri main thread.
 #[tauri::command]
-fn git_has_uncommitted(repo_path: String) -> Result<bool, String> {
-    let out = git_run(&repo_path, &["status", "--porcelain=v1", "-uno"])?;
-    Ok(!out.is_empty())
+async fn git_has_uncommitted(repo_path: String) -> Result<bool, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let out = git_run(&repo_path, &["status", "--porcelain=v1", "-uno"])?;
+        Ok(!out.is_empty())
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 /// Checks out the given branch in the repository.
 /// Returns an error when the branch does not exist or there are conflicts.
+/// Runs on a blocking thread so it never stalls the Tauri main thread.
 #[tauri::command]
-fn git_checkout_branch(repo_path: String, branch: String) -> Result<(), String> {
-    git_run(&repo_path, &["checkout", &branch]).map(|_| ())
+async fn git_checkout_branch(repo_path: String, branch: String) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        git_run(&repo_path, &["checkout", &branch]).map(|_| ())
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 /// Returns the Git diff for the repository (or a specific file within it).

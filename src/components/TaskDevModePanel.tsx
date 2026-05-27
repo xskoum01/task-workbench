@@ -65,6 +65,14 @@ export interface TaskDevModePanelProps {
    */
   pluginRefreshTick?: number;
   /**
+   * Controls when IPC/git/filesystem calls are issued on a cache miss.
+   * - 'immediate' (default): calls start synchronously inside the React effect.
+   * - 'after-paint': calls are deferred until after the browser has painted the
+   *   panel shell. Use this in contexts where the panel is rendered inline and
+   *   must not block the frame that expanded the task row.
+   */
+  loadStrategy?: 'immediate' | 'after-paint';
+  /**
    * AI reviewer configurations from settings.
    * When provided, the Run AI Review button is shown after the open button.
    */
@@ -110,6 +118,23 @@ export interface TaskDevModePanelHandle {
   openReviewModal(): Promise<void>;
 }
 
+// ---------------------------------------------------------------------------
+// Scheduling helper — defers a callback until after the first browser paint.
+// Returns a cancel function safe to call from React effect cleanup.
+// ---------------------------------------------------------------------------
+
+function scheduleAfterPaint(callback: () => void): () => void {
+  let rafId: number;
+  let timeoutId: ReturnType<typeof setTimeout> | undefined;
+  rafId = requestAnimationFrame(() => {
+    timeoutId = setTimeout(callback, 0);
+  });
+  return () => {
+    cancelAnimationFrame(rafId);
+    if (timeoutId !== undefined) clearTimeout(timeoutId);
+  };
+}
+
 export default forwardRef<TaskDevModePanelHandle, TaskDevModePanelProps>(function TaskDevModePanel({
   task,
   customer,
@@ -119,6 +144,7 @@ export default forwardRef<TaskDevModePanelHandle, TaskDevModePanelProps>(functio
   scriptOpenPath,
   onError,
   autoCollapsed = false,
+  loadStrategy = 'immediate',
   onSelectedPluginChange,
   onPluginProjectMissing,
   selectedPluginProject: persistedSelectedPlugin,
@@ -313,6 +339,11 @@ export default forwardRef<TaskDevModePanelHandle, TaskDevModePanelProps>(functio
   // Load plugin project subfolders when mode = plugin.
   // Hydrates from the session cache immediately when available (no loading spinner,
   // no Tauri call). Falls back to a filesystem scan on a cache miss.
+  //
+  // In 'after-paint' mode the IPC call is deferred until after the first browser
+  // paint so that expanding the task row never stalls the frame. The loading
+  // spinner is still shown immediately (the panel shell renders at once).
+  //
   // The cancelled flag prevents stale async results from updating state after the
   // task changes or the component unmounts.
   useEffect(() => {
@@ -326,36 +357,48 @@ export default forwardRef<TaskDevModePanelHandle, TaskDevModePanelProps>(functio
       return;
     }
 
-    // Cache miss — scan the filesystem.
+    // Cache miss — show the loading indicator immediately, then scan.
     let cancelled = false;
     setPluginProjectsLoading(true);
 
-    tauriApi.listSubfolders(pluginsDir)
-      .then((folders) => {
-        if (cancelled) return;
-        setCachedPluginProjects(pluginsDir, folders);
-        applyPluginFolders(folders);
-        setPluginProjectsLoaded(true);
-      })
-      .catch(() => {
-        if (cancelled) return;
-        setPluginProjects([]);
-        setPluginProjectsLoaded(true);
-      })
-      .finally(() => {
-        if (!cancelled) setPluginProjectsLoading(false);
-      });
+    function doLoad() {
+      tauriApi.listSubfolders(pluginsDir!)
+        .then((folders) => {
+          if (cancelled) return;
+          setCachedPluginProjects(pluginsDir!, folders);
+          applyPluginFolders(folders);
+          setPluginProjectsLoaded(true);
+        })
+        .catch(() => {
+          if (cancelled) return;
+          setPluginProjects([]);
+          setPluginProjectsLoaded(true);
+        })
+        .finally(() => {
+          if (!cancelled) setPluginProjectsLoading(false);
+        });
+    }
 
-    return () => { cancelled = true; };
-  }, [devMode, pluginsDir, pluginProjectsLoaded, task]);
+    const cancelSchedule = loadStrategy === 'after-paint'
+      ? scheduleAfterPaint(doLoad)
+      : (doLoad(), () => {});
+
+    return () => { cancelled = true; cancelSchedule(); };
+  }, [devMode, pluginsDir, pluginProjectsLoaded, task, loadStrategy]);
 
   // Load branch info when mode = plugin.
   // On cache hit: hydrates synchronously (no loading spinner, no git call).
-  // On cache miss: runs a QUICK load — reads .git/HEAD directly for the branch
-  // name and calls `git branch --list` for the list. `gitHasUncommitted` is
-  // intentionally skipped here because `git status` scans the whole working tree
-  // and freezes the UI on first open of large repos. The dirty state is only
-  // refreshed when the user explicitly clicks the refresh button.
+  // On cache miss runs a two-phase quick load:
+  //   Phase 1 — reads .git/HEAD directly (getGitBranchQuick, no subprocess).
+  //             Shows the branch name as soon as it arrives and clears the spinner.
+  //   Phase 2 — silently chains listGitBranches to populate the branch switcher.
+  //             Errors here are swallowed; the switcher just stays hidden.
+  // gitHasUncommitted is intentionally skipped — git status scans the whole
+  // working tree and would freeze the UI on large repos. Dirty state is only
+  // checked when the user clicks the refresh button.
+  //
+  // In 'after-paint' mode the first git call is deferred until after the browser
+  // paints the panel shell, so expanding a task row is never blocked.
   useEffect(() => {
     if (devMode !== 'plugin' || !effectiveRepoRoot || currentBranch !== null) return;
 
@@ -371,33 +414,44 @@ export default forwardRef<TaskDevModePanelHandle, TaskDevModePanelProps>(functio
       return;
     }
 
-    // Cache miss — quick load (branch name + list; no dirty check).
+    // Cache miss — phase 1: quick branch name (file read); phase 2: branch list (git).
     let cancelled = false;
     setBranchLoading(true);
     setBranchError(null);
 
-    Promise.all([
-      tauriApi.getGitBranchQuick(effectiveRepoRoot),
-      tauriApi.listGitBranches(effectiveRepoRoot),
-    ])
-      .then(([branch, branchList]) => {
-        if (cancelled) return;
-        // Store without dirty — dirty is checked only on explicit refresh.
-        setCachedBranchInfo(effectiveRepoRoot, { currentBranch: branch, branches: branchList });
-        setBranch(branch);
-        setSelectedBranch(branch);
-        setBranches(branchList);
-      })
-      .catch((err) => {
-        if (cancelled) return;
-        setBranchError(String(err));
-      })
-      .finally(() => {
-        if (!cancelled) setBranchLoading(false);
-      });
+    function doLoad() {
+      tauriApi.getGitBranchQuick(effectiveRepoRoot!)
+        .then((branch) => {
+          if (cancelled) return;
+          // Phase 1 done — show branch name, clear spinner.
+          setBranch(branch);
+          setSelectedBranch(branch);
+          setBranchLoading(false);
+          // Write to cache immediately (branch list will be filled in by phase 2).
+          setCachedBranchInfo(effectiveRepoRoot!, { currentBranch: branch, branches: [] });
 
-    return () => { cancelled = true; };
-  }, [devMode, effectiveRepoRoot, currentBranch]);
+          // Phase 2 — silent background load of the full branch list.
+          tauriApi.listGitBranches(effectiveRepoRoot!)
+            .then((branchList) => {
+              if (cancelled) return;
+              setBranches(branchList);
+              setCachedBranchInfo(effectiveRepoRoot!, { currentBranch: branch, branches: branchList });
+            })
+            .catch(() => { /* branch list is a nice-to-have; ignore errors */ });
+        })
+        .catch((err) => {
+          if (cancelled) return;
+          setBranchError(String(err));
+          setBranchLoading(false);
+        });
+    }
+
+    const cancelSchedule = loadStrategy === 'after-paint'
+      ? scheduleAfterPaint(doLoad)
+      : (doLoad(), () => {});
+
+    return () => { cancelled = true; cancelSchedule(); };
+  }, [devMode, effectiveRepoRoot, currentBranch, loadStrategy]);
 
   // Scan selected plugin folder for a Visual Studio solution.
   useEffect(() => {
