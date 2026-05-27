@@ -18,8 +18,10 @@ import TaskEmailContent from './TaskEmailContent';
 import TaskDevModePanel from './TaskDevModePanel';
 import TaskModeSwitch from './TaskModeSwitch';
 import { resolveTaskDevTarget, getPluginsDir } from '../lib/resolveTaskDevTarget';
+import type { DevTargetKind } from '../lib/resolveTaskDevTarget';
 import { buildTaskWorkflowPlan } from '../lib/workflowPlan';
 import { inferTaskMode } from '../lib/taskMode';
+import { getCachedBranchInfo } from '../lib/devTargetCache';
 
 interface Props {
   task: Task;
@@ -77,6 +79,94 @@ function updatesForPhase(phase: TaskPhase): Partial<Task> {
   }
 }
 
+// ---------------------------------------------------------------------------
+// EmailPreview — compact text-based preview shown before the full iframe loads
+// ---------------------------------------------------------------------------
+
+interface EmailPreviewProps {
+  task: Task;
+  onShowFull: () => void;
+}
+
+function EmailPreview({ task, onShowFull }: EmailPreviewProps) {
+  // Build a plain-text excerpt from originalMessage, stripping leading header lines
+  const raw = task.originalMessage ?? '';
+  const previewLines: string[] = [];
+  let seenNonHeader = false;
+  for (const line of raw.split('\n')) {
+    const t = line.trim();
+    if (!seenNonHeader && /^(?:From|Sent|Date|To|Cc|Bcc|Subject|Od|Komu):\s/i.test(t)) continue;
+    if (!seenNonHeader && t === '') continue;
+    seenNonHeader = true;
+    if (t) previewLines.push(t);
+    if (previewLines.length >= 4) break;
+  }
+  const excerpt = previewLines.join('\n');
+
+  return (
+    <div className="tip-email-preview">
+      {(task.senderName || task.receivedAt) && (
+        <div className="tip-email-preview-meta">
+          {task.senderName && (
+            <span className="tip-email-preview-from">{task.senderName}</span>
+          )}
+          {task.receivedAt && (
+            <span className="tip-email-preview-date">
+              {new Date(task.receivedAt).toLocaleDateString(undefined, {
+                day: 'numeric', month: 'short',
+              })}
+            </span>
+          )}
+        </div>
+      )}
+      {excerpt && <p className="tip-email-preview-text">{excerpt}</p>}
+      <button className="btn btn-ghost btn-sm" onClick={onShowFull} type="button">
+        Show full email
+      </button>
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// DevPreview — zero-cost placeholder shown before TaskDevModePanel mounts
+// ---------------------------------------------------------------------------
+
+interface DevPreviewProps {
+  devTargetKind: DevTargetKind;
+  repoRootForGit: string | undefined;
+  persistedPlugin: string | undefined;
+  onLoad: () => void;
+}
+
+function DevPreview({ devTargetKind, repoRootForGit, persistedPlugin, onLoad }: DevPreviewProps) {
+  // Read from the session cache synchronously — no IPC, no effects.
+  const cachedBranch = repoRootForGit
+    ? getCachedBranchInfo(repoRootForGit)?.currentBranch
+    : undefined;
+  const kindLabel = devTargetKind === 'plugin' ? 'Plugin' : devTargetKind === 'script' ? 'Script' : 'Repo';
+
+  return (
+    <div className="tip-dev-preview">
+      <div className="tip-dev-preview-info">
+        <span className={`tip-dev-kind tip-dev-kind--${devTargetKind}`}>{kindLabel}</span>
+        {devTargetKind === 'plugin' && persistedPlugin && (
+          <span className="tip-dev-preview-project">{persistedPlugin}</span>
+        )}
+        {cachedBranch && (
+          <span className="tip-dev-preview-branch">{cachedBranch}</span>
+        )}
+      </div>
+      <button className="btn btn-secondary btn-sm" onClick={onLoad} type="button">
+        Load dev tools
+      </button>
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Main component
+// ---------------------------------------------------------------------------
+
 export default function InlineTaskPanel({ task, onOpenDetail }: Props) {
   const { updateTask, getCustomerById, deleteTask, settings } = useApp();
   const customer = getCustomerById(task.customerId);
@@ -86,12 +176,17 @@ export default function InlineTaskPanel({ task, onOpenDetail }: Props) {
   const [analyzing, setAnalyzing]     = useState(false);
   const [confirmDelete, setConfirmDelete] = useState(false);
   const [linkError, setLinkError] = useState<string | null>(null);
+  // Lazy-load gates — reset whenever the selected task changes.
+  const [emailExpanded, setEmailExpanded]   = useState(false);
+  const [devToolsLoaded, setDevToolsLoaded] = useState(false);
 
   useEffect(() => {
     setNotes(task.notes ?? '');
     setMsgExpanded(false);
     setConfirmDelete(false);
     setLinkError(null);
+    setEmailExpanded(false);
+    setDevToolsLoaded(false);
   }, [task.id]);
 
   useEffect(() => {
@@ -183,7 +278,14 @@ export default function InlineTaskPanel({ task, onOpenDetail }: Props) {
           {isEmailTask ? (
             <div className="tip-section">
               <div className="tip-sec-label">Message</div>
-              <TaskEmailContent task={task} />
+              {/* Defer the iframe — only mount TaskEmailContent after user expands.
+                  Plain-text email tasks (no emailBodyHtml) always use the full view
+                  because they don't create an expensive iframe. */}
+              {task.emailBodyHtml && !emailExpanded ? (
+                <EmailPreview task={task} onShowFull={() => setEmailExpanded(true)} />
+              ) : (
+                <TaskEmailContent task={task} />
+              )}
             </div>
           ) : msg ? (
             <div className="tip-section">
@@ -344,21 +446,33 @@ export default function InlineTaskPanel({ task, onOpenDetail }: Props) {
                     </button>
                   </div>
                 )}
-                <TaskDevModePanel
-                  task={task}
-                  customer={customer}
-                  pluginsDir={pluginsDir}
-                  repoRootForGit={repoRootForGit}
-                  defaultMode={devTarget.kind === 'plugin' ? 'plugin' : 'script'}
-                  scriptOpenPath={task.workflowSetup?.scriptPath ?? customer?.scriptFolder ?? effectiveVscodePath}
-                  onError={() => {}}
-                  autoCollapsed={false}
-                  selectedPluginProject={task.workflowSetup?.pluginProject ?? task.selectedPluginProject}
-                  onSelectedPluginChange={(plugin) =>
-                    updateTask(task.id, { selectedPluginProject: plugin || undefined }).catch(() => {})
-                  }
-                  reviewerConfigs={plan.requiresAiFileReview ? settings.aiReviewers : undefined}
-                />
+                {/* Mount TaskDevModePanel only after the user clicks "Load dev tools".
+                    Until then show a zero-cost DevPreview that reads from the session
+                    cache (synchronous) — no IPC calls, no git processes. */}
+                {devToolsLoaded ? (
+                  <TaskDevModePanel
+                    task={task}
+                    customer={customer}
+                    pluginsDir={pluginsDir}
+                    repoRootForGit={repoRootForGit}
+                    defaultMode={devTarget.kind === 'plugin' ? 'plugin' : 'script'}
+                    scriptOpenPath={task.workflowSetup?.scriptPath ?? customer?.scriptFolder ?? effectiveVscodePath}
+                    onError={() => {}}
+                    autoCollapsed={false}
+                    selectedPluginProject={task.workflowSetup?.pluginProject ?? task.selectedPluginProject}
+                    onSelectedPluginChange={(plugin) =>
+                      updateTask(task.id, { selectedPluginProject: plugin || undefined }).catch(() => {})
+                    }
+                    reviewerConfigs={plan.requiresAiFileReview ? settings.aiReviewers : undefined}
+                  />
+                ) : (
+                  <DevPreview
+                    devTargetKind={devTarget.kind}
+                    repoRootForGit={repoRootForGit}
+                    persistedPlugin={task.workflowSetup?.pluginProject ?? task.selectedPluginProject}
+                    onLoad={() => setDevToolsLoaded(true)}
+                  />
+                )}
               </div>
             )}
 
