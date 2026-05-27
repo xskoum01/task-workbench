@@ -2,6 +2,7 @@ import { useState, useCallback, useEffect, useRef } from 'react';
 import type { Task } from '../types';
 import { useApp } from '../context/AppContext';
 import Icon from '../components/Icon';
+import Modal from '../components/Modal';
 import TaskDetail from '../components/TaskDetail';
 import { TypeBadge, SourceBadge } from '../components/StatusBadge';
 
@@ -70,14 +71,16 @@ interface DayNoteProps {
   dateKey: string;
   initialNote: string;
   onSave: (dateKey: string, note: string) => void;
+  /** Number of visible textarea rows. Default 3 (inline), pass more in the modal. */
+  rows?: number;
 }
 
-function DayNote({ dateKey, initialNote, onSave }: DayNoteProps) {
+function DayNote({ dateKey, initialNote, onSave, rows = 3 }: DayNoteProps) {
   const [value, setValue] = useState(initialNote);
   const [saved, setSaved] = useState(true);
   const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
-  // Sync when switching weeks
+  // Sync when switching weeks or opening a different day in the modal
   useEffect(() => {
     setValue(initialNote);
     setSaved(true);
@@ -111,10 +114,37 @@ function DayNote({ dateKey, initialNote, onSave }: DayNoteProps) {
         placeholder="What did you work on today?"
         onChange={handleChange}
         onBlur={handleBlur}
-        rows={3}
+        rows={rows}
       />
       {!saved && <span className="wl-note-saving">saving…</span>}
     </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// NotePreviewButton — compact button shown in day cards instead of a textarea
+// ---------------------------------------------------------------------------
+
+interface NotePreviewButtonProps {
+  note: string;
+  onClick: () => void;
+}
+
+function NotePreviewButton({ note, onClick }: NotePreviewButtonProps) {
+  const hasNote = note.trim().length > 0;
+  // Single-line preview: collapse newlines, cap at 100 chars
+  const preview = hasNote
+    ? note.trim().replace(/\n+/g, ' · ').slice(0, 100)
+    : null;
+  return (
+    <button
+      className={`wl-note-preview${hasNote ? '' : ' wl-note-preview--empty'}`}
+      onClick={onClick}
+      type="button"
+      title={hasNote ? note : 'Add a note for this day'}
+    >
+      {preview ?? 'Add note…'}
+    </button>
   );
 }
 
@@ -150,6 +180,7 @@ export default function WeekLogPage() {
 
   const [weekStart, setWeekStart] = useState<Date>(() => getMondayOf(new Date()));
   const [selectedTaskId, setSelectedTaskId] = useState<string | null>(null);
+  const [noteModalDateKey, setNoteModalDateKey] = useState<string | null>(null);
   const detailRef = useRef<HTMLDivElement>(null);
 
   // Clear selection when the task is deleted or no longer in the list.
@@ -183,6 +214,12 @@ export default function WeekLogPage() {
   }, [tasks]);
 
   const tasksByDay = completedByDay();
+
+  // Resolve the day entry for the currently open note modal (may be null when
+  // the modal is closed or when the note date is outside the visible week).
+  const noteModalDay = noteModalDateKey
+    ? (days.find((d) => d.key === noteModalDateKey) ?? null)
+    : null;
 
   // Navigation
   function goBack() {
@@ -246,7 +283,7 @@ export default function WeekLogPage() {
             const isEmpty = !note.trim() && dayTasks.length === 0;
 
             return (
-              <div key={key} className={`wl-day-card${isToday ? ' wl-day-card--today' : ''}`}>
+              <div key={key} className={`wl-day-card${isToday ? ' wl-day-card--today wl-day-card--featured' : ''}`}>
                 {/* Card header */}
                 <div className="wl-day-header">
                   <span className="wl-day-name">{name}</span>
@@ -254,11 +291,10 @@ export default function WeekLogPage() {
                   {isToday && <span className="wl-today-badge">Today</span>}
                 </div>
 
-                {/* Note textarea */}
-                <DayNote
-                  dateKey={key}
-                  initialNote={note}
-                  onSave={updateWeeklyNote}
+                {/* Compact note preview — click opens the edit modal */}
+                <NotePreviewButton
+                  note={note}
+                  onClick={() => setNoteModalDateKey(key)}
                 />
 
                 {/* Completed tasks */}
@@ -276,7 +312,7 @@ export default function WeekLogPage() {
                   </div>
                 )}
 
-                {/* Empty state */}
+                {/* Empty state — no tasks and no note */}
                 {isEmpty && (
                   <div className="wl-empty">No activity logged.</div>
                 )}
@@ -295,6 +331,34 @@ export default function WeekLogPage() {
           </div>
         )}
       </div>
+
+      {/* Note edit modal — opens when the user clicks a day's note preview button */}
+      {noteModalDateKey && (
+        <Modal
+          title={
+            noteModalDay
+              ? `Note — ${noteModalDay.name} ${fmtDay(noteModalDay.date)}`
+              : 'Day Note'
+          }
+          onClose={() => setNoteModalDateKey(null)}
+          footer={
+            <button
+              className="btn btn-secondary btn-sm"
+              onClick={() => setNoteModalDateKey(null)}
+              type="button"
+            >
+              Close
+            </button>
+          }
+        >
+          <DayNote
+            dateKey={noteModalDateKey}
+            initialNote={settings.weeklyNotes?.[noteModalDateKey] ?? ''}
+            onSave={updateWeeklyNote}
+            rows={7}
+          />
+        </Modal>
+      )}
     </div>
   );
 }

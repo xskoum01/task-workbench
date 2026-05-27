@@ -5489,26 +5489,27 @@ body {
   gap: 0;
 }
 
-/* 7-day grid */
+/* 7-day grid: 8 equal tracks so the featured (today) card can span 2 without
+   pushing other columns. minmax(0, 1fr) prevents content from expanding columns. */
 .wl-grid {
   display: grid;
-  grid-template-columns: repeat(7, 1fr);
+  grid-template-columns: repeat(8, minmax(0, 1fr));
   gap: 8px;
   padding: var(--gap-md);
   flex-shrink: 0;
-  align-content: start;
+  align-items: start;
 }
 
 /* Responsive: fewer columns on smaller windows */
 @media (max-width: 1200px) {
   .wl-grid {
-    grid-template-columns: repeat(4, 1fr);
+    grid-template-columns: repeat(4, minmax(0, 1fr));
   }
 }
 
 @media (max-width: 800px) {
   .wl-grid {
-    grid-template-columns: repeat(2, 1fr);
+    grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 }
 
@@ -5516,10 +5517,17 @@ body {
   .wl-grid {
     grid-template-columns: 1fr;
   }
+  /* Featured card reverts to single column at very small sizes */
+  .wl-day-card--featured {
+    grid-column: span 1;
+    min-height: 138px;
+    padding: 10px 10px 8px;
+  }
 }
 
-/* Day card */
+/* Day card — grows vertically with content; width is capped by the grid track */
 .wl-day-card {
+  min-width: 0;
   background: var(--bg-surface);
   border: 1px solid var(--border-subtle);
   border-radius: var(--radius-md);
@@ -5527,13 +5535,31 @@ body {
   display: flex;
   flex-direction: column;
   gap: 8px;
-  min-height: 140px;
+  min-height: 138px;
 }
 
+/* Today: accent border + tinted background */
 .wl-day-card--today {
   border-color: var(--accent);
   box-shadow: 0 0 0 1px color-mix(in srgb, var(--accent) 30%, transparent);
   background: color-mix(in srgb, var(--accent) 5%, var(--bg-surface));
+}
+
+/* Featured (today's) card: spans two grid columns, more breathing room */
+.wl-day-card--featured {
+  grid-column: span 2;
+  min-height: 220px;
+  padding: 14px 14px 12px;
+}
+
+/* Larger, accented header text in the featured card */
+.wl-day-card--featured .wl-day-name {
+  color: var(--accent);
+  font-size: 12px;
+}
+
+.wl-day-card--featured .wl-day-date {
+  font-size: 18px;
 }
 
 /* Card header */
@@ -5571,7 +5597,43 @@ body {
   line-height: 16px;
 }
 
-/* Note textarea */
+/* Note preview button — dark compact field, matches the VS Code / admin tool look.
+   Muted color by default so the button reads as a subtle secondary element. */
+.wl-note-preview {
+  width: 100%;
+  min-width: 0;
+  min-height: 30px;
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-sm);
+  background: var(--bg-overlay);
+  color: var(--text-muted);
+  font-size: 12px;
+  font-family: inherit;
+  line-height: 1.35;
+  padding: 6px 8px;
+  text-align: left;
+  cursor: pointer;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  display: block;
+  transition: border-color 0.15s, background 0.12s, color 0.12s;
+}
+
+.wl-note-preview:hover,
+.wl-note-preview:focus-visible {
+  border-color: color-mix(in srgb, var(--accent) 45%, var(--border-subtle));
+  background: var(--bg-hover);
+  color: var(--text-primary);
+  outline: none;
+}
+
+/* Empty / no-note state — italic placeholder text */
+.wl-note-preview--empty {
+  font-style: italic;
+}
+
+/* Note textarea — used inside the edit modal */
 .wl-note-wrap {
   position: relative;
   display: flex;
@@ -5612,6 +5674,7 @@ body {
 
 /* Completed task section */
 .wl-tasks {
+  min-width: 0;
   display: flex;
   flex-direction: column;
   gap: 4px;
@@ -5626,7 +5689,11 @@ body {
   margin-bottom: 2px;
 }
 
+/* Task rows must never push the card wider — min-width: 0 + overflow: hidden
+   are both required for text-overflow: ellipsis to work in a flex/grid context. */
 .wl-task-row {
+  min-width: 0;
+  overflow: hidden;
   display: flex;
   flex-direction: column;
   gap: 3px;
@@ -5646,6 +5713,7 @@ body {
 }
 
 .wl-task-title {
+  min-width: 0;
   font-size: 12px;
   font-weight: 500;
   color: var(--text-primary);
@@ -5656,6 +5724,8 @@ body {
 }
 
 .wl-task-meta {
+  min-width: 0;
+  overflow: hidden;
   display: flex;
   align-items: center;
   gap: 4px;
