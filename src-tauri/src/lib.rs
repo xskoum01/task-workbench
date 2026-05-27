@@ -62,6 +62,22 @@ fn write_json(path: &PathBuf, value: &Value) -> Result<(), String> {
     fs::write(path, raw).map_err(|e| e.to_string())
 }
 
+/// Prevents a console window from flashing when spawning console programs on Windows.
+/// On Windows GUI apps, any child process that is a console application (git, cmd, …)
+/// will briefly show a console window unless CREATE_NO_WINDOW is set.
+/// This is a no-op on other platforms.
+#[cfg(target_os = "windows")]
+const CREATE_NO_WINDOW: u32 = 0x08000000;
+
+#[cfg(target_os = "windows")]
+fn hide_console_window(cmd: &mut std::process::Command) {
+    use std::os::windows::process::CommandExt;
+    cmd.creation_flags(CREATE_NO_WINDOW);
+}
+
+#[cfg(not(target_os = "windows"))]
+fn hide_console_window(_cmd: &mut std::process::Command) {}
+
 // --- Tasks -----------------------------------------------------------------
 
 #[tauri::command]
@@ -229,9 +245,10 @@ fn open_in_vscode(path: String) -> Result<(), String> {
     #[cfg(target_os = "windows")]
     let result = {
         eprintln!("[open_in_vscode] cmd /c code \"{}\"", path);
-        std::process::Command::new("cmd")
-            .args(["/c", "code", &path])
-            .spawn()
+        let mut cmd = std::process::Command::new("cmd");
+        cmd.args(["/c", "code", &path]);
+        hide_console_window(&mut cmd);
+        cmd.spawn()
     };
 
     #[cfg(not(target_os = "windows"))]
@@ -278,6 +295,7 @@ fn open_in_vscode_workspace(workspace_path: String, file_path: Option<String>) -
         let mut cmd = std::process::Command::new("cmd");
         cmd.arg("/c").arg("code");
         for a in &args { cmd.arg(a); }
+        hide_console_window(&mut cmd);
         cmd.spawn()
     };
     #[cfg(not(target_os = "windows"))]
@@ -304,9 +322,10 @@ fn open_in_vscode_workspace(workspace_path: String, file_path: Option<String>) -
 fn open_with_shell(path: String) -> Result<(), String> {
     #[cfg(target_os = "windows")]
     {
-        std::process::Command::new("cmd")
-            .args(["/c", "start", "", &path])
-            .spawn()
+        let mut cmd = std::process::Command::new("cmd");
+        cmd.args(["/c", "start", "", &path]);
+        hide_console_window(&mut cmd);
+        cmd.spawn()
             .map(|_| ())
             .map_err(|e| format!("Failed to open with shell: {e}"))
     }
@@ -372,18 +391,16 @@ fn git_run(repo_path: &str, args: &[&str]) -> Result<String, String> {
     if !p.exists() {
         return Err(format!("Repository path not found: {repo_path}"));
     }
-    let output = std::process::Command::new("git")
-        .arg("-C")
-        .arg(repo_path)
-        .args(args)
-        .output()
-        .map_err(|e| {
-            if e.kind() == std::io::ErrorKind::NotFound {
-                "git is not installed or not on PATH.".to_string()
-            } else {
-                format!("Failed to run git: {e}")
-            }
-        })?;
+    let mut cmd = std::process::Command::new("git");
+    cmd.arg("-C").arg(repo_path).args(args);
+    hide_console_window(&mut cmd);
+    let output = cmd.output().map_err(|e| {
+        if e.kind() == std::io::ErrorKind::NotFound {
+            "git is not installed or not on PATH.".to_string()
+        } else {
+            format!("Failed to run git: {e}")
+        }
+    })?;
     if output.status.success() {
         Ok(String::from_utf8_lossy(&output.stdout)
             .trim()
@@ -1824,9 +1841,10 @@ fn initialize_git_repository(
     };
 
     // Run: git init -b <branch> <path>
-    let init_out = std::process::Command::new("git")
-        .args(["init", "-b", &branch, &path])
-        .output();
+    let mut init_cmd = std::process::Command::new("git");
+    init_cmd.args(["init", "-b", &branch, &path]);
+    hide_console_window(&mut init_cmd);
+    let init_out = init_cmd.output();
 
     let output = match init_out {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -1859,19 +1877,21 @@ fn initialize_git_repository(
     let mut committed = false;
     if create_initial_commit {
         // Stage all files
-        let add_ok = std::process::Command::new("git")
-            .args(["-C", &path, "add", "."])
-            .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false);
+        let add_ok = {
+            let mut cmd = std::process::Command::new("git");
+            cmd.args(["-C", &path, "add", "."]);
+            hide_console_window(&mut cmd);
+            cmd.output().map(|o| o.status.success()).unwrap_or(false)
+        };
 
         if add_ok {
             // Create commit — tolerate failure silently (e.g. nothing to commit)
-            let commit_ok = std::process::Command::new("git")
-                .args(["-C", &path, "commit", "-m", "Initial commit"])
-                .output()
-                .map(|o| o.status.success())
-                .unwrap_or(false);
+            let commit_ok = {
+                let mut cmd = std::process::Command::new("git");
+                cmd.args(["-C", &path, "commit", "-m", "Initial commit"]);
+                hide_console_window(&mut cmd);
+                cmd.output().map(|o| o.status.success()).unwrap_or(false)
+            };
             committed = commit_ok;
         }
     }
