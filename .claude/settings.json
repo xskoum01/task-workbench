@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python3 -c ' *)",
+      "Bash(\"C:\\\\Program Files\\\\nodejs\\\\node.exe\" \"C:\\\\Users\\\\vskoumal\\\\AppData\\\\Local\\\\Temp\\\\test_mcp_fix.mjs\")"
+    ],
+    "additionalDirectories": [
+      "C:\\Users\\vskoumal\\AppData\\Local\\Temp"
+    ]
+  }
+}

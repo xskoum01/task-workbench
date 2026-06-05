@@ -1,8 +1,11 @@
 ﻿import type { Task, TaskStatus, WorkflowSetup } from '../types';
 import { inferTaskMode } from './taskMode';
 
+/** Extends TaskStatus with the virtual 'testing' phase used for display only. */
+export type DisplayPhase = TaskStatus | 'testing';
+
 export interface WorkflowStage {
-  id: TaskStatus;
+  id: DisplayPhase;
   label: string;
   actionLabel: string;
   next: TaskStatus | null;
@@ -21,6 +24,7 @@ export type PlanAction =
   | 'analyze'
   | 'confirm-setup'
   | 'start-development'
+  | 'verify-implementation'
   | 'mark-waiting-review'
   | 'mark-done'
   | 'none';
@@ -28,6 +32,8 @@ export type PlanAction =
 export interface TaskWorkflowPlan {
   stages: WorkflowStage[];
   workflowKind: WorkflowKind;
+  /** Display phase — equals task.status normally; 'testing' when in-progress with consultant-testing waitingState. */
+  displayPhase: DisplayPhase;
   targetKind: TargetKind;
   currentAction: PlanAction;
   currentActionLabel: string;
@@ -54,6 +60,12 @@ const S_ANA_SETUP_REQ: WorkflowStage = { id: 'analyzed', label: 'Analyzed', acti
 const S_ANA_START: WorkflowStage = { id: 'analyzed', label: 'Analyzed', actionLabel: 'Start Development', next: 'in-progress' };
 const S_ANA_DONE: WorkflowStage = { id: 'analyzed', label: 'Analyzed', actionLabel: 'Mark Done', next: 'done' };
 const S_IN_PROGRESS: WorkflowStage = { id: 'in-progress', label: 'Development', actionLabel: 'Mark Waiting for Review', next: 'ready-for-review' };
+/** Development stage for confirmed plugin tasks — primary action opens verification checks modal. */
+const S_IN_PROGRESS_PLUGIN: WorkflowStage = { id: 'in-progress', label: 'Development', actionLabel: 'Verify Implementation', next: 'ready-for-review' };
+/** Virtual Testing stage — active when displayPhase === 'testing' (any status with consultant-testing waitingState). */
+const S_TESTING: WorkflowStage = { id: 'testing', label: 'Testing', actionLabel: 'Testing in progress', next: null };
+/** Display-only Development stage used in the general stage array (not actionable via the stepper). */
+const S_IN_PROGRESS_GEN: WorkflowStage = { id: 'in-progress', label: 'Development', actionLabel: '', next: null };
 const S_FOR_REVIEW: WorkflowStage = { id: 'ready-for-review', label: 'Review', actionLabel: 'Mark Done', next: 'done' };
 const S_DONE: WorkflowStage = { id: 'done', label: 'Done', actionLabel: 'Completed', next: null };
 
@@ -108,10 +120,17 @@ export function buildTaskWorkflowPlan(task: Task, heuristicKind?: DevKind): Task
   // The timeline is a lifecycle map; tools live in the side panel.
   let stages: WorkflowStage[];
   if (isGeneral) {
-    stages = [S_NEW, S_ANA_DONE, S_DONE];
+    // Include Development, Testing, and Review so any status shows an active step.
+    stages = [S_NEW, S_ANA_DONE, S_IN_PROGRESS_GEN, S_TESTING, S_FOR_REVIEW, S_DONE];
   } else {
-    stages = [isDeveloperAwaitingSetup ? S_NEW_CONFIRM : S_NEW, S_ANA_START, S_IN_PROGRESS, S_FOR_REVIEW, S_DONE];
+    const devStage = (devKind === 'plugin' && !!confirmedKind) ? S_IN_PROGRESS_PLUGIN : S_IN_PROGRESS;
+    stages = [isDeveloperAwaitingSetup ? S_NEW_CONFIRM : S_NEW, S_ANA_START, devStage, S_TESTING, S_FOR_REVIEW, S_DONE];
   }
+
+  // Display phase: 'testing' whenever consultant-testing waitingState is set, regardless of status.
+  // This covers local-testing-in-progress (in-progress) and waiting-for-consultant (any status).
+  const displayPhase: DisplayPhase =
+    task.waitingState === 'consultant-testing' ? 'testing' : task.status;
 
   let currentAction: PlanAction = 'none';
   switch (task.status) {
@@ -127,7 +146,16 @@ export function buildTaskWorkflowPlan(task: Task, heuristicKind?: DevKind): Task
       else                                 currentAction = 'start-development';
       break;
     case 'in-progress':
-      currentAction = isCode ? 'mark-waiting-review' : 'none'; break;
+      if (isCode) {
+        // Plugin tasks get "Verify Implementation" as the primary Development action.
+        // Script/other dev tasks keep "Mark Waiting for Review".
+        currentAction = (devKind === 'plugin' && !!confirmedKind)
+          ? 'verify-implementation'
+          : 'mark-waiting-review';
+      } else {
+        currentAction = 'none';
+      }
+      break;
     case 'ready-for-review':
       currentAction = 'mark-done'; break;
     default:
@@ -143,6 +171,7 @@ export function buildTaskWorkflowPlan(task: Task, heuristicKind?: DevKind): Task
   return {
     stages,
     workflowKind,
+    displayPhase,
     targetKind: (confirmedKind ?? devKind) as TargetKind,
     currentAction,
     currentActionLabel,

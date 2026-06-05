@@ -430,6 +430,15 @@ export default forwardRef<TaskDevModePanelHandle, TaskDevModePanelProps>(functio
           // Write to cache immediately (branch list will be filled in by phase 2).
           setCachedBranchInfo(effectiveRepoRoot!, { currentBranch: branch, branches: [] });
 
+          // Phase 1b — check whether HEAD exists (unborn branch = no commits yet).
+          // Runs in background; sets a warning but does not block the branch display.
+          tauriApi.gitHasHead(effectiveRepoRoot!).then((hasHead) => {
+            if (cancelled) return;
+            if (!hasHead) {
+              setBranchError('Repository has no commits yet — initial commit required.');
+            }
+          }).catch(() => { /* ignore — non-critical */ });
+
           // Phase 2 — silent background load of the full branch list.
           tauriApi.listGitBranches(effectiveRepoRoot!)
             .then((branchList) => {
@@ -1056,7 +1065,7 @@ export default forwardRef<TaskDevModePanelHandle, TaskDevModePanelProps>(functio
             disabled={!selectedPlugin}
           >
             <Icon name="terminal" size={13} />{' '}
-            {pluginOpenHint?.startsWith('.sln') ? 'Open Plugin in Visual Studio' : 'Open Plugin Folder'}
+            {'Open Plugin in Visual Studio'}
           </button>
         </>
       ) : (

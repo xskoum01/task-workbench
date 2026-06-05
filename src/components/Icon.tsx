@@ -58,7 +58,9 @@ export type IconName =
   | 'trash-2'        // delete
   | 'external-link'  // open external URL
   | 'log-in'         // reconnect / sign in
-  | 'pause';         // waiting bucket
+  | 'pause'          // waiting bucket
+  | 'eye'            // preview / view
+  | 'alert-triangle'; // warning banner
 
 // ---------------------------------------------------------------------------
 // SVG path definitions (24×24 viewBox, Lucide-style)
@@ -288,6 +290,18 @@ const ICON_PATHS: Record<IconName, string[]> = {
   // Pause — two vertical bars (waiting state)
   'pause': [
     'M6 4h4v16H6zM14 4h4v16h-4z',
+  ],
+
+  // Eye — preview / view
+  'eye': [
+    'M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z',
+    'M12 9a3 3 0 1 0 0 6 3 3 0 0 0 0-6z',
+  ],
+
+  // Alert triangle — warning banner
+  'alert-triangle': [
+    'M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z',
+    'M12 9v4M12 17h.01',
   ],
 };
 

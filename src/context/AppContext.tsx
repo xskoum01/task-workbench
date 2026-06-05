@@ -1,4 +1,5 @@
 import { createContext, useContext, useEffect, useState, useRef, useCallback } from 'react';
+import { listen } from '@tauri-apps/api/event';
 import type { Task, Customer, AppSettings, CreateRepoResult, CreateRepoOptions, TaskType, ClassificationState, PlanningBucket, AdoEmailContext } from '../types';
 import * as api from '../lib/tauriCommands';
 import { defaultSettings } from '../data/mockData';
@@ -85,6 +86,8 @@ interface AppContextValue {
   createTask: (draft: Omit<Task, 'id' | 'receivedAt' | 'suggestedActions'>) => Promise<void>;
   updateTask: (id: string, updates: Partial<Task>) => Promise<void>;
   deleteTask: (id: string) => Promise<void>;
+  /** Re-fetches tasks from storage. Useful after external writes (e.g. MCP tools). */
+  reloadTasks: () => Promise<void>;
 
   // Import pipeline — normalises, deduplicates, prefilters, and classifies
   importMessage: (input: ImportMessageInput) => Promise<ImportResult>;
@@ -311,9 +314,24 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
       }
     }
     load();
+
+    // Listen for MCP bridge writes and reload tasks to keep UI in sync
+    const unlisten = listen('tasks-changed-externally', () => {
+      api.loadTasks().then((updated) => {
+        setTasks(updated);
+      }).catch(() => {});
+    });
+
+    return () => {
+      unlisten.then(fn => fn());
+    };
   }, []);
 
   // --- Task operations ---
+
+  // All three task-mutation callbacks use the functional form of setTasks so they always
+  // operate on the latest state — safe for rapid sequential calls from async handlers.
+  // `captured` is set synchronously inside the updater before the async saveTasks call.
 
   const createTask = useCallback(
     async (draft: Omit<Task, 'id' | 'receivedAt' | 'suggestedActions'>) => {
@@ -323,51 +341,63 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
         receivedAt:       new Date().toISOString(),
         suggestedActions: [],
       };
-      const updated = [...tasks, newTask];
-      setTasks(updated);
+      let captured: Task[] = [];
+      setTasks((prev) => {
+        const next = [...prev, newTask];
+        captured = next;
+        return next;
+      });
       try {
-        await api.saveTasks(updated);
+        await api.saveTasks(captured);
       } catch (err) {
         console.warn('saveTasks failed:', err);
       }
     },
-    [tasks],
+    [],
   );
 
   const updateTask = useCallback(
     async (id: string, updates: Partial<Task>) => {
-      const updated = tasks.map((t) => {
-        if (t.id !== id) return t;
-        const merged = { ...t, ...updates };
-        // Track completion timestamp automatically.
-        if (updates.status === 'done' && t.status !== 'done') {
-          merged.completedAt = new Date().toISOString();
-        } else if (updates.status && updates.status !== 'done' && t.status === 'done') {
-          merged.completedAt = undefined;
-        }
-        return merged;
+      let captured: Task[] = [];
+      setTasks((prev) => {
+        const next = prev.map((t) => {
+          if (t.id !== id) return t;
+          const merged = { ...t, ...updates };
+          // Track completion timestamp automatically.
+          if (updates.status === 'done' && t.status !== 'done') {
+            merged.completedAt = new Date().toISOString();
+          } else if (updates.status && updates.status !== 'done' && t.status === 'done') {
+            merged.completedAt = undefined;
+          }
+          return merged;
+        });
+        captured = next;
+        return next;
       });
-      setTasks(updated);
       try {
-        await api.saveTasks(updated);
+        await api.saveTasks(captured);
       } catch (err) {
         console.warn('saveTasks failed:', err);
       }
     },
-    [tasks],
+    [],
   );
 
   const deleteTask = useCallback(
     async (id: string) => {
-      const updated = tasks.filter((t) => t.id !== id);
-      setTasks(updated);
+      let captured: Task[] = [];
+      setTasks((prev) => {
+        const next = prev.filter((t) => t.id !== id);
+        captured = next;
+        return next;
+      });
       try {
-        await api.saveTasks(updated);
+        await api.saveTasks(captured);
       } catch (err) {
         console.warn('saveTasks (deleteTask) failed:', err);
       }
     },
-    [tasks],
+    [],
   );
 
   // ---------------------------------------------------------------------------
@@ -946,18 +976,20 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
 
   const updateSettings = useCallback(
     async (updates: Partial<AppSettings>) => {
-      const updated = { ...settings, ...updates };
-      setSettings(updated);
+      const next = { ...settings, ...updates };
+      setSettings(next);
       try {
-        await api.saveSettings(updated);
-        // Refresh CRM folders when base directory changes
+        await api.saveSettings(next);
+        const persisted = await api.loadSettings();
+        setSettings(persisted);
         if ('crmBaseDirectory' in updates) {
-          const baseDir = updates.crmBaseDirectory ?? '';
+          const baseDir = persisted.crmBaseDirectory ?? '';
           const folders = baseDir ? await api.listCrmFolders(baseDir).catch(() => []) : [];
           setCrmFolders(folders);
         }
       } catch (err) {
         console.warn('saveSettings failed:', err);
+        throw err;
       }
     },
     [settings],
@@ -1073,6 +1105,10 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
         createTask,
         updateTask,
         deleteTask,
+        reloadTasks: async () => {
+          const updated = await api.loadTasks();
+          setTasks(updated);
+        },
         importMessage,
         createCustomer,
         updateCustomer,

@@ -1,5 +1,15 @@
 ﻿import { useState, useEffect, useRef } from 'react';
-import type { Task, TaskStatus, SkeletonPreview, WorkflowSetup, AiFileReviewResult } from '../types';
+import type {
+  Task,
+  TaskStatus,
+  SkeletonPreview,
+  WorkflowSetup,
+  AiFileReviewResult,
+  CrmSkeletonResult,
+  CrmVerificationReport,
+  CrmPullRequestFixUpdateTracking,
+  ImplementationVerification,
+} from '../types';
 import TaskEmailContent from './TaskEmailContent';
 import TaskDevModePanel, { type TaskDevModePanelHandle } from './TaskDevModePanel';
 import { useApp } from '../context/AppContext';
@@ -14,18 +24,77 @@ import {
 import TaskForm from './TaskForm';
 import CreatePluginProjectModal from './CreatePluginProjectModal';
 import ConfirmSetupModal from './ConfirmSetupModal';
+import StartDevelopmentModal from './StartDevelopmentModal';
 import Icon from './Icon';
 import Modal from './Modal';
 import AiReviewResultView from './AiReviewResultView';
+import CrmSkeletonResultView from './CrmSkeletonResultView';
+import CrmVerificationReportView from './CrmVerificationReportView';
+import CrmDeveloperWorkflowPanel from './CrmDeveloperWorkflowPanel';
+import PrimarchVerificationModal, { type PrimarchVerifyStep } from './PrimarchVerificationModal';
+import ImplementationVerificationModal from './ImplementationVerificationModal';
 import * as tauriApi from '../lib/tauriCommands';
 import { openReviewTarget } from '../lib/openReviewTarget';
+import { formatTaskActivityNotes, splitTaskNotes } from '../lib/taskActivityFormatter';
 import { WorkflowStepper } from './WorkflowStepper';
+import GitCommitModal from './GitCommitModal';
 import { buildTaskWorkflowPlan } from '../lib/workflowPlan';
+import type { TaskWorkflowPlan } from '../lib/workflowPlan';
+import {
+  buildCrmDeveloperWorkflowStateAfterMetadataVerification,
+  buildCrmDeveloperWorkflowStateAfterDiffApproval,
+  buildCrmDeveloperWorkflowStateAfterDiffApprovalRevoked,
+  buildCrmDeveloperWorkflowStateAfterDraftRegenerated,
+  buildCrmDeveloperWorkflowStateAfterExternalActionApproval,
+  buildCrmDeveloperWorkflowStateAfterExternalActionApprovalRevoked,
+  buildCrmDeveloperWorkflowStateAfterPlanApproval,
+  buildCrmDeveloperWorkflowStateAfterPlanApprovalRevoked,
+  buildCrmDeveloperWorkflowStateAfterTechnicalPlan,
+  buildCrmDeveloperWorkflowStateAfterPlanAndDraft,
+  buildCrmDeveloperWorkflowStateSnapshot,
+  buildCrmTechnicalImplementationPlan,
+  getCrmCodeGenerationReadiness,
+  getCrmDiffReviewStatus,
+  getCrmExternalActionApprovalStatus,
+  getCrmExternalExecutionStatus,
+  isMeaningfulCrmVerificationReport,
+  isDeveloperWorkflowTask,
+  buildCrmExternalExecutionPreview,
+  buildCrmDeveloperWorkflowStateAfterExternalExecutionCompleted,
+  buildCrmDeveloperWorkflowStateAfterExternalExecutionRevoked,
+  buildCrmDeveloperWorkflowStateAfterManualPullRequestTracked,
+  buildCrmDeveloperWorkflowStateAfterManualPullRequestTrackingRevoked,
+  buildCrmDeveloperWorkflowStateAfterPullRequestProposal,
+  buildCrmDeveloperWorkflowStateAfterPullRequestReviewIntake,
+  buildCrmDeveloperWorkflowStateAfterPullRequestReviewAnalysis,
+  buildCrmDeveloperWorkflowStateAfterPullRequestFixProposal,
+  buildCrmDeveloperWorkflowStateAfterManualPullRequestFixUpdated,
+  buildCrmDeveloperWorkflowStateAfterManualPullRequestFixUpdateRevoked,
+  buildCrmPullRequestProposal,
+  buildCrmPullRequestReviewIntake,
+  buildCrmPullRequestReviewAnalysis,
+  buildCrmPullRequestFixProposal,
+  buildCrmDraftContextFromPullRequestFixProposal,
+  fetchCrmGitHubPullRequestReviewIntake,
+  getCrmPullRequestProposalStatus,
+  getCrmPullRequestReviewStatus,
+  getCrmPullRequestReviewAnalysisStatus,
+  getCrmPullRequestFixProposalStatus,
+  getCrmPullRequestFixUpdateStatus,
+  getCrmPullRequestTrackingStatus,
+  type CrmExternalExecutionPreview,
+} from '../lib/crmDeveloperWorkflow';
+import CrmExecutionPreviewModal from './CrmExecutionPreviewModal';
 import { resolveTaskDevTarget, getPluginsDir } from '../lib/resolveTaskDevTarget';
 import TaskModeSwitch from './TaskModeSwitch';
 import { inferTaskMode } from '../lib/taskMode';
 import { BUCKET_META, computePlanning, effectiveBucket } from '../lib/planning';
 import { isOverdue, formatRelativeDate } from '../lib/dates';
+import {
+  scanJavaScriptCrmReferences,
+  scanCSharpCrmReferences,
+  type CrmReferenceScanResult,
+} from '../lib/crmReferenceScanner';
 
 interface TaskDetailProps {
   task: Task;
@@ -34,10 +103,66 @@ interface TaskDetailProps {
 
 type AiAction = 'analyze' | 'draft';
 
+type PrimarchAction = 'skeleton' | 'verify';
+
+function withCrmDraftContext(task: Task, context: string | undefined): Task {
+  if (!context) return task;
+  return {
+    ...task,
+    originalMessage: `${task.originalMessage}\n\n${context}`,
+  };
+}
+
 function formatEffort(hours: number): string {
   if (hours < 1) return `${Math.round(hours * 60)}m`;
   if (hours === 1) return '1h';
   return `${hours}h`;
+}
+
+function formatCrmVerdict(verdict: string): string {
+  return verdict.replace(/_/g, ' ').toUpperCase();
+}
+
+function createPrimarchVerifySteps(): PrimarchVerifyStep[] {
+  return [
+    { id: 'resolve-target-file', label: 'Resolve target file', status: 'pending' },
+    { id: 'read-local-code', label: 'Read local code', status: 'pending' },
+    { id: 'scan-crm-references', label: 'Scan CRM references', status: 'pending' },
+    { id: 'connect-primarch-mcp', label: 'Connect to Primarch MCP', status: 'pending' },
+    { id: 'inspect-dataverse', label: 'Inspect targeted Dataverse metadata', status: 'pending' },
+    { id: 'build-report', label: 'Build verification report', status: 'pending' },
+    { id: 'done', label: 'Done', status: 'pending' },
+  ];
+}
+
+function setStepStatus(
+  steps: PrimarchVerifyStep[],
+  stepId: string,
+  status: PrimarchVerifyStep['status'],
+  detail?: string,
+): PrimarchVerifyStep[] {
+  return steps.map((step) => (
+    step.id === stepId ? { ...step, status, detail } : step
+  ));
+}
+
+function summarizeVerifications(issues: CrmVerificationReport['issues'], verdict: CrmVerificationReport['verdict']): string {
+  const errorCount = issues.filter((i) => i.severity === 'error').length;
+  const warningCount = issues.filter((i) => i.severity === 'warning').length;
+  const suggestionCount = issues.filter((i) => i.severity === 'suggestion').length;
+  switch (verdict) {
+    case 'pass':
+      return 'This code is consistent with the inspected Dataverse metadata. No missing logical names were found.';
+    case 'warnings':
+      return 'This code is mostly consistent with Dataverse metadata, but some references could not be fully verified.';
+    case 'fail':
+      return `This code has Dataverse metadata issues and may not match this environment. ${errorCount} errors and ${warningCount} warnings were found.`;
+    case 'not_configured':
+      return 'CRM metadata verification is not configured. Enable Primarch MCP in Settings.';
+    case 'error':
+    default:
+      return `Verification could not be completed. ${errorCount} errors, ${warningCount} warnings, ${suggestionCount} suggestions.`;
+  }
 }
 
 // Bilingual analysis block
@@ -258,7 +383,7 @@ function PlanningSection({ task }: PlanningSectionProps) {
         )}
         {isMismatch && suggested && (
           <span className="detail-planning-suggestion" title="Auto-suggestion differs from manual choice">
-            â†’ suggested: {BUCKET_META[suggested].label}
+            {'->'} suggested: {BUCKET_META[suggested].label}
           </span>
         )}
       </div>
@@ -276,6 +401,237 @@ function PlanningSection({ task }: PlanningSectionProps) {
       )}
     </div>
   );
+}
+
+// ¦¦ Workflow summary helpers ¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦
+
+type CheckStatus = 'done' | 'partial' | 'pending' | 'active' | 'skip';
+
+interface CheckRow { label: string; status: CheckStatus; }
+
+// Maps checklist row labels to MCP override keys
+const CHECKLIST_KEY_MAP: Record<string, string> = {
+  'Task analyzed':        'task-analyzed',
+  'Setup confirmed':      'setup-confirmed',
+  'CRM metadata verified':'crm-metadata-verified',
+  'Technical plan':       'technical-plan-ready',
+  'Implementation':       'implementation-done',
+  'Local test':           'local-test-done',
+  'Consultant testing':   'consultant-testing',
+  'Pull request':         'pull-request',
+  'Code review':          'code-review',
+  'Done':                 'done',
+};
+
+function buildWorkflowChecklist(task: Task, effectiveMode: string): CheckRow[] {
+  const overrides = task.mcpChecklistOverrides ?? {};
+  const applyOverride = (label: string, derived: CheckStatus): CheckStatus => {
+    const key = CHECKLIST_KEY_MAP[label];
+    return key && overrides[key] ? (overrides[key] as CheckStatus) : derived;
+  };
+
+  if (effectiveMode !== 'developer') {
+    const rows: CheckRow[] = [
+      { label: 'Task analyzed', status: (!!task.analysisResult || task.status !== 'new') ? 'done' : 'pending' },
+      { label: 'Done',          status: task.status === 'done' ? 'done' : 'pending' },
+    ];
+    return rows.map((r) => ({ ...r, status: applyOverride(r.label, r.status) }));
+  }
+  const wf  = task.crmDeveloperWorkflow;
+  const ver = task.crmVerificationReports?.[0];
+  const verOk            = !!ver && (ver.verdict === 'pass' || ver.verdict === 'warnings');
+  const verFail          = ver?.verdict === 'fail';
+  const planApproved     = !!(wf?.planApproval?.approved && !wf.planApproval.invalidatedAt);
+  const diffApproved     = !!(wf?.diffApproval?.approved && !wf.diffApproval.invalidatedAt);
+  const consultantDone   = !!(wf?.externalExecution?.completed && !wf.externalExecution.invalidatedAt)
+                         || task.consultantTestRecord?.status === 'confirmed';
+  const prTracked        = !!(wf?.pullRequestTracking?.createdManually && !wf.pullRequestTracking.invalidatedAt);
+  const reviewDone       = !!(wf?.pullRequestReview && !wf.pullRequestReview.invalidatedAt);
+  const reviewNeedsAttention = !!wf?.pullRequestReview?.attentionRequired;
+  const isInProgress     = task.status === 'in-progress';
+  const isTesting        = task.waitingState === 'consultant-testing';
+  const isReview         = task.status === 'ready-for-review';
+  const isDone           = task.status === 'done';
+
+  // Local test status from MCP record
+  const localTestSt = task.localTestRecord?.status;
+  const localTestDerived: CheckStatus =
+    localTestSt === 'passed'     ? 'done'    :
+    localTestSt === 'failed'     ? 'partial' :
+    localTestSt === 'not-needed' ? 'skip'    : 'pending';
+
+  // Consultant test status (also updated via MCP record_consultant_testing)
+  const consultantTestNotNeeded = task.consultantTestRecord?.status === 'not-needed';
+  const consultantDerived: CheckStatus =
+    consultantDone                  ? 'done'   :
+    isTesting                       ? 'active' :
+    consultantTestNotNeeded         ? 'skip'   : 'skip';
+
+  const rows: CheckRow[] = [
+    { label: 'Task analyzed',        status: (!!task.analysisResult || task.status !== 'new') ? 'done' : 'pending' },
+    { label: 'Setup confirmed',      status: !!task.workflowSetup?.confirmedAt ? 'done' : 'pending' },
+    { label: 'CRM metadata verified',status: verFail ? 'partial' : verOk ? 'done' : 'pending' },
+    { label: 'Technical plan',       status: planApproved ? 'done' : wf?.technicalPlan ? 'partial' : 'pending' },
+    { label: 'Implementation',       status: diffApproved ? 'done' : (isInProgress && !isTesting) ? 'active' : 'pending' },
+    { label: 'Local test',           status: localTestDerived },
+    { label: 'Consultant testing',   status: consultantDerived },
+    { label: 'Pull request',         status: prTracked ? 'done' : isReview ? 'active' : 'pending' },
+    { label: 'Code review',          status: reviewDone ? (reviewNeedsAttention ? 'partial' : 'done') : 'pending' },
+    { label: 'Done',                 status: isDone ? 'done' : 'pending' },
+  ];
+  return rows.map((r) => ({ ...r, status: applyOverride(r.label, r.status) }));
+}
+
+function deriveNextStep(task: Task, plan: TaskWorkflowPlan, effectiveMode: string): { action: string; why: string } | null {
+  if (task.status === 'done') return null;
+
+  // MCP-provided next step takes priority over the heuristic when present and non-empty.
+  const mcp = task.mcpNextStep;
+  if (mcp?.action?.trim()) {
+    return { action: mcp.action.trim(), why: mcp.reason?.trim() ?? '' };
+  }
+
+  if (task.status === 'new') {
+    if (plan.isDeveloperAwaitingSetup)
+      return { action: 'Confirm developer setup', why: 'Choose plugin or script target before analysis.' };
+    return { action: 'Analyze task', why: 'Run AI analysis to understand the assignment.' };
+  }
+
+  if (task.status === 'analyzed') {
+    if (effectiveMode === 'general')
+      return { action: 'Mark as done when ready', why: 'Task analyzed. Continue manually and mark done.' };
+    if (plan.isDeveloperAwaitingSetup)
+      return { action: 'Confirm developer setup', why: 'Plugin or script target must be confirmed.' };
+    const ver = task.crmVerificationReports?.[0];
+    if (!ver)
+      return { action: 'Verify Dataverse metadata', why: 'CRM metadata not yet verified for this task.' };
+    const wf = task.crmDeveloperWorkflow;
+    if (!wf?.technicalPlan)
+      return { action: 'Generate technical plan', why: 'No technical plan yet. Generate one in the workflow details below.' };
+    if (!wf.planApproval?.approved || wf.planApproval.invalidatedAt)
+      return { action: 'Approve technical plan', why: 'Technical plan needs approval before development starts.' };
+    return { action: 'Start development', why: 'Plan approved. Begin implementation.' };
+  }
+
+  if (task.status === 'in-progress') {
+    if (task.waitingState === 'consultant-testing')
+      return { action: 'Awaiting consultant testing', why: 'Waiting for the tester to verify the change.' };
+    const wf = task.crmDeveloperWorkflow;
+    if (!wf?.diffApproval?.approved || wf.diffApproval.invalidatedAt)
+      return { action: 'Review implementation diff', why: 'Diff review not yet completed in the workflow details.' };
+    if (!wf?.pullRequestProposal || wf.pullRequestProposal.invalidatedAt)
+      return { action: 'Generate PR proposal', why: 'PR proposal not yet generated.' };
+    return { action: 'Mark ready for code review', why: 'Development complete. Create PR and move to review.' };
+  }
+
+  if (task.status === 'ready-for-review') {
+    if (task.attentionState === 'pr-comments')
+      return { action: 'Address PR comments', why: 'Active PR comments need to be resolved.' };
+    const wf = task.crmDeveloperWorkflow;
+    if (!wf?.pullRequestTracking?.createdManually)
+      return { action: 'Track created pull request', why: 'Record the PR URL after creating it manually.' };
+    if (wf?.pullRequestReview?.attentionRequired)
+      return { action: 'Address review feedback', why: 'PR review has items that require attention.' };
+    return { action: 'Mark as done when ready', why: 'Code review in progress. Mark done when approved.' };
+  }
+
+  return null;
+}
+
+/**
+ * Appends a timestamped activity note line to the task's notes string.
+ * Format: `[ISO-timestamp] body` — matched by the activity formatter.
+ */
+function appendActivityNote(existing: string | undefined, body: string): string {
+  const line = `[${new Date().toISOString()}] ${body}`;
+  return existing?.trim() ? `${existing.trim()}\n${line}` : line;
+}
+
+/**
+ * Resolves a repo-root candidate to an absolute path.
+ *
+ * - If the candidate is already absolute (starts with a drive letter, `\\`, or `/`) → returned as-is.
+ * - If the candidate looks like a bare folder name (e.g. "VSK-Test") → joined with `crmBase`.
+ * - If neither gives an absolute result → returns `undefined` so the caller falls through.
+ *
+ * This prevents bare folder names stored in customer/task state from being passed directly
+ * to Rust git commands, which would fail with "Repository path not found: VSK-Test".
+ */
+function resolveToAbsRepoPath(
+  candidate: string | null | undefined,
+  crmBase: string | undefined,
+): string | undefined {
+  const p = candidate?.trim();
+  if (!p) return undefined;
+  // Already absolute: Windows "C:\..." / UNC "\\..." or Unix "/"
+  if (/^[a-zA-Z]:[\\/]/.test(p) || p.startsWith('/') || p.startsWith('\\\\')) {
+    return p;
+  }
+  // Bare/relative name — resolve against the CRM base directory
+  const base = crmBase?.replace(/[\\/]+$/, '').trim();
+  if (base) return `${base}/${p}`;
+  // No base available — discard rather than pass a relative path to git
+  return undefined;
+}
+
+/**
+ * Derives an Azure DevOps repository URL from a work-item URL by replacing
+ * `/_workitems/edit/{id}` with `/_git/{repositoryName}`.
+ *
+ * Returns `null` when the input is not a valid ADO work-item URL or repositoryName is empty.
+ *
+ * @example
+ * deriveAzureDevOpsRepoUrlFromWorkItemUrl(
+ *   "https://dev.azure.com/Ptacek-velkoobchod/CRM/_workitems/edit/10277/",
+ *   "CRM_Code"
+ * )
+ * // → "https://dev.azure.com/Ptacek-velkoobchod/CRM/_git/CRM_Code"
+ */
+function deriveAzureDevOpsRepoUrlFromWorkItemUrl(
+  workItemUrl: string,
+  repositoryName: string,
+): string | null {
+  if (!workItemUrl.startsWith('https://dev.azure.com/')) return null;
+  if (!repositoryName.trim()) return null;
+  const m = /^(https:\/\/dev\.azure\.com\/[^/]+\/[^/]+)\/_workitems\/edit\//.exec(workItemUrl);
+  if (!m) return null;
+  return `${m[1]}/_git/${repositoryName.trim()}`;
+}
+
+type AzureDevOpsResolution =
+  | { kind: 'repo';      url: string }
+  | { kind: 'work-item'; url: string }   // fallback — not a repo URL, clearly labelled
+  | null;
+
+/**
+ * Resolves the best Azure DevOps URL for opening after testing confirmation.
+ *
+ * Priority:
+ *   A. customer.azureDevOpsRepoUrl — explicit repo URL
+ *   B. Derived from task.devopsTaskUrl + customer.repositoryName → /_git/{repo}
+ *   C. task.devopsTaskUrl itself — work-item fallback (opened if no repo URL)
+ */
+function buildAzureDevOpsRepoUrl(
+  task: { devopsTaskUrl?: string },
+  customer: { azureDevOpsRepoUrl?: string; repositoryName?: string } | null,
+): AzureDevOpsResolution {
+  // A. Explicit repo URL
+  const explicit = customer?.azureDevOpsRepoUrl?.trim();
+  if (explicit?.startsWith('https://dev.azure.com/')) {
+    return { kind: 'repo', url: explicit };
+  }
+  // B. Derived from work-item URL + repositoryName
+  const workItemUrl = task.devopsTaskUrl;
+  const repoName = customer?.repositoryName;
+  if (workItemUrl && repoName) {
+    const derived = deriveAzureDevOpsRepoUrlFromWorkItemUrl(workItemUrl, repoName);
+    if (derived) return { kind: 'repo', url: derived };
+  }
+  // C. Work-item URL fallback
+  if (workItemUrl?.startsWith('https://dev.azure.com/')) {
+    return { kind: 'work-item', url: workItemUrl };
+  }
+  return null;
 }
 
 export default function TaskDetail({ task, onClose }: TaskDetailProps) {
@@ -312,8 +668,29 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
 
   // Container directory for plugin project subfolders.
   const pluginsDir = getPluginsDir(customer, crmFolderPath);
-  // Root used for git operations (branch switching).
-  const repoRootForGit = customer?.resolvedRepositoryPath ?? customer?.repositoryRoot;
+  // Root used for git operations (branch switching, commit preview).
+  //
+  // Resolution priority:
+  //   A. task.workflowSetup.repositoryRoot  — explicit task config
+  //   B. customer.resolvedRepositoryPath    — computed by rescanRepositories (absolute)
+  //   C. customer.repositoryRoot            — explicit customer config
+  //   D. crmFolderPath                      — settings.crmBaseDirectory + customer.folderName
+  //   E. parent(pluginsDir)                 — inferred from plugin folder path
+  //
+  // All candidates pass through resolveToAbsRepoPath so that bare folder names
+  // like "VSK-Test" are resolved against crmBaseDirectory rather than used as-is.
+  const crmBase = settings?.crmBaseDirectory;
+  const repoRootForGit: string | undefined =
+    resolveToAbsRepoPath(task.workflowSetup?.repositoryRoot, crmBase)
+    ?? resolveToAbsRepoPath(customer?.resolvedRepositoryPath, crmBase)
+    ?? resolveToAbsRepoPath(customer?.repositoryRoot, crmBase)
+    ?? crmFolderPath   // already absolute when both crmBaseDirectory and folderName are set
+    ?? (() => {
+      if (!pluginsDir) return undefined;
+      const norm = pluginsDir.replace(/[\\/]+$/, '').replace(/\\/g, '/');
+      const idx = norm.lastIndexOf('/');
+      return idx > 0 ? norm.slice(0, idx) : undefined;
+    })();
 
   // Inline feedback message (e.g. "Analysis recorded")
   const [feedback, setFeedback] = useState<string | null>(null);
@@ -323,6 +700,20 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
   const [aiError, setAiError]   = useState<string | null>(null);
   // Which AI action is currently running
   const [aiLoading, setAiLoading] = useState<AiAction | null>(null);
+  // Which Primarch action is currently running
+  const [primarchActionLoading, setPrimarchActionLoading] = useState<PrimarchAction | null>(null);
+  const [crmWorkflowSaving, setCrmWorkflowSaving] = useState(false);
+  const [crmTechnicalPlanGenerating, setCrmTechnicalPlanGenerating] = useState(false);
+  const [crmPlanApprovalSaving, setCrmPlanApprovalSaving] = useState(false);
+  const [crmDiffApprovalSaving, setCrmDiffApprovalSaving] = useState(false);
+  const [crmExternalActionApprovalSaving, setCrmExternalActionApprovalSaving] = useState(false);
+  const [crmExternalExecutionSaving, setCrmExternalExecutionSaving] = useState(false);
+  const [crmPullRequestSaving, setCrmPullRequestSaving] = useState(false);
+  const [crmPullRequestReviewSaving, setCrmPullRequestReviewSaving] = useState(false);
+  const [crmPullRequestReviewAnalysisSaving, setCrmPullRequestReviewAnalysisSaving] = useState(false);
+  const [crmPullRequestFixProposalSaving, setCrmPullRequestFixProposalSaving] = useState(false);
+  const [crmPullRequestFixUpdateSaving, setCrmPullRequestFixUpdateSaving] = useState(false);
+  const [crmExecutionPreview, setCrmExecutionPreview] = useState<CrmExternalExecutionPreview | null>(null);
   // Confirm setup modal (shown for New tasks before Analyze)
   const [showSetupModal, setShowSetupModal] = useState(false);
   // Draft (plugin skeleton or script preview)
@@ -330,6 +721,26 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
   const [skeletonPreview, setSkeletonPreview] = useState<SkeletonPreview | null>(null);
   // Create Plugin Project modal
   const [showCreatePlugin, setShowCreatePlugin] = useState(false);
+  // Start Development modal
+  const [showStartDevModal, setShowStartDevModal] = useState(false);
+  // Testing actions modal
+  const [showTestingActionsModal, setShowTestingActionsModal] = useState(false);
+  // Git commit modal
+  const [showGitCommitModal, setShowGitCommitModal] = useState(false);
+  // When true, GitCommitModal was opened from the Testing → Prepare commit guided flow
+  const [gitCommitGuidedMode, setGitCommitGuidedMode] = useState(false);
+  // Implementation Verification modal
+  const [showImplVerifyModal,    setShowImplVerifyModal]    = useState(false);
+  const [implVerifyBuildRunning, setImplVerifyBuildRunning] = useState(false);
+  const [implVerifyDvRunning,    setImplVerifyDvRunning]    = useState(false);
+  const [implVerifyAiRunning,    setImplVerifyAiRunning]    = useState(false);
+  // Resolved artifact path shown in the modal (explicit or inferred).
+  const [modalArtifactPath,      setModalArtifactPath]      = useState<string | null>(null);
+  const [modalArtifactInferred,  setModalArtifactInferred]  = useState(false);
+  // Post-save action pending after skeleton preview confirmation (set by guided "Create + Save Draft + Open" flow).
+  const [pendingPostSaveAction, setPendingPostSaveAction] = useState<'save-draft-open' | null>(null);
+  // True when the guided flow auto-generated a technical plan (not approved) for the current skeleton preview.
+  const [skeletonUsedAutoGeneratedPlan, setSkeletonUsedAutoGeneratedPlan] = useState(false);
   // Plugin project folder names loaded when the Create Plugin Project modal opens.
   // Used to improve naming-convention auto-suggestions inside the modal.
   const [pluginProjectsForModal, setPluginProjectsForModal] = useState<string[]>([]);
@@ -346,19 +757,737 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
   const [notes, setNotes] = useState(task.notes ?? '');
   // Keep notes in sync when task changes (e.g. different task selected)
   useEffect(() => { setNotes(task.notes ?? ''); }, [task.id, task.notes]);
-  // Clear script draft path when switching tasks.
-  useEffect(() => { setScriptDraftPath(null); }, [task.id]);
+  // Clear script draft path, pending post-save action, plan-warning flag, and impl verify state when switching tasks.
+  useEffect(() => {
+    setScriptDraftPath(null);
+    setPendingPostSaveAction(null);
+    setSkeletonUsedAutoGeneratedPlan(false);
+    setShowImplVerifyModal(false);
+    setImplVerifyBuildRunning(false);
+    setImplVerifyDvRunning(false);
+    setImplVerifyAiRunning(false);
+    setModalArtifactPath(task.workflowSetup?.artifactPath ?? null);
+    setModalArtifactInferred(false);
+  }, [task.id]);
   // AI Code Review — modal state for viewing a saved review
   const [showSavedReviewModal, setShowSavedReviewModal] = useState(false);
+  const [showCrmSkeletonModal, setShowCrmSkeletonModal] = useState(false);
+  const [showCrmVerificationModal, setShowCrmVerificationModal] = useState(false);
+  const [showPrimarchVerifyModal, setShowPrimarchVerifyModal] = useState(false);
+  const [showAdvancedWorkflow, setShowAdvancedWorkflow]       = useState(false);
+  const [showPhaseActions, setShowPhaseActions]               = useState(false);
+  const [primarchVerifySteps, setPrimarchVerifySteps] = useState<PrimarchVerifyStep[]>(createPrimarchVerifySteps());
+  const [primarchVerifyResult, setPrimarchVerifyResult] = useState<CrmVerificationReport | null>(null);
+  const [primarchVerifyError, setPrimarchVerifyError] = useState<string | null>(null);
+  const [primarchVerifyFilePath, setPrimarchVerifyFilePath] = useState<string>('');
+  const [primarchPrimaryEntityOverride, setPrimarchPrimaryEntityOverride] = useState<string>(
+    task.workflowSetup?.primaryEntityLogicalName
+      ?? task.scriptAnalysis?.entityLogicalName
+      ?? '',
+  );
   const latestReview = task.aiFileReviews?.[0];
+  const latestCrmSkeleton = task.crmSkeletons?.[0];
+  const latestCrmVerification = task.crmVerificationReports?.[0];
   const isCreateIntent = task.workflowSetup?.workIntent === 'create';
   const isPluginCreate = isCreateIntent && devTarget.kind === 'plugin';
+  const primarchActionBusyRef = useRef(false);
+  const primarchVerifyIgnoreResultRef = useRef(false);
+  const primarchVerifyRunIdRef = useRef(0);
+
+  useEffect(() => {
+    setPrimarchActionLoading(null);
+    setShowPrimarchVerifyModal(false);
+    setPrimarchVerifySteps(createPrimarchVerifySteps());
+    setPrimarchVerifyResult(null);
+    setPrimarchVerifyError(null);
+    setPrimarchVerifyFilePath('');
+    setPrimarchPrimaryEntityOverride(task.workflowSetup?.primaryEntityLogicalName ?? task.scriptAnalysis?.entityLogicalName ?? '');
+    primarchActionBusyRef.current = false;
+    primarchVerifyIgnoreResultRef.current = false;
+    primarchVerifyRunIdRef.current += 1;
+  }, [task.id]);
 
   // Persists a new AI review result on the task (newest first, capped at 5).
   async function handleReviewSaved(review: AiFileReviewResult) {
     const existing = task.aiFileReviews ?? [];
     const updated = [review, ...existing].slice(0, 5);
     await updateTask(task.id, { aiFileReviews: updated });
+  }
+
+  async function handleSaveCrmDeveloperWorkflowState() {
+    setCrmWorkflowSaving(true);
+    try {
+      await updateTask(task.id, {
+        crmDeveloperWorkflow: buildCrmDeveloperWorkflowStateSnapshot(task),
+      });
+      setFeedback('CRM workflow diagnosis state saved locally.');
+    } catch (e) {
+      setAiError(String(e));
+    } finally {
+      setCrmWorkflowSaving(false);
+    }
+  }
+
+  async function handleGenerateCrmTechnicalPlan() {
+    setCrmTechnicalPlanGenerating(true);
+    try {
+      const generatedAt = new Date().toISOString();
+      const plan = buildCrmTechnicalImplementationPlan(task, generatedAt);
+      await updateTask(task.id, {
+        crmDeveloperWorkflow: buildCrmDeveloperWorkflowStateAfterTechnicalPlan(task, plan, generatedAt),
+      });
+      setFeedback('Draft CRM technical implementation plan saved locally.');
+    } catch (e) {
+      setAiError(String(e));
+    } finally {
+      setCrmTechnicalPlanGenerating(false);
+    }
+  }
+
+  async function handleApproveCrmTechnicalPlan() {
+    if (!task.crmDeveloperWorkflow?.technicalPlan) {
+      setAiError('Generate a CRM technical implementation plan before approving it.');
+      return;
+    }
+
+    setCrmPlanApprovalSaving(true);
+    try {
+      await updateTask(task.id, {
+        crmDeveloperWorkflow: buildCrmDeveloperWorkflowStateAfterPlanApproval(task),
+      });
+      setFeedback('CRM technical implementation plan approved locally.');
+    } catch (e) {
+      setAiError(String(e));
+    } finally {
+      setCrmPlanApprovalSaving(false);
+    }
+  }
+
+  async function handleRevokeCrmTechnicalPlanApproval() {
+    setCrmPlanApprovalSaving(true);
+    try {
+      await updateTask(task.id, {
+        crmDeveloperWorkflow: buildCrmDeveloperWorkflowStateAfterPlanApprovalRevoked(task),
+      });
+      setFeedback('CRM technical implementation plan approval revoked locally.');
+    } catch (e) {
+      setAiError(String(e));
+    } finally {
+      setCrmPlanApprovalSaving(false);
+    }
+  }
+
+  async function handleApproveCrmDiffReview() {
+    const diffStatus = getCrmDiffReviewStatus(task);
+    if (!diffStatus.approvable) {
+      setAiError(`CRM diff approval is not ready: ${diffStatus.reason}`);
+      return;
+    }
+
+    setCrmDiffApprovalSaving(true);
+    try {
+      await updateTask(task.id, {
+        crmDeveloperWorkflow: buildCrmDeveloperWorkflowStateAfterDiffApproval(task),
+      });
+      setFeedback(diffStatus.warnings.length > 0
+        ? 'CRM diff approved locally with warnings.'
+        : 'CRM diff approved locally.');
+    } catch (e) {
+      setAiError(String(e));
+    } finally {
+      setCrmDiffApprovalSaving(false);
+    }
+  }
+
+  async function handleRevokeCrmDiffReviewApproval() {
+    setCrmDiffApprovalSaving(true);
+    try {
+      await updateTask(task.id, {
+        crmDeveloperWorkflow: buildCrmDeveloperWorkflowStateAfterDiffApprovalRevoked(task),
+      });
+      setFeedback('CRM diff approval revoked locally.');
+    } catch (e) {
+      setAiError(String(e));
+    } finally {
+      setCrmDiffApprovalSaving(false);
+    }
+  }
+
+  async function handleApproveCrmExternalActionPlan() {
+    const externalStatus = getCrmExternalActionApprovalStatus(task);
+    if (!externalStatus.approvable) {
+      setAiError(`CRM external action approval is not ready: ${externalStatus.reason}`);
+      return;
+    }
+
+    setCrmExternalActionApprovalSaving(true);
+    try {
+      await updateTask(task.id, {
+        crmDeveloperWorkflow: buildCrmDeveloperWorkflowStateAfterExternalActionApproval(task),
+      });
+      setFeedback(externalStatus.warnings.length > 0
+        ? 'CRM external action plan approved locally with warnings.'
+        : 'CRM external action plan approved locally.');
+    } catch (e) {
+      setAiError(String(e));
+    } finally {
+      setCrmExternalActionApprovalSaving(false);
+    }
+  }
+
+  async function handleRevokeCrmExternalActionApproval() {
+    setCrmExternalActionApprovalSaving(true);
+    try {
+      await updateTask(task.id, {
+        crmDeveloperWorkflow: buildCrmDeveloperWorkflowStateAfterExternalActionApprovalRevoked(task),
+      });
+      setFeedback('CRM external action approval revoked locally.');
+    } catch (e) {
+      setAiError(String(e));
+    } finally {
+      setCrmExternalActionApprovalSaving(false);
+    }
+  }
+
+  function handleOpenCrmExecutionPreview() {
+    if (!getCrmExternalActionApprovalStatus(task).approved) return;
+    setCrmExecutionPreview(buildCrmExternalExecutionPreview(task, new Date().toISOString()));
+  }
+
+  async function handleMarkExternalExecutionCompleted(notes: string) {
+    const status = getCrmExternalExecutionStatus(task);
+    if (!status.completable) {
+      setAiError(`Cannot record manual completion: ${status.reason}`);
+      return;
+    }
+    if (!notes.trim()) {
+      setAiError('A completion note is required before marking external actions as completed.');
+      return;
+    }
+    setCrmExternalExecutionSaving(true);
+    try {
+      await updateTask(task.id, {
+        crmDeveloperWorkflow: buildCrmDeveloperWorkflowStateAfterExternalExecutionCompleted(
+          task,
+          notes.trim(),
+          new Date().toISOString(),
+        ),
+      });
+      setFeedback('External action completion recorded locally.');
+    } catch (e) {
+      setAiError(String(e));
+    } finally {
+      setCrmExternalExecutionSaving(false);
+    }
+  }
+
+  async function handleRevokeExternalExecution() {
+    setCrmExternalExecutionSaving(true);
+    try {
+      await updateTask(task.id, {
+        crmDeveloperWorkflow: buildCrmDeveloperWorkflowStateAfterExternalExecutionRevoked(
+          task,
+          new Date().toISOString(),
+        ),
+      });
+      setFeedback('External action completion record revoked.');
+    } catch (e) {
+      setAiError(String(e));
+    } finally {
+      setCrmExternalExecutionSaving(false);
+    }
+  }
+
+  async function handleGenerateCrmPullRequestProposal() {
+    const status = getCrmPullRequestProposalStatus(task);
+    if (!status.generatable) {
+      setAiError(`CRM pull request proposal is not ready: ${status.reason}`);
+      return;
+    }
+
+    setCrmPullRequestSaving(true);
+    try {
+      const generatedAt = new Date().toISOString();
+      const proposal = buildCrmPullRequestProposal(task, generatedAt);
+      await updateTask(task.id, {
+        crmDeveloperWorkflow: buildCrmDeveloperWorkflowStateAfterPullRequestProposal(task, proposal, generatedAt),
+      });
+      setFeedback(status.warnings.length > 0
+        ? 'CRM pull request proposal generated locally with warnings.'
+        : 'CRM pull request proposal generated locally.');
+    } catch (e) {
+      setAiError(String(e));
+    } finally {
+      setCrmPullRequestSaving(false);
+    }
+  }
+
+  async function handleMarkCrmPullRequestCreatedManually(prUrl: string, notes: string) {
+    const status = getCrmPullRequestTrackingStatus(task);
+    if (!status.trackable) {
+      setAiError(`Cannot record manual PR tracking: ${status.reason}`);
+      return;
+    }
+    if (!prUrl.trim() && !notes.trim()) {
+      setAiError('A PR URL or note is required before recording manual PR tracking.');
+      return;
+    }
+
+    setCrmPullRequestSaving(true);
+    try {
+      const now = new Date().toISOString();
+      await updateTask(task.id, {
+        crmDeveloperWorkflow: buildCrmDeveloperWorkflowStateAfterManualPullRequestTracked(
+          task,
+          prUrl.trim() || undefined,
+          notes.trim() || undefined,
+          now,
+        ),
+      });
+      setFeedback('Manual pull request tracking recorded locally.');
+    } catch (e) {
+      setAiError(String(e));
+    } finally {
+      setCrmPullRequestSaving(false);
+    }
+  }
+
+  async function handleRevokeCrmPullRequestTracking() {
+    setCrmPullRequestSaving(true);
+    try {
+      await updateTask(task.id, {
+        crmDeveloperWorkflow: buildCrmDeveloperWorkflowStateAfterManualPullRequestTrackingRevoked(
+          task,
+          new Date().toISOString(),
+        ),
+      });
+      setFeedback('Manual pull request tracking revoked locally.');
+    } catch (e) {
+      setAiError(String(e));
+    } finally {
+      setCrmPullRequestSaving(false);
+    }
+  }
+
+  async function handleFetchCrmPullRequestReviewStatus() {
+    const status = getCrmPullRequestReviewStatus(task);
+    if (!status.fetchable) {
+      setAiError(`Cannot fetch PR review status: ${status.reason}`);
+      return;
+    }
+
+    setCrmPullRequestReviewSaving(true);
+    try {
+      const fetchedAt = new Date().toISOString();
+      const prUrl = task.crmDeveloperWorkflow?.pullRequestTracking?.prUrl?.trim() ?? '';
+      const review = status.provider === 'github'
+        ? await fetchCrmGitHubPullRequestReviewIntake(prUrl, fetchedAt)
+        : buildCrmPullRequestReviewIntake(task, fetchedAt);
+      await updateTask(task.id, {
+        crmDeveloperWorkflow: buildCrmDeveloperWorkflowStateAfterPullRequestReviewIntake(task, review, fetchedAt),
+      });
+      setFeedback(status.provider === 'github'
+        ? 'Read-only GitHub PR review snapshot saved locally.'
+        : 'Read-only PR review intake saved locally. Automatic provider fetching is not configured yet.');
+    } catch (e) {
+      setAiError(String(e));
+    } finally {
+      setCrmPullRequestReviewSaving(false);
+    }
+  }
+
+  async function handleGenerateCrmPullRequestReviewAnalysis() {
+    const status = getCrmPullRequestReviewAnalysisStatus(task);
+    if (!status.generatable) {
+      setAiError(`Cannot generate PR review analysis: ${status.reason}`);
+      return;
+    }
+
+    setCrmPullRequestReviewAnalysisSaving(true);
+    try {
+      const generatedAt = new Date().toISOString();
+      const analysis = buildCrmPullRequestReviewAnalysis(task, generatedAt);
+      await updateTask(task.id, {
+        crmDeveloperWorkflow: buildCrmDeveloperWorkflowStateAfterPullRequestReviewAnalysis(
+          task,
+          analysis,
+          generatedAt,
+        ),
+      });
+      setFeedback(analysis.attentionRequired
+        ? 'Local PR review fix plan generated. Attention is needed before responding to the PR.'
+        : 'Local PR review fix plan generated.');
+    } catch (e) {
+      setAiError(String(e));
+    } finally {
+      setCrmPullRequestReviewAnalysisSaving(false);
+    }
+  }
+
+  async function handleGenerateCrmPullRequestFixProposal() {
+    const status = getCrmPullRequestFixProposalStatus(task);
+    if (!status.generatable) {
+      setAiError(`Cannot generate PR fix proposal: ${status.reason}`);
+      return;
+    }
+
+    setCrmPullRequestFixProposalSaving(true);
+    try {
+      const generatedAt = new Date().toISOString();
+      const proposal = buildCrmPullRequestFixProposal(task, generatedAt);
+      await updateTask(task.id, {
+        crmDeveloperWorkflow: buildCrmDeveloperWorkflowStateAfterPullRequestFixProposal(
+          task,
+          proposal,
+          generatedAt,
+        ),
+      });
+      setFeedback(proposal.canGenerateCodeLater
+        ? 'Local PR fix proposal generated. Future code drafting may be possible after approval in a later step.'
+        : 'Local PR fix proposal generated as a manual/conservative plan.');
+    } catch (e) {
+      setAiError(String(e));
+    } finally {
+      setCrmPullRequestFixProposalSaving(false);
+    }
+  }
+
+  async function handleMarkCrmPullRequestFixUpdatedManually(notes: string, commitSha: string, branchName: string) {
+    const status = getCrmPullRequestFixUpdateStatus(task);
+    if (!status.trackable) {
+      setAiError(`Cannot record manual PR fix update: ${status.reason}`);
+      return;
+    }
+    if (!notes.trim() && !commitSha.trim()) {
+      setAiError('A note or commit SHA is required before recording a manual PR fix update.');
+      return;
+    }
+
+    setCrmPullRequestFixUpdateSaving(true);
+    try {
+      const now = new Date().toISOString();
+      const tracking: CrmPullRequestFixUpdateTracking = {
+        updatedManually: true,
+        updatedAt: now,
+        notes: notes.trim() || undefined,
+        commitSha: commitSha.trim() || undefined,
+        branchName: branchName.trim() || undefined,
+        relatedFixProposalGeneratedAt: task.crmDeveloperWorkflow?.pullRequestFixProposal?.generatedAt,
+      };
+      await updateTask(task.id, {
+        crmDeveloperWorkflow: buildCrmDeveloperWorkflowStateAfterManualPullRequestFixUpdated(task, tracking, now),
+      });
+      setFeedback('Manual PR fix update recorded locally. Next recommended step: fetch PR review status again.');
+    } catch (e) {
+      setAiError(String(e));
+    } finally {
+      setCrmPullRequestFixUpdateSaving(false);
+    }
+  }
+
+  async function handleRevokeCrmPullRequestFixUpdateTracking() {
+    setCrmPullRequestFixUpdateSaving(true);
+    try {
+      await updateTask(task.id, {
+        crmDeveloperWorkflow: buildCrmDeveloperWorkflowStateAfterManualPullRequestFixUpdateRevoked(
+          task,
+          new Date().toISOString(),
+        ),
+      });
+      setFeedback('Manual PR fix update tracking revoked locally.');
+    } catch (e) {
+      setAiError(String(e));
+    } finally {
+      setCrmPullRequestFixUpdateSaving(false);
+    }
+  }
+
+  function handleClosePrimarchVerifyModal() {
+    primarchVerifyIgnoreResultRef.current = true;
+    setShowPrimarchVerifyModal(false);
+  }
+
+  async function handleGenerateCrmSkeleton() {
+    if (primarchActionBusyRef.current) {
+      return;
+    }
+    if (effectiveMode !== 'developer') {
+      setAiError('CRM skeleton is available only for developer tasks.');
+      return;
+    }
+    if (!settings.crmMetadataEnabled) {
+      setAiError('CRM metadata assistant is not enabled. Configure it in Settings › CRM Metadata.');
+      return;
+    }
+
+    primarchActionBusyRef.current = true;
+    setPrimarchActionLoading('skeleton');
+    setAiError(null);
+    try {
+      const result = await tauriApi.generateCrmSkeleton(task, customer ?? null, task.workflowSetup);
+      const existing = task.crmSkeletons ?? [];
+      const enriched: CrmSkeletonResult = {
+        ...result,
+        id: result.id ?? `${Date.now()}`,
+        createdAt: result.createdAt ?? new Date().toISOString(),
+      };
+      const updated = [enriched, ...existing].slice(0, 5);
+      await updateTask(task.id, { crmSkeletons: updated });
+      setFeedback('CRM skeleton generated.');
+    } catch (e) {
+      setAiError(String(e));
+    } finally {
+      primarchActionBusyRef.current = false;
+      setPrimarchActionLoading(null);
+    }
+  }
+
+  async function handleVerifyAgainstCrm() {
+    if (primarchActionBusyRef.current) {
+      return;
+    }
+    if (effectiveMode !== 'developer') {
+      setAiError('CRM verification is available only for developer tasks.');
+      return;
+    }
+    if (
+      !settings.crmMetadataEnabled
+      || !(settings.primarchMcpCommand ?? '').trim()
+      || !(settings.primarchMcpArgs ?? '').trim()
+    ) {
+      setAiError('CRM metadata assistant is not configured. Open Settings › CRM Metadata, enable assistant, configure MCP command/args, and save settings.');
+      return;
+    }
+
+    const primaryEntityOverride = primarchPrimaryEntityOverride.trim() || undefined;
+
+    primarchActionBusyRef.current = true;
+    primarchVerifyIgnoreResultRef.current = false;
+    primarchVerifyRunIdRef.current += 1;
+    const runId = primarchVerifyRunIdRef.current;
+
+    setPrimarchActionLoading('verify');
+    setPrimarchVerifyError(null);
+    setPrimarchVerifyResult(null);
+    setPrimarchVerifyFilePath('');
+    setPrimarchVerifySteps(createPrimarchVerifySteps());
+    setShowPrimarchVerifyModal(true);
+
+    const yieldToUi = () => new Promise<void>((resolve) => window.setTimeout(resolve, 0));
+
+    window.setTimeout(() => {
+      void (async () => {
+        let currentFilePath = '';
+        let localScan: CrmReferenceScanResult = {
+          entities: [],
+          attributes: {},
+          ambiguousAttributes: [],
+          notes: [],
+          entityReferences: [],
+          attributeReferences: [],
+          relationshipReferences: [],
+          ambiguousReferences: [],
+        };
+
+        try {
+          await yieldToUi();
+          if (runId !== primarchVerifyRunIdRef.current || primarchVerifyIgnoreResultRef.current) return;
+
+          setPrimarchVerifySteps((prev) => setStepStatus(prev, 'resolve-target-file', 'running'));
+
+          const configuredPath = task.workflowSetup?.artifactPath
+            ?? task.workflowSetup?.scriptPath
+            ?? '';
+          currentFilePath = configuredPath;
+
+          if (!currentFilePath) {
+            const basePath =
+              task.workflowSetup?.repositoryRoot
+              ?? customer?.resolvedRepositoryPath
+              ?? customer?.repositoryRoot
+              ?? effectiveVscodePath
+              ?? '';
+            if (basePath) {
+              currentFilePath = await tauriApi.inferReviewFilePath(
+                basePath,
+                devTarget.kind === 'plugin' ? 'plugin' : 'script',
+                task.workflowSetup?.pluginProject ?? '',
+                task.title,
+              ).catch(() => '');
+            }
+          }
+
+          if (!currentFilePath) {
+            throw new Error('No file available for CRM verification. Configure artifact/script path first.');
+          }
+
+          setPrimarchVerifyFilePath(currentFilePath);
+          setPrimarchVerifySteps((prev) => setStepStatus(prev, 'resolve-target-file', 'done', currentFilePath));
+
+          await yieldToUi();
+          if (runId !== primarchVerifyRunIdRef.current || primarchVerifyIgnoreResultRef.current) return;
+
+          setPrimarchVerifySteps((prev) => setStepStatus(prev, 'read-local-code', 'running', 'Reading source file...'));
+          const content = await tauriApi.readFileContent(currentFilePath);
+          setPrimarchVerifySteps((prev) => setStepStatus(prev, 'read-local-code', 'done', `Read ${content.length.toLocaleString()} characters.`));
+
+          await yieldToUi();
+          if (runId !== primarchVerifyRunIdRef.current || primarchVerifyIgnoreResultRef.current) return;
+
+          setPrimarchVerifySteps((prev) => setStepStatus(prev, 'scan-crm-references', 'running', 'Scanning CRM references...'));
+          const lower = currentFilePath.toLowerCase();
+          const fallbackEntity = task.scriptAnalysis?.entityLogicalName;
+          localScan = lower.endsWith('.cs')
+            ? scanCSharpCrmReferences(content, primaryEntityOverride)
+            : scanJavaScriptCrmReferences(content, fallbackEntity, currentFilePath);
+          const localReferenceCount = localScan.entityReferences.length
+            + localScan.attributeReferences.length
+            + localScan.relationshipReferences.length
+            + localScan.ambiguousReferences.length;
+          const entitySummary = localScan.entities.length ? localScan.entities.join(', ') : 'no explicit entities';
+          const entityAttrSummary = Object.entries(localScan.attributes)
+            .filter(([, attrs]) => attrs.length > 0)
+            .map(([e, attrs]) => `${e}(${attrs.length})`)
+            .join(', ');
+          const ambiguousAttrCount = localScan.ambiguousAttributes.length;
+          const primaryEntityNote = localScan.notes.find((note) =>
+            note.startsWith('Primary form entity:') || note.startsWith('Primary plugin entity:'),
+          );
+          const primarySource = localScan.pluginContext?.primaryEntitySource
+            ?? (primaryEntityNote ? 'inferred' : 'unknown');
+          const scanDetail = [
+            primaryEntityNote ?? '',
+            `Primary entity source: ${primarySource.replace(/_/g, ' ')}.`,
+            `Found ${localReferenceCount} references. Entities: ${entitySummary}.`,
+            entityAttrSummary ? `Attributes by entity: ${entityAttrSummary}.` : '',
+            ambiguousAttrCount > 0 ? `${ambiguousAttrCount} ambiguous attribute(s) could not be bound to a specific entity.` : '',
+          ].filter(Boolean).join(' ');
+          setPrimarchVerifySteps((prev) => setStepStatus(
+            prev,
+            'scan-crm-references',
+            'done',
+            scanDetail,
+          ));
+
+          await yieldToUi();
+          if (runId !== primarchVerifyRunIdRef.current || primarchVerifyIgnoreResultRef.current) return;
+
+          setPrimarchVerifySteps((prev) => setStepStatus(prev, 'connect-primarch-mcp', 'running', 'Connecting to Primarch MCP...'));
+          setPrimarchVerifySteps((prev) => setStepStatus(prev, 'inspect-dataverse', 'running', 'Inspecting targeted Dataverse metadata...'));
+
+          const report = await tauriApi.verifyAgainstCrm(
+            task,
+            customer ?? null,
+            localScan,
+            currentFilePath,
+            primaryEntityOverride,
+          );
+
+          if (runId !== primarchVerifyRunIdRef.current || primarchVerifyIgnoreResultRef.current) return;
+
+          setPrimarchVerifySteps((prev) => setStepStatus(prev, 'connect-primarch-mcp', 'done', report.metadataInspected?.toolsUsed?.length ? 'Primarch MCP connected.' : 'Primarch MCP not configured.'));
+          const inspectedEntityDetails = report.metadataInspected?.entityDetails?.length
+            ? report.metadataInspected.entityDetails
+                .map((detail) => {
+                  if (detail.schemaCompleteness === 'complete') {
+                    return `Received ${detail.columnCount} columns for ${detail.entityLogicalName} (complete schema)`;
+                  }
+                  if (detail.schemaCompleteness === 'incomplete') {
+                    return `Only ${detail.columnCount} columns returned for ${detail.entityLogicalName}; schema may be incomplete`;
+                  }
+                  return `${detail.entityLogicalName}: ${detail.columnCount} columns (completeness unknown)`;
+                })
+                .join('; ')
+            : '';
+          setPrimarchVerifySteps((prev) => setStepStatus(prev, 'inspect-dataverse', 'done', inspectedEntityDetails
+            ? `Requested full schema for ${report.metadataInspected?.entityLogicalNames?.join(', ') ?? 'entities'}. ${inspectedEntityDetails}.`
+            : 'No targeted metadata was inspected.'));
+          setPrimarchVerifySteps((prev) => setStepStatus(prev, 'build-report', 'running', 'Building verification report...'));
+
+          if (report.verdict === 'not_configured') {
+            setPrimarchVerifySteps((prev) => setStepStatus(prev, 'inspect-dataverse', 'failed', 'Dataverse verification was skipped because Primarch MCP is not configured.'));
+            setPrimarchVerifySteps((prev) => setStepStatus(prev, 'build-report', 'done', 'Local scan report built (metadata not inspected).'));
+            setPrimarchVerifySteps((prev) => setStepStatus(prev, 'done', 'done', 'Local reference scan completed; Dataverse verification skipped.'));
+          }
+
+          const enriched: CrmVerificationReport = {
+            ...report,
+            id: report.id ?? `${Date.now()}`,
+            createdAt: report.createdAt ?? new Date().toISOString(),
+            filePath: currentFilePath,
+            summary: report.summary || summarizeVerifications(report.issues ?? [], report.verdict),
+            answer: report.answer ?? report.summary,
+            rawExtractedReferences: localScan,
+          };
+
+          setPrimarchVerifyResult(enriched);
+          if (report.verdict !== 'not_configured') {
+            setPrimarchVerifySteps((prev) => setStepStatus(prev, 'build-report', 'done', 'Verification report ready.'));
+            setPrimarchVerifySteps((prev) => setStepStatus(prev, 'done', 'done', 'Verification complete.'));
+          }
+
+          if (report.verdict !== 'error' && report.verdict !== 'not_configured' && !primarchVerifyIgnoreResultRef.current) {
+            const existing = task.crmVerificationReports ?? [];
+            const updated = [enriched, ...existing].slice(0, 5);
+            const verificationCheckpointComplete = isMeaningfulCrmVerificationReport(enriched);
+            const verificationVerdict = formatCrmVerdict(enriched.verdict);
+            await updateTask(task.id, {
+              crmVerificationReports: updated,
+              ...(verificationCheckpointComplete
+                ? { crmDeveloperWorkflow: buildCrmDeveloperWorkflowStateAfterMetadataVerification(task, enriched) }
+                : {}),
+            });
+            setFeedback(
+              verificationCheckpointComplete
+                ? `CRM verification checkpoint complete (${verificationVerdict}).`
+                : `CRM verification stored (${verificationVerdict}).`,
+            );
+          }
+        } catch (e) {
+          const message = e instanceof Error ? e.message : String(e);
+          if (runId !== primarchVerifyRunIdRef.current) return;
+
+          setPrimarchVerifyError(message);
+          const errorReport: CrmVerificationReport = {
+            id: `${Date.now()}`,
+            createdAt: new Date().toISOString(),
+            filePath: currentFilePath || undefined,
+            verdict: 'error',
+            metadataVerdict: 'unknown',
+            runtimeReadiness: 'unknown',
+            summary: 'Verification could not be completed. See details below.',
+            answer: message,
+            issues: [],
+            confirmedReferences: [],
+            missingReferences: [],
+            ambiguousReferences: [],
+            runtimeRisks: [],
+            pluginChecks: [],
+            inspectedEntities: [],
+            inspectedAttributesByEntity: {},
+            unableToVerifyReasons: [],
+            compileReadiness: {
+              status: 'not_checked',
+              detail: 'Compile readiness was not checked during metadata verification.',
+            },
+            metadataInspected: {
+              entityLogicalNames: [],
+              attributeLogicalNames: {},
+              toolsUsed: [],
+            },
+            rawExtractedReferences: localScan,
+          };
+          setPrimarchVerifyResult(errorReport);
+          setPrimarchVerifySteps((prev) => setStepStatus(prev, 'build-report', 'failed', 'Verification could not be completed.'));
+          setPrimarchVerifySteps((prev) => setStepStatus(prev, 'done', 'failed', 'Verification could not be completed.'));
+        } finally {
+          if (runId === primarchVerifyRunIdRef.current) {
+            primarchActionBusyRef.current = false;
+            setPrimarchActionLoading(null);
+          }
+        }
+      })();
+    }, 0);
   }
 
   // Centralized workflow plan — drives BPF stages, action labels, feature flags.
@@ -431,6 +1560,10 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
 
   // --- Notes ---
 
+  const splitNotes = splitTaskNotes(notes);
+  const activityItems = formatTaskActivityNotes(splitNotes.activityLines);
+  const latestActivity = activityItems[activityItems.length - 1];
+
   async function handleNotesSave() {
     await updateTask(task.id, { notes });
   }
@@ -459,6 +1592,10 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
     setAiError(null);
     try {
       const result = await tauriApi.analyzeTask(task, customer ?? null);
+      // If setup provides a customer, persist it to task.customerId as well.
+      const customerUpdate = extraSetup?.customerId && extraSetup.customerId !== task.customerId
+        ? { customerId: extraSetup.customerId }
+        : {};
       await updateTask(task.id, {
         ...(extraSetup !== undefined ? { workflowSetup: extraSetup } : {}),
         status:         'analyzed',
@@ -466,6 +1603,7 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
         attentionState: null,
         analysisResult: result,
         confidence:     result.confidence,
+        ...customerUpdate,
       });
       setFeedback('AI analysis complete — status set to Analyzed');
     } catch (e) {
@@ -476,6 +1614,26 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
   }
 
   async function handleGenerateDraft() {
+    let draftTask = task;
+    let fixProposalDraftContextApplied = false;
+
+    if (isDeveloperWorkflowTask(task)) {
+      const readiness = getCrmCodeGenerationReadiness(task);
+      if (!readiness.ready) {
+        setAiError(`CRM code generation is not ready: ${readiness.reason}`);
+        return;
+      }
+      if (readiness.warnings.length > 0) {
+        setFeedback(`CRM code generation readiness has warnings: ${readiness.warnings.join(' ')}`);
+      }
+
+      const fixProposalContext = buildCrmDraftContextFromPullRequestFixProposal(task);
+      if (fixProposalContext.ready) {
+        draftTask = withCrmDraftContext(task, fixProposalContext.promptContext);
+        fixProposalDraftContextApplied = !!fixProposalContext.promptContext;
+      }
+    }
+
     if (devTarget.kind === 'plugin') {
       // If a project is selected, verify it still exists before generating.
       if (selectedPluginProject && pluginsDir) {
@@ -492,9 +1650,15 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
       setAiLoading('draft');
       setAiError(null);
       try {
-        const preview = await tauriApi.generateSkeletonPreview(task, customer ?? null);
+        const preview = await tauriApi.generateSkeletonPreview(draftTask, customer ?? null);
         setSkeletonPreview(preview);
         setShowSkeleton(true);
+        await updateTask(task.id, {
+          crmDeveloperWorkflow: buildCrmDeveloperWorkflowStateAfterDraftRegenerated(task),
+        });
+        if (fixProposalDraftContextApplied) {
+          setFeedback('Draft preview generated using the local PR fix proposal as additional context. Review the diff before approval.');
+        }
         // Do not write files, open IDEs, or advance status here; Apply/Start are explicit.
       } catch (e) {
         setAiError(String(e));
@@ -522,7 +1686,7 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
       setAiLoading('draft');
       setAiError(null);
       try {
-        const analysis = analyzeScriptTask(task, customer ?? null);
+        const analysis = analyzeScriptTask(draftTask, customer ?? null);
         const plan_ = await buildScriptPlan(
           analysis,
           effectiveScriptFolder,
@@ -540,6 +1704,12 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
         setSkeletonPreview({ fileName: preview.targetFileName, content: preview.newContent, targetPath: '' });
         setScriptDraftPath(preview.targetFile);
         setShowSkeleton(true);
+        await updateTask(task.id, {
+          crmDeveloperWorkflow: buildCrmDeveloperWorkflowStateAfterDraftRegenerated(task),
+        });
+        if (fixProposalDraftContextApplied) {
+          setFeedback('Draft preview generated using the local PR fix proposal as additional context. Review the diff before approval.');
+        }
         // Status is not changed by generation; Start Development is explicit.
       } catch (e) {
         setAiError(String(e));
@@ -560,6 +1730,7 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
         scriptPath:  writtenFilePath,
         artifactPath: writtenFilePath,
       },
+      crmDeveloperWorkflow: buildCrmDeveloperWorkflowStateAfterDraftRegenerated(task),
     });
     setSkeletonPreview(null);
     setShowSkeleton(false);
@@ -592,6 +1763,7 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
         desiredPluginProject: undefined,
         artifactPath:         writtenFilePath,
       },
+      crmDeveloperWorkflow: buildCrmDeveloperWorkflowStateAfterDraftRegenerated(task),
     });
     // Close the skeleton modal and clear preview state.
     setSkeletonPreview(null);
@@ -618,62 +1790,737 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
    *   4. Parent of CRM_Code folder (if script lives inside .../CRM_Code/...)
    *   5. Parent folder of the script file itself
    */
-  function resolveScriptWorkspaceRoot(scriptFilePath: string | undefined): string | undefined {
-    if (customer?.resolvedRepositoryPath) return customer.resolvedRepositoryPath;
-    if (customer?.repositoryRoot) return customer.repositoryRoot;
-    if (crmFolderPath) return crmFolderPath;
-    if (scriptFilePath) {
-      // If the file lives inside .../CRM_Code/... climb up to CRM_Code parent.
-      const norm = scriptFilePath.replace(/\\/g, '/');
-      const crmCodeIdx = norm.toLowerCase().lastIndexOf('/crm_code/');
-      if (crmCodeIdx !== -1) return norm.slice(0, crmCodeIdx + '/crm_code'.length);
-      // Last resort: parent directory of the file.
-      const lastSlash = norm.lastIndexOf('/');
-      if (lastSlash > 0) return norm.slice(0, lastSlash);
+  /** Opens the Implementation Verification modal (Development stage primary action for plugins). */
+  function handleVerifyImplementation() {
+    setShowImplVerifyModal(true);
+    // Kick off artifact path resolution as soon as the modal opens so the modal shows
+    // the correct path without the user having to run a check first.
+    const explicit = task.workflowSetup?.artifactPath;
+    if (explicit) {
+      setModalArtifactPath(explicit);
+      setModalArtifactInferred(false);
+    } else {
+      // inferArtifactPath is async — call it and update state when done.
+      inferArtifactPath().then((path) => {
+        if (path) {
+          setModalArtifactPath(path);
+          setModalArtifactInferred(true);
+          // Persist so subsequent actions find it without repeating inference.
+          updateTask(task.id, {
+            workflowSetup: { ...task.workflowSetup, artifactPath: path },
+          }).catch(() => {});
+        } else {
+          setModalArtifactPath(null);
+          setModalArtifactInferred(false);
+        }
+      }).catch(() => {});
     }
-    return undefined;
   }
 
-  /** Opens the code artifact for the task without changing workflow state. */
-  async function handleOpenWork() {
-    const artifact = task.workflowSetup?.artifactPath ?? task.workflowSetup?.scriptPath;
+  /** Opens the Start Development modal instead of immediately moving the task. */
+  function handleStartDevelopment() {
+    setShowStartDevModal(true);
+  }
+
+  /** Called when the user explicitly confirms "Start Development" inside the modal. */
+  async function handleStartDevelopmentConfirmed() {
+    const note = 'Development started from Start Development modal.';
+    const existing = task.notes?.trim() ?? '';
+    const combinedNotes = existing
+      ? `${existing}\n[${new Date().toISOString()}] ${note}`
+      : `[${new Date().toISOString()}] ${note}`;
+    await updateTask(task.id, {
+      status:       'in-progress',
+      waitingState: null,
+      attentionState: null,
+      notes:        combinedNotes,
+    });
+    setShowStartDevModal(false);
+    setFeedback('Development started');
+  }
+
+  /**
+   * Guided draft generation used by the Start Development modal for plugin tasks.
+   * Bypasses the plan-approval readiness check; auto-generates a draft technical plan if missing.
+   * postAction = 'save-draft-open': after the user confirms save in SkeletonPreviewModal,
+   *   opens VS, marks task in-progress, appends note, and sets next step.
+   */
+  async function handleGenerateDraftStartDev(postAction: 'none' | 'save-draft-open'): Promise<void> {
+    if (devTarget.kind !== 'plugin') {
+      throw new Error('Guided draft generation is only supported for plugin tasks.');
+    }
+    if (selectedPluginProject && pluginsDir) {
+      const projectPath = `${pluginsDir}/${selectedPluginProject}`;
+      const exists = await tauriApi.checkPathExists(projectPath).catch(() => false);
+      if (!exists) {
+        await handlePluginProjectMissing(selectedPluginProject);
+        throw new Error(`Plugin project '${selectedPluginProject}' no longer exists. Create it first.`);
+      }
+    }
+    setAiLoading('draft');
+    setAiError(null);
     try {
-      if (devTarget.kind === 'plugin') {
-        // Plugin: open the selected project's .sln in Visual Studio, or the
-        // selected project folder if no solution file exists.
-        if (pluginsDir && selectedPluginProject) {
-          const target = await tauriApi.resolveSelectedPluginOpenTarget(pluginsDir, selectedPluginProject);
-          if (!target) {
-            setFsError(`Plugin project '${selectedPluginProject}' was not found.`);
-            return;
-          }
-          console.log('[devTarget] final path=', target.path, `(selected plugin ${target.kind})`);
-          await tauriApi.openWithShell(target.path);
-        } else if (task.workflowSetup?.artifactPath) {
-          await tauriApi.openWithShell(task.workflowSetup.artifactPath);
-        }
-      } else {
-        // Script (create or update/fix): open workspace root + file.
-        const scriptFilePath = artifact;
-        const workspaceRoot = resolveScriptWorkspaceRoot(scriptFilePath);
-        if (workspaceRoot) {
-          await tauriApi.openInVscodeWorkspace(workspaceRoot, scriptFilePath);
-        } else if (scriptFilePath) {
-          await tauriApi.openInVscode(scriptFilePath);
-        } else if (effectiveScriptFolder) {
-          await tauriApi.openInVscode(effectiveScriptFolder);
-        } else if (effectiveVscodePath) {
-          await tauriApi.openInVscode(effectiveVscodePath);
-        }
+      const now = new Date().toISOString();
+      const hasPlan = !!task.crmDeveloperWorkflow?.technicalPlan;
+      const plan = hasPlan ? undefined : buildCrmTechnicalImplementationPlan(task, now);
+      const preview = await tauriApi.generateSkeletonPreview(task, customer ?? null);
+      setSkeletonPreview(preview);
+      setSkeletonUsedAutoGeneratedPlan(plan !== undefined); // warn when plan was auto-generated in this run
+      setShowSkeleton(true);
+      const workflowState = plan
+        ? buildCrmDeveloperWorkflowStateAfterPlanAndDraft(task, plan, now)
+        : buildCrmDeveloperWorkflowStateAfterDraftRegenerated(task, now);
+      await updateTask(task.id, { crmDeveloperWorkflow: workflowState });
+      if (postAction === 'save-draft-open') {
+        setPendingPostSaveAction('save-draft-open');
       }
     } catch (e) {
-      setFsError(String(e));
+      setAiError(String(e));
+      throw e;
+    } finally {
+      setAiLoading(null);
     }
   }
 
-  async function handleStartDevelopment() {
-    await handleStatusChange('in-progress');
-    setFeedback('Status set to Development');
+  /** Opens the selected plugin project in Visual Studio — used by StartDevelopmentModal. */
+  async function handleOpenPluginForModal() {
+    if (!pluginsDir || !selectedPluginProject) {
+      throw new Error('No plugin project selected.');
+    }
+    const target = await tauriApi.resolveSelectedPluginOpenTarget(pluginsDir, selectedPluginProject);
+    if (!target) {
+      throw new Error(`Plugin project '${selectedPluginProject}' not found.`);
+    }
+    await tauriApi.openWithShell(target.path);
+  }
+
+  /** Updates task.implementationVerification and persists it. */
+  async function handleUpdateImplVerification(iv: ImplementationVerification) {
+    await updateTask(task.id, { implementationVerification: iv });
+  }
+
+  /** Marks the task as awaiting consultant testing (status stays in-progress). */
+  async function handleMarkWaitingForConsultantTesting() {
+    await updateTask(task.id, { waitingState: 'consultant-testing', attentionState: null });
+    setShowImplVerifyModal(false);
+    setFeedback('Moved to consultant testing');
+  }
+
+  // --- Testing phase actions (from Testing step click) ---
+
+  /** Moves the task back to active development from consultant testing. */
+  async function handleTestingBackToDev() {
+    const now = new Date().toISOString();
+    await updateTask(task.id, {
+      waitingState: null,
+      attentionState: null,
+      mcpNextStep: { action: 'Continue development', reason: 'Moved back to development from consultant testing.', updatedAt: now },
+      notes: appendActivityNote(task.notes, 'UI: moved-back-to-development'),
+    });
+    setShowTestingActionsModal(false);
+    setFeedback('Moved back to development.');
+  }
+
+  /** Records that consultant testing failed; returns to development for fixes. */
+  async function handleTestingFailed() {
+    const now = new Date().toISOString();
+    await updateTask(task.id, {
+      waitingState: null,
+      attentionState: null,
+      consultantTestRecord: { status: 'failed', updatedAt: now, note: 'Consultant testing failed.' },
+      mcpNextStep: { action: 'Fix consultant testing findings', reason: 'Consultant testing failed or returned issues.', updatedAt: now },
+      notes: appendActivityNote(task.notes, 'UI: consultant-testing-failed'),
+    });
+    setShowTestingActionsModal(false);
+    setFeedback('Consultant testing failed — back to development.');
+  }
+
+  /**
+   * Primary guided action: marks consultant testing confirmed, then opens the Git commit modal.
+   * Does NOT move to Review yet — that happens only after a successful Commit + Push.
+   *
+   * If no Git repo is configured, the task is still marked confirmed (back in development)
+   * and the user receives feedback asking to configure the repository first.
+   */
+  async function handleTestingConfirmedPreparePR() {
+    const now = new Date().toISOString();
+    if (!repoRootForGit) {
+      await updateTask(task.id, {
+        waitingState: null,
+        attentionState: null,
+        consultantTestRecord: { status: 'confirmed', updatedAt: now, note: 'Consultant testing confirmed.' },
+        mcpNextStep: {
+          action: 'Configure repository and prepare commit',
+          reason: 'Consultant testing was confirmed, but Git repository was not detected. Configure repository before moving to Review.',
+          updatedAt: now,
+        },
+        notes: appendActivityNote(task.notes, 'UI: consultant-testing-confirmed'),
+      });
+      setShowTestingActionsModal(false);
+      setFeedback('Consultant testing confirmed, but Git repository was not detected. Configure repository before moving to Review.');
+      return;
+    }
+    // Mark testing confirmed — stays in-progress, NOT moved to Review yet.
+    await updateTask(task.id, {
+      waitingState: null,
+      attentionState: null,
+      consultantTestRecord: { status: 'confirmed', updatedAt: now, note: 'Consultant testing confirmed.' },
+      mcpNextStep: {
+        action: 'Prepare commit and push',
+        reason: 'Consultant testing was confirmed. Commit and push are required before code review.',
+        updatedAt: now,
+      },
+      notes: appendActivityNote(task.notes, 'UI: consultant-testing-confirmed'),
+    });
+    setShowTestingActionsModal(false);
+    setGitCommitGuidedMode(true);
+    setShowGitCommitModal(true);
+  }
+
+  /**
+   * Guided mode post-action: called by GitCommitModal after a successful Commit + Push.
+   * Moves the task to Review / Waiting for code review and opens Azure DevOps.
+   * Receives the pre-built commit note so both notes can be appended in a single updateTask call.
+   */
+  async function handleGitCommitMoveToReview(
+    commitNote: string,
+    _hash: string | undefined,
+    _branch: string | undefined,
+  ) {
+    const now = new Date().toISOString();
+    const notesWithCommit = appendActivityNote(task.notes, commitNote);
+    const notesWithBoth   = appendActivityNote(notesWithCommit, 'UI: testing-confirmed-commit-pushed-moved-to-review');
+    await updateTask(task.id, {
+      status:         'ready-for-review',
+      waitingState:   'code-review',
+      attentionState: null,
+      mcpNextStep: {
+        action:    'Wait for code review',
+        reason:    'Changes were committed and pushed. Task moved to code review.',
+        updatedAt: now,
+      },
+      notes: notesWithBoth,
+    });
+    setShowGitCommitModal(false);
+    setGitCommitGuidedMode(false);
+
+    const resolution = buildAzureDevOpsRepoUrl(task, customer ?? null);
+    if (resolution?.kind === 'repo') {
+      tauriApi.openExternalUrl(resolution.url).then(() => {
+        setFeedback('Committed and pushed — task moved to Review. Repository opened.');
+      }).catch(() => {
+        setFeedback('Committed and pushed — task moved to Review. Could not open repository.');
+      });
+    } else if (resolution?.kind === 'work-item') {
+      tauriApi.openExternalUrl(resolution.url).then(() => {
+        setFeedback('Committed and pushed — task moved to Review. Work item opened.');
+      }).catch(() => {
+        setFeedback('Committed and pushed — task moved to Review.');
+      });
+    } else {
+      setFeedback('Committed and pushed — task moved to Review. No Azure DevOps URL configured.');
+    }
+  }
+
+  /**
+   * Guided mode post-action: called by GitCommitModal after a commit-only (no push).
+   * Stays in Development, updates next step to prompt a push before moving to Review.
+   */
+  async function handleGitCommitOnlyGuided(commitNote: string, hash: string | undefined) {
+    const now = new Date().toISOString();
+    await updateTask(task.id, {
+      mcpNextStep: {
+        action:    'Push branch before moving to Review',
+        reason:    'Commit created. Push the branch to proceed to code review.',
+        updatedAt: now,
+      },
+      notes: appendActivityNote(task.notes, commitNote),
+    });
+    setFeedback(`Commit created (${hash ?? '?'}). Push the branch before moving to Review.`);
+  }
+
+  /**
+   * Tries to find a single candidate .cs implementation file in the plugin project folder
+   * when `task.workflowSetup.artifactPath` is not set (e.g. existing tasks).
+   *
+   * Returns the absolute path if exactly one candidate is found, or null otherwise.
+   * Excludes Properties/AssemblyInfo.cs (in a subdirectory — listDirectoryFiles is
+   * shallow, so AssemblyInfo.cs won't appear unless it is in the project root itself).
+   */
+  async function inferArtifactPath(): Promise<string | null> {
+    if (!pluginsDir || !selectedPluginProject) return null;
+    // Standard layout: pluginsDir/ProjectName/ProjectName/<ProjectPlugin>.cs
+    const projectFolder = `${pluginsDir.replace(/\\/g, '/')}/${selectedPluginProject}/${selectedPluginProject}`;
+    try {
+      const csFiles = await tauriApi.listDirectoryFiles(projectFolder, 'cs');
+      const candidates = csFiles.filter((name) => {
+        const lower = name.toLowerCase();
+        // Exclude AssemblyInfo.cs (in Properties/ but listDirectoryFiles is shallow)
+        // and any obviously generated or property file.
+        return !lower.includes('assemblyinfo');
+      });
+      if (candidates.length === 1) {
+        return `${projectFolder}/${candidates[0]}`;
+      }
+      return null;  // 0 files › nothing to infer; >1 › ambiguous
+    } catch {
+      return null;
+    }
+  }
+
+  /** Appends a timestamped git activity note to the task when a commit or push completes. */
+  async function handleGitActivityNote(note: string) {
+    await updateTask(task.id, { notes: appendActivityNote(task.notes, note) });
+  }
+
+  /**
+   * Returns `task.workflowSetup.artifactPath` if set, otherwise tries to infer it.
+   * When a unique candidate is inferred, auto-persists it to the task so subsequent
+   * actions find it without re-running inference.
+   */
+  async function resolveArtifactPath(): Promise<string | null> {
+    const explicit = task.workflowSetup?.artifactPath;
+    if (explicit) return explicit;
+    const inferred = await inferArtifactPath();
+    if (inferred) {
+      await updateTask(task.id, {
+        workflowSetup: { ...task.workflowSetup, artifactPath: inferred },
+      }).catch(() => {});
+    }
+    return inferred;
+  }
+
+  /**
+   * Runs Dataverse metadata verification inline (no Primarch progress modal).
+   * Stores the report to task.crmVerificationReports and derives status for the modal.
+   */
+  async function handleRunDataverseCheckForImpl(): Promise<void> {
+    const filePath = (await resolveArtifactPath())
+      ?? task.workflowSetup?.scriptPath
+      ?? '';
+    if (!filePath) {
+      setFeedback('No artifact file path found. Save a generated draft first or confirm the plugin setup.');
+      return;
+    }
+    setImplVerifyDvRunning(true);
+    try {
+      const override = (
+        task.workflowSetup?.primaryEntityLogicalName
+        ?? task.scriptAnalysis?.entityLogicalName
+        ?? primarchPrimaryEntityOverride
+        ?? ''
+      ) || undefined;
+
+      let localScan: CrmReferenceScanResult;
+      if (filePath.toLowerCase().endsWith('.cs')) {
+        // Use Rust scanner for C# — same backend path as MCP run_dataverse_check_for_task.
+        const rustScan = await tauriApi.scanCsFileForCrm(filePath, override ?? null);
+        localScan = rustScan as CrmReferenceScanResult;
+        console.debug('[DV check] artifactPath:', filePath);
+        console.debug('[DV check] primaryEntity:', (rustScan as { pluginContext?: { primaryEntityName?: string } }).pluginContext?.primaryEntityName);
+        console.debug('[DV check] entities extracted:', rustScan.entities);
+        console.debug('[DV check] attributes by entity:', rustScan.attributes);
+        console.debug('[DV check] raw scan (full):', rustScan);
+      } else {
+        const content = await tauriApi.readFileContent(filePath);
+        localScan = scanJavaScriptCrmReferences(content, undefined, filePath);
+        console.debug('[DV check] artifactPath:', filePath);
+        console.debug('[DV check] JS scan entities:', localScan.entities);
+      }
+
+      console.debug('[DV check] payload to verifyAgainstCrm:', localScan);
+      const report = await tauriApi.verifyAgainstCrm(task, customer ?? null, localScan, filePath, override);
+      console.debug('[DV check] verdict:', report.verdict);
+      console.debug('[DV check] confirmed:', report.confirmedReferences);
+      console.debug('[DV check] missing:', report.missingReferences);
+      console.debug('[DV check] ambiguous:', report.ambiguousReferences);
+
+      const now     = new Date().toISOString();
+      const enriched = {
+        ...report,
+        id:        report.id ?? String(Date.now()),
+        createdAt: report.createdAt ?? now,
+        filePath,
+        summary:   report.summary || summarizeVerifications(report.issues ?? [], report.verdict),
+        answer:    report.answer ?? report.summary,
+        rawExtractedReferences: localScan,
+      };
+      const existing = task.crmVerificationReports ?? [];
+      const updated  = [enriched, ...existing].slice(0, 5);
+      await updateTask(task.id, {
+        crmVerificationReports: updated,
+        ...(isMeaningfulCrmVerificationReport(enriched)
+          ? { crmDeveloperWorkflow: buildCrmDeveloperWorkflowStateAfterMetadataVerification(task, enriched) }
+          : {}),
+      });
+      setFeedback(`Dataverse check: ${formatCrmVerdict(report.verdict)}.`);
+    } catch (e) {
+      setFeedback(`Dataverse check failed: ${String(e)}`);
+    } finally {
+      setImplVerifyDvRunning(false);
+    }
+  }
+
+  /**
+   * Runs the build / project readiness check and saves the result to
+   * task.implementationVerification.buildCheck.
+   */
+  async function handleRunBuildCheckForImpl(): Promise<void> {
+    if (!pluginsDir || !selectedPluginProject) {
+      setFeedback('No plugin project selected.');
+      return;
+    }
+    const solutionDir   = `${pluginsDir}/${selectedPluginProject}`;
+    const artifactPath  = await resolveArtifactPath();
+    setImplVerifyBuildRunning(true);
+    try {
+      const result = await tauriApi.checkPluginBuildReadiness(solutionDir, artifactPath ?? undefined);
+      // Encode each BuildCheckItem as a pipe-delimited string so it fits in ImplCheckRecord.findings.
+      const findings = result.checks.map((c) => `${c.result}|${c.label}|${c.detail}`);
+      const now = new Date().toISOString();
+      await updateTask(task.id, {
+        implementationVerification: {
+          ...task.implementationVerification,
+          buildCheck: {
+            status:   result.status === 'passed' ? 'passed' : result.status === 'warnings' ? 'warnings' : 'failed',
+            runAt:    now,
+            summary:  result.summary,
+            findings,
+          },
+          updatedAt: now,
+        },
+      });
+      setFeedback(`Build check: ${result.status}.`);
+    } catch (e) {
+      setFeedback(`Build check failed: ${String(e)}`);
+      const now = new Date().toISOString();
+      await updateTask(task.id, {
+        implementationVerification: {
+          ...task.implementationVerification,
+          buildCheck: { status: 'failed', runAt: now, summary: `Check failed: ${String(e)}` },
+          updatedAt: now,
+        },
+      }).catch(() => {});
+    } finally {
+      setImplVerifyBuildRunning(false);
+    }
+  }
+
+  /**
+   * Runs AI internal code review using ONLY local read-only sources.
+   *
+   * Source priority:
+   *   1. Local branch diff — collect_git_review_context (read-only git commands only)
+   *   2. Single .cs file   — local file read via runAiFileReview
+   *
+   * GitHub connectors, GitHub API, PR reads/writes, and any remote write action
+   * are explicitly NOT used and must never be added to this function.
+   * Only task.implementationVerification.aiCodeReview is updated locally.
+   */
+  async function handleRunAiCodeReviewForImpl(): Promise<void> {
+    setImplVerifyAiRunning(true);
+    try {
+      const setup    = task.workflowSetup;
+      // Resolve artifact path (explicit or inferred from project folder).
+      const artifactPath = await resolveArtifactPath();
+      const techPlan = task.crmDeveloperWorkflow?.technicalPlan;
+      const dvReport = task.crmVerificationReports?.[0];
+      const buildChk = task.implementationVerification?.buildCheck;
+
+      // ¦¦ Repo root candidates ¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦
+      const repoCandidates = [
+        setup?.repositoryRoot,
+        customer?.resolvedRepositoryPath,
+        customer?.repositoryRoot,
+        pluginsDir,  // plugin folder might be inside a git repo
+      ].filter((p): p is string => !!p);
+
+      // ¦¦ Try to collect local branch diff (Mode B) ¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦
+      let gitCtx: import('../lib/tauriCommands').GitReviewContext | null = null;
+      for (const candidate of repoCandidates) {
+        try {
+          const ctx = await tauriApi.collectGitReviewContext(candidate);
+          if (ctx.diff.trim() || ctx.changedFiles.length > 0) {
+            gitCtx = ctx;
+            break;
+          }
+        } catch { /* not a git repo or git unavailable — try next */ }
+      }
+
+      // ¦¦ Build shared instructions context ¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦
+      // (used in both diff and file review modes)
+      function buildInstructions(reviewMode: string, gitInfo?: string): string {
+        const ctx: string[] = [];
+        ctx.push('You are an expert Dynamics 365 / Power Platform CRM developer and code reviewer.');
+        ctx.push(`Review mode: ${reviewMode}.`);
+        ctx.push(
+          'This is a READ-ONLY code review. ' +
+          'You MUST NOT use, invoke, or suggest any of the following GitHub / repository write actions: ' +
+          'create_branch, create_commit, create_file, update_file, delete_file, ' +
+          'create_pull_request, update_pull_request, add_review_to_pr, add_comment_to_issue, ' +
+          'request_pull_request_reviewers, mark_pull_request_ready_for_review, ' +
+          'merge_pull_request, update_ref, or any other write action. ' +
+          'Only report findings as text. Do not modify code, files, Git state, Dataverse, or any external system.',
+        );
+        ctx.push('Respond in Czech as required by the output format.');
+        if (gitInfo) ctx.push(gitInfo);
+        ctx.push('');
+
+        ctx.push('=== ÚKOL ===');
+        ctx.push(`Název: ${task.title}`);
+        if (task.originalMessage) ctx.push(`Původní požadavek: ${task.originalMessage.slice(0, 600)}`);
+        const analysisText = task.analysisResult?.summaryEn || task.analysisResult?.summary;
+        if (analysisText) ctx.push(`Analýza: ${analysisText.slice(0, 400)}`);
+        ctx.push('');
+
+        ctx.push('=== SETUP PROJEKTU ===');
+        const proj = setup?.pluginProject || selectedPluginProject;
+        if (proj)                             ctx.push(`Plugin projekt (namespace): ${proj}`);
+        if (setup?.primaryEntityLogicalName)  ctx.push(`Primární entita: ${setup.primaryEntityLogicalName}`);
+        if (customer?.name)                   ctx.push(`Zákazník: ${customer.name}`);
+        if (setup?.workIntent)                ctx.push(`Záměr práce: ${setup.workIntent}`);
+        if (techPlan?.target?.message)        ctx.push(`Očekávaná zpráva (MessageName): ${techPlan.target.message}`);
+        if (techPlan?.target?.stage)          ctx.push(`Fáze (Stage): ${techPlan.target.stage}`);
+        if (techPlan?.target?.mode)           ctx.push(`Mód (Sync/Async): ${techPlan.target.mode}`);
+        ctx.push('');
+
+        if (techPlan) {
+          ctx.push('=== TECHNICKÝ PLÁN ===');
+          if (techPlan.summary) ctx.push(techPlan.summary.slice(0, 500));
+          if (techPlan.implementationSteps.length) {
+            ctx.push('Kroky implementace:');
+            techPlan.implementationSteps.slice(0, 6).forEach((s) => ctx.push(`- ${s}`));
+          }
+          if (techPlan.risks.length) {
+            ctx.push('Rizika:');
+            techPlan.risks.slice(0, 3).forEach((r) => ctx.push(`- ${r}`));
+          }
+          ctx.push('');
+        }
+
+        if (buildChk) {
+          ctx.push('=== VÝSLEDEK BUILD CHECKU ===');
+          ctx.push(`Stav: ${buildChk.status}${buildChk.summary ? ` — ${buildChk.summary}` : ''}`);
+          const bldIssues = (buildChk.findings ?? [])
+            .map((f) => { const [r, l, d] = f.split('|'); return { r, l, d }; })
+            .filter((f) => f.r && f.r !== 'pass' && f.r !== 'skip');
+          if (bldIssues.length > 0) {
+            ctx.push('Problémy:');
+            bldIssues.slice(0, 8).forEach((f) =>
+              ctx.push(`- [${f.r}] ${f.l ?? ''}${f.d ? `: ${f.d}` : ''}`)
+            );
+          }
+          ctx.push('');
+        }
+
+        if (dvReport) {
+          ctx.push('=== VÝSLEDEK DATAVERSE CHECKU ===');
+          ctx.push(`Verdikt: ${dvReport.verdict}`);
+          if (dvReport.summary) ctx.push(dvReport.summary.slice(0, 400));
+          if (dvReport.inspectedEntities?.length) {
+            ctx.push(`Ověřené entity: ${dvReport.inspectedEntities.join(', ')}`);
+          }
+          const missing = (dvReport.missingReferences ?? [])
+            .map((r) => `${r.kind}: ${r.displayName}${r.entityLogicalName ? ` (${r.entityLogicalName})` : ''}`)
+            .slice(0, 8);
+          if (missing.length > 0) {
+            ctx.push('Chybějící reference v Dataverse:');
+            missing.forEach((m) => ctx.push(`- ${m}`));
+          }
+          (dvReport.issues ?? []).slice(0, 5).forEach((i) =>
+            ctx.push(`- [${i.severity}] ${i.title}`)
+          );
+          (dvReport.pluginChecks ?? []).filter((c) => c.status !== 'confirmed').slice(0, 4).forEach((c) =>
+            ctx.push(`- [${c.status}] ${c.title}: ${c.detail}`)
+          );
+          ctx.push('');
+        }
+
+        return ctx.join('\n');
+      }
+
+      // ¦¦ Shared function to flatten AI result into findings ¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦
+      function flattenFindings(result: AiFileReviewResult): string[] {
+        if (!result.structured) {
+          return result.markdown ? [result.markdown.slice(0, 400)] : [];
+        }
+        return [
+          ...(result.structured.comments ?? []).map((c) => {
+            const loc = c.lineStart ? ` (ř.${c.lineStart})` : '';
+            const firstLine = (c.problem ?? '').split('\n')
+              .find((l) => l.trim().startsWith('-'))?.replace(/^-\s*/, '') ?? c.problem ?? '';
+            return `[${c.severity}] ${c.title}${loc}: ${firstLine}`.slice(0, 200);
+          }),
+          ...(result.structured.generalSuggestions ?? []).map((s) => String(s).slice(0, 200)),
+        ];
+      }
+
+      // ¦¦ Mode B: Local branch diff review ¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦
+      if (gitCtx) {
+        const modeLabel = 'Local branch diff';
+        const gitInfo = [
+          `=== GIT CONTEXT ===`,
+          `Větev: ${gitCtx.currentBranch} › base: ${gitCtx.baseBranch}`,
+          `Změněné soubory (${gitCtx.changedFiles.length}): ${gitCtx.changedFiles.slice(0, 10).join(', ')}`,
+          gitCtx.hasCommitted  ? 'Zahrnuje: odevzdané změny větve' : '',
+          gitCtx.hasStaged     ? 'Zahrnuje: staged změny' : '',
+          gitCtx.hasUnstaged   ? 'Zahrnuje: unstaged změny' : '',
+          gitCtx.noiseFiles.length > 0 ? `POZOR — noise soubory v diff: ${gitCtx.noiseFiles.slice(0, 5).join(', ')}` : '',
+          gitCtx.flaggedPaths.length > 0 ? `UPOZORNĚNÍ — přidány podezřelé soubory: ${gitCtx.flaggedPaths.join(', ')}` : '',
+        ].filter(Boolean).join('\n');
+
+        const diffRules = [
+          '',
+          '=== PRAVIDLA REVIEW (DIFF) ===',
+          'Zkontroluj scope diffu:',
+          '- Jen očekávané soubory byly změněny',
+          '- Žádné nesouvisející soubory',
+          '- Žádné .github/copilot-instructions.md přidány',
+          '- Žádné .vs/, bin/, obj/, packages/ soubory v commitu',
+          '- Generovaný .cs soubor je zahrnut v .csproj jako Compile Include',
+          '',
+          'Zkontroluj plugin správnost:',
+          '- IPlugin implementace, Execute metoda',
+          '- Přístup k Target, MessageName/Stage/Entity assumptions',
+          '- PreOperation Create: Target atributy přímo, ne service.Update(target)',
+          '- Tracing, exception handling, konstanty pro logické názvy',
+          '- Namespace odpovídá projektu',
+          '',
+          'Zkontroluj Dataverse správnost:',
+          '- Logické názvy v diffu odpovídají ověřeným názvům z Dataverse checku',
+          '- Žádné neověřené logické názvy',
+          '',
+          'Zkontroluj business alignment:',
+          '- Diff implementuje úkol a nic navíc',
+          '- Chování odpovídá původnímu požadavku a technickému plánu',
+        ].join('\n');
+
+        const instructions = buildInstructions(modeLabel, gitInfo) + diffRules;
+        const taskCtx = `${task.title}. ${gitCtx.summary}`;
+        const fileName = `local changes (${gitCtx.currentBranch} › ${gitCtx.baseBranch})`;
+
+        const result = await tauriApi.runAiChangeReview(
+          gitCtx.diff,
+          taskCtx,
+          fileName,
+          'Plugin Internal Check',
+          instructions,
+          '',  // use configured model
+          0.2,
+        );
+
+        const verdict    = result.structured?.verdict;
+        const implStatus = verdict === 'pass' ? 'passed' : verdict === 'needs_changes' ? 'failed' : 'warnings';
+
+        // Prepend review source metadata as the first findings entries for display
+        const metaFindings: string[] = [
+          `Review source: Local read-only git diff (${gitCtx.currentBranch} › ${gitCtx.baseBranch})`,
+          `[info] Changed files (${gitCtx.changedFiles.length}): ${gitCtx.changedFiles.slice(0, 6).join(', ')}${gitCtx.changedFiles.length > 6 ? '…' : ''}`,
+          ...(gitCtx.hasStaged    ? ['[info] Staged changes included'] : []),
+          ...(gitCtx.hasUnstaged  ? ['[info] Unstaged changes included'] : []),
+          ...(gitCtx.hasUntracked ? [`[info] Untracked files included (${gitCtx.untrackedIncluded.length}): ${gitCtx.untrackedIncluded.join(', ')}`] : []),
+          ...(gitCtx.untrackedSkipped.length > 0 ? [`[info] Untracked files skipped: ${gitCtx.untrackedSkipped.slice(0, 3).join(', ')}`] : []),
+          ...(gitCtx.noiseFiles.length  > 0 ? [`[warning] Noise files in diff: ${gitCtx.noiseFiles.slice(0, 3).join(', ')}`] : []),
+          ...(gitCtx.flaggedPaths.length > 0 ? [`[warning] Flagged paths added: ${gitCtx.flaggedPaths.join(', ')}`] : []),
+        ];
+        const findings = [...metaFindings, ...flattenFindings(result)];
+
+        const now = new Date().toISOString();
+        const existing = task.aiFileReviews ?? [];
+        const reviewEntry: AiFileReviewResult = {
+          ...result,
+          id: `impl-review-${now}`,
+          reviewerName: 'Plugin Internal Check',
+          filePath:     fileName,
+          reviewMode:   'change',
+        };
+        await updateTask(task.id, {
+          aiFileReviews: [reviewEntry, ...existing].slice(0, 5),
+          implementationVerification: {
+            ...task.implementationVerification,
+            aiCodeReview: {
+              status:   implStatus,
+              runAt:    now,
+              summary:  result.structured?.summary ?? gitCtx.summary,
+              findings,
+            },
+            updatedAt: now,
+          },
+        });
+        setFeedback(`AI code review (branch diff): ${implStatus}.`);
+
+      // ¦¦ Mode C: Single file fallback ¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦
+      } else if (artifactPath) {
+        const modeLabel  = 'Single file review';
+        const fileRules  = [
+          '',
+          '=== PRAVIDLA REVIEW (SOUBOR) ===',
+          'Zkontroluj plugin strukturu:',
+          '1. IPlugin, Execute(IServiceProvider), ITracingService, IPluginExecutionContext, Target null check',
+          '2. MessageName/PrimaryEntityName/Stage ověřeny nebo dokumentovány',
+          '3. PreOperation Create: Target přímo, ne service.Update(target)',
+          '4. Logické názvy = konstanty/readonly, ne inline literály',
+          '5. Namespace odpovídá projektu',
+          '6. Tracing, exception handling, žádné TODO-only',
+          '7. Depth/recursion guard kde potřeba',
+          '8. Implementace odpovídá popisu úkolu',
+        ].join('\n');
+        const instructions = buildInstructions(modeLabel) + fileRules;
+
+        const result = await tauriApi.runAiFileReview(
+          artifactPath,
+          'Plugin Internal Check',
+          instructions,
+          '',
+          0.2,
+        );
+
+        const verdict    = result.structured?.verdict;
+        const implStatus = verdict === 'pass' ? 'passed' : verdict === 'needs_changes' ? 'failed' : 'warnings';
+
+        const metaFindings = [`Review source: Single file fallback (${artifactPath.replace(/\\/g, '/').split('/').pop()})`];
+        const findings = [...metaFindings, ...flattenFindings(result)];
+
+        const now = new Date().toISOString();
+        const existing = task.aiFileReviews ?? [];
+        const reviewEntry: AiFileReviewResult = {
+          ...result,
+          id: `impl-review-${now}`,
+          reviewerName: 'Plugin Internal Check',
+          filePath:     artifactPath,
+          reviewMode:   'file',
+        };
+        await updateTask(task.id, {
+          aiFileReviews: [reviewEntry, ...existing].slice(0, 5),
+          implementationVerification: {
+            ...task.implementationVerification,
+            aiCodeReview: {
+              status:   implStatus,
+              runAt:    now,
+              summary:  result.structured?.summary ?? '',
+              findings,
+            },
+            updatedAt: now,
+          },
+        });
+        setFeedback(`AI code review (file): ${implStatus}.`);
+
+      } else {
+        setFeedback('No artifact file and no git repository found. Configure the plugin project first.');
+      }
+    } catch (e) {
+      setFeedback(`AI code review failed: ${String(e)}`);
+      const now = new Date().toISOString();
+      await updateTask(task.id, {
+        implementationVerification: {
+          ...task.implementationVerification,
+          aiCodeReview: { status: 'failed', runAt: now, summary: `Review failed: ${String(e)}` },
+          updatedAt: now,
+        },
+      }).catch(() => {});
+    } finally {
+      setImplVerifyAiRunning(false);
+    }
   }
 
   async function handleMarkWaitingForReview() {
@@ -708,8 +2555,9 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
         }
         break;
       case 'confirm-setup':          setShowSetupModal(true);  break;
-      case 'start-development': handleStartDevelopment(); break;
-      case 'mark-waiting-review': handleMarkWaitingForReview(); break;
+      case 'start-development':      handleStartDevelopment(); break;
+      case 'verify-implementation':  handleVerifyImplementation(); break;
+      case 'mark-waiting-review':    handleMarkWaitingForReview(); break;
       case 'mark-done':      handleMarkDone();          break;
       default: break;
     }
@@ -733,7 +2581,17 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
         if (!extensionMismatch) artifactPath = existingArtifact;
       }
     }
-    await updateTask(task.id, { workflowSetup: { ...setup, artifactPath }, status: 'analyzed', waitingState: null, attentionState: null });
+    // Also persist setup.customerId › task.customerId so the task header reflects the correct customer.
+    const customerUpdate = setup.customerId && setup.customerId !== task.customerId
+      ? { customerId: setup.customerId }
+      : {};
+    await updateTask(task.id, {
+      workflowSetup: { ...setup, artifactPath },
+      status: 'analyzed',
+      waitingState: null,
+      attentionState: null,
+      ...customerUpdate,
+    });
     setFeedback('Setup confirmed — status set to Analyzed');
   }
 
@@ -824,6 +2682,15 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
   // Show VS Code button whenever any path is resolvable (including CRM folder)
   const hasVscodePath = !!effectiveVscodePath;
   const hasAnyPath = hasRepo || hasPlugin || hasScript || hasVscodePath;
+  const primarchMetadataConfigured = !!settings.crmMetadataEnabled
+    && !!(settings.primarchMcpCommand ?? '').trim()
+    && !!(settings.primarchMcpArgs ?? '').trim();
+  const workflowMetadataVerificationDisabled = !!primarchActionLoading || !primarchMetadataConfigured;
+  const workflowMetadataVerificationDisabledReason = !primarchMetadataConfigured
+    ? 'Configure and save CRM metadata assistant settings before verification.'
+    : primarchActionLoading
+      ? 'Another Primarch action is already running.'
+      : undefined;
 
   return (
     <>
@@ -887,10 +2754,11 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
 
         {/* ---- Workflow BPF strip (always visible, never scrolls) ---- */}
         <WorkflowStepper
-          status={task.status}
+          displayPhase={plan.displayPhase}
           stages={plan.stages}
           onRunCurrentAction={runCurrentStageAction}
           isRunning={!!aiLoading}
+          onTestingAction={() => setShowTestingActionsModal(true)}
         />
 
         {/* ---- Two-column inner layout ---- */}
@@ -1045,14 +2913,56 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
           {/* Notes */}
           <div className="detail-section">
             <span className="detail-section-label">Notes</span>
-            <textarea
-              className="detail-notes-textarea"
-              value={notes}
-              placeholder="Write notes, context, or reminders…"
-              onChange={(e) => setNotes(e.target.value)}
-              onBlur={handleNotesSave}
-            />
+            {splitNotes.manualNotes.length > 0 ? (
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+                {splitNotes.manualNotes.map((note, index) => (
+                  <div key={`${index}-${note}`} style={{ border: '1px solid var(--border-subtle)', borderRadius: 4, background: 'var(--bg-overlay)', padding: '7px 9px', fontSize: 12, color: 'var(--text-secondary)', lineHeight: 1.45 }}>
+                    {note}
+                  </div>
+                ))}
+              </div>
+            ) : (
+              <span className="detail-empty-inline">No manual notes.</span>
+            )}
+            <details style={{ marginTop: 8 }}>
+              <summary style={{ cursor: 'pointer', fontSize: 11, color: 'var(--text-muted)' }}>Raw notes editor</summary>
+              <textarea
+                className="detail-notes-textarea"
+                value={notes}
+                placeholder="Write notes, context, or reminders..."
+                onChange={(e) => setNotes(e.target.value)}
+                onBlur={handleNotesSave}
+                style={{ marginTop: 6 }}
+              />
+            </details>
           </div>
+
+          {activityItems.length > 0 && (
+            <div className="detail-section">
+              <details>
+                <summary style={{ cursor: 'pointer' }}>
+                  <span className="detail-section-label" style={{ display: 'inline' }}>Activity Log ({activityItems.length})</span>
+                  {latestActivity && (
+                    <span style={{ marginLeft: 8, fontSize: 11, color: 'var(--text-muted)' }}>
+                      {[latestActivity.timestampLabel, latestActivity.message].filter(Boolean).join(' | ')}
+                    </span>
+                  )}
+                </summary>
+                <div style={{ display: 'flex', flexDirection: 'column', gap: 8, marginTop: 8 }}>
+                  {activityItems.map((item) => (
+                    <div key={item.id} style={{ border: '1px solid var(--border-subtle)', borderRadius: 4, background: 'var(--bg-overlay)', padding: '7px 9px' }}>
+                      {(item.timestampLabel || item.source) && (
+                        <div style={{ fontSize: 11, color: 'var(--text-muted)', marginBottom: 3 }}>
+                          {[item.timestampLabel, item.source].filter(Boolean).join(' | ')}
+                        </div>
+                      )}
+                      <div style={{ fontSize: 12, color: 'var(--text-secondary)', lineHeight: 1.45 }}>{item.message}</div>
+                    </div>
+                  ))}
+                </div>
+              </details>
+            </div>
+          )}
 
           {/* Azure DevOps context — shown for ADO-sourced tasks with parsed metadata */}
           {task.adoContext && task.adoContext.type !== 'other' && (
@@ -1142,7 +3052,7 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
                           className="detail-tracking-link"
                           onClick={() => handleOpenUrl(task.adoContext!.workItemUrl)}
                         >
-                          Open in Azure DevOps â†—
+                          Open in Azure DevOps (external)
                         </button>
                       </div>
                     )}
@@ -1157,6 +3067,151 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
             <div className="detail-section">
               <span className="detail-section-label detail-ai-label">AI analýza / analysis</span>
               <AnalysisBlock result={task.analysisResult} />
+            </div>
+          )}
+
+          {/* WORKFLOW CHECKLIST — compact progress snapshot */}
+          {effectiveMode === 'developer' && (
+            <div className="detail-section">
+              <span className="detail-section-label">Workflow progress</span>
+              <div className="td-checklist">
+                {buildWorkflowChecklist(task, effectiveMode).map((row) => (
+                  <div key={row.label} className={`td-checklist-row td-checklist-row--${row.status}`}>
+                    <span className="td-checklist-icon">
+                      {row.status === 'done'    ? '?'
+                     : row.status === 'active'  ? '?'
+                     : row.status === 'partial' ? '!'
+                     : row.status === 'skip'    ? '–'
+                     :                            '·'}
+                    </span>
+                    <span className="td-checklist-label">{row.label}</span>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+
+          {/* CRM DEVELOPER WORKFLOW — collapsed by default to reduce clutter */}
+          {effectiveMode === 'developer' && (
+            <div className="detail-section">
+              <button
+                className="td-advanced-btn"
+                onClick={() => setShowAdvancedWorkflow((v) => !v)}
+              >
+                {showAdvancedWorkflow ? '^ Hide advanced workflow details' : 'ˇ Advanced workflow details'}
+              </button>
+              {showAdvancedWorkflow && (
+              <CrmDeveloperWorkflowPanel
+                key={task.id}
+                task={task}
+                onSaveDiagnosisState={handleSaveCrmDeveloperWorkflowState}
+                onVerifyMetadata={handleVerifyAgainstCrm}
+                onGenerateTechnicalPlan={handleGenerateCrmTechnicalPlan}
+                onApproveTechnicalPlan={handleApproveCrmTechnicalPlan}
+                onRevokeTechnicalPlanApproval={handleRevokeCrmTechnicalPlanApproval}
+                onApproveDiffReview={handleApproveCrmDiffReview}
+                onRevokeDiffReviewApproval={handleRevokeCrmDiffReviewApproval}
+                onApproveExternalActionPlan={handleApproveCrmExternalActionPlan}
+                onRevokeExternalActionApproval={handleRevokeCrmExternalActionApproval}
+                onOpenExecutionPreview={handleOpenCrmExecutionPreview}
+                onMarkExternalExecutionCompleted={handleMarkExternalExecutionCompleted}
+                onRevokeExternalExecution={handleRevokeExternalExecution}
+                onGeneratePullRequestProposal={handleGenerateCrmPullRequestProposal}
+                onMarkPullRequestCreatedManually={handleMarkCrmPullRequestCreatedManually}
+                onRevokePullRequestTracking={handleRevokeCrmPullRequestTracking}
+                onFetchPullRequestReviewStatus={handleFetchCrmPullRequestReviewStatus}
+                onGeneratePullRequestReviewAnalysis={handleGenerateCrmPullRequestReviewAnalysis}
+                onGeneratePullRequestFixProposal={handleGenerateCrmPullRequestFixProposal}
+                onUseFixProposalForDraftGeneration={handleGenerateDraft}
+                onMarkPullRequestFixUpdatedManually={handleMarkCrmPullRequestFixUpdatedManually}
+                onRevokePullRequestFixUpdateTracking={handleRevokeCrmPullRequestFixUpdateTracking}
+                savingState={crmWorkflowSaving}
+                verifyingMetadata={primarchActionLoading === 'verify'}
+                generatingTechnicalPlan={crmTechnicalPlanGenerating}
+                savingPlanApproval={crmPlanApprovalSaving}
+                savingDiffApproval={crmDiffApprovalSaving}
+                savingExternalActionApproval={crmExternalActionApprovalSaving}
+                savingExternalExecution={crmExternalExecutionSaving}
+                savingPullRequest={crmPullRequestSaving}
+                savingPullRequestReview={crmPullRequestReviewSaving}
+                savingPullRequestReviewAnalysis={crmPullRequestReviewAnalysisSaving}
+                savingPullRequestFixProposal={crmPullRequestFixProposalSaving}
+                savingPullRequestFixUpdate={crmPullRequestFixUpdateSaving}
+                generatingDraftFromFixProposal={aiLoading === 'draft'}
+                metadataVerificationDisabled={workflowMetadataVerificationDisabled}
+                metadataVerificationDisabledReason={workflowMetadataVerificationDisabledReason}
+              />
+              )}
+            </div>
+          )}
+
+          {/* CRM Skeleton — compact card for latest generated metadata-based skeleton */}
+          {latestCrmSkeleton && (
+            <div className="detail-section">
+              <span className="detail-section-label detail-ai-label">CRM Skeleton</span>
+              <div style={{
+                border: '1px solid var(--border-subtle)',
+                borderRadius: 4,
+                background: 'var(--bg-overlay)',
+                padding: '8px 10px',
+                display: 'flex',
+                flexDirection: 'column',
+                gap: 6,
+              }}>
+                <div style={{ fontSize: 12, fontWeight: 600, color: 'var(--text-primary)' }}>
+                  {latestCrmSkeleton.summary || 'CRM skeleton generated'}
+                </div>
+                <div style={{ fontSize: 11, color: 'var(--text-muted)' }}>
+                  Mode: {latestCrmSkeleton.mode} · Entities inspected: {(latestCrmSkeleton.metadataInspected?.entityLogicalNames ?? []).length}
+                </div>
+                <pre className="detail-code-block" style={{ whiteSpace: 'pre-wrap', maxHeight: 120, overflow: 'auto', margin: 0 }}>
+                  {latestCrmSkeleton.pseudoCode || ''}
+                </pre>
+                <div style={{ display: 'flex', gap: 6 }}>
+                  <button className="btn btn-secondary btn-sm" type="button" onClick={() => setShowCrmSkeletonModal(true)}>
+                    <Icon name="search" size={11} /> Open skeleton
+                  </button>
+                </div>
+              </div>
+            </div>
+          )}
+
+          {/* CRM Verification — compact card for latest deterministic report */}
+          {latestCrmVerification && (
+            <div className="detail-section">
+              <span className="detail-section-label detail-ai-label">CRM Verification</span>
+              <div style={{
+                border: '1px solid var(--border-subtle)',
+                borderRadius: 4,
+                background: 'var(--bg-overlay)',
+                padding: '8px 10px',
+                display: 'flex',
+                flexDirection: 'column',
+                gap: 6,
+              }}>
+                <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
+                  <span style={{ fontSize: 12, fontWeight: 600, color: 'var(--text-primary)' }}>
+                    Verdict: {formatCrmVerdict(latestCrmVerification.verdict)}
+                  </span>
+                  <span style={{ fontSize: 11, color: 'var(--text-muted)' }}>
+                    Errors: {(latestCrmVerification.issues ?? []).filter(i => i.severity === 'error').length}
+                  </span>
+                  <span style={{ fontSize: 11, color: 'var(--text-muted)' }}>
+                    Warnings: {(latestCrmVerification.issues ?? []).filter(i => i.severity === 'warning').length}
+                  </span>
+                  <span style={{ fontSize: 11, color: 'var(--text-muted)' }}>
+                    Suggestions: {(latestCrmVerification.issues ?? []).filter(i => i.severity === 'suggestion').length}
+                  </span>
+                </div>
+                <div style={{ fontSize: 11, color: 'var(--text-secondary)' }}>
+                  {latestCrmVerification.summary || '—'}
+                </div>
+                <div style={{ display: 'flex', gap: 6 }}>
+                  <button className="btn btn-secondary btn-sm" type="button" onClick={() => setShowCrmVerificationModal(true)}>
+                    <Icon name="search" size={11} /> Open report
+                  </button>
+                </div>
+              </div>
             </div>
           )}
 
@@ -1283,7 +3338,7 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
                       onClick={() => handleOpenUrl(task.ticketUrl)}
                       title={task.ticketUrl}
                     >
-                      Open Ticket â†—
+                      Open Ticket (external)
                     </button>
                   </div>
                 )}
@@ -1295,7 +3350,7 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
                       onClick={() => handleOpenUrl(task.devopsTaskUrl)}
                       title={task.devopsTaskUrl}
                     >
-                      Open DevOps Task â†—
+                      Open DevOps Task (external)
                     </button>
                   </div>
                 )}
@@ -1307,7 +3362,7 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
                       onClick={() => handleOpenUrl(task.sourceUrl)}
                       title={task.sourceUrl}
                     >
-                      Open Source Message ↗
+                      Open Source Message ?
                     </button>
                   </div>
                 )}
@@ -1341,6 +3396,24 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
         {/* ---- Action footer ---- */}
         <div className="detail-action-groups">
 
+          {/* MODE SWITCH — top of the action panel for immediate visibility */}
+          <div className="detail-action-group">
+            <div className="detail-action-group-label">Mode</div>
+            <TaskModeSwitch task={task} onSetMode={handleSetMode} />
+          </div>
+
+          {/* NEXT STEP — single recommended action */}
+          {(() => {
+            const step = deriveNextStep(task, plan, effectiveMode);
+            if (!step) return null;
+            return (
+              <div className="td-next-step">
+                <div className="td-next-step-action">{step.action}</div>
+                {step.why && <div className="td-next-step-why">{step.why}</div>}
+              </div>
+            );
+          })()}
+
           {/* Inline feedback message */}
           {feedback && (
             <div className="detail-feedback-ok">
@@ -1353,7 +3426,7 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
             <div className="detail-fs-error">! {aiError}</div>
           )}
 
-          {/* WORKFLOW */}
+          {/* WORKFLOW — primary actions: Analyze + Done */}
           <div className="detail-action-group">
             <div className="detail-action-group-label">Workflow</div>
             <div className="detail-action-grid">
@@ -1382,41 +3455,80 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
                 </button>
               )}
 
-              {effectiveMode === 'developer' && task.status !== 'done' && (
+              {task.status !== 'done' && (
                 <button
                   className="btn btn-secondary btn-sm"
-                  onClick={() => setShowSetupModal(true)}
+                  onClick={handleMarkDone}
                   disabled={!!aiLoading}
-                  title="Review or adjust workflow setup"
+                  title="Mark task as done"
                 >
-                  <Icon name="settings" size={13} /> Confirm Setup
+                  <Icon name="check" size={13} /> Done
                 </button>
               )}
+            </div>
+          </div>
 
-              {task.status === 'analyzed' && plan.workflowKind !== 'general' && (
-                <button
-                  className="btn btn-primary btn-sm"
-                  onClick={handleStartDevelopment}
-                  disabled={!!aiLoading}
-                  title="Move the task into Development without opening external tools"
-                >
-                  <Icon name="play" size={13} /> Start Development
-                </button>
-              )}
-
-              {task.status === 'in-progress' && (
-                <button
-                  className="btn btn-primary btn-sm"
-                  onClick={handleMarkWaitingForReview}
-                  disabled={!!aiLoading}
-                  title="Mark this task as waiting for code review"
-                >
-                  <Icon name="pause" size={13} /> Waiting for Code Review
-                </button>
-              )}
-
-              {task.status !== 'done' && (
-                <>
+          {/* PHASE ACTIONS — secondary transitions, collapsed by default */}
+          {task.status !== 'done' && (
+            <div className="detail-action-group">
+              <button
+                className="td-advanced-btn"
+                onClick={() => setShowPhaseActions((v) => !v)}
+              >
+                {showPhaseActions ? '^ Hide phase actions' : 'ˇ More phase actions'}
+              </button>
+              {showPhaseActions && (
+                <div className="detail-action-grid" style={{ marginTop: 4 }}>
+                  {effectiveMode === 'developer' && (
+                    <button
+                      className="btn btn-secondary btn-sm"
+                      onClick={() => setShowSetupModal(true)}
+                      disabled={!!aiLoading}
+                      title="Review or adjust workflow setup"
+                    >
+                      <Icon name="settings" size={13} /> Confirm Setup
+                    </button>
+                  )}
+                  {task.status === 'analyzed' && plan.workflowKind !== 'general' && (
+                    <button
+                      className="btn btn-secondary btn-sm"
+                      onClick={handleStartDevelopment}
+                      disabled={!!aiLoading}
+                      title="Move the task into Development without opening external tools"
+                    >
+                      <Icon name="play" size={13} /> Start Development
+                    </button>
+                  )}
+                  {task.status === 'in-progress' && plan.targetKind === 'plugin' && (
+                    <button
+                      className="btn btn-secondary btn-sm"
+                      onClick={handleVerifyImplementation}
+                      disabled={!!aiLoading}
+                      title="Open implementation verification checks before code review"
+                    >
+                      <Icon name="check" size={13} /> Verify Implementation
+                    </button>
+                  )}
+                  {task.status === 'in-progress' && (
+                    <button
+                      className="btn btn-secondary btn-sm"
+                      onClick={handleMarkWaitingForReview}
+                      disabled={!!aiLoading}
+                      title="Mark this task as waiting for code review"
+                    >
+                      <Icon name="pause" size={13} /> Waiting for Code Review
+                    </button>
+                  )}
+                  {task.waitingState === 'consultant-testing' && (
+                    <button
+                      className="btn btn-secondary btn-sm"
+                      onClick={() => handleStatusChange('in-progress')}
+                      disabled={!!aiLoading}
+                      title="Move this task back to active development"
+                    >
+                      <Icon name="play" size={13} /> Back to Development
+                    </button>
+                  )}
                   <button
                     className="btn btn-secondary btn-sm"
                     onClick={handleMarkPrComments}
@@ -1425,18 +3537,10 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
                   >
                     <Icon name="message-square" size={13} /> PR Comments
                   </button>
-                  <button
-                    className="btn btn-secondary btn-sm"
-                    onClick={handleMarkDone}
-                    disabled={!!aiLoading}
-                    title="Mark task as done"
-                  >
-                    <Icon name="check" size={13} /> Done
-                  </button>
-                </>
+                </div>
               )}
             </div>
-          </div>
+          )}
 
           {/* ASSISTANT TOOLS */}
           {effectiveMode === 'developer' && plan.requiresDevTools && (
@@ -1471,15 +3575,6 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
 
                 <button
                   className="btn btn-secondary btn-sm"
-                  onClick={handleOpenWork}
-                  disabled={!!aiLoading}
-                  title="Open the configured script, plugin, or folder without changing status"
-                >
-                  <Icon name="terminal" size={13} /> Open Work
-                </button>
-
-                <button
-                  className="btn btn-secondary btn-sm"
                   onClick={() => devModePanelRef.current?.openReviewModal()}
                   disabled={!!aiLoading}
                   title="Open AI review tools without changing workflow state"
@@ -1487,6 +3582,52 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
                   <Icon name="search" size={13} /> Run AI Review
                 </button>
 
+              </div>
+            </div>
+          )}
+
+          {/* PRIMARCH */}
+          {effectiveMode === 'developer' && plan.requiresDevTools && (
+            <div className="detail-action-group">
+              <div className="detail-action-group-label">Primarch</div>
+              <div style={{ marginBottom: 8 }}>
+                <label className="form-label" htmlFor="primarch-primary-entity-override">Primary entity override (optional)</label>
+                <input
+                  id="primarch-primary-entity-override"
+                  className="form-input"
+                  type="text"
+                  placeholder="account, contact, nvr_accountcompanyrelation"
+                  value={primarchPrimaryEntityOverride}
+                  onChange={(e) => setPrimarchPrimaryEntityOverride(e.target.value)}
+                />
+                <div className="settings-field-hint" style={{ marginTop: 4 }}>
+                  Used only for this task verification run unless you explicitly save it in task setup.
+                </div>
+              </div>
+              <div className="detail-action-grid">
+                <button
+                  className="btn btn-secondary btn-sm"
+                  onClick={handleGenerateCrmSkeleton}
+                  disabled={!!primarchActionLoading}
+                  title="Generate metadata-based CRM pseudo-code skeleton (read-only)"
+                >
+                  {primarchActionLoading === 'skeleton'
+                    ? <><span className="btn-spinner" /> Generating…</>
+                    : <><Icon name="layers" size={13} /> Generate CRM Skeleton</>}
+                </button>
+
+                <button
+                  className="btn btn-secondary btn-sm"
+                  onClick={handleVerifyAgainstCrm}
+                  disabled={!!primarchActionLoading || !settings.crmMetadataEnabled || !(settings.primarchMcpCommand ?? '').trim() || !(settings.primarchMcpArgs ?? '').trim()}
+                  title={(!settings.crmMetadataEnabled || !(settings.primarchMcpCommand ?? '').trim() || !(settings.primarchMcpArgs ?? '').trim())
+                    ? 'Configure and save CRM metadata assistant settings first.'
+                    : 'Verify current artifact references against CRM metadata (read-only)'}
+                >
+                  {primarchActionLoading === 'verify'
+                    ? <><span className="btn-spinner" /> Verifying…</>
+                    : <><Icon name="check" size={13} /> Verify against CRM</>}
+                </button>
               </div>
             </div>
           )}
@@ -1502,12 +3643,6 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
                 </div>
               )}
               <div className="detail-action-grid">
-                <button
-                  className="btn btn-secondary btn-sm"
-                  onClick={() => handleOpenPath(pluginsDir, 'plugins folder')}
-                >
-                  <Icon name="folder" size={13} /> Open Plugins Folder
-                </button>
                 <button
                   className="btn btn-secondary btn-sm"
                   onClick={async () => {
@@ -1552,12 +3687,6 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
             );
           })()}
 
-          {/* MODE SWITCH */}
-          <div className="detail-action-group">
-            <div className="detail-action-group-label">Mode</div>
-            <TaskModeSwitch task={task} onSetMode={handleSetMode} />
-          </div>
-
           {/* FILESYSTEM — only rendered when the customer has at least one path */}
           {hasAnyPath && (
             <div className="detail-action-group">
@@ -1572,13 +3701,18 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
                 </button>
               )}
 
-              {hasPlugin && (
+              {repoRootForGit ? (
                 <button
                   className="btn btn-secondary btn-sm btn-full"
-                  onClick={() => handleOpenPath(customer?.pluginFolder, 'plugin folder')}
+                  onClick={() => setShowGitCommitModal(true)}
+                  title="Stage files, review changes, and commit / push to the repository"
                 >
-                  <Icon name="plug" size={13} /> Open Plugin Folder
+                  <Icon name="layers" size={13} /> Prepare Commit
                 </button>
+              ) : (
+                <div style={{ fontSize: 12, color: 'var(--color-text-muted)', padding: '2px 0' }}>
+                  Git repository not detected for this task.
+                </div>
               )}
 
               {hasScript && (
@@ -1660,12 +3794,133 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
                 ? `${pluginsDir}/${selectedPluginProject}`
                 : undefined
             }
-            onClose={() => { setShowSkeleton(false); }}
-            onSaved={(filePath) => {
-              // "Save to File" succeeded inside the modal — persist artifact metadata only.
-              // selectedPluginProject is guaranteed non-empty when resolvedPluginBase is provided.
-              if (selectedPluginProject) {
-                completePluginDraft(selectedPluginProject, filePath);
+            unapprovedPlanWarning={
+              skeletonUsedAutoGeneratedPlan
+                ? 'Technical plan was generated automatically and has not been approved. Saving this draft means you accept this generated implementation direction.'
+                : undefined
+            }
+            onClose={() => { setShowSkeleton(false); setPendingPostSaveAction(null); setSkeletonUsedAutoGeneratedPlan(false); }}
+            onSaved={async (filePath) => {
+              // 1. Persist artifact metadata and close modal state.
+              const project = selectedPluginProject;
+              if (project) {
+                await completePluginDraft(project, filePath);
+              }
+
+              // 2. Add the file to the legacy .csproj (if this is a legacy project).
+              //    SDK-style projects auto-include .cs files and need no change.
+              let csprojOk = false; // true › file is in project (added, sdk, or already there)
+              let csprojFeedback = `Plugin draft saved: ${project}.`;
+              try {
+                const result = await tauriApi.addCompileIncludeToCsproj(filePath);
+                switch (result.action) {
+                  case 'added':
+                    csprojOk = true;
+                    csprojFeedback = 'Draft saved and added to the project file.';
+                    break;
+                  case 'sdk_style':
+                    csprojOk = true;
+                    csprojFeedback = 'Draft saved. SDK-style project auto-includes .cs files.';
+                    break;
+                  case 'already_present':
+                    csprojOk = true;
+                    csprojFeedback = 'Plugin draft saved. File is already referenced in the project.';
+                    break;
+                  default:
+                    // no_csproj_found — keep default message; may be a custom template layout
+                    break;
+                }
+              } catch {
+                csprojFeedback = 'Draft was saved, but it could not be added to the .csproj. Use Show All Files › Include In Project in Visual Studio.';
+              }
+
+              // 3. Post-save guided action ("Create + Save Draft + Open").
+              //    pendingPostSaveAction is read from the closure (captured at last render);
+              //    it is still 'save-draft-open' here even though onClose already called
+              //    setPendingPostSaveAction(null), because React state updates are async.
+              if (pendingPostSaveAction === 'save-draft-open') {
+                setPendingPostSaveAction(null);
+
+                // 3a. Restore NuGet packages (nuget.exe › direct download fallback).
+                //     Solution dir = pluginsDir/projectName (parent of the .sln file).
+                let nugetOk = false;
+                let nugetMsg = '';
+                if (pluginsDir && project) {
+                  const solutionDir = `${pluginsDir}/${project}`;
+                  try {
+                    const nugetResult = await tauriApi.restoreNugetPackages(solutionDir);
+                    nugetOk  = nugetResult.dllExists;
+                    nugetMsg = nugetResult.message;
+                  } catch (e) {
+                    nugetMsg = `NuGet restore failed: ${String(e)}`;
+                  }
+                }
+
+                // 3b. Open Visual Studio.
+                let vsOpened = false;
+                try {
+                  await handleOpenPluginForModal();
+                  vsOpened = true;
+                } catch { /* VS open failed — surfaced via feedback and adjusted next step below */ }
+
+                const noteText = 'Plugin project created and draft generated from Start Development workflow.';
+                const existing = task.notes?.trim() ?? '';
+                const combinedNotes = existing
+                  ? `${existing}\n[${new Date().toISOString()}] ${noteText}`
+                  : `[${new Date().toISOString()}] ${noteText}`;
+
+                // Next step encodes all failure dimensions: .csproj, NuGet, VS open.
+                const nextStepParts: string[] = [];
+                if (!nugetOk)   nextStepParts.push('restore NuGet packages');
+                if (!csprojOk)  nextStepParts.push('include generated .cs file in project');
+                if (!vsOpened)  nextStepParts.push('open plugin project manually');
+                const baseStep   = nextStepParts.length === 0
+                  ? 'Build and test plugin'
+                  : `${nextStepParts.join(', then ')}, then build and test plugin`;
+                const nextStepAction = vsOpened
+                  ? baseStep
+                  : `Open plugin project manually and ${baseStep.replace('open plugin project manually, then ', '').toLowerCase()}`;
+
+                const nextStepReason = [
+                  'Draft generated and saved from Start Development workflow.',
+                  !nugetOk  ? (nugetMsg || 'NuGet packages not restored.') : '',
+                  !csprojOk ? 'The .cs file could not be added to the .csproj automatically.' : '',
+                  !vsOpened ? 'Visual Studio could not be opened automatically.' : '',
+                ].filter(Boolean).join(' ');
+
+                // Include workflowSetup.artifactPath explicitly to prevent the stale-closure
+                // race: updateTask uses the tasks closure from the last render, which does not
+                // yet reflect the workflowSetup.artifactPath set by completePluginDraft above.
+                await updateTask(task.id, {
+                  status:         'in-progress',
+                  waitingState:   null,
+                  attentionState: null,
+                  notes:          combinedNotes,
+                  workflowSetup: {
+                    ...task.workflowSetup,
+                    devTargetKind: 'plugin',
+                    pluginProject: project || task.workflowSetup?.pluginProject,
+                    artifactPath:  filePath,
+                  },
+                  mcpNextStep: {
+                    action:    nextStepAction,
+                    reason:    nextStepReason,
+                    updatedAt: new Date().toISOString(),
+                  },
+                });
+
+                // Feedback for the guided flow.
+                const feedbackParts: string[] = [];
+                if (csprojOk)       feedbackParts.push('Draft saved and added to project.');
+                else                feedbackParts.push('Draft saved.');
+                if (nugetOk)        feedbackParts.push('NuGet packages restored.');
+                else                feedbackParts.push('NuGet packages not restored — use Restore NuGet Packages in Visual Studio.');
+                if (vsOpened)       feedbackParts.push('Visual Studio opened.');
+                else                feedbackParts.push('Visual Studio could not be opened.');
+                setFeedback(feedbackParts.join(' '));
+              } else {
+                // Non-guided flow: show the .csproj result as feedback.
+                setFeedback(csprojFeedback);
               }
             }}
           />
@@ -1700,6 +3955,201 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
           onConfirm={handleConfirmSetup}
           onConfirmOnly={handleConfirmSetupOnly}
           onCancel={() => setShowSetupModal(false)}
+        />
+      )}
+
+      {/* Start Development modal */}
+      {showStartDevModal && (
+        <StartDevelopmentModal
+          task={task}
+          customer={customer}
+          plan={plan}
+          pluginsDir={pluginsDir}
+          selectedPluginProject={selectedPluginProject}
+          repoRoot={customer?.resolvedRepositoryPath ?? customer?.repositoryRoot}
+          scriptOpenPath={task.workflowSetup?.scriptPath ?? customer?.scriptFolder ?? effectiveVscodePath}
+          templateDir={settings.pluginTemplateFolder ?? ''}
+          verificationVerdict={task.crmVerificationReports?.[0]?.verdict ?? 'none'}
+          onOpenPlugin={handleOpenPluginForModal}
+          onGenerateDraft={handleGenerateDraft}
+          onGenerateDraftGuided={() => handleGenerateDraftStartDev('none')}
+          onGenerateDraftAndOpen={() => handleGenerateDraftStartDev('save-draft-open')}
+          onCreatePlugin={async () => {
+            setShowStartDevModal(false);
+            const folders = await tauriApi.listSubfolders(pluginsDir ?? '').catch(() => [] as string[]);
+            setPluginProjectsForModal(folders);
+            setShowCreatePlugin(true);
+          }}
+          onProjectCreated={(projectName) => {
+            // Update task state after direct (no-form) project creation from the modal.
+            updateTask(task.id, {
+              selectedPluginProject: projectName,
+              workflowSetup: {
+                ...task.workflowSetup,
+                pluginProject:        projectName,
+                desiredPluginProject: undefined,
+              },
+            }).catch(() => {});
+            setDevPanelRefreshTick((t) => t + 1);
+            setFeedback(`Plugin project created: ${projectName}`);
+          }}
+          onStartDevelopment={handleStartDevelopmentConfirmed}
+          onClose={() => setShowStartDevModal(false)}
+        />
+      )}
+
+      {/* Git commit modal */}
+      {showGitCommitModal && repoRootForGit && (
+        <GitCommitModal
+          task={task}
+          customer={customer ?? null}
+          repoRoot={repoRootForGit}
+          postCommitPushAction={gitCommitGuidedMode ? 'move-to-review-and-open-ado' : undefined}
+          onPostCommitPushSuccess={gitCommitGuidedMode ? handleGitCommitMoveToReview : undefined}
+          onCommitOnlySuccess={gitCommitGuidedMode ? handleGitCommitOnlyGuided : undefined}
+          onClose={() => { setShowGitCommitModal(false); setGitCommitGuidedMode(false); }}
+          onActivityNote={(note) => void handleGitActivityNote(note)}
+        />
+      )}
+
+      {/* Testing actions modal */}
+      {showTestingActionsModal && (
+        <div className="modal-overlay" onClick={() => setShowTestingActionsModal(false)}>
+          <div className="modal" onClick={(e) => e.stopPropagation()} role="dialog" aria-modal="true" aria-labelledby="testing-modal-title">
+            <div className="modal-header">
+              <h3 className="modal-title" id="testing-modal-title">Testing actions</h3>
+              <button
+                type="button"
+                className="modal-close"
+                onClick={() => setShowTestingActionsModal(false)}
+                aria-label="Close"
+              >
+                ×
+              </button>
+            </div>
+            <div className="modal-body" style={{ display: 'flex', flexDirection: 'column', gap: 'var(--gap-sm)' }}>
+              <p style={{ margin: 0, fontSize: 13, color: 'var(--color-text-muted)' }}>
+                Testing in progress — waiting for consultant testing.
+              </p>
+              {/* Azure DevOps URL hint — shows customer name and what is/isn't configured */}
+              {(() => {
+                const resolution  = buildAzureDevOpsRepoUrl(task, customer ?? null);
+                const workItemUrl = task.devopsTaskUrl;
+                const custName    = customer?.name ?? 'unknown customer';
+                const repoName    = customer?.repositoryName;
+                const repoUrl     = customer?.azureDevOpsRepoUrl;
+
+                if (resolution?.kind === 'repo') {
+                  return (
+                    <p style={{ margin: 0, fontSize: 12, wordBreak: 'break-all', color: 'var(--color-text-muted)' }}>
+                      Repository: <span style={{ color: 'var(--color-accent)' }}>{resolution.url}</span>
+                    </p>
+                  );
+                }
+                if (resolution?.kind === 'work-item') {
+                  return (
+                    <div style={{ fontSize: 12, color: 'var(--color-text-muted)', display: 'flex', flexDirection: 'column', gap: 2 }}>
+                      <p style={{ margin: 0 }}>
+                        Repository URL not configured for <strong>{custName}</strong>.
+                        {!repoName && <span> Set <code style={{ fontSize: 11 }}>repositoryName</code> for {custName}.</span>}
+                      </p>
+                      <p style={{ margin: 0 }}>Fallback: Azure DevOps work item will be opened.</p>
+                      <p style={{ margin: 0, wordBreak: 'break-all', opacity: 0.75 }}>Work item: {resolution.url}</p>
+                    </div>
+                  );
+                }
+                return (
+                  <div style={{ fontSize: 12, color: 'var(--color-text-muted)', display: 'flex', flexDirection: 'column', gap: 2 }}>
+                    <p style={{ margin: 0 }}>
+                      Repository URL not configured for <strong>{custName}</strong>.
+                    </p>
+                    <p style={{ margin: 0, opacity: 0.8 }}>
+                      repositoryName: <span style={{ fontStyle: repoName ? 'normal' : 'italic' }}>{repoName ?? '(not set)'}</span>
+                      {' · '}
+                      azureDevOpsRepoUrl: <span style={{ fontStyle: repoUrl ? 'normal' : 'italic' }}>{repoUrl ?? '(not set)'}</span>
+                    </p>
+                    <p style={{ margin: 0 }}>
+                      Configure <code style={{ fontSize: 11 }}>repositoryName</code> or <code style={{ fontSize: 11 }}>azureDevOpsRepoUrl</code> for {custName} in workspace settings.
+                    </p>
+                    {workItemUrl && (
+                      <p style={{ margin: 0, wordBreak: 'break-all', opacity: 0.75 }}>Work item: {workItemUrl}</p>
+                    )}
+                  </div>
+                );
+              })()}
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 6, marginTop: 4 }}>
+                <button
+                  type="button"
+                  className="btn btn-secondary"
+                  onClick={handleTestingBackToDev}
+                >
+                  Back to Development
+                </button>
+                <button
+                  type="button"
+                  className="btn btn-secondary"
+                  onClick={handleTestingFailed}
+                >
+                  Testing failed
+                </button>
+                <button
+                  type="button"
+                  className="btn btn-primary"
+                  onClick={() => void handleTestingConfirmedPreparePR()}
+                  title={repoRootForGit
+                    ? 'Marks testing confirmed and opens commit dialog — Commit + Push will move to Review and open Azure DevOps'
+                    : 'Marks testing confirmed — Git repository not configured, configure it before moving to Review'}
+                >
+                  Testing confirmed → Prepare commit / PR
+                </button>
+              </div>
+            </div>
+            <div className="modal-footer">
+              <button
+                type="button"
+                className="btn btn-ghost"
+                onClick={() => setShowTestingActionsModal(false)}
+              >
+                Cancel
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Implementation Verification modal */}
+      {showImplVerifyModal && (
+        <ImplementationVerificationModal
+          task={task}
+          customer={customer}
+          selectedPluginProject={selectedPluginProject}
+          resolvedArtifactPath={modalArtifactPath ?? task.workflowSetup?.artifactPath ?? null}
+          artifactInferred={modalArtifactInferred && !task.workflowSetup?.artifactPath}
+          buildCheckRunning={implVerifyBuildRunning}
+          dataverseCheckRunning={implVerifyDvRunning}
+          aiCodeReviewRunning={implVerifyAiRunning}
+          onRunBuildCheck={handleRunBuildCheckForImpl}
+          onRunDataverseCheck={handleRunDataverseCheckForImpl}
+          onRunAiCodeReview={handleRunAiCodeReviewForImpl}
+          onUpdate={handleUpdateImplVerification}
+          onContinueToTesting={handleMarkWaitingForConsultantTesting}
+          onProceedToReview={async () => {
+            await handleMarkWaitingForReview();
+            setShowImplVerifyModal(false);
+          }}
+          onUpdateNextStepAndClose={async (nextStep) => {
+            await updateTask(task.id, {
+              mcpNextStep: {
+                action: nextStep,
+                reason: 'Updated from Implementation Verification.',
+                updatedAt: new Date().toISOString(),
+              },
+            });
+            setFeedback(`Next step set: "${nextStep}"`);
+            setShowImplVerifyModal(false);
+          }}
+          onOpenAiReview={() => setShowSavedReviewModal(true)}
+          onClose={() => setShowImplVerifyModal(false)}
         />
       )}
 
@@ -1795,6 +4245,69 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
           </Modal>
         );
       })()}
+
+      {/* Live Primarch verification modal */}
+      {showPrimarchVerifyModal && (
+        <PrimarchVerificationModal
+          filePath={primarchVerifyFilePath}
+          steps={primarchVerifySteps}
+          running={primarchActionLoading === 'verify'}
+          result={primarchVerifyResult}
+          error={primarchVerifyError}
+          primaryEntityOverride={primarchPrimaryEntityOverride.trim() || undefined}
+          crmMetadataEnabled={!!settings.crmMetadataEnabled}
+          mcpCommandConfigured={!!(settings.primarchMcpCommand ?? '').trim()}
+          mcpArgsConfigured={!!(settings.primarchMcpArgs ?? '').trim()}
+          onClose={handleClosePrimarchVerifyModal}
+        />
+      )}
+
+      {/* CRM Skeleton modal */}
+      {showCrmSkeletonModal && latestCrmSkeleton && (
+        <Modal
+          title="CRM Skeleton"
+          size="xl"
+          onClose={() => setShowCrmSkeletonModal(false)}
+          footer={
+            <button
+              className="btn btn-secondary btn-sm"
+              onClick={() => setShowCrmSkeletonModal(false)}
+              type="button"
+            >
+              Close
+            </button>
+          }
+        >
+          <CrmSkeletonResultView result={latestCrmSkeleton} />
+        </Modal>
+      )}
+
+      {/* CRM Verification modal */}
+      {showCrmVerificationModal && latestCrmVerification && (
+        <Modal
+          title="CRM Verification Report"
+          size="xl"
+          onClose={() => setShowCrmVerificationModal(false)}
+          footer={
+            <button
+              className="btn btn-secondary btn-sm"
+              onClick={() => setShowCrmVerificationModal(false)}
+              type="button"
+            >
+              Close
+            </button>
+          }
+        >
+          <CrmVerificationReportView report={latestCrmVerification} />
+        </Modal>
+      )}
+
+      {crmExecutionPreview && (
+        <CrmExecutionPreviewModal
+          preview={crmExecutionPreview}
+          onClose={() => setCrmExecutionPreview(null)}
+        />
+      )}
     </>
   );
 }

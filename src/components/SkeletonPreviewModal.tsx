@@ -26,6 +26,11 @@ interface SkeletonPreviewModalProps {
   overrideSavePath?: string;
   /** Override the modal title. Defaults to "Skeleton: <fileName>". */
   modalTitle?: string;
+  /**
+   * When set, shows a visible warning above the code preview and before Save to File.
+   * Used to alert the user that the technical plan was auto-generated and not yet approved.
+   */
+  unapprovedPlanWarning?: string;
 }
 
 function buildSavePath(
@@ -47,6 +52,7 @@ export default function SkeletonPreviewModal({
   resolvedPluginBase,
   overrideSavePath,
   modalTitle,
+  unapprovedPlanWarning,
 }: SkeletonPreviewModalProps) {
   const [copied, setCopied] = useState(false);
   const [saving, setSaving] = useState(false);
@@ -192,6 +198,19 @@ export default function SkeletonPreviewModal({
       )}
       {saveError && (
         <div className="detail-fs-error">! {saveError}</div>
+      )}
+      {unapprovedPlanWarning && (
+        <div style={{
+          fontSize: 12,
+          lineHeight: 1.5,
+          color: 'var(--color-warning, #d29922)',
+          border: '1px solid var(--color-warning, #d29922)',
+          borderRadius: 4,
+          padding: '7px 10px',
+          marginBottom: 6,
+        }}>
+          ! {unapprovedPlanWarning}
+        </div>
       )}
       <pre className="skeleton-code-preview">{preview.content}</pre>
     </Modal>

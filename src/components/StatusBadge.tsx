@@ -26,8 +26,9 @@ export function StatusBadge({ status }: StatusBadgeProps) {
 // --- Waiting / attention badges -------------------------------------------
 
 export const WAITING_LABELS: Record<TaskWaitingState, string> = {
-  'pricing-approval': 'Waiting for estimate approval',
-  'code-review':      'Waiting for code review',
+  'pricing-approval':    'Waiting for estimate approval',
+  'code-review':         'Waiting for code review',
+  'consultant-testing':  'Waiting for consultant testing',
 };
 
 export const ATTENTION_LABELS: Record<TaskAttentionState, string> = {

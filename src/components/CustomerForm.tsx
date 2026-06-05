@@ -11,42 +11,45 @@ interface CustomerFormProps {
 }
 
 type FormState = {
-  name:           string;
-  shortCode:      string;
-  folderName:     string;
-  repositoryName: string;
-  repositoryRoot: string;
-  pluginFolder:   string;
-  scriptFolder:   string;
-  namespace:      string;
-  notes:          string;
+  name:               string;
+  shortCode:          string;
+  folderName:         string;
+  repositoryName:     string;
+  azureDevOpsRepoUrl: string;
+  repositoryRoot:     string;
+  pluginFolder:       string;
+  scriptFolder:       string;
+  namespace:          string;
+  notes:              string;
 };
 
 function blankForm(): FormState {
   return {
-    name:           '',
-    shortCode:      '',
-    folderName:     '',
-    repositoryName: '',
-    repositoryRoot: '',
-    pluginFolder:   '',
-    scriptFolder:   '',
-    namespace:      '',
-    notes:          '',
+    name:               '',
+    shortCode:          '',
+    folderName:         '',
+    repositoryName:     '',
+    azureDevOpsRepoUrl: '',
+    repositoryRoot:     '',
+    pluginFolder:       '',
+    scriptFolder:       '',
+    namespace:          '',
+    notes:              '',
   };
 }
 
 function customerToForm(c: Customer): FormState {
   return {
-    name:           c.name,
-    shortCode:      c.shortCode,
-    folderName:     c.folderName      ?? '',
-    repositoryName: c.repositoryName  ?? '',
-    repositoryRoot: c.repositoryRoot  ?? '',
-    pluginFolder:   c.pluginFolder    ?? '',
-    scriptFolder:   c.scriptFolder    ?? '',
-    namespace:      c.namespace       ?? '',
-    notes:          c.notes           ?? '',
+    name:               c.name,
+    shortCode:          c.shortCode,
+    folderName:         c.folderName          ?? '',
+    repositoryName:     c.repositoryName      ?? '',
+    azureDevOpsRepoUrl: c.azureDevOpsRepoUrl  ?? '',
+    repositoryRoot:     c.repositoryRoot      ?? '',
+    pluginFolder:       c.pluginFolder        ?? '',
+    scriptFolder:       c.scriptFolder        ?? '',
+    namespace:          c.namespace           ?? '',
+    notes:              c.notes               ?? '',
   };
 }
 
@@ -54,15 +57,16 @@ function customerToForm(c: Customer): FormState {
 function formToCustomer(form: FormState): Omit<Customer, 'id'> {
   const opt = (v: string) => v.trim() || undefined;
   return {
-    name:           form.name.trim(),
-    shortCode:      form.shortCode.trim().toUpperCase(),
-    folderName:     opt(form.folderName),
-    repositoryName: opt(form.repositoryName),
-    repositoryRoot: opt(form.repositoryRoot),
-    pluginFolder:   opt(form.pluginFolder),
-    scriptFolder:   opt(form.scriptFolder),
-    namespace:      opt(form.namespace),
-    notes:          opt(form.notes),
+    name:               form.name.trim(),
+    shortCode:          form.shortCode.trim().toUpperCase(),
+    folderName:         opt(form.folderName),
+    repositoryName:     opt(form.repositoryName),
+    azureDevOpsRepoUrl: opt(form.azureDevOpsRepoUrl),
+    repositoryRoot:     opt(form.repositoryRoot),
+    pluginFolder:       opt(form.pluginFolder),
+    scriptFolder:       opt(form.scriptFolder),
+    namespace:          opt(form.namespace),
+    notes:              opt(form.notes),
   };
 }
 
@@ -292,7 +296,19 @@ export default function CustomerForm({ initialData, onClose }: CustomerFormProps
                 value={form.repositoryName ?? ''}
                 onChange={(e) => set('repositoryName', e.target.value)}
               />
+              <span className="form-hint">Used with Azure DevOps work-item URL to derive /_git/{'{repositoryName}'}</span>
             </div>
+          </div>
+          <div className="form-group">
+            <label className="form-label">Azure DevOps Repo URL</label>
+            <input
+              className="form-input"
+              type="url"
+              placeholder="https://dev.azure.com/org/project/_git/repo"
+              value={form.azureDevOpsRepoUrl ?? ''}
+              onChange={(e) => set('azureDevOpsRepoUrl', e.target.value)}
+            />
+            <span className="form-hint">Direct repository URL — takes priority over Repository Name derivation</span>
           </div>
           <div className="form-row">
             <div className="form-group">

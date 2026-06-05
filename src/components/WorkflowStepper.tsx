@@ -1,42 +1,56 @@
-import type { TaskStatus } from '../types';
-import type { WorkflowStage } from '../lib/workflowPlan';
+import type { DisplayPhase, WorkflowStage } from '../lib/workflowPlan';
 
 interface WorkflowStepperProps {
-  status: TaskStatus;
+  displayPhase: DisplayPhase;
   /** Dynamic stage list from buildTaskWorkflowPlan(). */
   stages: WorkflowStage[];
   /** Called when the user clicks the active step to trigger its stage action. */
   onRunCurrentAction: () => void;
   /** True while the current stage action is running — disables + shows spinner. */
   isRunning: boolean;
+  /**
+   * Called when the user clicks the active Testing step.
+   * When provided, the Testing step becomes clickable even though it has no next action.
+   */
+  onTestingAction?: () => void;
 }
 
-export function WorkflowStepper({ status, stages, onRunCurrentAction, isRunning }: WorkflowStepperProps) {
-  const isBlocked    = status === 'blocked';
-  const currentIndex = isBlocked ? -1 : stages.findIndex((s) => s.id === status);
+export function WorkflowStepper({ displayPhase, stages, onRunCurrentAction, isRunning, onTestingAction }: WorkflowStepperProps) {
+  const isBlocked    = displayPhase === 'blocked';
+  const currentIndex = isBlocked ? -1 : stages.findIndex((s) => s.id === displayPhase);
 
   return (
     <div className="workflow-bpf" aria-label="Task workflow">
       {stages.map((stage, i) => {
-        const isActive    = !isBlocked && stage.id === status;
-        const isCompleted = !isBlocked && i < currentIndex;
+        const isActive      = !isBlocked && stage.id === displayPhase;
+        const isCompleted   = !isBlocked && i < currentIndex;
+        const isTestingStep = stage.id === 'testing';
+        // Testing step is clickable when active and the caller provided a handler,
+        // even though it has no next action in the normal flow.
+        const hasClickAction = isActive && (stage.next != null || (isTestingStep && !!onTestingAction));
 
         const stateClass = isActive    ? 'workflow-bpf-step--active'
                          : isCompleted ? 'workflow-bpf-step--completed'
                          :               'workflow-bpf-step--upcoming';
+
+        const handleClick = hasClickAction
+          ? (stage.next != null ? onRunCurrentAction : onTestingAction)
+          : undefined;
 
         return (
           <button
             key={stage.id}
             type="button"
             className={`workflow-bpf-step workflow-bpf-step--${stage.id} ${stateClass}`}
-            onClick={isActive && stage.next ? onRunCurrentAction : undefined}
-            disabled={!isActive || !stage.next || isRunning}
+            onClick={handleClick}
+            disabled={!hasClickAction || isRunning}
             title={
-              isActive && stage.next
+              hasClickAction
                 ? isRunning
                   ? `Running: ${stage.actionLabel}…`
-                  : `Click to run: ${stage.actionLabel}`
+                  : isTestingStep
+                    ? 'Click to view testing actions'
+                    : `Click to run: ${stage.actionLabel}`
                 : isCompleted
                   ? stage.label
                   : `Not yet reached: ${stage.label}`
@@ -47,7 +61,7 @@ export function WorkflowStepper({ status, stages, onRunCurrentAction, isRunning 
               {stage.label}
             </span>
             <span className="workflow-bpf-action-label">
-              {isActive && stage.next && !isRunning && (
+              {hasClickAction && !isRunning && (
                 <span className="workflow-bpf-action-arrow" aria-hidden="true">›&nbsp;</span>
               )}
               {isActive && isRunning && (

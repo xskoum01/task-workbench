@@ -35,7 +35,10 @@ interface FormState {
   namespace: string;
   createInitialClass: boolean;
   openAfterCreate: boolean;
+  legacyStyle: boolean;
 }
+
+interface ScaffoldCheck { label: string; ok: boolean; path: string };
 
 function sanitize(name: string): string {
   // PascalCase-safe: strip forbidden filesystem chars
@@ -164,10 +167,12 @@ function areaFromNaverticaProject(projectName: string): string | null {
 }
 
 /**
- * Determine the best Navertica.<Area> project name and matching namespace.
+ * Determine the best project name and matching namespace for a new plugin project.
  *
  * Priority:
- *   1. Already-selected plugin project on the task (strong existing context)
+ *   0. Explicitly confirmed plugin project from workflow setup — never override the user's choice
+ *   1a. Desired project name (preserved after a deleted project so the modal re-opens with the same name)
+ *   1b. Already-selected plugin project on the task
  *   2. Explicit entity declaration in text ("entita je Contact", "entity is X", etc.)
  *   3. Keyword match in title
  *   4. Keyword match in full body — with existing-project reuse
@@ -181,6 +186,13 @@ function inferPluginSuggestions(
 ): { projectName: string; namespace: string; suggestionReason: string } {
   const fullText = `${task.title} ${task.originalMessage ?? ''}`;
 
+  // 0. Confirmed plugin project from Confirm Setup — highest priority.
+  //    The user explicitly chose this name; never override it with entity/keyword inference.
+  if (task.workflowSetup?.pluginProject) {
+    const name = task.workflowSetup.pluginProject;
+    return { projectName: name, namespace: name, suggestionReason: 'confirmed setup' };
+  }
+
   // 1a. Desired project name — preserved when a project was deleted so the modal re-opens
   //     with the same name the user previously intended, without running inference again.
   if (task.workflowSetup?.desiredPluginProject) {
@@ -188,13 +200,13 @@ function inferPluginSuggestions(
     return { projectName: dp, namespace: dp, suggestionReason: 'previous project name' };
   }
 
-  // 1b. Use existing selection on the task when it already follows the convention
+  // 1b. Already-selected project on the task (any naming convention, not only Navertica.*).
   if (task.selectedPluginProject) {
-    const area = areaFromNaverticaProject(task.selectedPluginProject);
-    if (area) {
-      const name = `Navertica.${area}`;
-      return { projectName: name, namespace: name, suggestionReason: 'existing project selection' };
-    }
+    const name = task.selectedPluginProject;
+    // If it follows the Navertica.* convention, keep that convention; otherwise use as-is.
+    const area = areaFromNaverticaProject(name);
+    const canonical = area ? `Navertica.${area}` : name;
+    return { projectName: canonical, namespace: canonical, suggestionReason: 'existing project selection' };
   }
 
   // 2. Explicit entity declaration — highest-confidence signal, beats keyword matches.
@@ -257,31 +269,47 @@ export default function CreatePluginProjectModal({
   const { settings } = useApp();
   const templateDir = settings.pluginTemplateFolder ?? '';
 
-  // Smart defaults derived from task + customer + existing project context
   const suggested = inferPluginSuggestions(task, customer, existingPluginProjects);
 
   const [form, setForm] = useState<FormState>({
     projectName:        suggested.projectName,
     namespace:          suggested.namespace,
-    // Default to false: the task-specific plugin class is created in the Generate Draft step.
-    // Check this only if you want a generic starter class alongside the task-specific one.
     createInitialClass: false,
     openAfterCreate:    true,
+    // Default to legacy style for Dynamics 365 plugin development.
+    // Custom templates ignore this flag and use the template as-is.
+    legacyStyle:        true,
   });
-  const [creating, setCreating] = useState(false);
-  const [error, setError] = useState<string | null>(null);
+  const [creating, setCreating]               = useState(false);
+  const [error, setError]                     = useState<string | null>(null);
+  const [checks, setChecks]                   = useState<ScaffoldCheck[] | null>(null);
+  const [showAdvanced, setShowAdvanced]       = useState(false);
 
-  function set<K extends keyof FormState>(key: K, value: FormState[K]) {
-    setForm((prev) => ({ ...prev, [key]: value }));
+  function set<K extends keyof FormState>(k: K, v: FormState[K]) {
+    setForm((prev) => ({ ...prev, [k]: v }));
     setError(null);
+    setChecks(null);
   }
+
+  const isCustomTemplate = !!templateDir;
+  const pn = sanitize(form.projectName.trim()) || '<ProjectName>';
+
+  // Files that will be created (for preview)
+  const previewFiles: string[] = [
+    `${pn}.sln`,
+    `${pn}/${pn}.csproj`,
+    ...((!isCustomTemplate && form.legacyStyle)
+      ? [`${pn}/packages.config`, `${pn}/app.config`, `${pn}/key.snk`, `${pn}/Properties/AssemblyInfo.cs`]
+      : []),
+    ...(form.createInitialClass ? [`${pn}/${pn.split('.').pop() ?? pn}Plugin.cs`] : []),
+  ];
 
   async function handleCreate() {
     const projectName = sanitize(form.projectName.trim());
     if (!projectName) { setError('Project name is required.'); return; }
-    // No check for templateDir — the backend falls back to the built-in stub when it is empty.
     setCreating(true);
     setError(null);
+    setChecks(null);
     try {
       const createdPath = await tauriApi.createPluginProjectFromTemplate(
         templateDir,
@@ -289,18 +317,31 @@ export default function CreatePluginProjectModal({
         projectName,
         form.namespace.trim() || suggested.namespace,
         form.createInitialClass,
+        !isCustomTemplate && form.legacyStyle,
       );
 
+      // Post-creation verification
+      if (!isCustomTemplate && form.legacyStyle) {
+        const projDir = `${createdPath}/${projectName}`;
+        const checkItems: ScaffoldCheck[] = await Promise.all([
+          { label: `${projectName}.sln`,              path: `${createdPath}/${projectName}.sln` },
+          { label: `${projectName}.csproj`,           path: `${projDir}/${projectName}.csproj` },
+          { label: 'packages.config',                 path: `${projDir}/packages.config` },
+          { label: 'app.config',                      path: `${projDir}/app.config` },
+          { label: 'key.snk',                         path: `${projDir}/key.snk` },
+          { label: 'Properties/AssemblyInfo.cs',      path: `${projDir}/Properties/AssemblyInfo.cs` },
+        ].map(async (item) => ({
+          ...item,
+          ok: await tauriApi.checkPathExists(item.path).catch(() => false),
+        })));
+        setChecks(checkItems);
+      }
+
       if (form.openAfterCreate) {
-        // Try to open .sln; fall back to .csproj; fall back to folder
-        // The Rust command returns the solution root. The .sln is at solutionRoot/ProjectName.sln
-        // The .csproj is one level deeper: solutionRoot/ProjectName/ProjectName.csproj
-        // Always use openWithShell so Visual Studio is used (not VS Code).
         const slns = await tauriApi.listDirectoryFiles(createdPath, 'sln').catch(() => [] as string[]);
         if (slns.length > 0) {
           await tauriApi.openWithShell(`${createdPath}/${slns[0]}`).catch(() => {});
         } else {
-          // .sln not found — try .csproj in the nested project subfolder
           const projDir = `${createdPath}/${projectName}`;
           const csprojs = await tauriApi.listDirectoryFiles(projDir, 'csproj').catch(() => [] as string[]);
           if (csprojs.length > 0) {
@@ -331,26 +372,31 @@ export default function CreatePluginProjectModal({
   return (
     <Modal title="Create Plugin Project" onClose={onClose} footer={footer} size="md">
 
-      {/* Template status */}
-      {!templateDir && (
-        <div style={{ fontSize: 11, color: 'var(--text-muted)', marginBottom: 12 }}>
-          No custom template configured — a built-in default Dataverse plugin stub will be used.
-          Set a Plugin Template folder in Settings to use your own template instead.
-        </div>
-      )}
-      {templateDir && (
-        <div style={{ fontSize: 11, color: 'var(--text-muted)', marginBottom: 12 }}>
-          Template: <code style={{ fontFamily: 'monospace' }}>{templateDir}</code>
-        </div>
-      )}
-
-      {/* Target location — solution and project land in the same directory */}
-      <div style={{ fontSize: 11, color: 'var(--text-muted)', marginBottom: 16 }}>
-        Target: <code style={{ fontFamily: 'monospace' }}>{pluginsDir}/</code>
-        <span style={{ fontWeight: 600 }}>{sanitize(form.projectName) || '<ProjectName>'}</span>
+      {/* ── Source / scaffold info ─────────────────────────────────────── */}
+      <div style={{ fontSize: 11, color: 'var(--text-muted)', marginBottom: 12 }}>
+        {isCustomTemplate ? (
+          <>
+            <span style={{ color: 'var(--color-done, #3fb950)', fontWeight: 600 }}>✓ </span>
+            Using plugin template:{' '}
+            <code style={{ fontFamily: 'monospace' }}>{templateDir}</code>
+          </>
+        ) : (
+          <>
+            No plugin template configured — using built-in legacy CRM plugin scaffold.
+            {' '}<span style={{ color: 'var(--text-disabled, var(--text-muted))', opacity: 0.7 }}>
+              Set Plugin Template Folder in Settings to use your Visual Studio plugin template.
+            </span>
+          </>
+        )}
       </div>
 
-      {/* Project name */}
+      {/* ── Target location ───────────────────────────────────────────── */}
+      <div style={{ fontSize: 11, color: 'var(--text-muted)', marginBottom: 12 }}>
+        Target: <code style={{ fontFamily: 'monospace' }}>{pluginsDir}/</code>
+        <span style={{ fontWeight: 600 }}>{pn}</span>
+      </div>
+
+      {/* ── Project name ──────────────────────────────────────────────── */}
       <div className="form-group">
         <label className="form-label form-label-required">Project / Assembly Name</label>
         <input
@@ -362,16 +408,14 @@ export default function CreatePluginProjectModal({
           autoFocus
         />
         <div className="form-hint">
-          Convention: <code>Navertica.&lt;BroaderArea&gt;</code>. Used for the solution folder name,
-          .sln, .csproj, and the <code>__PROJECT_NAME__</code> placeholder.
-          Standard VS layout: <code>{sanitize(form.projectName) || 'ProjectName'}/{sanitize(form.projectName) || 'ProjectName'}/</code>.
+          Convention: <code>Navertica.&lt;BroaderArea&gt;</code>. Used for folder name, .sln, .csproj.
         </div>
-        <div style={{ fontSize: 10, color: 'var(--text-muted)', marginTop: 3 }}>
-          Suggested from {suggested.suggestionReason}
+        <div style={{ fontSize: 10, color: 'var(--text-muted)', marginTop: 2 }}>
+          Suggested from: {suggested.suggestionReason}
         </div>
       </div>
 
-      {/* Namespace */}
+      {/* ── Namespace ─────────────────────────────────────────────────── */}
       <div className="form-group">
         <label className="form-label">Root Namespace</label>
         <input
@@ -381,40 +425,124 @@ export default function CreatePluginProjectModal({
           value={form.namespace}
           onChange={(e) => set('namespace', e.target.value)}
         />
-        <div className="form-hint">
-          Replaces <code>__NAMESPACE__</code> in all template files. Defaults to the project name.
-        </div>
+        <div className="form-hint">Replaces <code>__NAMESPACE__</code>. Defaults to project name.</div>
       </div>
 
-      {/* Options */}
-      <div className="form-group" style={{ display: 'flex', flexDirection: 'column', gap: 8, marginTop: 8 }}>
+      {/* ── Files preview ─────────────────────────────────────────────── */}
+      <div className="form-group" style={{ marginTop: 4 }}>
+        <label className="form-label">Files that will be created</label>
+        {isCustomTemplate ? (
+          <div style={{ fontSize: 11.5, color: 'var(--text-muted)', lineHeight: 1.6 }}>
+            Files are copied from the configured template. The following are excluded:{' '}
+            <code>.github</code>, <code>.vs</code>, <code>bin</code>, <code>obj</code>,{' '}
+            <code>packages/</code>, <code>key.snk</code>.
+            A fresh <code>key.snk</code> will be generated in the project folder.
+            The template folder base name is replaced with the new project name.
+          </div>
+        ) : (
+          <div style={{
+            background: 'var(--bg-overlay)', border: '1px solid var(--border-subtle)',
+            borderRadius: 'var(--radius-sm)', padding: '6px 10px', fontSize: 11.5,
+            fontFamily: 'var(--font-mono, Consolas, monospace)', lineHeight: 1.8,
+            color: 'var(--text-muted)',
+          }}>
+            {previewFiles.map((f) => <div key={f}>{f}</div>)}
+          </div>
+        )}
+      </div>
+
+      {/* ── Primary option: open after create ─────────────────────────── */}
+      <div style={{ marginTop: 4 }}>
         <label className="form-checkbox-row">
-          <input
-            type="checkbox"
-            checked={form.createInitialClass}
-            onChange={(e) => set('createInitialClass', e.target.checked)}
-          />
-          <span>
-            Create generic starter plugin class
-            <span style={{ display: 'block', fontSize: 10, color: 'var(--text-muted)', marginTop: 2 }}>
-              Leave unchecked — the task-specific class is generated by Generate Draft.
-            </span>
-          </span>
-        </label>
-        <label className="form-checkbox-row">
-          <input
-            type="checkbox"
-            checked={form.openAfterCreate}
-            onChange={(e) => set('openAfterCreate', e.target.checked)}
-          />
+          <input type="checkbox" checked={form.openAfterCreate}
+            onChange={(e) => set('openAfterCreate', e.target.checked)} />
           <span>Open project after creation</span>
         </label>
       </div>
 
-      {/* Error */}
-      {error && (
-        <div className="detail-fs-error" style={{ marginTop: 12 }}>! {error}</div>
+      {/* ── Advanced ──────────────────────────────────────────────────── */}
+      <div style={{ marginTop: 10 }}>
+        <button
+          type="button"
+          className="td-advanced-btn"
+          onClick={() => setShowAdvanced((v) => !v)}
+        >
+          {showAdvanced ? '▲ Hide advanced options' : '▼ Advanced options'}
+        </button>
+
+        {showAdvanced && (
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 10, marginTop: 8 }}>
+
+            {/* Starter class option */}
+            <label className="form-checkbox-row">
+              <input type="checkbox" checked={form.createInitialClass}
+                onChange={(e) => set('createInitialClass', e.target.checked)} />
+              <span>
+                Create generic starter plugin class
+                <span style={{ display: 'block', fontSize: 10, color: 'var(--text-muted)', marginTop: 2 }}>
+                  Leave unchecked — Generate Draft creates the task-specific plugin class.
+                </span>
+              </span>
+            </label>
+
+            {/* Built-in scaffold style (shown only when no template configured) */}
+            {!isCustomTemplate && (
+              <div>
+                <label className="form-label" style={{ marginBottom: 6 }}>Built-in scaffold style</label>
+                <div style={{ display: 'flex', gap: 6 }}>
+                  <button
+                    type="button"
+                    className={`btn btn-sm ${form.legacyStyle ? 'btn-primary' : 'btn-secondary'}`}
+                    onClick={() => set('legacyStyle', true)}
+                  >
+                    Legacy packages.config
+                  </button>
+                  <button
+                    type="button"
+                    className={`btn btn-sm ${!form.legacyStyle ? 'btn-primary' : 'btn-secondary'}`}
+                    onClick={() => set('legacyStyle', false)}
+                  >
+                    SDK-style PackageReference
+                  </button>
+                </div>
+                <div className="form-hint" style={{ marginTop: 4 }}>
+                  {form.legacyStyle
+                    ? 'Legacy: packages.config + app.config + key.snk + Properties/AssemblyInfo.cs. Recommended for CRM plugins.'
+                    : 'SDK style: PackageReference in .csproj. Simpler, no packages.config, no assembly signing.'}
+                </div>
+              </div>
+            )}
+          </div>
+        )}
+      </div>
+
+      {/* ── Post-creation verification results ───────────────────────── */}
+      {checks && (
+        <div style={{ marginTop: 12 }}>
+          <div style={{ fontSize: 11, fontWeight: 600, marginBottom: 5, color: 'var(--text-muted)' }}>
+            Verification
+          </div>
+          {checks.map((c) => (
+            <div key={c.label} style={{ display: 'flex', alignItems: 'baseline', gap: 7, fontSize: 11.5, lineHeight: 1.7 }}>
+              <span style={{ color: c.ok ? 'var(--color-done, #3fb950)' : 'var(--color-warning, #d29922)', fontWeight: 700 }}>
+                {c.ok ? '✓' : '!'}
+              </span>
+              <span style={{ fontFamily: 'monospace', color: c.ok ? 'var(--text-muted)' : 'var(--color-warning, #d29922)' }}>
+                {c.label}{!c.ok ? ' — missing' : ''}
+              </span>
+            </div>
+          ))}
+          {checks.some((c) => !c.ok) && (
+            <div style={{ fontSize: 11, color: 'var(--text-muted)', marginTop: 6 }}>
+              Missing files can be created manually. key.snk:{' '}
+              <code style={{ fontFamily: 'monospace' }}>sn.exe -k key.snk</code>
+            </div>
+          )}
+        </div>
       )}
+
+      {/* ── Error ─────────────────────────────────────────────────────── */}
+      {error && <div className="detail-fs-error" style={{ marginTop: 12 }}>! {error}</div>}
     </Modal>
   );
 }

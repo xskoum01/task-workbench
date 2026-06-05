@@ -119,6 +119,39 @@ export default function SettingsPage() {
   const [m365Notice, setM365Notice] = useState('');
   const [templateValidation, setTemplateValidation] = useState<TemplateValidationState>('not_selected');
   const [templateValidating, setTemplateValidating] = useState(false);
+  // MCP connection test state
+  const [mcpTestStatus, setMcpTestStatus] = useState<string | null>(null);
+  const [mcpTestMessage, setMcpTestMessage] = useState<string>('');
+  const [mcpTestUsedDraft, setMcpTestUsedDraft] = useState(false);
+  const [mcpTesting, setMcpTesting] = useState(false);
+  const [mcpTools, setMcpTools] = useState<Array<{ name: string; description: string; readOnly: boolean }> | null>(null);
+  const [mcpToolsLoading, setMcpToolsLoading] = useState(false);
+  const [taskMcpBridgeLoading, setTaskMcpBridgeLoading] = useState(false);
+  const [taskMcpBridge, setTaskMcpBridge] = useState<{
+    active: boolean;
+    host: string;
+    port: number;
+    serverPath: string;
+    readOnlyMode: boolean;
+    localWriteMode: boolean;
+    readOnlyTools: Array<{ name: string; description: string; readOnly: boolean }>;
+    localWriteTools: Array<{ name: string; description: string; readOnly: boolean }>;
+    lastError?: string;
+  } | null>(null);
+
+  type SettingsTab = 'general' | 'workspace' | 'ai' | 'crm' | 'm365';
+  const [activeTab, setActiveTab] = useState<SettingsTab>('general');
+
+  type McpSetupTool = 'claude-code' | 'claude-desktop' | 'cursor' | 'vscode-copilot' | 'windsurf' | 'codex';
+  const [mcpSetupTab, setMcpSetupTab] = useState<McpSetupTool>('claude-code');
+
+  const TABS: { id: SettingsTab; label: string; icon: IconName }[] = [
+    { id: 'general',   label: 'General',       icon: 'settings'       },
+    { id: 'workspace', label: 'Workspace',      icon: 'folder'         },
+    { id: 'ai',        label: 'AI',             icon: 'search'         },
+    { id: 'crm',       label: 'CRM Metadata',   icon: 'folder'         },
+    { id: 'm365',      label: 'Microsoft 365',  icon: 'mail'           },
+  ];
 
   useEffect(() => {
     setDraft(settings);
@@ -269,6 +302,134 @@ export default function SettingsPage() {
     setTemplateValidation('not_selected');
   }
 
+  // --- Primarch MCP actions ------------------------------------------------
+
+  async function handleTestPrimarchMcpConnection() {
+    setMcpTesting(true);
+    setMcpTestStatus(null);
+    setMcpTestMessage('');
+    setMcpTestUsedDraft(false);
+    try {
+      const usedDraft = isDirty;
+      const result = await tauriApi.testPrimarchMcpConnection(draft);
+      const status = String(result.status ?? 'error');
+      const message = String(result.message ?? 'No response message.');
+      setMcpTestStatus(status);
+      setMcpTestMessage(message);
+      setMcpTestUsedDraft(usedDraft);
+
+      if (usedDraft) {
+        setDraft((prev) => ({
+          ...prev,
+          primarchMcpLastStatus: status as AppSettings['primarchMcpLastStatus'],
+          primarchMcpLastError: status === 'error' ? message : undefined,
+        }));
+        setIsDirty(true);
+        setSaved(false);
+      } else {
+        await updateSettings({
+          primarchMcpLastStatus: status as AppSettings['primarchMcpLastStatus'],
+          primarchMcpLastError: status === 'error' ? message : undefined,
+        });
+        setSaved(true);
+        setTimeout(() => setSaved(false), 3000);
+      }
+    } catch (err) {
+      const message = String(err);
+      setMcpTestStatus('error');
+      setMcpTestMessage(message);
+      setDraft((prev) => ({
+        ...prev,
+        primarchMcpLastStatus: 'error',
+        primarchMcpLastError: message,
+      }));
+      setIsDirty(true);
+      setSaved(false);
+    } finally {
+      setMcpTesting(false);
+    }
+  }
+
+    async function handleListPrimarchMcpTools() {
+      setMcpToolsLoading(true);
+      setMcpTools(null);
+      try {
+        if (isDirty) {
+          await updateSettings(draft);
+          setIsDirty(false);
+        }
+        const result = await tauriApi.listPrimarchMcpTools();
+        const tools = Array.isArray(result.tools) ? result.tools : [];
+        setMcpTools(tools);
+        if (!tools.length && result.message) {
+          setMcpTestStatus('not_configured');
+          setMcpTestMessage(String(result.message));
+        }
+      } catch (err) {
+        setMcpTestStatus('error');
+        setMcpTestMessage(String(err));
+        setMcpTools([]);
+      } finally {
+        setMcpToolsLoading(false);
+      }
+    }
+
+  async function refreshTaskMcpBridgeStatus() {
+    setTaskMcpBridgeLoading(true);
+    try {
+      const status = await tauriApi.getTaskMcpBridgeStatus();
+      setTaskMcpBridge(status);
+    } catch (err) {
+      setTaskMcpBridge({
+        active: false,
+        host: '127.0.0.1',
+        port: 38473,
+        serverPath: 'mcp/task-workbench-mcp.mjs',
+        readOnlyMode: false,
+        localWriteMode: true,
+        readOnlyTools: [],
+        localWriteTools: [],
+        lastError: String(err),
+      });
+    } finally {
+      setTaskMcpBridgeLoading(false);
+    }
+  }
+
+  useEffect(() => {
+    if (activeTab !== 'crm') return;
+    void refreshTaskMcpBridgeStatus();
+  }, [activeTab]);
+
+  // Normalise to forward slashes for all snippet use.
+  const taskMcpServerPath = (taskMcpBridge?.serverPath ?? 'mcp/task-workbench-mcp.mjs').replace(/\\/g, '/');
+
+  const mcpJsonSnippet = JSON.stringify({
+    mcpServers: {
+      'task-workbench': {
+        command: 'node',
+        args: [taskMcpServerPath],
+      },
+    },
+  }, null, 2);
+  const claudeDesktopSnippet = mcpJsonSnippet;
+  const cursorSnippet      = mcpJsonSnippet;
+  const vsCodeCopilotSnippet = mcpJsonSnippet;
+  const windsurfSnippet    = mcpJsonSnippet;
+  const codexSnippet       = `codex mcp add task-workbench --command node --arg "${taskMcpServerPath}"`;
+  const claudeCodeSnippet  = `claude mcp add task-workbench --command node --arg "${taskMcpServerPath}"`;
+
+  type McpToolTab = { id: McpSetupTool; label: string; hint: string; snippet: string };
+  const MCP_TOOL_TABS: McpToolTab[] = [
+    { id: 'claude-code',    label: 'Claude Code',     hint: 'Run once in a terminal:',                                          snippet: claudeCodeSnippet },
+    { id: 'claude-desktop', label: 'Claude Desktop',  hint: 'Add to claude_desktop_config.json under "mcpServers":',           snippet: claudeDesktopSnippet },
+    { id: 'cursor',         label: 'Cursor',          hint: 'Add to .cursor/mcp.json or project .mcp.json:',                   snippet: cursorSnippet },
+    { id: 'vscode-copilot', label: 'VS Code Copilot', hint: 'Add to .vscode/mcp.json or workspace .mcp.json:',                 snippet: vsCodeCopilotSnippet },
+    { id: 'windsurf',       label: 'Windsurf',        hint: 'Add to .windsurf/mcp.json or project .mcp.json:',                 snippet: windsurfSnippet },
+    { id: 'codex',          label: 'Codex CLI',       hint: 'Run once in a terminal:',                                          snippet: codexSnippet },
+  ];
+  const activeMcpTab = MCP_TOOL_TABS.find((t) => t.id === mcpSetupTab) ?? MCP_TOOL_TABS[0];
+
   // --- M365 connection actions ---------------------------------------------
 
   async function handleM365SignIn() {
@@ -405,20 +566,6 @@ export default function SettingsPage() {
 
   const baseDir      = draft.crmBaseDirectory ?? '';
   const templatePath = draft.repositoryTemplatePath ?? '';
-
-  // ---------------------------------------------------------------------------
-  // Tab state
-  // ---------------------------------------------------------------------------
-
-  type SettingsTab = 'general' | 'workspace' | 'ai' | 'm365';
-  const [activeTab, setActiveTab] = useState<SettingsTab>('general');
-
-  const TABS: { id: SettingsTab; label: string; icon: IconName }[] = [
-    { id: 'general',   label: 'General',       icon: 'settings'       },
-    { id: 'workspace', label: 'Workspace',      icon: 'folder'         },
-    { id: 'ai',        label: 'AI',             icon: 'search'         },
-    { id: 'm365',      label: 'Microsoft 365',  icon: 'mail'           },
-  ];
 
   return (
     <div className="page-content">
@@ -741,29 +888,67 @@ export default function SettingsPage() {
             <SettingsBlock
               icon="search"
               title="AI Configuration"
-              description="OpenAI API key and model for task classification and workflow automation"
+              description="Provider-aware AI configuration for analysis, draft generation, and reviews"
             >
-              <SettingsField label="Model">
+              <SettingsField label="Active Provider">
+                <select
+                  className="form-select"
+                  value={draft.activeAiProvider ?? 'openai'}
+                  onChange={(e) => set('activeAiProvider', e.target.value as AppSettings['activeAiProvider'])}
+                  style={{ maxWidth: 280 }}
+                >
+                  <option value="openai">OpenAI</option>
+                  <option value="anthropic">Claude (Anthropic)</option>
+                </select>
+              </SettingsField>
+
+              <SettingsField label="OpenAI Model">
                 <input
                   className="form-input"
                   type="text"
                   placeholder="gpt-4.1-mini"
-                  value={draft.aiModel}
-                  onChange={(e) => set('aiModel', e.target.value)}
+                  value={draft.openaiModel ?? ''}
+                  onChange={(e) => set('openaiModel', e.target.value)}
                   style={{ maxWidth: 280 }}
                 />
               </SettingsField>
 
-              <SettingsField label="API Key">
+              <SettingsField label="OpenAI API Key">
                 <input
                   className="form-input"
                   type="password"
                   placeholder="sk-…"
-                  value={draft.aiApiKey}
-                  onChange={(e) => set('aiApiKey', e.target.value)}
+                  value={draft.openaiApiKey ?? ''}
+                  onChange={(e) => set('openaiApiKey', e.target.value)}
                   style={{ maxWidth: 280 }}
                 />
               </SettingsField>
+
+              <SettingsField label="Claude Model">
+                <input
+                  className="form-input"
+                  type="text"
+                  placeholder="claude-sonnet-4-5"
+                  value={draft.anthropicModel ?? ''}
+                  onChange={(e) => set('anthropicModel', e.target.value)}
+                  style={{ maxWidth: 280 }}
+                />
+              </SettingsField>
+
+              <SettingsField label="Claude API Key">
+                <input
+                  className="form-input"
+                  type="password"
+                  placeholder="sk-ant-…"
+                  value={draft.anthropicApiKey ?? ''}
+                  onChange={(e) => set('anthropicApiKey', e.target.value)}
+                  style={{ maxWidth: 280 }}
+                />
+              </SettingsField>
+
+              <div className="settings-field-hint">
+                Legacy <code>aiApiKey</code> and <code>aiModel</code> are preserved and used automatically as OpenAI fallback.
+              </div>
             </SettingsBlock>
 
             <SettingsBlock
@@ -783,6 +968,233 @@ export default function SettingsPage() {
                 Reviewer instructions are sent as the AI system prompt. Changes take effect
                 immediately when you save Settings.
               </p>
+            </SettingsBlock>
+          </>
+        )}
+
+        {/* ── CRM Metadata / Primarch MCP ─────────────────────────────────── */}
+        {activeTab === 'crm' && (
+          <>
+            <SettingsBlock
+              icon="plug"
+              title="Task MCP Bridge"
+              description="Primarch-style local bridge used by mcp/task-workbench-mcp.mjs. Localhost only."
+            >
+              <div className="settings-inline-list" style={{ marginTop: 2, marginBottom: 8 }}>
+                <span className={`repo-status-badge ${taskMcpBridge?.active ? 'repo-status-linked' : 'repo-status-missing'}`}>
+                  {taskMcpBridge?.active ? 'Bridge Active' : 'Not running'}
+                </span>
+                <span className="repo-status-badge repo-status-missing">Local workflow writes</span>
+                <span className="repo-status-badge repo-status-linked">External writes blocked</span>
+              </div>
+              <div className="settings-field-hint" style={{ marginTop: 4 }}>
+                AI clients can create local task-workbench tasks and test tasks, and can update local task workflow fields
+                such as analysis, summary, phase, waiting state, estimate, checklist, notes, technical plan drafts,
+                consultant testing records, and manual PR tracking.
+                They still cannot modify Dataverse, Git, GitHub, Azure DevOps, plugin registrations, web resources, or repository files.
+              </div>
+
+              <SettingsField label="Localhost endpoint">
+                <div style={{ fontSize: 13, color: 'var(--text-muted)' }}>
+                  {taskMcpBridge?.host ?? '127.0.0.1'}:{taskMcpBridge?.port ?? 38473}
+                </div>
+              </SettingsField>
+
+              <SettingsField label="MCP server path">
+                <input
+                  className="form-input"
+                  type="text"
+                  readOnly
+                  value={taskMcpServerPath}
+                  style={{ maxWidth: 700 }}
+                />
+              </SettingsField>
+
+              <div className="settings-action-row" style={{ marginTop: 8 }}>
+                <button
+                  className="btn btn-secondary btn-sm"
+                  onClick={refreshTaskMcpBridgeStatus}
+                  disabled={taskMcpBridgeLoading}
+                >
+                  {taskMcpBridgeLoading ? <><span className="btn-spinner" /> Refreshing…</> : 'Refresh Bridge Status'}
+                </button>
+              </div>
+
+              {taskMcpBridge?.lastError && (
+                <div className="settings-field-hint" style={{ marginTop: 8 }}>
+                  {taskMcpBridge.lastError}
+                </div>
+              )}
+
+              {/* Setup instructions */}
+              <div style={{ marginTop: 12 }}>
+                <div className="settings-field-hint" style={{ marginBottom: 6, fontWeight: 600 }}>
+                  Setup instructions
+                </div>
+                <ol style={{ margin: '0 0 10px', paddingLeft: 18, fontSize: 12, color: 'var(--text-muted)', lineHeight: 1.7 }}>
+                  <li>Task Workbench app must be running — the MCP bridge starts automatically on launch.</li>
+                  <li>Verify the bridge status above — endpoint should show active.</li>
+                  <li style={{ marginBottom: 6 }}>Add the MCP config to your AI tool:</li>
+                </ol>
+
+                {/* Tool selector */}
+                <div className="planning-filter-bar" style={{ flexWrap: 'wrap', marginBottom: 8 }}>
+                  {MCP_TOOL_TABS.map((t) => (
+                    <button
+                      key={t.id}
+                      className={`planning-filter-chip${mcpSetupTab === t.id ? ' active' : ''}`}
+                      onClick={() => setMcpSetupTab(t.id)}
+                    >
+                      {t.label}
+                    </button>
+                  ))}
+                </div>
+
+                {/* Active snippet */}
+                <div className="settings-field-hint" style={{ marginBottom: 4 }}>{activeMcpTab.hint}</div>
+                <div style={{ position: 'relative' }}>
+                  <pre style={{
+                    margin: 0, padding: '8px 56px 8px 10px',
+                    fontSize: 11.5, fontFamily: 'var(--font-mono, Consolas, monospace)',
+                    background: 'var(--bg-overlay)', border: '1px solid var(--border-subtle)',
+                    borderRadius: 'var(--radius-sm)', whiteSpace: 'pre-wrap', wordBreak: 'break-all',
+                    color: 'var(--text-secondary)', lineHeight: 1.55,
+                  }}>
+                    {activeMcpTab.snippet}
+                  </pre>
+                  <button
+                    className="btn btn-ghost btn-sm"
+                    style={{ position: 'absolute', top: 5, right: 5, fontSize: 11 }}
+                    onClick={() => navigator.clipboard.writeText(activeMcpTab.snippet).catch(() => {})}
+                    title="Copy to clipboard"
+                  >
+                    Copy
+                  </button>
+                </div>
+
+                <div style={{ marginTop: 8, fontSize: 12, color: 'var(--text-muted)' }}>
+                  4. Restart or reload your AI tool after adding the config.
+                </div>
+              </div>
+
+              <div style={{ marginTop: 10 }}>
+                <div className="settings-field-hint" style={{ marginBottom: 4 }}>Available tools</div>
+                <div className="detail-analysis-points" style={{ maxHeight: 260, overflow: 'auto' }}>
+                  {(taskMcpBridge?.readOnlyTools ?? []).map((t) => (
+                    <div key={`ro-${t.name}`} style={{ marginBottom: 4 }}>
+                      <strong>{t.name}</strong> · read-only
+                      {t.description ? <div className="settings-field-hint">{t.description}</div> : null}
+                    </div>
+                  ))}
+                  {(taskMcpBridge?.localWriteTools ?? []).map((t) => (
+                    <div key={`rw-${t.name}`} style={{ marginBottom: 4 }}>
+                      <strong>{t.name}</strong> · local-write
+                      {t.description ? <div className="settings-field-hint">{t.description}</div> : null}
+                    </div>
+                  ))}
+                </div>
+              </div>
+            </SettingsBlock>
+
+            <SettingsBlock
+              icon="folder"
+              title="CRM Metadata / Primarch MCP"
+              description="Read-only Dataverse metadata assistant for CRM skeleton and deterministic verification"
+            >
+              <SettingsField label="Enable CRM metadata assistant">
+                <label className="checkbox-inline" style={{ marginTop: 4 }}>
+                  <input
+                    type="checkbox"
+                    checked={!!draft.crmMetadataEnabled}
+                    onChange={(e) => set('crmMetadataEnabled', e.target.checked)}
+                  />
+                  Enabled
+                </label>
+              </SettingsField>
+
+              <SettingsField label="MCP command">
+                <input
+                  className="form-input"
+                  type="text"
+                  placeholder="e.g. node"
+                  value={draft.primarchMcpCommand ?? ''}
+                  onChange={(e) => set('primarchMcpCommand', e.target.value)}
+                  style={{ maxWidth: 520 }}
+                />
+              </SettingsField>
+
+              <SettingsField label="MCP args">
+                <input
+                  className="form-input"
+                  type="text"
+                  placeholder="e.g. path/to/primarch-mcp-server.js"
+                  value={draft.primarchMcpArgs ?? ''}
+                  onChange={(e) => set('primarchMcpArgs', e.target.value)}
+                  style={{ maxWidth: 520 }}
+                />
+              </SettingsField>
+
+              <SettingsField label="Working directory">
+                <input
+                  className="form-input"
+                  type="text"
+                  placeholder="optional absolute path"
+                  value={draft.primarchMcpWorkingDirectory ?? ''}
+                  onChange={(e) => set('primarchMcpWorkingDirectory', e.target.value)}
+                  style={{ maxWidth: 520 }}
+                />
+              </SettingsField>
+
+              <div className="settings-inline-list" style={{ marginTop: 2 }}>
+                <span className="repo-status-badge repo-status-linked">Read-only mode enforced</span>
+              </div>
+
+              <div className="settings-action-row" style={{ marginTop: 8 }}>
+                <button
+                  className="btn btn-secondary btn-sm"
+                  onClick={handleTestPrimarchMcpConnection}
+                  disabled={mcpTesting}
+                >
+                  {mcpTesting ? <><span className="btn-spinner" /> Testing…</> : 'Test Connection'}
+                </button>
+
+                <button
+                  className="btn btn-ghost btn-sm"
+                  onClick={handleListPrimarchMcpTools}
+                  disabled={mcpToolsLoading}
+                >
+                  {mcpToolsLoading ? <><span className="btn-spinner" /> Loading…</> : 'List Read-only Tools'}
+                </button>
+              </div>
+
+              {mcpTestMessage && (
+                <div className="settings-field-hint" style={{ marginTop: 8 }}>
+                  {mcpTestStatus ? `[${mcpTestStatus}] ` : ''}{mcpTestMessage}
+                </div>
+              )}
+
+              {(isDirty || mcpTestUsedDraft) && (
+                <div className="settings-field-hint" style={{ marginTop: 8 }}>
+                  Connection test used unsaved draft values. Click Save Settings before using Verify.
+                </div>
+              )}
+
+              {mcpTools && (
+                <div style={{ marginTop: 8 }}>
+                  <div className="settings-field-hint" style={{ marginBottom: 4 }}>
+                    Tools returned by MCP server:
+                  </div>
+                  <div className="detail-analysis-points" style={{ maxHeight: 220, overflow: 'auto' }}>
+                    {mcpTools.length === 0 && <div className="settings-field-hint">No tools returned.</div>}
+                    {mcpTools.map((t) => (
+                      <div key={t.name} style={{ marginBottom: 4 }}>
+                        <strong>{t.name}</strong> {t.readOnly ? '· read-only' : '· blocked'}
+                        {t.description ? <div className="settings-field-hint">{t.description}</div> : null}
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
             </SettingsBlock>
           </>
         )}

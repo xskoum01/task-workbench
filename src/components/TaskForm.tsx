@@ -1,7 +1,8 @@
 import { useState } from 'react';
-import type { Task, TaskSource, TaskStatus, TaskType } from '../types';
+import type { Task, TaskSource, TaskType } from '../types';
 import { useApp } from '../context/AppContext';
 import Modal from './Modal';
+import { type TaskPhase, PHASE_OPTIONS, getTaskPhase, applyTaskPhase } from '../lib/taskPhase';
 
 interface TaskFormProps {
   onClose: () => void;
@@ -14,7 +15,8 @@ interface FormState {
   customerId: string;
   taskType: TaskType;
   source: TaskSource;
-  status: TaskStatus;
+  /** Uses the shared TaskPhase vocabulary; converted via applyTaskPhase() before saving. */
+  status: TaskPhase;
   confidence: string; // string while editing, converted on submit
   originalMessage: string;
   // Tracking
@@ -39,14 +41,6 @@ const SOURCE_OPTIONS: { value: TaskSource; label: string }[] = [
   { value: 'teams',  label: 'Teams'   },
 ];
 
-const STATUS_OPTIONS: { value: TaskStatus; label: string }[] = [
-  { value: 'new',              label: 'New'            },
-  { value: 'analyzed',         label: 'Analyzed'       },
-  { value: 'in-progress',      label: 'In Progress'    },
-  { value: 'ready-for-review', label: 'For Review'     },
-  { value: 'blocked',          label: 'Blocked'        },
-  { value: 'done',             label: 'Done'           },
-];
 
 function blankForm(customers: { id: string }[], defaultConfidence: number): FormState {
   return {
@@ -70,7 +64,7 @@ function taskToForm(task: Task): FormState {
     customerId:      task.customerId,
     taskType:        task.taskType,
     source:          task.source,
-    status:          task.status,
+    status:          getTaskPhase(task),
     confidence:      String(task.confidence),
     originalMessage: task.originalMessage,
     ticketUrl:       task.ticketUrl ?? '',
@@ -123,7 +117,7 @@ export default function TaskForm({ onClose, initialTask }: TaskFormProps) {
           customerId:      form.customerId,
           taskType:        form.taskType,
           source:          form.source,
-          status:          form.status,
+          ...applyTaskPhase(form.status),
           confidence,
           originalMessage: form.originalMessage.trim(),
           ...trackingFields,
@@ -134,7 +128,7 @@ export default function TaskForm({ onClose, initialTask }: TaskFormProps) {
           customerId:      form.customerId,
           taskType:        form.taskType,
           source:          form.source,
-          status:          form.status,
+          ...applyTaskPhase(form.status),
           confidence,
           originalMessage: form.originalMessage.trim(),
           ...trackingFields,
@@ -218,13 +212,13 @@ export default function TaskForm({ onClose, initialTask }: TaskFormProps) {
         </div>
 
         <div className="form-group">
-          <label className="form-label">Status</label>
+          <label className="form-label">Phase</label>
           <select
             className="form-select"
             value={form.status}
-            onChange={(e) => set('status', e.target.value as TaskStatus)}
+            onChange={(e) => set('status', e.target.value as TaskPhase)}
           >
-            {STATUS_OPTIONS.map((o) => (
+            {PHASE_OPTIONS.map((o) => (
               <option key={o.value} value={o.value}>{o.label}</option>
             ))}
           </select>

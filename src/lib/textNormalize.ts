@@ -1,4 +1,4 @@
-﻿/**
+/**
  * Text normalization utilities for imported email and Teams message content.
  *
  * Handles the three common corruption sources:
@@ -44,7 +44,7 @@ const MOJIBAKE_MAP: [string, string][] = [
   ['\u00c5\u00a1', '\u0161'],
   // Czech r-caron (U+0159)
   ['\u00c5\u0099', '\u0159'],
-  // "A " artifact from non-breaking space (the Â char followed by space)
+  // Non-breaking-space mojibake artifact followed by a space
   ['\u00c2 ', ' '],
 ];
 

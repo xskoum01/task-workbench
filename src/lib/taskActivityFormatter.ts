@@ -1,0 +1,201 @@
+export interface FormattedTaskActivity {
+  id: string;
+  timestampLabel?: string;
+  source?: string;
+  message: string;
+  raw: string;
+}
+
+const PRAGUE_TIME_FORMATTER = new Intl.DateTimeFormat('cs-CZ', {
+  timeZone: 'Europe/Prague',
+  year: 'numeric',
+  month: 'numeric',
+  day: 'numeric',
+  hour: '2-digit',
+  minute: '2-digit',
+  hour12: false,
+});
+
+const TEXT = {
+  testTaskCreated: 'Vytvo\u0159en testovac\u00ed \u00fakol.',
+  dataverseRun: 'Spu\u0161t\u011bna kontrola v\u016f\u010di Dataverse.',
+  resultWarning: 'varov\u00e1n\u00ed',
+  resultFailed: 'chyba',
+  resultPassed: 'bez chyb',
+  pluginDraftCreated: 'Vytvo\u0159en plugin projekt a vygenerov\u00e1n draft.',
+  developmentStarted: 'V\u00fdvoj byl zah\u00e1jen.',
+  testingConfirmed: 'Konzultantsk\u00e9 testov\u00e1n\u00ed potvrzeno.',
+  testingFailed: 'Konzultantsk\u00e9 testov\u00e1n\u00ed nepro\u0161lo.',
+  testingConfirmedAndMovedToReview: 'Konzultantsk\u00e9 testov\u00e1n\u00ed potvrzeno a \u00fakol p\u0159esunut do Review / Waiting for PR.',
+  movedToReview: '\u00dakol p\u0159esunut do Review / Waiting for PR.',
+  movedBackToDevelopment: '\u00dakol vr\u00e1cen zp\u011bt do v\u00fdvoje.',
+  gitCommitCreated: 'Vytvo\u0159en Git commit.',
+  gitBranchPushed: 'Git v\u011btev byla pushnuta.',
+  gitCommitAndPush: 'Vytvo\u0159en Git commit a v\u011btev byla pushnuta.',
+  testingConfirmedCommitPushedMovedToReview: 'Zm\u011bny byly commitnuty a pushnuty; \u00fakol p\u0159esunut do Review / Waiting for PR.',
+};
+
+function formatTimestamp(rawTimestamp: string | undefined): string | undefined {
+  if (!rawTimestamp) return undefined;
+  const date = new Date(rawTimestamp);
+  if (Number.isNaN(date.getTime())) return undefined;
+  return PRAGUE_TIME_FORMATTER.format(date);
+}
+
+function formatDataverseResult(rawResult: string): string {
+  const normalized = rawResult.trim().toLowerCase();
+  if (normalized === 'warnings' || normalized === 'warning') return TEXT.resultWarning;
+  if (normalized === 'failed' || normalized === 'fail') return TEXT.resultFailed;
+  if (normalized === 'passed' || normalized === 'pass') return TEXT.resultPassed;
+  return rawResult.trim();
+}
+
+export function formatTaskActivityNote(rawNote: string, index = 0): FormattedTaskActivity {
+  const raw = rawNote.trim();
+  const timestampMatch = /^\[([^\]]+)\]\s*(.*)$/.exec(raw);
+  const timestampLabel = formatTimestamp(timestampMatch?.[1]);
+  const body = (timestampMatch?.[2] ?? raw).trim();
+
+  if (/^MCP local write:\s*create_test_task$/i.test(body)) {
+    return {
+      id: `${index}-${raw}`,
+      timestampLabel,
+      source: 'MCP / Task Workbench',
+      message: TEXT.testTaskCreated,
+      raw,
+    };
+  }
+
+  const dataverseMatch = /^MCP local write:\s*run_dataverse_check_for_task\s*->\s*(.+)$/i.exec(body);
+  if (dataverseMatch) {
+    return {
+      id: `${index}-${raw}`,
+      timestampLabel,
+      source: 'MCP / Dataverse kontrola',
+      message: `${TEXT.dataverseRun} V\u00fdsledek: ${formatDataverseResult(dataverseMatch[1])}.`,
+      raw,
+    };
+  }
+
+  if (body === 'Plugin project created and draft generated from Start Development workflow.') {
+    return {
+      id: `${index}-${raw}`,
+      timestampLabel,
+      source: 'Start Development',
+      message: TEXT.pluginDraftCreated,
+      raw,
+    };
+  }
+
+  if (body === 'Development started from Start Development modal.') {
+    return {
+      id: `${index}-${raw}`,
+      timestampLabel,
+      source: 'Start Development',
+      message: TEXT.developmentStarted,
+      raw,
+    };
+  }
+
+  if (body === 'UI: consultant-testing-confirmed') {
+    return { id: `${index}-${raw}`, timestampLabel, source: 'Testing', message: TEXT.testingConfirmed, raw };
+  }
+  if (body === 'UI: consultant-testing-failed') {
+    return { id: `${index}-${raw}`, timestampLabel, source: 'Testing', message: TEXT.testingFailed, raw };
+  }
+  if (body === 'UI: consultant-testing-confirmed-and-moved-to-review') {
+    return { id: `${index}-${raw}`, timestampLabel, source: 'Testing', message: TEXT.testingConfirmedAndMovedToReview, raw };
+  }
+  if (body === 'UI: moved-to-review') {
+    return { id: `${index}-${raw}`, timestampLabel, source: 'Testing', message: TEXT.movedToReview, raw };
+  }
+  if (body === 'UI: moved-back-to-development') {
+    return { id: `${index}-${raw}`, timestampLabel, source: 'Testing', message: TEXT.movedBackToDevelopment, raw };
+  }
+  if (body === 'UI: testing-confirmed-commit-pushed-moved-to-review') {
+    return { id: `${index}-${raw}`, timestampLabel, source: 'Git / Testing', message: TEXT.testingConfirmedCommitPushedMovedToReview, raw };
+  }
+
+  const gitCommitMatch = /^UI: git-commit-created -> (.+)$/i.exec(body);
+  if (gitCommitMatch) {
+    return { id: `${index}-${raw}`, timestampLabel, source: 'Git', message: `${TEXT.gitCommitCreated} (${gitCommitMatch[1]})`, raw };
+  }
+  const gitPushMatch = /^UI: git-branch-pushed -> (.+)$/i.exec(body);
+  if (gitPushMatch) {
+    return { id: `${index}-${raw}`, timestampLabel, source: 'Git', message: `${TEXT.gitBranchPushed} (${gitPushMatch[1]})`, raw };
+  }
+  const gitCommitPushMatch = /^UI: git-commit-and-push -> (.+)$/i.exec(body);
+  if (gitCommitPushMatch) {
+    return { id: `${index}-${raw}`, timestampLabel, source: 'Git', message: `${TEXT.gitCommitAndPush} (${gitCommitPushMatch[1]})`, raw };
+  }
+  const mcpGitCommitMatch = /^MCP local write: commit_task_changes -> (.+)$/i.exec(body);
+  if (mcpGitCommitMatch) {
+    return { id: `${index}-${raw}`, timestampLabel, source: 'MCP / Git', message: `${TEXT.gitCommitCreated} (${mcpGitCommitMatch[1]})`, raw };
+  }
+  const mcpGitPushMatch = /^MCP local write: push_task_branch -> (.+)$/i.exec(body);
+  if (mcpGitPushMatch) {
+    return { id: `${index}-${raw}`, timestampLabel, source: 'MCP / Git', message: `${TEXT.gitBranchPushed} (${mcpGitPushMatch[1]})`, raw };
+  }
+  const mcpGitBothMatch = /^MCP local write: commit_and_push_task_changes -> (.+)$/i.exec(body);
+  if (mcpGitBothMatch) {
+    return { id: `${index}-${raw}`, timestampLabel, source: 'MCP / Git', message: `${TEXT.gitCommitAndPush} (${mcpGitBothMatch[1]})`, raw };
+  }
+
+  return {
+    id: `${index}-${raw}`,
+    timestampLabel,
+    message: body || raw,
+    raw,
+  };
+}
+
+export function isTaskActivityLine(line: string): boolean {
+  const raw = line.trim();
+  const timestampMatch = /^\[([^\]]+)\]\s*(.*)$/.exec(raw);
+  if (!timestampMatch) return false;
+
+  const body = timestampMatch[2].trim();
+  return (
+    /^MCP local write:\s*create_test_task$/i.test(body) ||
+    /^MCP local write:\s*run_dataverse_check_for_task\s*->\s*.+$/i.test(body) ||
+    body === 'Plugin project created and draft generated from Start Development workflow.' ||
+    body === 'Development started from Start Development modal.' ||
+    body === 'UI: consultant-testing-confirmed' ||
+    body === 'UI: consultant-testing-failed' ||
+    body === 'UI: consultant-testing-confirmed-and-moved-to-review' ||
+    body === 'UI: moved-to-review' ||
+    body === 'UI: moved-back-to-development' ||
+    body === 'UI: testing-confirmed-commit-pushed-moved-to-review' ||
+    /^UI: git-commit-created -> .+$/i.test(body) ||
+    /^UI: git-branch-pushed -> .+$/i.test(body) ||
+    /^UI: git-commit-and-push -> .+$/i.test(body) ||
+    /^MCP local write: commit_task_changes -> .+$/i.test(body) ||
+    /^MCP local write: push_task_branch -> .+$/i.test(body) ||
+    /^MCP local write: commit_and_push_task_changes -> .+$/i.test(body)
+  );
+}
+
+export function splitTaskNotes(notes: string | undefined): { manualNotes: string[]; activityLines: string[] } {
+  const manualNotes: string[] = [];
+  const activityLines: string[] = [];
+
+  for (const line of (notes ?? '').split(/\r?\n/)) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    if (isTaskActivityLine(trimmed)) {
+      activityLines.push(trimmed);
+    } else {
+      manualNotes.push(trimmed);
+    }
+  }
+
+  return { manualNotes, activityLines };
+}
+
+export function formatTaskActivityNotes(notes: string | string[] | undefined): FormattedTaskActivity[] {
+  const lines = Array.isArray(notes) ? notes : (notes ?? '').split(/\r?\n/);
+  return lines
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .map((line, index) => formatTaskActivityNote(line, index));
+}

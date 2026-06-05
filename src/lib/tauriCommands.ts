@@ -3,7 +3,28 @@
  * filesystem commands. Maps 1-to-1 with the Rust commands in lib.rs.
  */
 import { invoke } from '@tauri-apps/api/core';
-import type { Task, Customer, AppSettings, TaskAnalysis, SkeletonPreview, GitInitStatus, OutlookMessage, OutlookFlaggedListResult, TeamsChat, TeamsChatMessage, TeamsFlatMessage, ClassificationResult, AiFileReviewResult, AiStructuredReview } from '../types';
+import type {
+  Task,
+  Customer,
+  AppSettings,
+  TaskAnalysis,
+  SkeletonPreview,
+  GitInitStatus,
+  OutlookMessage,
+  OutlookFlaggedListResult,
+  TeamsChat,
+  TeamsChatMessage,
+  TeamsFlatMessage,
+  ClassificationResult,
+  AiFileReviewResult,
+  AiStructuredReview,
+  CrmRawExtractedReferences,
+  CrmSkeletonResult,
+  CrmVerificationReport,
+  GitCommitPreview,
+  GitCommitResult,
+  GitPushResult,
+} from '../types';
 
 export type { ClassificationResult };
 
@@ -174,9 +195,168 @@ export function generateSkeletonPreview(task: Task, customer: Customer | null): 
   return invoke('generate_skeleton_preview', { task, customer });
 }
 
+/** Tests Primarch MCP server connectivity by running initialize + tools/list only. */
+export function testPrimarchMcpConnection(settingsOverride?: Partial<AppSettings>): Promise<{ status: string; message: string; toolCount?: number; safeToolCount?: number }> {
+  return invoke('test_primarch_mcp_connection', {
+    settingsOverride: settingsOverride ?? null,
+  });
+}
+
+/** Returns status and published tools for the local task-workbench MCP bridge. */
+export function getTaskMcpBridgeStatus(): Promise<{
+  active: boolean;
+  host: string;
+  port: number;
+  serverPath: string;
+  readOnlyMode: boolean;
+  localWriteMode: boolean;
+  readOnlyTools: Array<{ name: string; description: string; readOnly: boolean }>;
+  localWriteTools: Array<{ name: string; description: string; readOnly: boolean }>;
+  lastError?: string;
+}> {
+  return invoke('get_task_mcp_bridge_status');
+}
+
+/** Lists MCP tools and marks each one as read-only safe or blocked. */
+export function listPrimarchMcpTools(): Promise<{ tools: Array<{ name: string; description: string; readOnly: boolean }>; message?: string }> {
+  return invoke('list_primarch_mcp_tools');
+}
+
+/** Generate CRM metadata-based pseudo-code skeleton (read-only metadata calls only). */
+export function generateCrmSkeleton(
+  task: Task,
+  customer: Customer | null,
+  workflowSetup?: Task['workflowSetup'],
+): Promise<CrmSkeletonResult> {
+  return invoke('generate_crm_skeleton', { task, customer, workflowSetup: workflowSetup ?? null });
+}
+
+/** Returns true when the repository has at least one commit (HEAD resolves). False for new/empty repos. */
+export function gitHasHead(repoPath: string): Promise<boolean> {
+  return invoke('git_has_head', { repoPath });
+}
+
+// --- Git commit / push commands -------------------------------------------
+
+/** Returns a preview of pending git changes and a suggested commit message. Read-only. */
+export function getGitCommitPreview(repoRoot: string, taskJson?: unknown): Promise<GitCommitPreview> {
+  return invoke('get_git_commit_preview', { repoRoot, taskJson: taskJson ?? null });
+}
+
+/** Stages the listed files and creates a git commit. */
+export function commitTaskChanges(repoRoot: string, files: string[], message: string): Promise<GitCommitResult> {
+  return invoke('commit_task_changes', { repoRoot, files, message });
+}
+
+/** Pushes the current branch to origin. Blocks main/master; no force push. */
+export function pushTaskBranch(repoRoot: string): Promise<GitPushResult> {
+  return invoke('push_task_branch', { repoRoot });
+}
+
+/** Stages files, commits, then pushes — single-step wrapper. */
+export function commitAndPushTaskChanges(repoRoot: string, files: string[], message: string): Promise<GitPushResult> {
+  return invoke('commit_and_push_task_changes', { repoRoot, files, message });
+}
+
+/** Scans a C# file for Dataverse logical-name references using the Rust scanner (same as MCP path). */
+export function scanCsFileForCrm(
+  path: string,
+  primaryEntityOverride?: string | null,
+): Promise<CrmRawExtractedReferences & { ambiguousAttributes?: string[] }> {
+  return invoke('scan_cs_file_for_crm', {
+    path,
+    primaryEntityOverride: primaryEntityOverride ?? null,
+  });
+}
+
+/** Verify extracted CRM references against metadata (deterministic verdict). */
+export function verifyAgainstCrm(
+  task: Task,
+  customer: Customer | null,
+  scanResult: CrmRawExtractedReferences & { ambiguousAttributes?: string[] },
+  filePath?: string,
+  primaryEntityOverride?: string,
+): Promise<CrmVerificationReport> {
+  return invoke('verify_against_crm', {
+    task,
+    customer,
+    scanResult,
+    filePath: filePath ?? null,
+    primaryEntityOverride: primaryEntityOverride ?? null,
+  });
+}
+
 /** Writes content to the given absolute path, creating directories as needed. */
 export function saveGeneratedFile(path: string, content: string): Promise<void> {
   return invoke('save_generated_file', { path, content });
+}
+
+export interface BuildCheckItem {
+  id: string;
+  result: 'pass' | 'warning' | 'fail' | 'skip';
+  label: string;
+  detail: string;
+}
+
+export interface BuildReadinessResult {
+  status: 'passed' | 'warnings' | 'failed';
+  checks: BuildCheckItem[];
+  summary: string;
+  buildAttempted: boolean;
+  buildSucceeded?: boolean;
+  buildOutput?: string;
+}
+
+/**
+ * Checks plugin project build readiness: file-system prerequisites + optional msbuild.
+ * `solutionDir` = parent of the .sln (e.g. pluginsDir/ProjectName/).
+ * `artifactPath` = absolute path of the generated .cs file.
+ */
+export function checkPluginBuildReadiness(
+  solutionDir: string,
+  artifactPath?: string,
+): Promise<BuildReadinessResult> {
+  return invoke('check_plugin_build_readiness', {
+    solutionDir,
+    artifactPath: artifactPath ?? null,
+  });
+}
+
+export interface NugetRestoreResult {
+  /** true when Microsoft.Xrm.Sdk.dll exists on disk after restore. */
+  success: boolean;
+  /** "nuget_exe" | "direct_download" | "direct_download_failed" | "none" */
+  method: string;
+  message: string;
+  dllExists: boolean;
+  /** true when a missing Xrm.Sdk Reference was added to the .csproj (custom templates). */
+  xrmRefAdded: boolean;
+}
+
+/**
+ * Restores NuGet packages for a legacy packages.config plugin project.
+ * `solutionDir` is the folder containing the .sln file (e.g. pluginsDir/ProjectName/).
+ * Strategy: nuget.exe restore → direct NuGet.org download → warning.
+ */
+export function restoreNugetPackages(solutionDir: string): Promise<NugetRestoreResult> {
+  return invoke('restore_nuget_packages', { solutionDir });
+}
+
+export interface CsprojUpdateResult {
+  /** "added" | "already_present" | "sdk_style" | "no_csproj_found" */
+  action: string;
+  csprojPath?: string;
+  message: string;
+}
+
+/**
+ * After a .cs file is saved, adds a `<Compile Include="…" />` entry to the
+ * legacy .csproj in the same directory.  SDK-style projects are detected and
+ * skipped automatically.  Returns a tagged result the caller uses to show
+ * appropriate feedback and set the next step.
+ */
+export function addCompileIncludeToCsproj(csFilePath: string): Promise<CsprojUpdateResult> {
+  return invoke('add_compile_include_to_csproj', { csFilePath });
 }
 
 /**
@@ -213,10 +393,15 @@ export function runAiFileReview(
 }
 
 /**
- * Creates a new plugin project from a local template folder.
- * Copies the template into <pluginsDir>/<projectName>, replacing __PROJECT_NAME__
- * and __NAMESPACE__ placeholders in file content and file names.
- * Returns the absolute path of the created project folder.
+ * Creates a new plugin project from a local template folder or built-in scaffold.
+ * Copies the template (or generates built-in scaffold) into <pluginsDir>/<projectName>,
+ * replacing __PROJECT_NAME__ and __NAMESPACE__ placeholders.
+ *
+ * @param legacyStyle When true and no custom template is configured, generates a legacy
+ *   packages.config / Visual Studio style project (key.snk, app.config, AssemblyInfo).
+ *   When false (default), generates an SDK-style csproj with PackageReference.
+ *
+ * Returns the absolute path of the created solution root folder.
  */
 export function createPluginProjectFromTemplate(
   templateDir: string,
@@ -224,6 +409,7 @@ export function createPluginProjectFromTemplate(
   projectName: string,
   namespace: string,
   createInitialClass: boolean,
+  legacyStyle: boolean = false,
 ): Promise<string> {
   return invoke('create_plugin_project_from_template', {
     templateDir,
@@ -231,6 +417,7 @@ export function createPluginProjectFromTemplate(
     projectName,
     namespace,
     createInitialClass,
+    legacyStyle,
   });
 }
 
@@ -408,6 +595,49 @@ export async function resolveSelectedPluginOpenTarget(
 // ---------------------------------------------------------------------------
 // Git helpers
 // ---------------------------------------------------------------------------
+
+export interface GitReviewContext {
+  repoRoot: string;
+  currentBranch: string;
+  baseBranch: string;
+  /** All changed files (committed branch diff + working-tree status). */
+  changedFiles: string[];
+  /** Combined diff: branch diff + staged + unstaged, capped to safe sizes. */
+  diff: string;
+  hasStaged: boolean;
+  hasUnstaged: boolean;
+  hasCommitted: boolean;
+  /** True when at least one relevant untracked file was read and added to `diff`. */
+  hasUntracked: boolean;
+  /** Relative paths of untracked files whose content was included in `diff`. */
+  untrackedIncluded: string[];
+  /** Relative paths of untracked files that were skipped (with reason). */
+  untrackedSkipped: string[];
+  /** Files that are repository noise (bin/, obj/, packages/, .vs/, *.user, *.suo). */
+  noiseFiles: string[];
+  /** Paths that should be explicitly flagged (.github/copilot-instructions etc.). */
+  flaggedPaths: string[];
+  summary: string;
+}
+
+/**
+ * Collects read-only Git diff context for AI code review.
+ *
+ * Runs only: rev-parse, branch --show-current, diff (readonly variants), status --short.
+ * Never runs add, commit, push, checkout, merge, rebase, or any write command.
+ *
+ * `repoRoot` can be any path inside the repository — the command resolves the
+ * actual git root automatically via `git rev-parse --show-toplevel`.
+ */
+export function collectGitReviewContext(
+  repoRoot: string,
+  baseBranch?: string,
+): Promise<GitReviewContext> {
+  return invoke('collect_git_review_context', {
+    repoRoot,
+    baseBranch: baseBranch ?? null,
+  });
+}
 
 /** Returns the name of the currently checked-out branch. */
 export function getGitBranch(repoPath: string): Promise<string> {

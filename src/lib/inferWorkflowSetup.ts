@@ -172,6 +172,7 @@ export function inferWorkflowSetupDefaults({
   const scriptPath    = inferScriptPath(task, customer, scriptFolder);
   const reviewerId    = inferReviewerId(task, devKind, reviewerConfigs);
   const customerId    = task.workflowSetup?.customerId ?? task.customerId ?? '';
+  const primaryEntityLogicalName = task.workflowSetup?.primaryEntityLogicalName ?? task.scriptAnalysis?.entityLogicalName ?? '';
 
   // Infer the target script file name for Create + Script workflows.
   const { fileName: desiredScriptFile, source: desiredScriptFileSource } =
@@ -221,6 +222,7 @@ export function inferWorkflowSetupDefaults({
       customerId,
       pluginProject,
       scriptPath,
+      primaryEntityLogicalName,
       reviewerId,
       desiredScriptFile,
     },

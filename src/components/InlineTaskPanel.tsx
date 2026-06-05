@@ -1,12 +1,5 @@
-/**
- * InlineTaskPanel — compact 2-column workbench that expands inline when a task is selected.
- *
- * Layout:
- *   ┌──────────────────────────────┬──────────────────┐
- *   │  Analysis                    │  Notes (tall)    │
- *   ├──────────────────────────────┤──────────────────┤
- *   │  Message (collapsible)        │  Actions/Links   │
- *   └──────────────────────────────┴──────────────────┘
+﻿/**
+ * InlineTaskPanel - compact inline card shown when a task row is expanded.
  */
 
 import { useState, useEffect } from 'react';
@@ -15,66 +8,42 @@ import { useApp } from '../context/AppContext';
 import Icon from './Icon';
 import * as tauriApi from '../lib/tauriCommands';
 import TaskEmailContent from './TaskEmailContent';
-import TaskDevModePanel from './TaskDevModePanel';
 import TaskModeSwitch from './TaskModeSwitch';
-import { resolveTaskDevTarget, getPluginsDir } from '../lib/resolveTaskDevTarget';
-import { buildTaskWorkflowPlan } from '../lib/workflowPlan';
-import { inferTaskMode } from '../lib/taskMode';
+import { TYPE_LABELS } from './StatusBadge';
+import { formatTaskActivityNotes, splitTaskNotes } from '../lib/taskActivityFormatter';
+import { type TaskPhase, PHASE_OPTIONS, getTaskPhase, applyTaskPhase } from '../lib/taskPhase';
 
 interface Props {
   task: Task;
   onOpenDetail: () => void;
 }
 
-const MSG_PREVIEW_LINES = 8;
-
-type TaskPhase =
-  | 'new'
-  | 'analyzed'
-  | 'development'
-  | 'waiting-estimate-approval'
-  | 'waiting-review'
-  | 'pr-comments'
-  | 'done';
-
-const PHASE_OPTIONS: { value: TaskPhase; label: string }[] = [
-  { value: 'new',            label: 'New' },
-  { value: 'analyzed',       label: 'Analyzed' },
-  { value: 'development',    label: 'Development' },
-  { value: 'waiting-estimate-approval', label: 'Waiting for estimate approval' },
-  { value: 'waiting-review', label: 'Waiting for code review' },
-  { value: 'pr-comments',    label: 'PR comments' },
-  { value: 'done',           label: 'Done' },
-];
-
-function phaseFromTask(task: Task): TaskPhase {
-  if (task.attentionState === 'pr-comments') return 'pr-comments';
-  if (task.waitingState === 'pricing-approval') return 'waiting-estimate-approval';
-  if (task.waitingState === 'code-review') return 'waiting-review';
-  if (task.status === 'in-progress') return 'development';
-  if (task.status === 'ready-for-review') return 'waiting-review';
-  if (task.status === 'done') return 'done';
-  if (task.status === 'analyzed') return 'analyzed';
-  return 'new';
+function deriveDevClassification(task: Task): string | null {
+  const kind = task.workflowSetup?.devTargetKind;
+  const intent = task.workflowSetup?.workIntent;
+  if (!kind) return null;
+  if (kind === 'plugin') {
+    if (intent === 'create') return 'New plugin';
+    if (intent === 'update' || intent === 'fix') return 'Existing plugin update';
+    if (intent === 'review') return 'Plugin review';
+    return 'Plugin';
+  }
+  if (kind === 'script') {
+    if (intent === 'create') return 'New script';
+    if (intent === 'update' || intent === 'fix') return 'Existing script update';
+    if (intent === 'review') return 'Script review';
+    return 'Script';
+  }
+  if (kind === 'repo') return 'Repository change';
+  return null;
 }
 
-function updatesForPhase(phase: TaskPhase): Partial<Task> {
-  switch (phase) {
-    case 'new':
-      return { status: 'new', waitingState: null, attentionState: null };
-    case 'analyzed':
-      return { status: 'analyzed', waitingState: null, attentionState: null };
-    case 'development':
-      return { status: 'in-progress', waitingState: null, attentionState: null };
-    case 'waiting-estimate-approval':
-      return { status: 'analyzed', waitingState: 'pricing-approval', attentionState: null };
-    case 'waiting-review':
-      return { status: 'ready-for-review', waitingState: 'code-review', attentionState: null };
-    case 'pr-comments':
-      return { status: 'in-progress', waitingState: null, attentionState: 'pr-comments', planningBucket: 'now', isPlanningLocked: false };
-    case 'done':
-      return { status: 'done', waitingState: null, attentionState: null };
-  }
+function sourceLabel(task: Task): string {
+  if (task.workItemSource === 'azure_devops') return 'Azure DevOps';
+  if (task.workItemSource === 'helpdesk') return 'Helpdesk';
+  if (task.source === 'email') return 'Email';
+  if (task.source === 'teams') return 'Teams';
+  return 'Manual';
 }
 
 // ---------------------------------------------------------------------------
@@ -82,14 +51,14 @@ function updatesForPhase(phase: TaskPhase): Partial<Task> {
 // ---------------------------------------------------------------------------
 
 export default function InlineTaskPanel({ task, onOpenDetail }: Props) {
-  const { updateTask, getCustomerById, deleteTask, settings } = useApp();
+  const { updateTask, getCustomerById, deleteTask } = useApp();
   const customer = getCustomerById(task.customerId);
 
-  const [notes, setNotes]             = useState(task.notes ?? '');
-  const [msgExpanded, setMsgExpanded] = useState(false);
-  const [analyzing, setAnalyzing]     = useState(false);
+  const [notes, setNotes]               = useState(task.notes ?? '');
+  const [msgExpanded, setMsgExpanded]   = useState(false);
+  const [analyzing, setAnalyzing]       = useState(false);
   const [confirmDelete, setConfirmDelete] = useState(false);
-  const [linkError, setLinkError] = useState<string | null>(null);
+  const [linkError, setLinkError]       = useState<string | null>(null);
 
   useEffect(() => {
     setNotes(task.notes ?? '');
@@ -102,6 +71,10 @@ export default function InlineTaskPanel({ task, onOpenDetail }: Props) {
     setNotes(task.notes ?? '');
   }, [task.notes]);
 
+  const splitNotes = splitTaskNotes(notes);
+  const activityItems = formatTaskActivityNotes(splitNotes.activityLines);
+  const latestActivity = activityItems[activityItems.length - 1];
+
   async function handleNotesSave() {
     if (notes !== (task.notes ?? '')) {
       await updateTask(task.id, { notes });
@@ -113,7 +86,7 @@ export default function InlineTaskPanel({ task, onOpenDetail }: Props) {
   }
 
   async function handleSetPhase(phase: TaskPhase) {
-    await updateTask(task.id, updatesForPhase(phase));
+    await updateTask(task.id, applyTaskPhase(phase));
   }
 
   async function handleOpenExternalUrl(url: string | undefined) {
@@ -134,123 +107,100 @@ export default function InlineTaskPanel({ task, onOpenDetail }: Props) {
     } finally {
       setAnalyzing(false);
     }
-  }
-  // ── Analysis ────────────────────────────────────────────────────────────────
-  const r           = task.analysisResult;
-  const czSummary   = r?.summaryCz?.trim();
-  const czNext      = r?.nextStepCz?.trim();
-  const enSummary   = (r?.summaryEn ?? r?.summary)?.trim();
-  const enNext      = (r?.nextStepEn ?? r?.nextStep)?.trim();
-  const hasAnalysis = !!(czSummary || enSummary);
+  }  // Derived display values
+  const r         = task.analysisResult;
+  const summary   = r?.summaryCz?.trim() || r?.summaryEn?.trim() || r?.summary?.trim();
+  const devClass  = deriveDevClassification(task);
+  const taskPhase = getTaskPhase(task);
 
-  // ── Original message ────────────────────────────────────────────────────────
-  const msg         = task.originalMessage ?? '';
-  const msgLines    = msg.split('\n');
-  const needsExpand = msgLines.length > MSG_PREVIEW_LINES;
-  const msgPreview  = needsExpand && !msgExpanded
-    ? msgLines.slice(0, MSG_PREVIEW_LINES).join('\n')
-    : msg;
-
-  // ── Action links ────────────────────────────────────────────────────────────
-  const adoUrl   = task.adoContext?.workItemUrl || task.adoContext?.prUrl;
-  const repoRoot = customer?.repositoryRoot;
-  const crmFolderPath = (settings?.crmBaseDirectory && customer?.folderName)
-    ? `${settings.crmBaseDirectory}/${customer.folderName}`
-    : undefined;
-  const heuristicDevTarget   = resolveTaskDevTarget(task, customer, crmFolderPath);
-  const devTarget = task.workflowSetup?.devTargetKind
-    ? { ...heuristicDevTarget, kind: task.workflowSetup.devTargetKind as typeof heuristicDevTarget.kind }
-    : heuristicDevTarget;
-  const effectiveVscodePath = devTarget.path;
-  const pluginsDir       = getPluginsDir(customer, crmFolderPath);
-  const repoRootForGit   = customer?.resolvedRepositoryPath ?? customer?.repositoryRoot;
-  const hasRepo          = !!repoRoot;
-  const hasVscodePath    = !!effectiveVscodePath;
-  // Centralized workflow plan — pass heuristic kind for backward compat with unconfirmed tasks
-  const plan = buildTaskWorkflowPlan(task, heuristicDevTarget.kind);
-  const { mode: effectiveMode } = inferTaskMode(task);
-  const taskPhase = phaseFromTask(task);
-  // Use the same resolver as TaskDetail for consistent branching.
-  const isScriptTask = devTarget.kind === 'script';
-  const showOpenRepo = !!(repoRoot && (isScriptTask || tauriApi.isExternalWebUrl(repoRoot)));
-  // Is this an email-sourced task that should use rich email rendering?
-  const isEmailTask = !!(task.emailBodyHtml || task.senderName || task.senderEmail);
+  const adoUrl  = task.adoContext?.workItemUrl || task.adoContext?.prUrl;
+  const hasMsg  = !!(task.originalMessage || task.emailBodyHtml || task.senderName);
+  const isEmail = !!(task.emailBodyHtml || task.senderName || task.senderEmail);
 
   return (
     <div className="tip-panel" onClick={(e) => e.stopPropagation()}>
-      <div className="tip-columns">
-
-        {/* ────── Left column: Message + Analysis ────── */}
+      <div className="tip-columns">        {/* Left column: compact summary + collapsible message */}
         <div className="tip-col-main">
 
-          {/* Message */}
-          {isEmailTask ? (
-            <div className="tip-section">
-              <div className="tip-sec-label">Message</div>
-              <TaskEmailContent task={task} />
-            </div>
-          ) : msg ? (
-            <div className="tip-section">
-              <div className="tip-sec-label">Message</div>
-              <pre className="tip-message-body">{msgPreview}</pre>
-              {needsExpand && (
-                <button className="tip-expand-btn" onClick={() => setMsgExpanded((v) => !v)}>
-                  {msgExpanded ? '↑ Show less' : `↓ ${msgLines.length - MSG_PREVIEW_LINES} more lines…`}
-                </button>
+          {/* Compact summary card */}
+          <div className="tip-section tip-section--summary">
+            <div className="tip-summary-meta">
+              <span className="tip-meta-badge tip-meta-badge--source">{sourceLabel(task)}</span>
+              <span className="tip-meta-badge tip-meta-badge--type">{TYPE_LABELS[task.taskType]}</span>
+              {customer && (
+                <span className="tip-meta-customer">{customer.name}</span>
               )}
             </div>
-          ) : null}
 
-          {/* Analysis */}
-          <div className="tip-section">
-            <div className="tip-sec-label">Analysis</div>
-            {hasAnalysis ? (
-              <div className="tip-analysis-body">
-                {czSummary
-                  ? <p className="tip-content-text">{czSummary}</p>
-                  : enSummary && <p className="tip-content-text">{enSummary}</p>
-                }
-                {(czNext || enNext) && (
-                  <div className="tip-nextstep">
-                    <span className="tip-nextstep-label">Další krok</span>
-                    <span className="tip-nextstep-text">{czNext ?? enNext}</span>
-                  </div>
-                )}
-                <div>
-                  <button
-                    className="btn btn-ghost btn-sm"
-                    disabled={analyzing}
-                    onClick={handleAnalyze}
-                  >
-                    <Icon name="search" size={12} />
-                    {analyzing ? 'Analyzing…' : 'Re-analyze'}
-                  </button>
-                </div>
-              </div>
-            ) : (
-              <div className="tip-empty-state">
-                <p className="tip-empty-text">No analysis yet. Run AI analysis to get a summary and suggested next step.</p>
-                <button
-                  className="btn btn-secondary btn-sm"
-                  disabled={analyzing}
-                  onClick={handleAnalyze}
-                >
-                  <Icon name="search" size={12} />
-                  {analyzing ? 'Analyzing…' : 'Analyze'}
-                </button>
+            {task.estimatedEffort !== undefined && (
+              <div className="tip-summary-row">
+                <span className="tip-summary-label">Estimate</span>
+                <span className="tip-summary-value">
+                  {task.estimatedEffort < 1
+                    ? `${Math.round(task.estimatedEffort * 60)}m`
+                    : `${task.estimatedEffort}h`}
+                </span>
               </div>
             )}
-          </div>
-        </div>
 
-        {/* ────── Right column: Notes + Actions ────── */}
+            {devClass && (
+              <div className="tip-summary-row">
+                <span className="tip-summary-label">Dev type</span>
+                <span className="tip-summary-value">{devClass}</span>
+              </div>
+            )}
+
+            {summary && (
+              <p className="tip-summary-text">{summary}</p>
+            )}
+          </div>
+
+          {/* Collapsible original message */}
+          {hasMsg && (
+            <div className="tip-section tip-section--msg">
+              <button
+                className="tip-expand-btn"
+                onClick={() => setMsgExpanded((v) => !v)}
+              >
+                {msgExpanded ? 'Hide original message' : 'Show original message'}
+              </button>
+              {msgExpanded && (
+                isEmail ? (
+                  <TaskEmailContent task={task} />
+                ) : (
+                  <pre className="tip-message-body">{task.originalMessage}</pre>
+                )
+              )}
+            </div>
+          )}
+        </div>        {/* Right column: phase + mode + links + actions + notes */}
         <div className="tip-col-side">
 
-          {/* Actions */}
           <div className="tip-section tip-section--actions">
 
+            {/* Phase selector */}
+            <div className="tip-action-group">
+              <div className="tip-group-label">Task phase</div>
+              <select
+                className="form-select tip-phase-select"
+                value={taskPhase}
+                onChange={(e) => handleSetPhase(e.target.value as TaskPhase)}
+                title="Set task lifecycle phase"
+              >
+                {PHASE_OPTIONS.map((o) => (
+                  <option key={o.value} value={o.value}>{o.label}</option>
+                ))}
+              </select>
+            </div>
+
+            {/* Mode switch */}
+            <div className="tip-action-group">
+              <div className="tip-group-label">Mode</div>
+              <TaskModeSwitch task={task} onSetMode={handleSetMode} />
+            </div>
+
             {/* External links */}
-            {(adoUrl || task.devopsTaskUrl || task.ticketUrl || task.sourceUrl || showOpenRepo) && (
+            {(adoUrl || task.devopsTaskUrl || task.ticketUrl || task.sourceUrl) && (
               <div className="tip-action-group">
                 <div className="tip-group-label">Links</div>
                 <div className="tip-action-list">
@@ -274,21 +224,6 @@ export default function InlineTaskPanel({ task, onOpenDetail }: Props) {
                       <Icon name="external-link" size={11} /> Source message
                     </button>
                   )}
-                  {showOpenRepo && (
-                    <button
-                      className="tip-action-btn"
-                      onClick={() => {
-                        if (tauriApi.isExternalWebUrl(repoRoot)) {
-                          handleOpenExternalUrl(repoRoot);
-                        } else {
-                          tauriApi.openPath(repoRoot!).catch((err) => setLinkError(String(err)));
-                        }
-                      }}
-                      title={repoRoot}
-                    >
-                      <Icon name="folder" size={11} /> Open Repository
-                    </button>
-                  )}
                 </div>
                 {linkError && (
                   <div className="detail-devmode-hint" style={{ color: 'var(--color-blocked)' }}>
@@ -298,112 +233,18 @@ export default function InlineTaskPanel({ task, onOpenDetail }: Props) {
               </div>
             )}
 
-            {/* Task mode switch */}
-            <div className="tip-action-group">
-              <div className="tip-group-label">Mode</div>
-              <TaskModeSwitch task={task} onSetMode={handleSetMode} />
-            </div>
-
-            {/* Phase selector */}
-            <div className="tip-action-group">
-              <div className="tip-group-label">Task phase</div>
-              <select
-                className="form-select tip-phase-select"
-                value={taskPhase}
-                onChange={(e) => handleSetPhase(e.target.value as TaskPhase)}
-                title="Set task lifecycle phase"
-              >
-                {PHASE_OPTIONS.map((option) => (
-                  <option key={option.value} value={option.value}>{option.label}</option>
-                ))}
-              </select>
-            </div>
-
-            {/* Developer awaiting setup prompt */}
-            {effectiveMode === 'developer' && plan.isDeveloperAwaitingSetup && (
-              <div className="tip-action-group">
-                <div className="tip-group-label">Development</div>
-                <div className="tip-dev-setup-prompt">
-                  <span className="tip-dev-setup-text">Choose Plugin or Script target to enable developer tools.</span>
-                  <button className="btn btn-secondary btn-sm" onClick={onOpenDetail}>
-                    Confirm developer setup →
-                  </button>
-                </div>
-              </div>
-            )}
-
-            {/* Development */}
-            {effectiveMode === 'developer' && !plan.isDeveloperAwaitingSetup && (hasRepo || hasVscodePath) && plan.requiresDevTools && (
-              <div className="tip-action-group">
-                <div className="tip-group-label">Development</div>
-                {plan.requiresDraftGeneration && (
-                  <div className="tip-action-list">
-                    <button
-                      className="tip-action-btn"
-                      onClick={onOpenDetail}
-                      title="Open full detail to generate and preview safely"
-                    >
-                      <Icon name="layers" size={11} />
-                      {plan.draftIsPrimaryAction ? 'Generate Draft' : 'Patch Suggestion'}
-                    </button>
-                  </div>
-                )}
-                <TaskDevModePanel
-                  task={task}
-                  customer={customer}
-                  pluginsDir={pluginsDir}
-                  repoRootForGit={repoRootForGit}
-                  defaultMode={devTarget.kind === 'plugin' ? 'plugin' : 'script'}
-                  scriptOpenPath={task.workflowSetup?.scriptPath ?? customer?.scriptFolder ?? effectiveVscodePath}
-                  onError={() => {}}
-                  autoCollapsed={false}
-                  loadStrategy="after-paint"
-                  selectedPluginProject={task.workflowSetup?.pluginProject ?? task.selectedPluginProject}
-                  onSelectedPluginChange={(plugin) =>
-                    updateTask(task.id, { selectedPluginProject: plugin || undefined }).catch(() => {})
-                  }
-                  reviewerConfigs={plan.requiresAiFileReview ? settings.aiReviewers : undefined}
-                />
-              </div>
-            )}
-
-            {/* AI Code Review indicator — shown when a saved review exists */}
-            {task.aiFileReviews?.[0] && (() => {
-              const r = task.aiFileReviews![0];
-              const VERDICT_COLOR: Record<string, string> = {
-                pass: '#3fb950', comment: '#388bfd', needs_changes: '#d29922',
-              };
-              const VERDICT_LABEL: Record<string, string> = {
-                pass: 'Bez připomínek', comment: 'Komentář', needs_changes: 'Vyžaduje úpravy',
-              };
-              const verdict = r.structured?.verdict;
-              return (
-                <div style={{ padding: '3px 8px', fontSize: 11, color: 'var(--text-muted)',
-                  display: 'flex', alignItems: 'center', gap: 5 }}>
-                  <span style={{ color: 'var(--text-muted)' }}>AI recenze:</span>
-                  {verdict ? (
-                    <span style={{ color: VERDICT_COLOR[verdict] ?? 'var(--text-muted)', fontWeight: 600 }}>
-                      {VERDICT_LABEL[verdict] ?? verdict}
-                    </span>
-                  ) : (
-                    <span style={{ color: 'var(--text-muted)' }}>k dispozici</span>
-                  )}
-                </div>
-              );
-            })()}
-
-            {/* Task actions */}
+            {/* Primary task actions */}
             <div className="tip-action-group">
               <div className="tip-group-label">Task</div>
               <div className="tip-primary-btns">
-                {task.waitingState === 'pricing-approval' && (
-                  <button
-                    className="btn btn-primary btn-sm"
-                    onClick={() => updateTask(task.id, { status: 'in-progress', waitingState: null, attentionState: null })}
-                  >
-                    <Icon name="play" size={12} /> Development
-                  </button>
-                )}
+                <button
+                  className="btn btn-secondary btn-sm"
+                  disabled={analyzing}
+                  onClick={handleAnalyze}
+                >
+                  <Icon name="search" size={12} />
+                  {analyzing ? 'Analyzing...' : 'Analyze'}
+                </button>
                 {task.status !== 'done' && (
                   <button
                     className="btn btn-accent btn-sm"
@@ -413,7 +254,7 @@ export default function InlineTaskPanel({ task, onOpenDetail }: Props) {
                   </button>
                 )}
                 <button className="btn btn-secondary btn-sm" onClick={onOpenDetail}>
-                  Detail →
+                  Detail {'->'}
                 </button>
                 {confirmDelete ? (
                   <span className="tip-delete-confirm" onClick={(e) => e.stopPropagation()}>
@@ -447,14 +288,56 @@ export default function InlineTaskPanel({ task, onOpenDetail }: Props) {
           {/* Notes */}
           <div className="tip-section tip-section--notes">
             <div className="tip-sec-label">Notes</div>
-            <textarea
-              className="tip-notes"
-              value={notes}
-              placeholder="Notes, context, reminders…"
-              onChange={(e) => setNotes(e.target.value)}
-              onBlur={handleNotesSave}
-            />
+            {splitNotes.manualNotes.length > 0 ? (
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+                {splitNotes.manualNotes.map((note, index) => (
+                  <div key={`${index}-${note}`} style={{ border: '1px solid var(--border-subtle)', borderRadius: 4, background: 'var(--bg-overlay)', padding: '6px 8px', fontSize: 11.5, color: 'var(--text-secondary)', lineHeight: 1.4 }}>
+                    {note}
+                  </div>
+                ))}
+              </div>
+            ) : (
+              <div style={{ fontSize: 11.5, color: 'var(--text-muted)' }}>No manual notes.</div>
+            )}
+            <details style={{ marginTop: 7 }}>
+              <summary style={{ cursor: 'pointer', fontSize: 10.5, color: 'var(--text-muted)' }}>Raw notes editor</summary>
+              <textarea
+                className="tip-notes"
+                value={notes}
+                placeholder="Notes, context, reminders..."
+                onChange={(e) => setNotes(e.target.value)}
+                onBlur={handleNotesSave}
+                style={{ marginTop: 6 }}
+              />
+            </details>
           </div>
+
+          {activityItems.length > 0 && (
+            <div className="tip-section tip-section--notes">
+              <details>
+                <summary style={{ cursor: 'pointer' }}>
+                  <span className="tip-sec-label" style={{ display: 'inline' }}>Activity Log ({activityItems.length})</span>
+                  {latestActivity && (
+                    <span style={{ marginLeft: 6, fontSize: 10.5, color: 'var(--text-muted)' }}>
+                      {[latestActivity.timestampLabel, latestActivity.message].filter(Boolean).join(' | ')}
+                    </span>
+                  )}
+                </summary>
+                <div style={{ display: 'flex', flexDirection: 'column', gap: 6, marginTop: 7 }}>
+                  {activityItems.map((item) => (
+                    <div key={item.id} style={{ border: '1px solid var(--border-subtle)', borderRadius: 4, background: 'var(--bg-overlay)', padding: '6px 8px' }}>
+                      {(item.timestampLabel || item.source) && (
+                        <div style={{ fontSize: 10.5, color: 'var(--text-muted)', marginBottom: 2 }}>
+                          {[item.timestampLabel, item.source].filter(Boolean).join(' | ')}
+                        </div>
+                      )}
+                      <div style={{ fontSize: 11.5, color: 'var(--text-secondary)', lineHeight: 1.4 }}>{item.message}</div>
+                    </div>
+                  ))}
+                </div>
+              </details>
+            </div>
+          )}
         </div>
       </div>
     </div>

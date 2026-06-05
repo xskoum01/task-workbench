@@ -6,6 +6,9 @@
   "scripts": {
     "dev": "vite",
     "build": "tsc && vite build",
+    "test": "vitest run",
+    "test:scanner": "vitest run src/lib/crmReferenceScanner.spec.ts",
+    "mcp:readonly": "node mcp/task-workbench-mcp.mjs",
     "preview": "vite preview",
     "tauri": "tauri"
   },
@@ -23,6 +26,7 @@
     "@types/react-dom": "^19.1.6",
     "@vitejs/plugin-react": "^4.6.0",
     "typescript": "~5.8.3",
-    "vite": "^7.0.4"
+    "vite": "^7.0.4",
+    "vitest": "^4.1.7"
   }
 }

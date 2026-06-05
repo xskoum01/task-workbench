@@ -42,5 +42,12 @@ export const defaultSettings: AppSettings = {
   microsoftTenantName: undefined,
   lastMicrosoftSyncAt: undefined,
   lastMicrosoftError: undefined,
+  crmMetadataEnabled: false,
+  primarchMcpCommand: '',
+  primarchMcpArgs: '',
+  primarchMcpWorkingDirectory: '',
+  primarchMcpReadOnly: true,
+  primarchMcpLastStatus: 'not_configured',
+  primarchMcpLastError: undefined,
 };
 

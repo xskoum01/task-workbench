@@ -8,7 +8,8 @@ export type TaskStatus =
 
 export type TaskWaitingState =
   | 'pricing-approval'
-  | 'code-review';
+  | 'code-review'
+  | 'consultant-testing';
 
 export type TaskAttentionState =
   | 'pr-comments';
@@ -54,6 +55,266 @@ export interface SkeletonPreview {
   content: string;
   /** Relative subfolder within pluginFolder (empty string = root). */
   targetPath: string;
+}
+
+export type CrmDeveloperWorkKind =
+  | 'plugin'
+  | 'script'
+  | 'ribbon'
+  | 'repo-only'
+  | 'bugfix'
+  | 'review'
+  | 'unknown';
+
+export type CrmDeveloperWorkflowStep =
+  | 'diagnosis'
+  | 'metadata-verification'
+  | 'technical-plan'
+  | 'code-generation'
+  | 'diff-review'
+  | 'external-action'
+  | 'pull-request'
+  | 'done';
+
+export interface CrmDeveloperWorkflowApprovalGate {
+  approved: boolean;
+  approvedAt?: string;
+  approvedBy?: string;
+  invalidatedAt?: string;
+  invalidationReason?: string;
+}
+
+export interface CrmTechnicalImplementationPlan {
+  generatedAt: string;
+  generatedFromVerificationReportId?: string;
+  workKind: CrmDeveloperWorkKind;
+  summary: string;
+  target?: {
+    entityLogicalName?: string;
+    message?: string;
+    stage?: string;
+    mode?: string;
+    scriptPath?: string;
+    pluginProject?: string;
+  };
+  implementationSteps: string[];
+  dataverseFindings: string[];
+  risks: string[];
+  testChecklist: string[];
+  externalActionPreview?: string[];
+}
+
+/**
+ * Local-only record that the user manually completed an external action outside the app.
+ * Does not represent actual execution — the app never executes anything external.
+ */
+export interface CrmExternalExecutionTracking {
+  completed: boolean;
+  completedAt?: string;
+  /** Free-text note required before marking completed. */
+  notes?: string;
+  /** IDs of the proposal entries the user confirmed were done. */
+  completedActionIds?: string[];
+  invalidatedAt?: string;
+  invalidationReason?: string;
+}
+
+/** Local-only pull request proposal text. The app does not create the PR. */
+export interface CrmPullRequestProposal {
+  generatedAt: string;
+  title: string;
+  body: string;
+  checklist: string[];
+  warnings: string[];
+  relatedArtifactPath?: string;
+  sourceSummary?: string;
+  invalidatedAt?: string;
+  invalidationReason?: string;
+}
+
+/** Local-only record that a pull request was created manually outside the app. */
+export interface CrmPullRequestTracking {
+  createdManually: boolean;
+  createdAt?: string;
+  prUrl?: string;
+  notes?: string;
+  invalidatedAt?: string;
+  invalidationReason?: string;
+}
+
+export interface CrmPullRequestReviewComment {
+  id?: string;
+  author?: string;
+  body: string;
+  filePath?: string;
+  line?: number;
+  isResolved?: boolean;
+  createdAt?: string;
+}
+
+/** Local read-only snapshot of PR review intake. No remote PR state is modified. */
+export interface CrmPullRequestReviewIntake {
+  fetchedAt: string;
+  provider?: 'github' | 'azure-devops' | 'unknown';
+  prUrl: string;
+  title?: string;
+  state?: string;
+  author?: string;
+  baseBranch?: string;
+  headBranch?: string;
+  comments?: CrmPullRequestReviewComment[];
+  unresolvedCount?: number;
+  attentionRequired?: boolean;
+  summary?: string;
+  warnings?: string[];
+  error?: string;
+  invalidatedAt?: string;
+  invalidationReason?: string;
+}
+
+export interface CrmPullRequestReviewAnalysisComment {
+  id?: string;
+  author?: string;
+  body: string;
+  line?: number;
+  createdAt?: string;
+}
+
+export interface CrmPullRequestReviewGroupedFinding {
+  filePath?: string;
+  title: string;
+  comments: CrmPullRequestReviewAnalysisComment[];
+  suggestedAction: string;
+  riskLevel: 'low' | 'medium' | 'high';
+}
+
+/** Local deterministic plan for addressing fetched PR review comments. */
+export interface CrmPullRequestReviewAnalysis {
+  generatedAt: string;
+  sourceReviewFetchedAt?: string;
+  attentionRequired: boolean;
+  summary: string;
+  groupedFindings: CrmPullRequestReviewGroupedFinding[];
+  actionItems: string[];
+  testChecklist: string[];
+  warnings: string[];
+  limitations: string[];
+  invalidatedAt?: string;
+  invalidationReason?: string;
+}
+
+export interface CrmPullRequestFixProposedChange {
+  filePath?: string;
+  title: string;
+  description: string;
+  addressesCommentIds?: string[];
+  confidence: 'low' | 'medium' | 'high';
+  riskLevel: 'low' | 'medium' | 'high';
+}
+
+/** Local deterministic proposal for fixing PR review feedback. Does not edit files. */
+export interface CrmPullRequestFixProposal {
+  generatedAt: string;
+  sourceAnalysisGeneratedAt?: string;
+  summary: string;
+  proposedChanges: CrmPullRequestFixProposedChange[];
+  implementationOrder: string[];
+  testChecklist: string[];
+  warnings: string[];
+  limitations: string[];
+  canGenerateCodeLater: boolean;
+  invalidatedAt?: string;
+  invalidationReason?: string;
+}
+
+/** Local-only record that the user manually pushed/updated PR fixes outside the app. */
+export interface CrmPullRequestFixUpdateTracking {
+  updatedManually: boolean;
+  updatedAt?: string;
+  notes?: string;
+  commitSha?: string;
+  branchName?: string;
+  relatedFixProposalGeneratedAt?: string;
+  invalidatedAt?: string;
+  invalidationReason?: string;
+}
+
+export interface CrmDeveloperWorkflowState {
+  detectedWorkKind?: CrmDeveloperWorkKind;
+  currentStep?: CrmDeveloperWorkflowStep;
+  technicalPlan?: CrmTechnicalImplementationPlan;
+  planApproval?: CrmDeveloperWorkflowApprovalGate;
+  diffApproval?: CrmDeveloperWorkflowApprovalGate;
+  externalActionApproval?: CrmDeveloperWorkflowApprovalGate;
+  pullRequestApproval?: CrmDeveloperWorkflowApprovalGate;
+  /**
+   * User-recorded confirmation that external actions were completed outside the app.
+   * Local tracking only — the app never executes external actions.
+  */
+  externalExecution?: CrmExternalExecutionTracking;
+  /** Local deterministic PR proposal. The app never creates branches, commits, or PRs. */
+  pullRequestProposal?: CrmPullRequestProposal;
+  /** Local record of a PR created manually outside the app. */
+  pullRequestTracking?: CrmPullRequestTracking;
+  /** Local read-only PR review intake snapshot. The app never updates the remote PR. */
+  pullRequestReview?: CrmPullRequestReviewIntake;
+  /** Local deterministic plan for addressing fetched PR review comments. */
+  pullRequestReviewAnalysis?: CrmPullRequestReviewAnalysis;
+  /** Local deterministic proposal for future fix drafting. Does not edit files. */
+  pullRequestFixProposal?: CrmPullRequestFixProposal;
+  /** Local-only record that the user manually updated the PR outside the app. */
+  pullRequestFixUpdateTracking?: CrmPullRequestFixUpdateTracking;
+  createdAt?: string;
+  updatedAt?: string;
+}
+
+// ── Implementation verification types ────────────────────────────────────────
+
+/** Status for optional pre-review verification checks. */
+export type ImplCheckStatus =
+  | 'not-run'
+  | 'passed'
+  | 'warnings'
+  | 'failed'
+  | 'skipped'
+  | 'manually-verified';
+
+export type LocalTestImplStatus = 'not-run' | 'passed' | 'failed' | 'not-needed';
+
+/** Single optional verification check record — Dataverse check or AI code review. */
+export interface ImplCheckRecord {
+  status: ImplCheckStatus;
+  runAt?: string;
+  skippedAt?: string;
+  skippedReason?: string;
+  manuallyVerifiedAt?: string;
+  summary?: string;
+  findings?: string[];
+}
+
+/** Local test record inside the implementation verification block. */
+export interface ImplLocalTestRecord {
+  status: LocalTestImplStatus;
+  recordedAt?: string;
+  notes?: string;
+}
+
+/**
+ * Optional Development-phase verification state.
+ * All four checks are non-blocking — the task stays in Development regardless.
+ * dataverseCheck.status = 'not-run' or undefined means no manual override;
+ * the displayed status is derived from task.crmVerificationReports[0].verdict.
+ */
+export interface ImplementationVerification {
+  /** Build / project readiness check result. */
+  buildCheck?: ImplCheckRecord;
+  /** Manual override for Dataverse check status (skipped / manually-verified). */
+  dataverseCheck?: Pick<ImplCheckRecord, 'status' | 'skippedAt' | 'skippedReason' | 'manuallyVerifiedAt'>;
+  /** AI internal code review result. */
+  aiCodeReview?: ImplCheckRecord;
+  /** Local test record. */
+  localTest?: ImplLocalTestRecord;
+  updatedAt?: string;
 }
 
 export interface Task {
@@ -155,6 +416,24 @@ export interface Task {
   notes?: string;
 
   /**
+   * CRM skeleton proposals generated by "Generate CRM Skeleton" action.
+   * Newest first. Capped at 5 entries.
+   */
+  crmSkeletons?: CrmSkeletonResult[];
+
+  /**
+   * CRM verification reports generated by "Verify against CRM" action.
+   * Newest first. Capped at 5 entries.
+   */
+  crmVerificationReports?: CrmVerificationReport[];
+
+  /**
+   * Minimal persisted state for the guided CRM developer workflow.
+   * Local task state only; external approvals/actions are not executed by this field.
+   */
+  crmDeveloperWorkflow?: CrmDeveloperWorkflowState;
+
+  /**
    * Confirmed workflow setup choices the user verified before analysis.
    * When present, downstream stages (draft, review, dev mode) prefer these values
    * over heuristic guesses. Gaps fall back to the resolver as before.
@@ -175,6 +454,30 @@ export interface Task {
    * Used for display only — never fed into AI, prefilter, or text analysis.
    */
   emailBodyHtml?: string;
+
+  // ── Implementation verification (Development-phase optional checks) ──────
+  /**
+   * Results of the three optional Development-phase verification checks:
+   * Dataverse metadata, AI internal code review, and local test record.
+   * All checks are optional and non-blocking — the task stays in Development
+   * regardless of results. Only explicit user action moves it forward.
+   */
+  implementationVerification?: ImplementationVerification;
+
+  // ── MCP local workflow fields ─────────────────────────────────────────────
+  /** Local test record written by MCP record_local_test tool. */
+  localTestRecord?: { status: string; updatedAt: string; note?: string };
+  /** Consultant test record written by MCP record_consultant_testing tool. */
+  consultantTestRecord?: { status: string; updatedAt: string; note?: string };
+  /** Per-item checklist overrides set by MCP update_task_checklist_item tool. */
+  mcpChecklistOverrides?: Record<string, string>;
+  /** Recommended next step written by MCP set_task_next_step tool. */
+  mcpNextStep?: { action: string; reason: string; updatedAt: string };
+  /**
+   * True when this task was created by the MCP create_test_task tool.
+   * Used by delete_test_task to guard against accidental deletion of real tasks.
+   */
+  mcpTestTask?: boolean;
 }
 
 export type ClassificationState = 'pending' | 'analyzed' | 'rejected' | 'created';
@@ -203,6 +506,8 @@ export interface WorkflowSetup {
   desiredPluginProject?: string;
   /** Script file or folder path. */
   scriptPath?: string;
+  /** Optional primary Dataverse entity logical name chosen by the user for verification. */
+  primaryEntityLogicalName?: string;
   /** ID of the AI reviewer profile to default to. */
   reviewerId?: string;
   /** ISO timestamp of when the user confirmed. */
@@ -278,8 +583,10 @@ export interface Customer {
   id: string;
   name: string;
   shortCode: string;
-  /** Display name for the repository (e.g. "contoso-crm"). */
+  /** Display name for the repository (e.g. "contoso-crm"). Used for Azure DevOps repo URL construction. */
   repositoryName?: string;
+  /** Direct Azure DevOps repository URL (e.g. https://dev.azure.com/org/project/_git/repo). Overrides derived URL. */
+  azureDevOpsRepoUrl?: string;
   /** Absolute path to the repository root on the local machine. */
   repositoryRoot?: string;
   /**
@@ -402,12 +709,31 @@ export interface AppTemplate {
   description?: string;
 }
 
+// ── AI provider types ────────────────────────────────────────────────────────
+
+/** Which AI provider is active. */
+export type AiProvider = 'openai' | 'anthropic';
+
 export interface AppSettings {
   appName: string;
   theme: string;
   defaultTaskConfidence: number;
+  /** @deprecated Use openaiApiKey + activeAiProvider instead. Kept for backward compatibility. */
   aiModel: string;
+  /** @deprecated Use openaiApiKey + activeAiProvider instead. Kept for backward compatibility. */
   aiApiKey: string;
+
+  // ── AI provider config ────────────────────────────────────────────────────
+  /** Active AI provider. Defaults to 'openai' when absent. */
+  activeAiProvider?: AiProvider;
+  /** OpenAI API key. Falls back to legacy aiApiKey when empty. */
+  openaiApiKey?: string;
+  /** OpenAI model name. Falls back to legacy aiModel when empty. */
+  openaiModel?: string;
+  /** Anthropic API key. */
+  anthropicApiKey?: string;
+  /** Anthropic model name (e.g. claude-sonnet-4-5). */
+  anthropicModel?: string;
   /** Global base directory where all CRM customer repositories live. */
   crmBaseDirectory?: string;
   /**
@@ -494,6 +820,22 @@ export interface AppSettings {
    * Each reviewer defines its instructions, file-type targeting, and optional model override.
    */
   aiReviewers?: AiReviewerConfig[];
+
+  // ── CRM Metadata / Primarch MCP ───────────────────────────────────────────
+  /** When true, CRM metadata assistant buttons are enabled. */
+  crmMetadataEnabled?: boolean;
+  /** Shell command to start the Primarch MCP server (e.g. "node"). */
+  primarchMcpCommand?: string;
+  /** Space-separated arguments to pass to the MCP command. */
+  primarchMcpArgs?: string;
+  /** Working directory for the MCP server process. */
+  primarchMcpWorkingDirectory?: string;
+  /** Always true for now — read-only mode is enforced, not optional. */
+  primarchMcpReadOnly?: boolean;
+  /** Last known MCP connection status. */
+  primarchMcpLastStatus?: 'not_configured' | 'connected' | 'error';
+  /** Last MCP connection error message (redacted of secrets). */
+  primarchMcpLastError?: string;
 }
 
 // ── AI Reviewer types ─────────────────────────────────────────────────────────
@@ -707,7 +1049,238 @@ export interface ScriptApplyResult {
   bytesWritten: number;
 }
 
+// ── CRM Metadata types ───────────────────────────────────────────────────────
+
+/** A single validation issue found during CRM verification. */
+export interface CrmMetadataIssue {
+  severity: 'error' | 'warning' | 'suggestion';
+  category?: 'missing' | 'ambiguous' | 'plugin' | 'runtime' | 'not_verified';
+  /** Short machine-readable code, e.g. "UNKNOWN_ENTITY". */
+  code: string;
+  title: string;
+  detail: string;
+  entityLogicalName?: string;
+  attributeLogicalName?: string;
+  relatedEntityLogicalName?: string;
+  sourceReason?: string;
+  /** Nearest correct logical name when a typo/alias was detected. */
+  suggestedLogicalName?: string;
+}
+
+export type CrmMetadataVerdict = 'pass' | 'warnings' | 'fail' | 'unknown';
+
+export type CrmRuntimeReadiness = 'not_checked' | 'low_risk' | 'risks_found' | 'unknown';
+
+export type CrmCompileReadinessStatus =
+  | 'not_checked'
+  | 'could_not_find_project'
+  | 'project_found_build_not_run'
+  | 'build_check_available';
+
+export interface CrmReferenceFinding {
+  kind: 'entity' | 'attribute' | 'relationship' | 'option_value' | 'lookup_target' | 'plugin' | 'runtime';
+  displayName: string;
+  entityLogicalName?: string;
+  attributeLogicalName?: string;
+  relatedEntityLogicalName?: string;
+  sourceReason: string;
+  detail?: string;
+}
+
+export interface CrmPluginCheck {
+  status: 'confirmed' | 'warning' | 'not_verified';
+  title: string;
+  detail: string;
+  entityLogicalName?: string;
+  attributeLogicalName?: string;
+  sourceReason?: string;
+}
+
+export interface CrmCompileReadiness {
+  status: CrmCompileReadinessStatus;
+  detail: string;
+}
+
+export interface CrmDetectedEntityReference {
+  logicalName: string;
+  sourceReason: string;
+  contextType: string;
+  variableName?: string;
+}
+
+export interface CrmDetectedAttributeReference {
+  logicalName: string;
+  entityLogicalName?: string;
+  sourceReason: string;
+  contextType: string;
+  variableName?: string;
+  relatedEntityLogicalName?: string;
+  optionValues?: number[];
+}
+
+export interface CrmDetectedRelationshipReference {
+  sourceEntityLogicalName?: string;
+  sourceAttributeLogicalName: string;
+  targetEntityLogicalName?: string;
+  targetAttributeLogicalName: string;
+  sourceReason: string;
+  contextType: string;
+  variableName?: string;
+}
+
+export interface CrmAmbiguousReference {
+  kind: 'entity' | 'attribute' | 'relationship' | 'plugin';
+  logicalName: string;
+  sourceReason: string;
+  detail: string;
+  entityLogicalName?: string;
+  relatedEntityLogicalName?: string;
+}
+
+export interface CrmPluginScanInfo {
+  primaryEntityName?: string;
+  primaryEntitySource?: 'manual_override' | 'inferred' | 'unknown' | string;
+  messages: string[];
+  /** Stage integer (10=PreValidation, 20=PreOperation, 40=PostOperation). */
+  stage?: number;
+  stageName?: string;
+  /** Mode integer (0=Synchronous, 1=Asynchronous). */
+  mode?: number;
+  modeName?: string;
+  filteringAttributes: string[];
+  usesPreEntityImages: boolean;
+  usesPostEntityImages: boolean;
+  imageAttributes: Record<string, string[]>;
+  targetAttributes: string[];
+  notes: string[];
+}
+
+export interface CrmScanLookupAssignment {
+  entityLogicalName?: string;
+  attributeLogicalName: string;
+  targetEntityLogicalName?: string;
+  sourceReason: string;
+}
+
+export interface CrmScanOptionSetAssignment {
+  entityLogicalName?: string;
+  attributeLogicalName: string;
+  value: number;
+  sourceReason: string;
+}
+
+export interface CrmScanFieldAccess {
+  entityLogicalName?: string;
+  attributeLogicalName: string;
+  access: 'read' | 'write';
+  sourceReason: string;
+}
+
+export interface CrmInspectedEntityDetail {
+  entityLogicalName: string;
+  columnCount: number;
+  schemaCompleteness: 'complete' | 'incomplete' | 'unknown';
+  toolUsed: string;
+  paging?: string;
+  note?: string;
+}
+
+export interface CrmRawExtractedReferences {
+  entities: string[];
+  attributes: Record<string, string[]>;
+  entityReferences: CrmDetectedEntityReference[];
+  attributeReferences: CrmDetectedAttributeReference[];
+  relationshipReferences: CrmDetectedRelationshipReference[];
+  ambiguousReferences: CrmAmbiguousReference[];
+  notes: string[];
+  pluginContext?: CrmPluginScanInfo;
+  lookupAssignments?: CrmScanLookupAssignment[];
+  optionSetAssignments?: CrmScanOptionSetAssignment[];
+  fieldAccesses?: CrmScanFieldAccess[];
+}
+
+/** Summary of which Dataverse metadata was inspected during a CRM operation. */
+export interface CrmMetadataInspection {
+  entityLogicalNames: string[];
+  attributeLogicalNames: Record<string, string[]>;
+  entityDetails?: CrmInspectedEntityDetail[];
+  formNames?: string[];
+  solutionNames?: string[];
+  /** Names of the MCP tools that were called. */
+  toolsUsed: string[];
+}
+
+/** Result of the "Generate CRM Skeleton" action. */
+export interface CrmSkeletonResult {
+  id?: string;
+  createdAt?: string;
+  mode: 'script' | 'plugin';
+  summary: string;
+  pseudoCode: string;
+  logicalNamesUsed: string[];
+  metadataInspected: CrmMetadataInspection;
+}
+
+/** Result of the "Verify against CRM" action. */
+export interface CrmVerificationReport {
+  id?: string;
+  createdAt?: string;
+  filePath?: string;
+  verdict: 'pass' | 'warnings' | 'fail' | 'unknown' | 'not_configured' | 'error';
+  metadataVerdict: CrmMetadataVerdict;
+  staticInferenceConfidence?: 'high' | 'medium' | 'low' | 'inferred' | 'unknown';
+  runtimeReadiness: CrmRuntimeReadiness;
+  summary: string;
+  answer?: string;
+  issues: CrmMetadataIssue[];
+  confirmedReferences: CrmReferenceFinding[];
+  missingReferences: CrmReferenceFinding[];
+  ambiguousReferences: CrmReferenceFinding[];
+  runtimeRisks: CrmReferenceFinding[];
+  pluginChecks: CrmPluginCheck[];
+  inspectedEntities: string[];
+  inspectedAttributesByEntity: Record<string, string[]>;
+  unableToVerifyReasons: string[];
+  compileReadiness?: CrmCompileReadiness;
+  metadataInspected: CrmMetadataInspection;
+  rawExtractedReferences?: CrmRawExtractedReferences;
+}
+
 export type NavPage = 'inbox' | 'tasks' | 'week-log' | 'customers' | 'settings';
+
+// --- Git commit preview types -----------------------------------------------
+
+export interface GitChangedFile {
+  path: string;
+  status: 'staged' | 'modified' | 'added' | 'deleted' | 'untracked' | 'renamed';
+}
+
+export interface GitCommitPreview {
+  ok: boolean;
+  repoRoot: string;
+  branch: string;
+  remote?: string;
+  remoteUrl?: string;
+  changedFiles: GitChangedFile[];
+  ignoredFiles: GitChangedFile[];
+  warnings: string[];
+  suggestedCommitMessage: string;
+}
+
+export interface GitCommitResult {
+  ok: boolean;
+  commitHash?: string;
+  summary?: string;
+}
+
+export interface GitPushResult {
+  ok: boolean;
+  /** Present when this result comes from commit_and_push_task_changes. */
+  commitHash?: string;
+  branch?: string;
+  remote?: string;
+  summary?: string;
+}
 
 // ── Microsoft import types ────────────────────────────────────────────────────
 

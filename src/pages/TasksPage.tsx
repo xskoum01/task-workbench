@@ -42,7 +42,7 @@ const STATUS_FILTERS: { value: TaskStatus | 'all'; label: string }[] = [
 // ---------------------------------------------------------------------------
 
 export default function TasksPage() {
-  const { tasks, getCustomerById, updateTask, deleteTask } = useApp();
+  const { tasks, getCustomerById, updateTask, deleteTask, reloadTasks } = useApp();
 
   const [viewMode, setViewMode]           = useState<ViewMode>('planning');
   const [filter, setFilter]               = useState<TaskStatus | 'all'>('all');
@@ -52,6 +52,12 @@ export default function TasksPage() {
   const [detailOpenId, setDetailOpenId]   = useState<string | null>(null);
   const [showTaskForm, setShowTaskForm]   = useState(false);
   const [confirmDeleteId, setConfirmDeleteId] = useState<string | null>(null);
+  const [reloading, setReloading] = useState(false);
+
+  async function handleReload() {
+    setReloading(true);
+    try { await reloadTasks(); } finally { setReloading(false); }
+  }
 
   function handleSelect(id: string) {
     setSelectedId((prev) => (prev === id ? null : id));
@@ -191,6 +197,16 @@ export default function TasksPage() {
                 })}
               </div>
             )}
+
+            <button
+              className="btn btn-ghost"
+              onClick={handleReload}
+              disabled={reloading}
+              title="Reload tasks from storage (picks up changes made by AI/MCP)"
+              style={{ minWidth: 0 }}
+            >
+              <Icon name="refresh-cw" size={14} className={reloading ? 'spin' : undefined} />
+            </button>
 
             <button className="btn btn-secondary" onClick={() => setShowTaskForm(true)}>
               <span className="btn-icon">+</span>
