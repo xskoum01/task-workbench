@@ -1951,13 +1951,13 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
         consultantTestRecord: { status: 'confirmed', updatedAt: now, note: 'Consultant testing confirmed.' },
         mcpNextStep: {
           action: 'Configure repository and prepare commit',
-          reason: 'Consultant testing was confirmed, but Git repository was not detected. Configure repository before moving to Review.',
+          reason: 'Consultant testing was confirmed, but Git repository was not detected. Configure repository before moving to Code Review.',
           updatedAt: now,
         },
         notes: appendActivityNote(task.notes, 'UI: consultant-testing-confirmed'),
       });
       setShowTestingActionsModal(false);
-      setFeedback('Consultant testing confirmed, but Git repository was not detected. Configure repository before moving to Review.');
+      setFeedback('Consultant testing confirmed, but Git repository was not detected. Configure repository before moving to Code Review.');
       return;
     }
     // Mark testing confirmed — stays in-progress, NOT moved to Review yet.
@@ -2007,18 +2007,18 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
     const resolution = buildAzureDevOpsRepoUrl(task, customer ?? null);
     if (resolution?.kind === 'repo') {
       tauriApi.openExternalUrl(resolution.url).then(() => {
-        setFeedback('Committed and pushed — task moved to Review. Repository opened.');
+        setFeedback('Committed and pushed — task moved to Code Review. Repository opened.');
       }).catch(() => {
-        setFeedback('Committed and pushed — task moved to Review. Could not open repository.');
+        setFeedback('Committed and pushed — task moved to Code Review. Could not open repository.');
       });
     } else if (resolution?.kind === 'work-item') {
       tauriApi.openExternalUrl(resolution.url).then(() => {
-        setFeedback('Committed and pushed — task moved to Review. Work item opened.');
+        setFeedback('Committed and pushed — task moved to Code Review. Work item opened.');
       }).catch(() => {
-        setFeedback('Committed and pushed — task moved to Review.');
+        setFeedback('Committed and pushed — task moved to Code Review.');
       });
     } else {
-      setFeedback('Committed and pushed — task moved to Review. No Azure DevOps URL configured.');
+      setFeedback('Committed and pushed — task moved to Code Review. No Azure DevOps URL configured.');
     }
   }
 
@@ -2030,13 +2030,13 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
     const now = new Date().toISOString();
     await updateTask(task.id, {
       mcpNextStep: {
-        action:    'Push branch before moving to Review',
+        action:    'Push branch before moving to Code Review',
         reason:    'Commit created. Push the branch to proceed to code review.',
         updatedAt: now,
       },
       notes: appendActivityNote(task.notes, commitNote),
     });
-    setFeedback(`Commit created (${hash ?? '?'}). Push the branch before moving to Review.`);
+    setFeedback(`Commit created (${hash ?? '?'}). Push the branch before moving to Code Review.`);
   }
 
   /**
@@ -4097,8 +4097,8 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
                   className="btn btn-primary"
                   onClick={() => void handleTestingConfirmedPreparePR()}
                   title={repoRootForGit
-                    ? 'Marks testing confirmed and opens commit dialog — Commit + Push will move to Review and open Azure DevOps'
-                    : 'Marks testing confirmed — Git repository not configured, configure it before moving to Review'}
+                    ? 'Marks testing confirmed and opens commit dialog — Commit + Push will move to Code Review and open Azure DevOps'
+                    : 'Marks testing confirmed — Git repository not configured, configure it before moving to Code Review'}
                 >
                   Testing confirmed → Prepare commit / PR
                 </button>

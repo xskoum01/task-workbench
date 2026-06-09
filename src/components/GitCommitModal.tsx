@@ -1,6 +1,7 @@
 import { useState, useEffect, useCallback } from 'react';
 import type { Task, Customer, GitCommitPreview } from '../types';
 import * as tauriApi from '../lib/tauriCommands';
+import { generateBranchName, validateBranchName } from '../lib/gitBranchName';
 
 interface GitCommitModalProps {
   task: Task;
@@ -29,6 +30,11 @@ interface GitCommitModalProps {
    * Receives the pre-built activity note and commit hash.
    */
   onCommitOnlySuccess?: (commitNote: string, hash: string | undefined) => Promise<void>;
+  /**
+   * Called after a feature branch is successfully created so the parent can
+   * record the activity note.
+   */
+  onBranchCreated?: (note: string) => void;
 }
 
 export default function GitCommitModal({
@@ -40,6 +46,7 @@ export default function GitCommitModal({
   postCommitPushAction,
   onPostCommitPushSuccess,
   onCommitOnlySuccess,
+  onBranchCreated,
 }: GitCommitModalProps) {
   const [preview, setPreview]             = useState<GitCommitPreview | null>(null);
   const [loading, setLoading]             = useState(true);
@@ -49,6 +56,12 @@ export default function GitCommitModal({
   const [working, setWorking]             = useState(false);
   const [resultMessage, setResultMessage] = useState<string | null>(null);
   const [resultError, setResultError]     = useState<string | null>(null);
+
+  // Feature branch creation state
+  const [branchInput, setBranchInput]             = useState('');
+  const [branchWorking, setBranchWorking]         = useState(false);
+  const [branchCreateError, setBranchCreateError] = useState<string | null>(null);
+  const [branchCreatedMsg, setBranchCreatedMsg]   = useState<string | null>(null);
 
   const loadPreview = useCallback(async () => {
     setLoading(true);
@@ -60,6 +73,11 @@ export default function GitCommitModal({
       setPreview(p);
       if (!commitMessage) setCommitMessage(p.suggestedCommitMessage);
       setSelectedFiles(new Set(p.changedFiles.map((f) => f.path)));
+      // Seed branch input only when on default branch and not yet set.
+      const isDefault = p.branch === 'main' || p.branch === 'master';
+      if (isDefault) {
+        setBranchInput((prev) => prev || generateBranchName(task));
+      }
     } catch (e) {
       setLoadError(String(e));
       setPreview(null);
@@ -93,7 +111,6 @@ export default function GitCommitModal({
         const r = await tauriApi.commitAndPushTaskChanges(repoRoot, files, commitMessage.trim());
         const note = `UI: git-commit-and-push -> ${r.commitHash ?? '?'} ${r.branch ?? '?'}`;
         if (onPostCommitPushSuccess) {
-          // Guided mode: parent handles all note+state updates atomically.
           await onPostCommitPushSuccess(note, r.commitHash, r.branch);
         } else {
           onActivityNote?.(note);
@@ -103,7 +120,6 @@ export default function GitCommitModal({
         const r = await tauriApi.commitTaskChanges(repoRoot, files, commitMessage.trim());
         const note = `UI: git-commit-created -> ${r.commitHash ?? '?'}`;
         if (onCommitOnlySuccess) {
-          // Guided mode: parent handles all note+state updates atomically.
           await onCommitOnlySuccess(note, r.commitHash);
         } else {
           onActivityNote?.(note);
@@ -118,9 +134,52 @@ export default function GitCommitModal({
     }
   }
 
-  const isMainMaster = preview?.branch === 'main' || preview?.branch === 'master';
-  const hasFiles = (preview?.changedFiles.length ?? 0) > 0;
-  const noneSelected = selectedFiles.size === 0;
+  async function handleCreateBranch() {
+    const name = branchInput.trim();
+    const validationError = validateBranchName(name);
+    if (validationError) {
+      setBranchCreateError(validationError);
+      return;
+    }
+    setBranchWorking(true);
+    setBranchCreateError(null);
+    setBranchCreatedMsg(null);
+    try {
+      const r = await tauriApi.createGitBranch(repoRoot, name);
+      const note = `UI: git-branch-created -> ${r.branch}`;
+      onBranchCreated?.(note);
+      onActivityNote?.(note);
+      setBranchCreatedMsg(`Feature branch created: ${r.branch}`);
+      await loadPreview();
+    } catch (e) {
+      setBranchCreateError(String(e));
+    } finally {
+      setBranchWorking(false);
+    }
+  }
+
+  const isMainMaster   = preview?.branch === 'main' || preview?.branch === 'master';
+  const hasFiles       = (preview?.changedFiles.length ?? 0) > 0;
+  const noneSelected   = selectedFiles.size === 0;
+  const baseBranch     = preview?.baseBranch;
+  const hasMergeBase   = preview?.hasMergeBase;
+  // No merge base on a feature branch means the PR will fail.
+  const noMergeBaseOnFeature = !isMainMaster && baseBranch !== undefined && hasMergeBase === false;
+  // Block Commit+Push (and Move to Review) when push would produce an unresolvable PR.
+  const pushBlocked    = isMainMaster || noMergeBaseOnFeature;
+
+  const branchValidationError = branchInput.trim() ? validateBranchName(branchInput.trim()) : null;
+
+  // Label for the "create branch" button: include the detected base so the user knows what they're doing.
+  const createBtnLabel = baseBranch
+    ? `Create branch from ${baseBranch}`
+    : 'Create branch';
+
+  // Filter out the default-branch warning since we render it in its own styled block.
+  const otherWarnings = (preview?.warnings ?? []).filter(
+    (w) => !(w.startsWith("Branch '") && w.includes('default branch')) &&
+           !(w.includes('no common history')),
+  );
 
   return (
     <div className="modal-overlay" onClick={onClose}>
@@ -144,7 +203,7 @@ export default function GitCommitModal({
               background: 'rgba(60,120,200,0.08)', border: '1px solid rgba(60,120,200,0.25)',
               borderRadius: 4, padding: '6px 10px', marginBottom: 10, fontSize: 12,
             }}>
-              Guided flow: Commit + Push will move the task to Review / Waiting for code review
+              Guided flow: Commit + Push will move the task to Code Review / Waiting for code review
               and open Azure DevOps. Commit only will create the commit but leave the task in Development.
             </div>
           )}
@@ -164,16 +223,103 @@ export default function GitCommitModal({
                 {preview.remoteUrl && (
                   <div><strong>Remote:</strong> <code style={{ fontSize: 11 }}>{preview.remoteUrl}</code></div>
                 )}
+                {baseBranch && (
+                  <div style={{ fontSize: 11, color: noMergeBaseOnFeature ? 'var(--color-blocked)' : 'var(--color-text-muted)' }}>
+                    <strong>Base branch for PR:</strong> <code style={{ fontSize: 11 }}>{baseBranch}</code>
+                    {!isMainMaster && hasMergeBase === true && (
+                      <span style={{ marginLeft: 6, color: 'var(--color-pass, #4c4)' }}>Branch is based on {baseBranch}.</span>
+                    )}
+                    {noMergeBaseOnFeature && (
+                      <span style={{ marginLeft: 6 }}>No common history — PR compare will fail.</span>
+                    )}
+                  </div>
+                )}
               </div>
 
-              {/* Warnings */}
-              {preview.warnings.length > 0 && (
+              {/* Default-branch warning + feature branch creator */}
+              {isMainMaster && (
+                <div style={{
+                  background: 'rgba(200,100,0,0.07)', border: '1px solid rgba(200,100,0,0.35)',
+                  borderRadius: 4, padding: '8px 10px', marginBottom: 10, fontSize: 12,
+                  display: 'flex', flexDirection: 'column', gap: 6,
+                }}>
+                  <div style={{ fontWeight: 600, color: 'var(--color-blocked)' }}>
+                    Branch &apos;{preview.branch}&apos; is the default branch — push will be blocked.
+                  </div>
+
+                  <div style={{ color: 'var(--color-text-muted)' }}>
+                    Create a feature branch before commit / push:
+                  </div>
+
+                  <div style={{ display: 'flex', gap: 6, alignItems: 'flex-start', flexDirection: 'column' }}>
+                    <input
+                      type="text"
+                      className="form-input"
+                      value={branchInput}
+                      onChange={(e) => {
+                        setBranchInput(e.target.value);
+                        setBranchCreateError(null);
+                        setBranchCreatedMsg(null);
+                      }}
+                      placeholder="feature/..."
+                      disabled={branchWorking}
+                      style={{ fontFamily: 'monospace', fontSize: 12, width: '100%', boxSizing: 'border-box' }}
+                      aria-label="Feature branch name"
+                    />
+                    {branchValidationError && !branchCreateError && (
+                      <span style={{ fontSize: 11, color: 'var(--color-blocked)' }}>{branchValidationError}</span>
+                    )}
+                    <button
+                      type="button"
+                      className="btn btn-secondary"
+                      onClick={() => void handleCreateBranch()}
+                      disabled={branchWorking || !!branchValidationError || !branchInput.trim()}
+                      style={{ alignSelf: 'flex-start' }}
+                    >
+                      {branchWorking ? 'Creating…' : createBtnLabel}
+                    </button>
+                  </div>
+
+                  {branchCreateError && (
+                    <p style={{ margin: 0, fontSize: 12, color: 'var(--color-blocked)' }}>✗ {branchCreateError}</p>
+                  )}
+                  {branchCreatedMsg && (
+                    <p style={{ margin: 0, fontSize: 12, color: 'var(--color-pass, #4c4)' }}>✓ {branchCreatedMsg}</p>
+                  )}
+                </div>
+              )}
+
+              {/* Unrelated-history warning + repair guidance */}
+              {noMergeBaseOnFeature && (
+                <div style={{
+                  background: 'rgba(200,50,0,0.07)', border: '1px solid rgba(200,50,0,0.4)',
+                  borderRadius: 4, padding: '8px 10px', marginBottom: 10, fontSize: 12,
+                  display: 'flex', flexDirection: 'column', gap: 4,
+                }}>
+                  <div style={{ fontWeight: 600, color: 'var(--color-blocked)' }}>
+                    This branch has no common history with {baseBranch}. A normal PR cannot be created.
+                  </div>
+                  <div style={{ color: 'var(--color-text-muted)' }}>Recommended fix:</div>
+                  <ol style={{ margin: '2px 0 0 18px', padding: 0, display: 'flex', flexDirection: 'column', gap: 2 }}>
+                    <li>Fetch origin: <code style={{ fontSize: 11 }}>git fetch origin</code></li>
+                    <li>Create a new branch from {baseBranch}: <code style={{ fontSize: 11 }}>git checkout -b feature/my-fix {baseBranch}</code></li>
+                    <li>Reapply or cherry-pick the intended changes onto the new branch.</li>
+                    <li>Push the new branch.</li>
+                  </ol>
+                  <div style={{ fontSize: 11, color: 'var(--color-text-muted)', marginTop: 2 }}>
+                    Commit + Push and Move to Code Review are blocked until the branch has a valid base.
+                  </div>
+                </div>
+              )}
+
+              {/* Generic warnings */}
+              {otherWarnings.length > 0 && (
                 <div style={{
                   background: 'rgba(200,160,0,0.08)', border: '1px solid rgba(200,160,0,0.35)',
                   borderRadius: 4, padding: '6px 10px', marginBottom: 10, fontSize: 12,
                   display: 'flex', flexDirection: 'column', gap: 3,
                 }}>
-                  {preview.warnings.map((w, i) => <div key={i}>⚠ {w}</div>)}
+                  {otherWarnings.map((w, i) => <div key={i}>⚠ {w}</div>)}
                 </div>
               )}
 
@@ -271,10 +417,18 @@ export default function GitCommitModal({
               type="button"
               className="btn btn-primary"
               onClick={() => void handleCommit(true)}
-              disabled={loading || working || !hasFiles || noneSelected || isMainMaster}
-              title={isMainMaster ? 'Push to main/master is blocked' : postCommitPushAction ? 'Commit, push, move to Review, and open Azure DevOps' : 'Commit selected files and push branch'}
+              disabled={loading || working || !hasFiles || noneSelected || pushBlocked}
+              title={
+                isMainMaster
+                  ? 'Push to main/master is blocked — create a feature branch first'
+                  : noMergeBaseOnFeature
+                    ? `Branch has no common history with ${baseBranch ?? 'remote base'} — PR compare will fail`
+                    : postCommitPushAction
+                      ? 'Commit, push, move to Code Review, and open Azure DevOps'
+                      : 'Commit selected files and push branch'
+              }
             >
-              {working ? 'Working…' : postCommitPushAction ? 'Commit + Push and Move to Review' : 'Commit + Push'}
+              {working ? 'Working…' : postCommitPushAction ? 'Commit + Push and Move to Code Review' : 'Commit + Push'}
             </button>
           </div>
         </div>

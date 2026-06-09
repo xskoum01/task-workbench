@@ -59,14 +59,14 @@ const S_NEW_CONFIRM: WorkflowStage = { id: 'new', label: 'New', actionLabel: 'Co
 const S_ANA_SETUP_REQ: WorkflowStage = { id: 'analyzed', label: 'Analyzed', actionLabel: 'Setup Required', next: 'in-progress' };
 const S_ANA_START: WorkflowStage = { id: 'analyzed', label: 'Analyzed', actionLabel: 'Start Development', next: 'in-progress' };
 const S_ANA_DONE: WorkflowStage = { id: 'analyzed', label: 'Analyzed', actionLabel: 'Mark Done', next: 'done' };
-const S_IN_PROGRESS: WorkflowStage = { id: 'in-progress', label: 'Development', actionLabel: 'Mark Waiting for Review', next: 'ready-for-review' };
+const S_IN_PROGRESS: WorkflowStage = { id: 'in-progress', label: 'Development', actionLabel: 'Mark Waiting for Code Review', next: 'ready-for-review' };
 /** Development stage for confirmed plugin tasks — primary action opens verification checks modal. */
 const S_IN_PROGRESS_PLUGIN: WorkflowStage = { id: 'in-progress', label: 'Development', actionLabel: 'Verify Implementation', next: 'ready-for-review' };
 /** Virtual Testing stage — active when displayPhase === 'testing' (any status with consultant-testing waitingState). */
 const S_TESTING: WorkflowStage = { id: 'testing', label: 'Testing', actionLabel: 'Testing in progress', next: null };
 /** Display-only Development stage used in the general stage array (not actionable via the stepper). */
 const S_IN_PROGRESS_GEN: WorkflowStage = { id: 'in-progress', label: 'Development', actionLabel: '', next: null };
-const S_FOR_REVIEW: WorkflowStage = { id: 'ready-for-review', label: 'Review', actionLabel: 'Mark Done', next: 'done' };
+const S_FOR_REVIEW: WorkflowStage = { id: 'ready-for-review', label: 'Code Review', actionLabel: 'Mark Done', next: 'done' };
 const S_DONE: WorkflowStage = { id: 'done', label: 'Done', actionLabel: 'Completed', next: null };
 
 export function buildTaskWorkflowPlan(task: Task, heuristicKind?: DevKind): TaskWorkflowPlan {

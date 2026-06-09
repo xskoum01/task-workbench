@@ -1265,6 +1265,18 @@ export interface GitCommitPreview {
   ignoredFiles: GitChangedFile[];
   warnings: string[];
   suggestedCommitMessage: string;
+  /** Remote default branch detected by the backend (e.g. "origin/main"). */
+  baseBranch?: string;
+  /** True when current HEAD shares a merge base with baseBranch. */
+  hasMergeBase?: boolean;
+  /** True when the branch can produce a normal PR (not main/master, has merge base, has remote). */
+  canCreatePullRequest?: boolean;
+  /** True when an upstream tracking branch is configured for the current branch. */
+  hasUpstream?: boolean;
+  /** The configured upstream ref, e.g. "origin/main" or "origin/VSM/10277". */
+  upstreamBranch?: string;
+  /** True when the upstream ref matches origin/<currentBranch>. */
+  upstreamMatchesCurrentBranch?: boolean;
 }
 
 export interface GitCommitResult {

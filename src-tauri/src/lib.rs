@@ -1064,6 +1064,47 @@ fn git_commit_preview_impl(repo_root: &str, task_json: Option<&Value>) -> Result
         .map(|t| generate_commit_message(t))
         .unwrap_or_else(|| "Update task files".into());
 
+    // Detect remote base and check whether current HEAD has a usable merge base.
+    let base_branch = detect_remote_base_branch(repo);
+    let has_merge_base = base_branch.as_deref()
+        .map(|b| has_merge_base_with_remote(repo, b))
+        .unwrap_or(false);
+    // A feature branch can produce a normal PR only when it is not a default branch,
+    // has a remote configured, and shares a merge base with origin/main|master.
+    let is_feature = branch != "main" && branch != "master" && !branch.is_empty();
+    let can_create_pr = is_feature && has_merge_base && remote_url.is_some();
+
+    if base_branch.is_some() && is_feature && !has_merge_base {
+        warnings.push(format!(
+            "Branch has no common history with {}. \
+             A normal PR cannot be created — GitHub compare will show unrelated histories.",
+            base_branch.as_deref().unwrap_or("remote base")
+        ));
+    }
+
+    // Detect upstream tracking configuration.
+    // `git rev-parse --abbrev-ref --symbolic-full-name @{u}` returns e.g. "origin/main"
+    // or exits non-zero when no upstream is configured.
+    let upstream_branch = run_git_ro(repo, &["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"])
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    let has_upstream = upstream_branch.is_some();
+    let expected_upstream = format!("origin/{branch}");
+    let upstream_matches = upstream_branch.as_deref()
+        .map(|u| u == expected_upstream)
+        .unwrap_or(false);
+
+    // Warn about upstream mismatch (does not block — push will auto-fix with --set-upstream).
+    if is_feature && has_upstream && !upstream_matches {
+        warnings.push(format!(
+            "Current branch tracks {} as upstream, but it should publish to {}. \
+             First push will automatically reset the upstream to {}.",
+            upstream_branch.as_deref().unwrap_or("?"),
+            expected_upstream,
+            expected_upstream,
+        ));
+    }
+
     Ok(serde_json::json!({
         "ok": true,
         "repoRoot": canonical_root,
@@ -1074,6 +1115,12 @@ fn git_commit_preview_impl(repo_root: &str, task_json: Option<&Value>) -> Result
         "ignoredFiles": noise,
         "warnings": warnings,
         "suggestedCommitMessage": suggested_message,
+        "baseBranch": base_branch,
+        "hasMergeBase": has_merge_base,
+        "canCreatePullRequest": can_create_pr,
+        "hasUpstream": has_upstream,
+        "upstreamBranch": upstream_branch,
+        "upstreamMatchesCurrentBranch": upstream_matches,
     }))
 }
 
@@ -1111,6 +1158,12 @@ fn git_commit_impl(repo_root: &str, files: &[String], message: &str) -> Result<V
 }
 
 /// Core logic for pushing the current branch — shared by Tauri command and MCP handler.
+///
+/// Push strategy (never force-pushes, never pushes to main/master):
+/// A. No upstream configured → `git push --set-upstream origin <branch>` (first publish)
+/// B. Upstream exists but is NOT `origin/<branch>` (e.g. tracks origin/main) →
+///    `git push --set-upstream origin <branch>` (fixes the tracking and publishes)
+/// C. Upstream already matches `origin/<branch>` → `git push`
 fn git_push_impl(repo_root: &str) -> Result<Value, String> {
     let branch = git_run(repo_root, &["branch", "--show-current"])
         .map_err(|e| format!("Cannot determine branch: {e}"))?
@@ -1119,8 +1172,164 @@ fn git_push_impl(repo_root: &str) -> Result<Value, String> {
     if branch == "main" || branch == "master" {
         return Err(format!("Push to '{branch}' is blocked from Task Workbench. Use a feature branch."));
     }
-    git_run(repo_root, &["push"]).map_err(|e| format!("git push failed: {e}"))?;
+
+    // Determine current upstream (if any). `@{u}` resolves to e.g. "origin/main" or
+    // "origin/VSM/10277". Returns None when no upstream is set.
+    let upstream = run_git_ro(repo_root, &["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"]);
+    let expected_upstream = format!("origin/{branch}");
+    let needs_set_upstream = upstream.as_deref().map(str::trim)
+        .map(|u| u != expected_upstream)
+        .unwrap_or(true); // None → no upstream → also needs set-upstream
+
+    if needs_set_upstream {
+        // Publish the branch (creates remote branch and sets correct tracking).
+        git_run(repo_root, &["push", "--set-upstream", "origin", &branch])
+            .map_err(|e| format!("git push --set-upstream failed: {e}"))?;
+    } else {
+        git_run(repo_root, &["push"])
+            .map_err(|e| format!("git push failed: {e}"))?;
+    }
+
     Ok(serde_json::json!({ "ok": true, "branch": branch, "summary": format!("Branch '{branch}' pushed.") }))
+}
+
+/// Detects the remote default/base branch.
+/// Priority: origin/main → origin/master → symbolic-ref refs/remotes/origin/HEAD.
+/// Returns "origin/main", "origin/master", or None. Read-only.
+fn detect_remote_base_branch(repo_root: &str) -> Option<String> {
+    if run_git_ro(repo_root, &["rev-parse", "--verify", "origin/main"]).is_some() {
+        return Some("origin/main".into());
+    }
+    if run_git_ro(repo_root, &["rev-parse", "--verify", "origin/master"]).is_some() {
+        return Some("origin/master".into());
+    }
+    // Symbolic ref: refs/remotes/origin/HEAD → refs/remotes/origin/main
+    if let Some(sym) = run_git_ro(repo_root, &["symbolic-ref", "refs/remotes/origin/HEAD"]) {
+        let sym = sym.trim();
+        if let Some(suffix) = sym.strip_prefix("refs/remotes/") {
+            if run_git_ro(repo_root, &["rev-parse", "--verify", suffix]).is_some() {
+                return Some(suffix.to_string());
+            }
+        }
+    }
+    None
+}
+
+/// Returns true when HEAD and base_ref share a common ancestor (merge base exists).
+/// Uses read-only `git merge-base`; returns false on any error.
+fn has_merge_base_with_remote(repo_root: &str, base_ref: &str) -> bool {
+    run_git_ro(repo_root, &["merge-base", base_ref, "HEAD"])
+        .map(|s| !s.trim().is_empty())
+        .unwrap_or(false)
+}
+
+/// Validates a Git branch name for safety. Returns Err with a human-readable reason.
+fn validate_git_branch_name(name: &str) -> Result<(), String> {
+    let t = name.trim();
+    if t.is_empty()            { return Err("Branch name cannot be empty.".into()); }
+    if t.contains("..")        { return Err("Branch name must not contain \"..\"".into()); }
+    if t.starts_with('-')      { return Err("Branch name must not start with \"-\".".into()); }
+    if t.ends_with('.')        { return Err("Branch name must not end with \".\".".into()); }
+    if t.contains(' ')         { return Err("Branch name must not contain spaces.".into()); }
+    if t.contains('\\')        { return Err("Branch name must not contain backslash.".into()); }
+    for ch in ['~', '^', ':', '?', '*', '['] {
+        if t.contains(ch) {
+            return Err(format!("Branch name must not contain '{ch}'."));
+        }
+    }
+    if t == "main" || t == "master" {
+        return Err(format!("\"{}\" is a default branch — use a feature branch name.", t));
+    }
+    if t.starts_with("refs/") {
+        return Err("Branch name must not start with \"refs/\".".into());
+    }
+    Ok(())
+}
+
+/// Creates a new local branch from the remote base branch and switches to it.
+/// Runs `git fetch origin --prune` first to ensure remote refs are current.
+/// Rejects if the branch already exists, if no remote base is found, or if the
+/// working tree has uncommitted changes that cannot safely survive the base switch
+/// (i.e. the local history has no merge base with origin/main|master).
+/// Never pushes, commits, or merges.
+fn create_git_branch_impl(repo_root: &str, branch_name: &str) -> Result<Value, String> {
+    let name = branch_name.trim();
+    validate_git_branch_name(name)?;
+
+    // Confirm repo_root is a Git repository.
+    run_git_ro(repo_root, &["rev-parse", "--show-toplevel"])
+        .ok_or_else(|| format!("Not a Git repository: {repo_root}"))?;
+
+    // Fetch remote refs so origin/main / origin/master are current.
+    {
+        let out = {
+            let mut cmd = std::process::Command::new("git");
+            hide_console_window(&mut cmd);
+            cmd.arg("-C").arg(repo_root)
+                .args(["fetch", "origin", "--prune"]);
+            cmd.output().map_err(|e| format!("Failed to run git fetch: {e}"))?
+        };
+        if !out.status.success() {
+            let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+            return Err(format!(
+                "git fetch origin failed: {stderr}\n\
+                 Cannot verify remote base branch without a successful fetch."
+            ));
+        }
+    }
+
+    // Detect remote base branch (after fetch so refs are fresh).
+    let base_branch = detect_remote_base_branch(repo_root)
+        .ok_or_else(|| {
+            "No remote base branch found (tried origin/main and origin/master). \
+             Cannot create a branch with a valid PR base. \
+             Ensure a remote named 'origin' is configured and has a main or master branch.".to_string()
+        })?;
+
+    // Guard: if uncommitted changes exist and there's no merge base, switching the
+    // working tree base would risk losing or mangling those changes.
+    let has_uncommitted = run_git_ro(repo_root, &["status", "--porcelain=v1", "--short"])
+        .map(|s| !s.is_empty())
+        .unwrap_or(false);
+    if has_uncommitted && !has_merge_base_with_remote(repo_root, &base_branch) {
+        return Err(format!(
+            "Cannot create branch from {base_branch}: the current working tree has uncommitted \
+             changes and the local history has no common ancestor with {base_branch}. \
+             This usually means the local repository was initialised independently of the remote. \
+             Recommended: create a clean clone, create the feature branch there, and bring your \
+             changes across manually."
+        ));
+    }
+
+    // Reject if the target branch already exists.
+    let already = run_git_ro(repo_root, &["rev-parse", "--verify", &format!("refs/heads/{name}")]);
+    if already.is_some() {
+        return Err(format!("Branch '{name}' already exists."));
+    }
+
+    // Create and switch to the new branch, rooted at the remote base.
+    // --no-track prevents git from setting origin/main as the upstream of the new
+    // branch, which would cause `git push` to refuse with "upstream does not match".
+    let out = {
+        let mut cmd = std::process::Command::new("git");
+        hide_console_window(&mut cmd);
+        cmd.arg("-C").arg(repo_root)
+            .arg("checkout").arg("--no-track").arg("-b").arg(name).arg(&base_branch);
+        cmd.output().map_err(|e| format!("Failed to run git checkout -b: {e}"))?
+    };
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+        return Err(format!("git checkout -b failed: {stderr}"));
+    }
+
+    Ok(serde_json::json!({ "ok": true, "branch": name, "baseBranch": base_branch }))
+}
+
+/// Creates a new local Git branch and switches to it.
+/// Rejects push/merge/force operations — local branch creation only.
+#[tauri::command]
+fn create_git_branch(repo_root: String, branch_name: String) -> Result<Value, String> {
+    create_git_branch_impl(&repo_root, &branch_name)
 }
 
 /// Resolves the repository root for a task in the MCP bridge context.
@@ -5936,6 +6145,7 @@ fn task_mcp_local_write_tool_definitions() -> Vec<Value> {
         serde_json::json!({"name":"save_pr_fix_proposal",                "description":"Save local PR fix proposal: summary and proposed changes. Does not edit files, commit, or push.","readOnly":false}),
         serde_json::json!({"name":"update_task_checklist_item",          "description":"Set status of a local workflow checklist item. Strict key and status enum validation.","readOnly":false}),
         serde_json::json!({"name":"set_task_next_step",                  "description":"Set the AI-recommended next action and reason. Does not overwrite analysis or plan.","readOnly":false}),
+        serde_json::json!({"name":"create_branch_for_task",              "description":"This modifies the local Git repository by creating and switching to a new branch. Creates a local branch only — no commit, no push, no PR, no GitHub/Azure DevOps API calls.","readOnly":false}),
     ]
 }
 
@@ -7639,6 +7849,21 @@ fn task_mcp_execute_tool(app: &tauri::AppHandle, tool_name: &str, args: &Value) 
                 .ok_or_else(|| format!("Task not found: {task_id}"))?;
             let task_snap = tasks[task_idx].clone();
             let repo_root = mcp_resolve_repo_root_for_task(app, &task_snap)?;
+
+            // When moving to Review, require a valid merge base so a normal PR can be created.
+            if move_to_review {
+                if let Some(base) = detect_remote_base_branch(&repo_root) {
+                    if !has_merge_base_with_remote(&repo_root, &base) {
+                        return Err(format!(
+                            "Current branch has no common history with {base}. \
+                             A normal PR cannot be created. \
+                             Create a branch from {base} first using create_branch_for_task, \
+                             then reapply your changes."
+                        ));
+                    }
+                }
+            }
+
             let commit = git_commit_impl(&repo_root, &files, message)?;
             let hash   = commit["commitHash"].as_str().unwrap_or("?").to_string();
             let push   = git_push_impl(&repo_root)?;
@@ -7664,6 +7889,22 @@ fn task_mcp_execute_tool(app: &tauri::AppHandle, tool_name: &str, args: &Value) 
                 format!("Commit {hash} created and branch '{branch}' pushed.")
             };
             serde_json::json!({ "ok": true, "commitHash": hash, "branch": branch, "movedToReview": move_to_review, "summary": summary })
+        }
+
+        "create_branch_for_task" => {
+            let task_id     = args["taskId"].as_str().unwrap_or("").trim();
+            let branch_name = args["branchName"].as_str().unwrap_or("").trim();
+            if task_id.is_empty()     { return Err("Missing required argument: taskId".into()); }
+            if branch_name.is_empty() { return Err("Missing required argument: branchName".into()); }
+            let task_idx = task_mcp_find_task_index(&tasks, task_id)
+                .ok_or_else(|| format!("Task not found: {task_id}"))?;
+            let task_snap = tasks[task_idx].clone();
+            let repo_root = mcp_resolve_repo_root_for_task(app, &task_snap)?;
+            let result = create_git_branch_impl(&repo_root, branch_name)?;
+            let branch = result["branch"].as_str().unwrap_or("?").to_string();
+            { let t = &mut tasks[task_idx]; task_mcp_append_audit_note(t, &format!("create_branch_for_task -> {branch}")); }
+            updated = true;
+            result
         }
 
         "mark_testing_confirmed_prepare_commit" => {
@@ -11080,6 +11321,7 @@ pub fn run() {
                 commit_task_changes,
                 push_task_branch,
                 commit_and_push_task_changes,
+                create_git_branch,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

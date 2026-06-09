@@ -258,6 +258,15 @@ export function commitAndPushTaskChanges(repoRoot: string, files: string[], mess
   return invoke('commit_and_push_task_changes', { repoRoot, files, message });
 }
 
+/**
+ * Creates a new local branch and switches to it.
+ * Rejects if the branch already exists or the name is unsafe.
+ * Never pushes, commits, or merges.
+ */
+export function createGitBranch(repoRoot: string, branchName: string): Promise<{ ok: boolean; branch: string }> {
+  return invoke('create_git_branch', { repoRoot, branchName });
+}
+
 /** Scans a C# file for Dataverse logical-name references using the Rust scanner (same as MCP path). */
 export function scanCsFileForCrm(
   path: string,

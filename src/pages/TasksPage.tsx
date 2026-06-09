@@ -32,7 +32,7 @@ const STATUS_FILTERS: { value: TaskStatus | 'all'; label: string }[] = [
   { value: 'new',              label: 'New'        },
   { value: 'analyzed',         label: 'Analyzed'   },
   { value: 'in-progress',      label: 'In Progress'},
-  { value: 'ready-for-review', label: 'For Review' },
+  { value: 'ready-for-review', label: 'Code Review' },
   { value: 'blocked',          label: 'Blocked'    },
   { value: 'done',             label: 'Done'       },
 ];

@@ -6,7 +6,7 @@ export const STATUS_LABELS: Record<TaskStatus, string> = {
   'new':              'New',
   'analyzed':         'Analyzed',
   'in-progress':      'In Progress',
-  'ready-for-review': 'For Review',
+  'ready-for-review': 'Code Review',
   'done':             'Done',
   'blocked':          'Blocked',
 };

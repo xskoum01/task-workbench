@@ -26,13 +26,14 @@ const TEXT = {
   developmentStarted: 'V\u00fdvoj byl zah\u00e1jen.',
   testingConfirmed: 'Konzultantsk\u00e9 testov\u00e1n\u00ed potvrzeno.',
   testingFailed: 'Konzultantsk\u00e9 testov\u00e1n\u00ed nepro\u0161lo.',
-  testingConfirmedAndMovedToReview: 'Konzultantsk\u00e9 testov\u00e1n\u00ed potvrzeno a \u00fakol p\u0159esunut do Review / Waiting for PR.',
-  movedToReview: '\u00dakol p\u0159esunut do Review / Waiting for PR.',
+  testingConfirmedAndMovedToReview: 'Konzultantsk\u00e9 testov\u00e1n\u00ed potvrzeno a \u00fakol p\u0159esunut do Code Review / Waiting for PR.',
+  movedToReview: '\u00dakol p\u0159esunut do Code Review / Waiting for PR.',
   movedBackToDevelopment: '\u00dakol vr\u00e1cen zp\u011bt do v\u00fdvoje.',
+  gitBranchCreated: 'Vytvo\u0159ena Git v\u011btev.',
   gitCommitCreated: 'Vytvo\u0159en Git commit.',
   gitBranchPushed: 'Git v\u011btev byla pushnuta.',
   gitCommitAndPush: 'Vytvo\u0159en Git commit a v\u011btev byla pushnuta.',
-  testingConfirmedCommitPushedMovedToReview: 'Zm\u011bny byly commitnuty a pushnuty; \u00fakol p\u0159esunut do Review / Waiting for PR.',
+  testingConfirmedCommitPushedMovedToReview: 'Zm\u011bny byly commitnuty a pushnuty; \u00fakol p\u0159esunut do Code Review / Waiting for PR.',
 };
 
 function formatTimestamp(rawTimestamp: string | undefined): string | undefined {
@@ -116,6 +117,15 @@ export function formatTaskActivityNote(rawNote: string, index = 0): FormattedTas
     return { id: `${index}-${raw}`, timestampLabel, source: 'Git / Testing', message: TEXT.testingConfirmedCommitPushedMovedToReview, raw };
   }
 
+  const gitBranchCreatedMatch = /^UI: git-branch-created -> (.+)$/i.exec(body);
+  if (gitBranchCreatedMatch) {
+    return { id: `${index}-${raw}`, timestampLabel, source: 'Git', message: `${TEXT.gitBranchCreated} (${gitBranchCreatedMatch[1]})`, raw };
+  }
+  const mcpGitBranchCreatedMatch = /^MCP local write: create_branch_for_task -> (.+)$/i.exec(body);
+  if (mcpGitBranchCreatedMatch) {
+    return { id: `${index}-${raw}`, timestampLabel, source: 'MCP / Git', message: `${TEXT.gitBranchCreated} (${mcpGitBranchCreatedMatch[1]})`, raw };
+  }
+
   const gitCommitMatch = /^UI: git-commit-created -> (.+)$/i.exec(body);
   if (gitCommitMatch) {
     return { id: `${index}-${raw}`, timestampLabel, source: 'Git', message: `${TEXT.gitCommitCreated} (${gitCommitMatch[1]})`, raw };
@@ -166,9 +176,11 @@ export function isTaskActivityLine(line: string): boolean {
     body === 'UI: moved-to-review' ||
     body === 'UI: moved-back-to-development' ||
     body === 'UI: testing-confirmed-commit-pushed-moved-to-review' ||
+    /^UI: git-branch-created -> .+$/i.test(body) ||
     /^UI: git-commit-created -> .+$/i.test(body) ||
     /^UI: git-branch-pushed -> .+$/i.test(body) ||
     /^UI: git-commit-and-push -> .+$/i.test(body) ||
+    /^MCP local write: create_branch_for_task -> .+$/i.test(body) ||
     /^MCP local write: commit_task_changes -> .+$/i.test(body) ||
     /^MCP local write: push_task_branch -> .+$/i.test(body) ||
     /^MCP local write: commit_and_push_task_changes -> .+$/i.test(body)

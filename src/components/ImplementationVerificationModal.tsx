@@ -404,10 +404,10 @@ export default function ImplementationVerificationModal({
               padding: '6px 10px', display: 'flex', alignItems: 'center', gap: 10,
             }}>
               <span style={{ flex: 1 }}>
-                Some implementation checks are not completed. Move to Review anyway?
+                Some implementation checks are not completed. Move to Code Review anyway?
               </span>
               <button className="btn btn-danger btn-sm" onClick={handleReviewConfirmed} disabled={reviewBusy} type="button">
-                {reviewBusy ? <><span className="btn-spinner" /> Moving</> : 'Move to Review'}
+                {reviewBusy ? <><span className="btn-spinner" /> Moving</> : 'Move to Code Review'}
               </button>
               <button className="btn btn-ghost btn-sm" onClick={() => setReviewConfirmPending(false)} type="button">
                 Cancel
@@ -441,7 +441,7 @@ export default function ImplementationVerificationModal({
               title="Mark task as Waiting for PR / Code Review"
               type="button"
             >
-              {reviewBusy ? <><span className="btn-spinner" /> Moving</> : <><Icon name="check" size={13} /> Move to Review / Waiting for PR</>}
+              {reviewBusy ? <><span className="btn-spinner" /> Moving</> : <><Icon name="check" size={13} /> Move to Code Review / Waiting for PR</>}
             </button>
           </div>
         </div>
