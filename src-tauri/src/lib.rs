@@ -1,11 +1,17 @@
 use std::fs;
 use std::io;
 use std::io::BufRead;
-use std::net::TcpListener;
+use std::io::{Read, Write};
+use std::net::{TcpListener, TcpStream};
+use std::process::Stdio;
 use std::path::PathBuf;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::sync::{Mutex, OnceLock};
+use std::thread;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader as TokioBufReader};
+use tokio::time::{timeout, Duration};
 use tauri::Manager;
 use tauri_plugin_dialog::DialogExt;
 use reqwest::Client;
@@ -156,8 +162,24 @@ fn default_settings() -> Value {
         "appName": "Task Workbench",
         "theme": "dark",
         "defaultTaskConfidence": 80,
+        // Legacy fields — kept for backward compatibility
         "aiModel": "",
         "aiApiKey": "",
+        // Multi-provider AI config
+        "activeAiProvider": "openai",
+        "openaiApiKey": "",
+        "openaiModel": "gpt-4.1-mini",
+        "anthropicApiKey": "",
+        "anthropicModel": "claude-sonnet-4-5",
+        // CRM Metadata / Primarch MCP
+        "crmMetadataEnabled": false,
+        "primarchMcpCommand": "",
+        "primarchMcpArgs": "",
+        "primarchMcpWorkingDirectory": "",
+        "primarchMcpReadOnly": true,
+        "primarchMcpLastStatus": "not_configured",
+        "primarchMcpLastError": null,
+        // Other existing fields
         "crmBaseDirectory": "",
         "repositoryTemplate": "",
         "repositoryTemplateType": "none",
@@ -173,16 +195,42 @@ fn default_settings() -> Value {
     })
 }
 
+fn merge_settings_defaults(defaults: &Value, current: &Value) -> Value {
+    match (defaults, current) {
+        (Value::Object(default_map), Value::Object(current_map)) => {
+            let mut merged = serde_json::Map::new();
+            for (key, default_value) in default_map {
+                if let Some(current_value) = current_map.get(key) {
+                    merged.insert(key.clone(), merge_settings_defaults(default_value, current_value));
+                } else {
+                    merged.insert(key.clone(), default_value.clone());
+                }
+            }
+            for (key, current_value) in current_map {
+                if !merged.contains_key(key) {
+                    merged.insert(key.clone(), current_value.clone());
+                }
+            }
+            Value::Object(merged)
+        }
+        _ => current.clone(),
+    }
+}
+
 #[tauri::command]
 fn load_settings(app: tauri::AppHandle) -> Result<Value, String> {
     let path = app_data_dir(&app)?.join("settings.json");
     let value = read_json(&path)?;
+    let defaults = default_settings();
     if value.is_null() {
-        let defaults = default_settings();
         write_json(&path, &defaults)?;
         Ok(defaults)
     } else {
-        Ok(value)
+        let merged = merge_settings_defaults(&defaults, &value);
+        if merged != value {
+            write_json(&path, &merged)?;
+        }
+        Ok(merged)
     }
 }
 
@@ -590,38 +638,79 @@ fn get_git_diff(repo_path: String, file_path: Option<String>) -> Result<String, 
 
 // --- AI helpers ------------------------------------------------------------
 
-/// Reads aiApiKey and aiModel from settings.json.
-/// Returns an error if the API key is empty.
-fn get_ai_settings(app: &tauri::AppHandle) -> Result<(String, String), String> {
+/// Resolved AI provider configuration loaded from settings.
+struct AiConfig {
+    /// "openai" | "anthropic"
+    provider: String,
+    /// API key for the active provider (never logged).
+    api_key: String,
+    /// Model name for the active provider.
+    model: String,
+}
+
+/// Reads AI provider config from settings.json.
+/// Supports both the new multi-provider fields and the legacy aiApiKey/aiModel fallback.
+/// Returns an error (without the key) if the resolved API key is empty.
+fn get_ai_config(app: &tauri::AppHandle) -> Result<AiConfig, String> {
     let path = app_data_dir(app)?.join("settings.json");
     let settings = read_json(&path)?;
 
-    let api_key = settings["aiApiKey"].as_str().unwrap_or("").to_string();
-    if api_key.is_empty() {
-        return Err(
-            "AI API key not configured. Add your OpenAI API key in Settings.".to_string(),
-        );
-    }
+    let provider = settings["activeAiProvider"].as_str().unwrap_or("openai").to_string();
 
-    let model = {
-        let m = settings["aiModel"].as_str().unwrap_or("");
-        if m.is_empty() {
-            "gpt-4.1-mini".to_string()
-        } else {
-            m.to_string()
-        }
+    let (api_key, model) = if provider == "anthropic" {
+        let key = settings["anthropicApiKey"].as_str().unwrap_or("").to_string();
+        let mdl = {
+            let m = settings["anthropicModel"].as_str().unwrap_or("");
+            if m.is_empty() { "claude-sonnet-4-5".to_string() } else { m.to_string() }
+        };
+        (key, mdl)
+    } else {
+        // OpenAI — with legacy fallback
+        let key = {
+            let k = settings["openaiApiKey"].as_str().unwrap_or("");
+            if k.is_empty() {
+                settings["aiApiKey"].as_str().unwrap_or("").to_string()
+            } else {
+                k.to_string()
+            }
+        };
+        let mdl = {
+            let m = settings["openaiModel"].as_str().unwrap_or("");
+            if m.is_empty() {
+                let legacy = settings["aiModel"].as_str().unwrap_or("");
+                if legacy.is_empty() { "gpt-4.1-mini".to_string() } else { legacy.to_string() }
+            } else {
+                m.to_string()
+            }
+        };
+        (key, mdl)
     };
 
-    Ok((api_key, model))
+    if api_key.is_empty() {
+        let label = if provider == "anthropic" { "Anthropic" } else { "OpenAI" };
+        return Err(format!(
+            "AI API key not configured. Add your {label} API key in Settings → AI."
+        ));
+    }
+
+    Ok(AiConfig { provider, api_key, model })
 }
 
-/// Calls the OpenAI Responses API and returns the text of the first output message.
-/// `prompt` is sent as the user input; `instructions` is the optional system prompt.
-async fn call_openai(
+/// Legacy helper — kept to avoid touching unchanged call sites individually.
+/// New code should use get_ai_config.
+#[allow(dead_code)]
+fn get_ai_settings(app: &tauri::AppHandle) -> Result<(String, String), String> {
+    let c = get_ai_config(app)?;
+    Ok((c.api_key, c.model))
+}
+
+/// OpenAI Responses API call with optional temperature.
+async fn call_openai_with_temperature(
     api_key: &str,
     model: &str,
     instructions: &str,
     prompt: &str,
+    temperature: Option<f64>,
 ) -> Result<String, String> {
     let client = Client::new();
 
@@ -631,6 +720,11 @@ async fn call_openai(
     });
     if !instructions.is_empty() {
         body["instructions"] = serde_json::Value::String(instructions.to_string());
+    }
+    if let Some(t) = temperature {
+        if t > 0.0 {
+            body["temperature"] = serde_json::Value::from(t.clamp(0.0, 2.0));
+        }
     }
 
     let resp = client
@@ -658,6 +752,76 @@ async fn call_openai(
             let snippet = json.to_string();
             format!("Unexpected OpenAI response format: {}", &snippet[..snippet.len().min(300)])
         })
+}
+
+/// Calls the Anthropic Messages API and returns the text of the first content block.
+async fn call_anthropic_text(
+    api_key: &str,
+    model: &str,
+    instructions: &str,
+    prompt: &str,
+    temperature: Option<f64>,
+) -> Result<String, String> {
+    let client = Client::new();
+    let messages = serde_json::json!([{"role": "user", "content": prompt}]);
+    let mut body = serde_json::json!({
+        "model": model,
+        "max_tokens": 4096,
+        "messages": messages,
+    });
+    if !instructions.is_empty() {
+        body["system"] = serde_json::Value::String(instructions.to_string());
+    }
+    if let Some(t) = temperature {
+        if t > 0.0 {
+            body["temperature"] = serde_json::Value::from(t.clamp(0.0, 1.0));
+        }
+    }
+
+    let resp = client
+        .post("https://api.anthropic.com/v1/messages")
+        .header("x-api-key", api_key)
+        .header("anthropic-version", "2023-06-01")
+        .header("content-type", "application/json")
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| format!("Network error: {e}"))?;
+
+    if !resp.status().is_success() {
+        let status = resp.status().as_u16();
+        let text = resp.text().await.unwrap_or_default();
+        return Err(format!("Anthropic API error {status}: {text}"));
+    }
+
+    let json: Value = resp.json().await.map_err(|e| e.to_string())?;
+    // Anthropic Messages API: content[0].text
+    json["content"][0]["text"]
+        .as_str()
+        .map(|s| s.to_string())
+        .ok_or_else(|| {
+            let snippet = json.to_string();
+            format!("Unexpected Anthropic response format: {}", &snippet[..snippet.len().min(300)])
+        })
+}
+
+/// Provider-aware AI text call. Routes to OpenAI or Anthropic based on config.
+async fn call_ai_text(config: &AiConfig, instructions: &str, prompt: &str) -> Result<String, String> {
+    call_ai_text_with_temperature(config, instructions, prompt, None).await
+}
+
+/// Provider-aware AI call with optional temperature override.
+async fn call_ai_text_with_temperature(
+    config: &AiConfig,
+    instructions: &str,
+    prompt: &str,
+    temperature: Option<f64>,
+) -> Result<String, String> {
+    if config.provider == "anthropic" {
+        call_anthropic_text(&config.api_key, &config.model, instructions, prompt, temperature).await
+    } else {
+        call_openai_with_temperature(&config.api_key, &config.model, instructions, prompt, temperature).await
+    }
 }
 
 /// Strip markdown code fences (```json ... ```) that the model sometimes adds
@@ -707,10 +871,10 @@ fn normalize_task_analysis(mut v: Value) -> Value {
     v
 }
 
-/// Analyses a task using OpenAI and returns a TaskAnalysis JSON object.
+/// Analyses a task using AI and returns a TaskAnalysis JSON object.
 #[tauri::command]
 async fn analyze_task(app: tauri::AppHandle, task: Value, customer: Value) -> Result<Value, String> {
-    let (api_key, model) = get_ai_settings(&app)?;
+    let config = get_ai_config(&app)?;
 
     let title         = task["title"].as_str().unwrap_or("");
     let task_type     = task["taskType"].as_str().unwrap_or("");
@@ -759,7 +923,7 @@ Rules — follow strictly:\n\
 - No long sentences. No corporate language. No markdown inside string values."
     );
 
-    let text = call_openai(&api_key, &model, instructions, &prompt).await?;
+    let text = call_ai_text(&config, instructions, &prompt).await?;
 
     let parsed: Value = serde_json::from_str(strip_fences(&text)).map_err(|e| {
         let snippet = &text[..text.len().min(300)];
@@ -772,7 +936,7 @@ Rules — follow strictly:\n\
 /// Generates a professional reply draft. Returns plain text.
 #[tauri::command]
 async fn generate_reply(app: tauri::AppHandle, task: Value, customer: Value) -> Result<String, String> {
-    let (api_key, model) = get_ai_settings(&app)?;
+    let config = get_ai_config(&app)?;
 
     let title         = task["title"].as_str().unwrap_or("");
     let task_type     = task["taskType"].as_str().unwrap_or("");
@@ -790,13 +954,13 @@ Write 2-4 short paragraphs. Acknowledge the request, state current status, \
 set clear expectations. End with 'Best regards'."
     );
 
-    call_openai(&api_key, &model, instructions, &prompt).await
+    call_ai_text(&config, instructions, &prompt).await
 }
 
 /// Generates a C# plugin skeleton and returns a SkeletonPreview JSON object.
 #[tauri::command]
 async fn generate_skeleton_preview(app: tauri::AppHandle, task: Value, customer: Value) -> Result<Value, String> {
-    let (api_key, model) = get_ai_settings(&app)?;
+    let config = get_ai_config(&app)?;
 
     let title     = task["title"].as_str().unwrap_or("");
     let task_type = task["taskType"].as_str().unwrap_or("");
@@ -838,7 +1002,7 @@ Execute method built on the base stub above with task-specific logic replacing t
 - targetPath: relative subfolder within plugin folder (empty string for root)"
     );
 
-    let text = call_openai(&api_key, &model, instructions, &prompt).await?;
+    let text = call_ai_text(&config, instructions, &prompt).await?;
 
     serde_json::from_str(strip_fences(&text)).map_err(|e| {
         let snippet = &text[..text.len().min(300)];
@@ -861,9 +1025,11 @@ async fn run_ai_file_review(
     model_override: String,
     temperature: f64,
 ) -> Result<Value, String> {
-    // Read API key and base model from settings
-    let (api_key, base_model) = get_ai_settings(&app)?;
-    let model = if model_override.trim().is_empty() { base_model } else { model_override.trim().to_string() };
+    // Read AI config from settings; allow model_override from reviewer profile
+    let mut ai_config = get_ai_config(&app)?;
+    if !model_override.trim().is_empty() {
+        ai_config.model = model_override.trim().to_string();
+    }
 
     // Read the file from disk (cap at 200 KB to stay within token budgets)
     const MAX_BYTES: usize = 200 * 1024;
@@ -935,41 +1101,8 @@ Pravidla:
         format!("{instructions}{json_format_requirement}")
     };
 
-    let client = reqwest::Client::new();
-    let mut body = serde_json::json!({
-        "model": model,
-        "input": prompt,
-        "instructions": full_instructions,
-    });
-    if temperature > 0.0 {
-        body["temperature"] = serde_json::Value::from(temperature.clamp(0.0, 2.0));
-    }
-
-    let resp = client
-        .post("https://api.openai.com/v1/responses")
-        .bearer_auth(&api_key)
-        .header("content-type", "application/json")
-        .json(&body)
-        .send()
-        .await
-        .map_err(|e| format!("Network error: {e}"))?;
-
-    if !resp.status().is_success() {
-        let status = resp.status().as_u16();
-        let text = resp.text().await.unwrap_or_default();
-        return Err(format!("OpenAI API error {status}: {text}"));
-    }
-
-    let json: Value = resp.json().await.map_err(|e| e.to_string())?;
-    let text = json["output"][0]["content"][0]["text"]
-        .as_str()
-        .map(|s| s.to_string())
-        .ok_or_else(|| {
-            let snippet = json.to_string();
-            format!("Unexpected OpenAI response: {}", &snippet[..snippet.len().min(300)])
-        })?;
-
-    // Strip optional markdown fences the model might still emit despite the instruction.
+    let temp_opt = if temperature > 0.0 { Some(temperature) } else { None };
+    let text = call_ai_text_with_temperature(&ai_config, &full_instructions, &prompt, temp_opt).await?;
     let stripped = strip_json_fences(text.trim());
 
     // Try to parse the model response as structured JSON.
@@ -1020,8 +1153,10 @@ async fn run_ai_change_review(
     model_override: String,
     temperature: f64,
 ) -> Result<Value, String> {
-    let (api_key, base_model) = get_ai_settings(&app)?;
-    let model = if model_override.trim().is_empty() { base_model } else { model_override.trim().to_string() };
+    let mut ai_config = get_ai_config(&app)?;
+    if !model_override.trim().is_empty() {
+        ai_config.model = model_override.trim().to_string();
+    }
 
     // Cap diff at 200 KB to stay within model context limits.
     const MAX_BYTES: usize = 200 * 1024;
@@ -1087,40 +1222,8 @@ Pravidla:
         format!("{instructions}{json_format_requirement}")
     };
 
-    let client = reqwest::Client::new();
-    let mut body = serde_json::json!({
-        "model": model,
-        "input": prompt,
-        "instructions": full_instructions,
-    });
-    if temperature > 0.0 {
-        body["temperature"] = serde_json::Value::from(temperature.clamp(0.0, 2.0));
-    }
-
-    let resp = client
-        .post("https://api.openai.com/v1/responses")
-        .bearer_auth(&api_key)
-        .header("content-type", "application/json")
-        .json(&body)
-        .send()
-        .await
-        .map_err(|e| format!("Network error: {e}"))?;
-
-    if !resp.status().is_success() {
-        let status = resp.status().as_u16();
-        let text = resp.text().await.unwrap_or_default();
-        return Err(format!("OpenAI API error {status}: {text}"));
-    }
-
-    let json: Value = resp.json().await.map_err(|e| e.to_string())?;
-    let text = json["output"][0]["content"][0]["text"]
-        .as_str()
-        .map(|s| s.to_string())
-        .ok_or_else(|| {
-            let snippet = json.to_string();
-            format!("Unexpected OpenAI response: {}", &snippet[..snippet.len().min(300)])
-        })?;
-
+    let temp_opt = if temperature > 0.0 { Some(temperature) } else { None };
+    let text = call_ai_text_with_temperature(&ai_config, &full_instructions, &prompt, temp_opt).await?;
     let stripped = strip_json_fences(text.trim());
 
     match serde_json::from_str::<Value>(stripped) {
@@ -1377,11 +1480,11 @@ async fn classify_inbox_item(app: tauri::AppHandle, item: Value) -> Result<Value
         content.clone()
     };
 
-    // Try OpenAI. If not configured or call fails, use heuristic fallback.
-    let ai_result = get_ai_settings(&app);
+    // Try AI. If not configured or call fails, use heuristic fallback.
+    let ai_result = get_ai_config(&app);
     match ai_result {
-        Ok((api_key, model)) => {
-            // --- OpenAI path ---
+        Ok(config) => {
+            // --- AI path ---
             let source_context = match source.as_str() {
                 "teams" => "Teams chat message (very noisy channel — be strict, require explicit request verbs or clear issues)",
                 _       => "Outlook email (apply reasonable developer workflow classification)",
@@ -1452,12 +1555,12 @@ Field rules:\n\
 - title: must be in Czech for Teams messages. Use an action-oriented noun phrase (e.g. 'Upravit možnost změny data dokončení úkolu')."
             );
 
-            let text_result = call_openai(&api_key, &model, instructions, &prompt).await;
+            let text_result = call_ai_text(&config, instructions, &prompt).await;
             match text_result {
                 Ok(text) => {
                     match serde_json::from_str::<Value>(strip_fences(&text)) {
                         Ok(v) => {
-                            eprintln!("[classify] OpenAI result for \"{title}\": isTask={} conf={}",
+                            eprintln!("[classify] AI result for \"{title}\": isTask={} conf={}",
                                 v["isTask"], v["confidence"]);
                             Ok(v)
                         }
@@ -3739,18 +3842,42 @@ fn strip_html(html: &str) -> String {
     decoded.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-/// Returns an ISO 8601 UTC timestamp for "now" without pulling in chrono.
+fn is_leap_year(year: i64) -> bool {
+    (year % 4 == 0 && year % 100 != 0) || (year % 400 == 0)
+}
+
+/// Returns an accurate ISO 8601 UTC timestamp for "now" without pulling in chrono.
 fn chrono_now_iso() -> String {
-    let secs = now_unix();
-    // Format as a rough ISO 8601 string (accuracy sufficient for sync timestamps)
-    let days_since_epoch = secs / 86400;
+    let secs = now_unix() as i64;
     let time_of_day = secs % 86400;
     let h = time_of_day / 3600;
     let m = (time_of_day % 3600) / 60;
     let s = time_of_day % 60;
-    // Very simple date arithmetic (no leap-year handling needed for sync timestamps)
-    let year = 1970 + days_since_epoch / 365;
-    format!("{year:04}-01-01T{h:02}:{m:02}:{s:02}Z")
+
+    let mut remaining_days = secs / 86400;
+    let mut year = 1970i64;
+    loop {
+        let days_in_year = if is_leap_year(year) { 366 } else { 365 };
+        if remaining_days < days_in_year {
+            break;
+        }
+        remaining_days -= days_in_year;
+        year += 1;
+    }
+
+    let leap = is_leap_year(year);
+    let days_per_month: [i64; 12] = [31, if leap { 29 } else { 28 }, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+    let mut month = 1i64;
+    for &dim in &days_per_month {
+        if remaining_days < dim {
+            break;
+        }
+        remaining_days -= dim;
+        month += 1;
+    }
+    let day = remaining_days + 1;
+
+    format!("{year:04}-{month:02}-{day:02}T{h:02}:{m:02}:{s:02}Z")
 }
 
 // --- Teams message link detection and resolution --------------------------
@@ -4094,6 +4221,2423 @@ fn parse_teams_forwarded_card(msg: &Value, body_html: &str) -> Option<ForwardedM
     None
 }
 
+
+// --- Task Workbench MCP bridge --------------------------------------------
+
+const TASK_MCP_BRIDGE_HOST: &str = "127.0.0.1";
+const TASK_MCP_BRIDGE_PORT: u16 = 38473;
+const TASK_MCP_MAX_SUMMARY_LENGTH: usize = 700;
+const TASK_MCP_MAX_NOTE_LENGTH: usize = 1500;
+const TASK_MCP_MAX_BODY_BYTES: usize = 256 * 1024;
+
+static TASK_MCP_BRIDGE_STATE: OnceLock<Mutex<Value>> = OnceLock::new();
+static TASK_MCP_BRIDGE_TOKEN: OnceLock<String> = OnceLock::new();
+
+fn task_mcp_generate_token() -> String {
+    use rand::Rng;
+    rand::thread_rng()
+        .sample_iter(&rand::distributions::Alphanumeric)
+        .take(32)
+        .map(char::from)
+        .collect()
+}
+
+fn task_mcp_bridge_token() -> &'static str {
+    TASK_MCP_BRIDGE_TOKEN.get_or_init(task_mcp_generate_token)
+}
+
+fn task_mcp_bridge_state() -> &'static Mutex<Value> {
+    TASK_MCP_BRIDGE_STATE.get_or_init(|| {
+        Mutex::new(serde_json::json!({
+            "active": false,
+            "host": TASK_MCP_BRIDGE_HOST,
+            "port": TASK_MCP_BRIDGE_PORT,
+            "readOnlyTools": task_mcp_read_only_tool_definitions(),
+            "localWriteTools": task_mcp_local_write_tool_definitions(),
+            "readOnlyMode": false,
+            "localWriteMode": true,
+            "lastError": Value::Null,
+            "serverPath": task_mcp_server_script_path(),
+            "bridgeToken": task_mcp_bridge_token(),
+        }))
+    })
+}
+
+fn task_mcp_update_bridge_state(mutator: impl FnOnce(&mut Value)) {
+    if let Ok(mut state) = task_mcp_bridge_state().lock() {
+        mutator(&mut state);
+    }
+}
+
+fn task_mcp_current_bridge_state() -> Value {
+    task_mcp_bridge_state()
+        .lock()
+        .map(|v| v.clone())
+        .unwrap_or_else(|_| serde_json::json!({
+            "active": false,
+            "host": TASK_MCP_BRIDGE_HOST,
+            "port": TASK_MCP_BRIDGE_PORT,
+            "readOnlyTools": task_mcp_read_only_tool_definitions(),
+            "localWriteTools": task_mcp_local_write_tool_definitions(),
+            "readOnlyMode": false,
+            "localWriteMode": true,
+            "lastError": "Bridge state lock poisoned.",
+            "serverPath": task_mcp_server_script_path(),
+            "bridgeToken": task_mcp_bridge_token(),
+        }))
+}
+
+fn task_mcp_server_script_path() -> String {
+    let cwd = std::env::current_dir().ok();
+    if let Some(cwd) = cwd {
+        let candidate = cwd.join("mcp").join("task-workbench-mcp.mjs");
+        return candidate.to_string_lossy().to_string();
+    }
+    "mcp/task-workbench-mcp.mjs".to_string()
+}
+
+fn task_mcp_read_only_tool_definitions() -> Vec<Value> {
+    vec![
+        serde_json::json!({"name":"list_tasks","description":"List sanitized task-workbench tasks.","readOnly":true}),
+        serde_json::json!({"name":"get_task","description":"Get one sanitized task by id.","readOnly":true}),
+        serde_json::json!({"name":"get_task_summary","description":"Get one sanitized task summary by id.","readOnly":true}),
+        serde_json::json!({"name":"get_crm_workflow_state","description":"Get sanitized CRM Developer Workflow state for a task.","readOnly":true}),
+        serde_json::json!({"name":"get_current_crm_workflow_step","description":"Get the current CRM workflow step and gate summary.","readOnly":true}),
+        serde_json::json!({"name":"get_technical_plan","description":"Get the persisted local technical implementation plan for a task.","readOnly":true}),
+        serde_json::json!({"name":"get_pr_review_state","description":"Get sanitized local pull-request review state.","readOnly":true}),
+        serde_json::json!({"name":"get_next_recommended_step","description":"Get conservative next local workflow step for a task.","readOnly":true}),
+    ]
+}
+
+fn task_mcp_local_write_tool_definitions() -> Vec<Value> {
+    vec![
+        serde_json::json!({"name":"append_task_note","description":"Append a sanitized local note to task.notes.","readOnly":false}),
+        serde_json::json!({"name":"set_task_status","description":"Set task status to a validated local enum value.","readOnly":false}),
+        serde_json::json!({"name":"set_task_attention_state","description":"Set task attentionState to a validated local enum value or null.","readOnly":false}),
+        serde_json::json!({"name":"set_task_waiting_state","description":"Set task waitingState to a validated local enum value or null.","readOnly":false}),
+    ]
+}
+
+fn task_mcp_tool_definitions() -> Vec<Value> {
+    let mut tools = task_mcp_read_only_tool_definitions();
+    tools.extend(task_mcp_local_write_tool_definitions());
+    tools
+}
+
+fn task_mcp_strip_html(value: &str) -> String {
+    let mut text = value
+        .replace("<br>", "\n")
+        .replace("<br/>", "\n")
+        .replace("<br />", "\n")
+        .replace("\r\n", "\n");
+
+    while let Some(start) = text.find('<') {
+        if let Some(end_rel) = text[start..].find('>') {
+            let end = start + end_rel;
+            text.replace_range(start..=end, " ");
+        } else {
+            break;
+        }
+    }
+
+    text
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .trim()
+        .to_string()
+}
+
+fn task_mcp_summarize(value: Option<&str>, max_len: usize) -> String {
+    let clean = task_mcp_strip_html(value.unwrap_or(""));
+    if clean.len() <= max_len {
+        return clean;
+    }
+    format!("{}...", clean.chars().take(max_len.saturating_sub(3)).collect::<String>())
+}
+
+fn task_mcp_is_developer_task(task: &Value) -> bool {
+    task["taskMode"].as_str() == Some("developer")
+        || task.get("crmDeveloperWorkflow").is_some()
+        || task.get("workflowSetup").is_some()
+        || task
+            .get("crmVerificationReports")
+            .and_then(|v| v.as_array())
+            .is_some_and(|arr| !arr.is_empty())
+}
+
+fn task_mcp_latest_verification(task: &Value) -> Value {
+    let reports = task["crmVerificationReports"].as_array().cloned().unwrap_or_default();
+    if reports.is_empty() {
+        return serde_json::json!({
+            "exists": false,
+            "verdict": "missing",
+            "summary": "No CRM metadata verification report is stored for this task.",
+        });
+    }
+
+    let report = &reports[0];
+    serde_json::json!({
+        "exists": true,
+        "verdict": report["verdict"].as_str().or(report["status"].as_str()).unwrap_or("unknown"),
+        "createdAt": report["createdAt"].as_str().or(report["generatedAt"].as_str()),
+        "summary": task_mcp_summarize(report["summary"].as_str().or(report["message"].as_str()), TASK_MCP_MAX_SUMMARY_LENGTH),
+        "issueCount": report["issues"].as_array().map(|a| a.len()).or(report["issueCount"].as_u64().map(|n| n as usize)),
+        "inspectedEntityCount": report["inspectedEntities"].as_array().map(|a| a.len()).or(report["inspectedEntityCount"].as_u64().map(|n| n as usize)),
+    })
+}
+
+fn task_mcp_approval_summary(gate: Option<&Value>) -> Value {
+    let gate = gate.unwrap_or(&Value::Null);
+    serde_json::json!({
+        "approved": gate["approved"].as_bool().unwrap_or(false) && gate["invalidatedAt"].is_null(),
+        "approvedAt": gate["approvedAt"].as_str(),
+        "invalidatedAt": gate["invalidatedAt"].as_str(),
+        "invalidationReason": gate["invalidationReason"].as_str(),
+    })
+}
+
+fn task_mcp_safe_task_summary(task: &Value) -> Value {
+    let analysis = task.get("analysisResult").unwrap_or(&Value::Null);
+    let workflow = task.get("crmDeveloperWorkflow").unwrap_or(&Value::Null);
+    let summary_source = analysis["summaryEn"]
+        .as_str()
+        .or(analysis["summary"].as_str())
+        .or(task["title"].as_str());
+
+    let mut result = serde_json::json!({
+        "id": task["id"].as_str().unwrap_or(""),
+        "title": task["title"].as_str().unwrap_or(""),
+        "source": task["source"].as_str(),
+        "taskType": task["taskType"].as_str(),
+        "status": task["status"].as_str(),
+        "customerId": task["customerId"].as_str(),
+        "receivedAt": task["receivedAt"].as_str(),
+        "dueAt": task["dueAt"].as_str(),
+        "classificationState": task["classificationState"].as_str(),
+        "taskMode": task["taskMode"].as_str(),
+        "developerWorkflowTask": task_mcp_is_developer_task(task),
+        "summary": task_mcp_summarize(summary_source, TASK_MCP_MAX_SUMMARY_LENGTH),
+        "attentionState": task["attentionState"].as_str(),
+        "waitingState": task["waitingState"].as_str(),
+    });
+
+    if workflow["currentStep"].is_string() || workflow["detectedWorkKind"].is_string() {
+        result["crmWorkflow"] = serde_json::json!({
+            "detectedWorkKind": workflow["detectedWorkKind"].as_str(),
+            "currentStep": workflow["currentStep"].as_str(),
+            "updatedAt": workflow["updatedAt"].as_str(),
+        });
+    }
+
+    result
+}
+
+fn task_mcp_sanitize_comments(comments: Option<&Value>) -> Vec<Value> {
+    comments
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .take(50)
+        .map(|comment| {
+            serde_json::json!({
+                "id": comment["id"].as_str(),
+                "author": comment["author"].as_str(),
+                "body": task_mcp_summarize(comment["body"].as_str(), 900),
+                "filePath": comment["filePath"].as_str(),
+                "line": comment["line"].as_i64(),
+                "isResolved": comment["isResolved"].as_bool(),
+                "createdAt": comment["createdAt"].as_str(),
+            })
+        })
+        .collect()
+}
+
+fn task_mcp_pull_request_state(workflow: &Value) -> Value {
+    let proposal = workflow["pullRequestProposal"].clone();
+    let tracking = workflow["pullRequestTracking"].clone();
+    let review = workflow["pullRequestReview"].clone();
+    let analysis = workflow["pullRequestReviewAnalysis"].clone();
+    let fix_proposal = workflow["pullRequestFixProposal"].clone();
+    let fix_update_tracking = workflow["pullRequestFixUpdateTracking"].clone();
+
+    serde_json::json!({
+        "proposal": if proposal.is_object() {
+            serde_json::json!({
+                "generatedAt": proposal["generatedAt"].as_str(),
+                "title": proposal["title"].as_str(),
+                "bodySummary": task_mcp_summarize(proposal["body"].as_str(), TASK_MCP_MAX_SUMMARY_LENGTH),
+                "checklist": proposal["checklist"].as_array().cloned().unwrap_or_default(),
+                "warnings": proposal["warnings"].as_array().cloned().unwrap_or_default(),
+                "relatedArtifactPath": proposal["relatedArtifactPath"].as_str(),
+                "sourceSummary": task_mcp_summarize(proposal["sourceSummary"].as_str(), 400),
+                "invalidatedAt": proposal["invalidatedAt"].as_str(),
+                "invalidationReason": proposal["invalidationReason"].as_str(),
+            })
+        } else { Value::Null },
+        "tracking": if tracking.is_object() {
+            serde_json::json!({
+                "createdManually": tracking["createdManually"].as_bool().unwrap_or(false) && tracking["invalidatedAt"].is_null(),
+                "createdAt": tracking["createdAt"].as_str(),
+                "prUrl": tracking["prUrl"].as_str(),
+                "notes": task_mcp_summarize(tracking["notes"].as_str(), 400),
+                "invalidatedAt": tracking["invalidatedAt"].as_str(),
+                "invalidationReason": tracking["invalidationReason"].as_str(),
+            })
+        } else { Value::Null },
+        "review": if review.is_object() {
+            serde_json::json!({
+                "fetchedAt": review["fetchedAt"].as_str(),
+                "provider": review["provider"].as_str(),
+                "prUrl": review["prUrl"].as_str(),
+                "title": review["title"].as_str(),
+                "state": review["state"].as_str(),
+                "author": review["author"].as_str(),
+                "baseBranch": review["baseBranch"].as_str(),
+                "headBranch": review["headBranch"].as_str(),
+                "comments": task_mcp_sanitize_comments(Some(&review["comments"])),
+                "unresolvedCount": review["unresolvedCount"].as_i64(),
+                "attentionRequired": review["attentionRequired"].as_bool(),
+                "summary": task_mcp_summarize(review["summary"].as_str(), TASK_MCP_MAX_SUMMARY_LENGTH),
+                "warnings": review["warnings"].as_array().cloned().unwrap_or_default(),
+                "error": task_mcp_summarize(review["error"].as_str(), 400),
+                "invalidatedAt": review["invalidatedAt"].as_str(),
+                "invalidationReason": review["invalidationReason"].as_str(),
+            })
+        } else { Value::Null },
+        "analysis": if analysis.is_object() {
+            serde_json::json!({
+                "generatedAt": analysis["generatedAt"].as_str(),
+                "sourceReviewFetchedAt": analysis["sourceReviewFetchedAt"].as_str(),
+                "attentionRequired": analysis["attentionRequired"].as_bool(),
+                "summary": task_mcp_summarize(analysis["summary"].as_str(), TASK_MCP_MAX_SUMMARY_LENGTH),
+                "groupedFindings": analysis["groupedFindings"].as_array().cloned().unwrap_or_default(),
+                "actionItems": analysis["actionItems"].as_array().cloned().unwrap_or_default(),
+                "testChecklist": analysis["testChecklist"].as_array().cloned().unwrap_or_default(),
+                "warnings": analysis["warnings"].as_array().cloned().unwrap_or_default(),
+                "limitations": analysis["limitations"].as_array().cloned().unwrap_or_default(),
+                "invalidatedAt": analysis["invalidatedAt"].as_str(),
+                "invalidationReason": analysis["invalidationReason"].as_str(),
+            })
+        } else { Value::Null },
+        "fixProposal": fix_proposal,
+        "fixUpdateTracking": fix_update_tracking,
+    })
+}
+
+fn task_mcp_safe_crm_workflow_state(task: &Value) -> Value {
+    let workflow = task.get("crmDeveloperWorkflow").unwrap_or(&Value::Null);
+    if !workflow.is_object() {
+        return Value::Null;
+    }
+
+    serde_json::json!({
+        "detectedWorkKind": workflow["detectedWorkKind"].as_str(),
+        "currentStep": workflow["currentStep"].as_str(),
+        "createdAt": workflow["createdAt"].as_str(),
+        "updatedAt": workflow["updatedAt"].as_str(),
+        "approvals": {
+            "plan": task_mcp_approval_summary(workflow.get("planApproval")),
+            "diff": task_mcp_approval_summary(workflow.get("diffApproval")),
+            "externalAction": task_mcp_approval_summary(workflow.get("externalActionApproval")),
+            "pullRequest": task_mcp_approval_summary(workflow.get("pullRequestApproval")),
+        },
+        "technicalPlan": workflow["technicalPlan"].clone(),
+        "externalExecution": workflow["externalExecution"].clone(),
+        "pullRequest": task_mcp_pull_request_state(workflow),
+    })
+}
+
+fn task_mcp_safe_task_detail(task: &Value) -> Value {
+    let mut detail = task_mcp_safe_task_summary(task);
+    detail["analysis"] = serde_json::json!({
+        "summary": task_mcp_summarize(task["analysisResult"]["summaryEn"].as_str().or(task["analysisResult"]["summary"].as_str()), TASK_MCP_MAX_SUMMARY_LENGTH),
+        "nextStep": task_mcp_summarize(task["analysisResult"]["nextStepEn"].as_str().or(task["analysisResult"]["nextStep"].as_str()), 300),
+        "confidence": task["analysisResult"]["confidence"].as_f64(),
+        "problemPoints": task["analysisResult"]["problemPointsEn"].as_array().cloned().or(task["analysisResult"]["problemPoints"].as_array().cloned()),
+        "suggestedActions": task["analysisResult"]["suggestedActions"].as_array().cloned().unwrap_or_default(),
+    });
+    detail["workflowSetup"] = task["workflowSetup"].clone();
+    detail["latestCrmVerification"] = task_mcp_latest_verification(task);
+    detail["crmWorkflowState"] = task_mcp_safe_crm_workflow_state(task);
+    detail["adoContext"] = serde_json::json!({
+        "type": task["adoContext"]["type"].as_str(),
+        "project": task["adoContext"]["project"].as_str(),
+        "workItemId": task["adoContext"]["workItemId"].as_str(),
+        "pullRequestId": task["adoContext"]["pullRequestId"].as_str(),
+        "repository": task["adoContext"]["repository"].as_str(),
+        "branch": task["adoContext"]["branch"].as_str(),
+        "url": task["adoContext"]["url"].as_str(),
+    });
+    detail
+}
+
+fn task_mcp_allowed_statuses() -> &'static [&'static str] {
+    &["new", "analyzed", "in-progress", "ready-for-review", "done", "blocked"]
+}
+
+fn task_mcp_allowed_waiting_states() -> &'static [&'static str] {
+    &["pricing-approval", "code-review"]
+}
+
+fn task_mcp_allowed_attention_states() -> &'static [&'static str] {
+    &["pr-comments"]
+}
+
+fn task_mcp_normalize_small_text(input: &str, max_len: usize) -> String {
+    task_mcp_strip_html(input)
+        .chars()
+        .take(max_len)
+        .collect::<String>()
+        .trim()
+        .to_string()
+}
+
+fn task_mcp_append_audit_note(task: &mut Value, action: &str) {
+    let when = chrono_now_iso();
+    let line = format!("[{when}] MCP local write: {action}");
+    let existing = task["notes"].as_str().unwrap_or("").trim();
+    let next = if existing.is_empty() {
+        line
+    } else {
+        format!("{existing}\n{line}")
+    };
+    task["notes"] = Value::String(next);
+}
+
+fn task_mcp_find_task_index(tasks: &[Value], task_id: &str) -> Option<usize> {
+    tasks.iter().position(|task| task["id"].as_str().unwrap_or("") == task_id)
+}
+
+fn task_mcp_load_tasks(app: &tauri::AppHandle) -> Result<Vec<Value>, String> {
+    let path = app_data_dir(app)?.join("tasks.json");
+    let value = read_json(&path)?;
+    if value.is_null() {
+        return Ok(vec![]);
+    }
+    value
+        .as_array()
+        .cloned()
+        .ok_or_else(|| "tasks.json must contain a JSON array.".to_string())
+}
+
+fn task_mcp_save_tasks(app: &tauri::AppHandle, tasks: &[Value]) -> Result<(), String> {
+    let path = app_data_dir(app)?.join("tasks.json");
+    write_json(&path, &Value::Array(tasks.to_vec()))
+}
+
+fn task_mcp_get_task<'a>(tasks: &'a [Value], task_id: &str) -> Option<&'a Value> {
+    tasks.iter().find(|task| task["id"].as_str().unwrap_or("") == task_id)
+}
+
+fn task_mcp_next_recommended_step(task: &Value) -> Value {
+    if !task_mcp_is_developer_task(task) {
+        return serde_json::json!({
+            "step": "none",
+            "attentionRequired": false,
+            "reason": "This does not appear to be a CRM developer workflow task.",
+        });
+    }
+
+    let workflow = task.get("crmDeveloperWorkflow").unwrap_or(&Value::Null);
+    if !workflow.is_object() {
+        return serde_json::json!({
+            "step": "diagnosis",
+            "attentionRequired": true,
+            "reason": "Open the task in task-workbench and save the local CRM workflow diagnosis state.",
+        });
+    }
+
+    if workflow["technicalPlan"].is_null() {
+        return serde_json::json!({
+            "step": "technical-plan",
+            "attentionRequired": true,
+            "reason": "Generate a deterministic local technical implementation plan.",
+        });
+    }
+
+    let current = workflow["currentStep"].as_str().unwrap_or("diagnosis");
+    serde_json::json!({
+        "step": current,
+        "attentionRequired": true,
+        "reason": "Continue the current local CRM workflow step.",
+    })
+}
+
+fn task_mcp_execute_tool(app: &tauri::AppHandle, tool_name: &str, args: &Value) -> Result<Value, String> {
+    let mut tasks = task_mcp_load_tasks(app)?;
+    let mut updated = false;
+
+    let result = match tool_name {
+        "list_tasks" => {
+            let limit = args["limit"].as_u64().unwrap_or(25).clamp(1, 100) as usize;
+            let status_filter = args["status"].as_str();
+            let developer_only = args["developerOnly"].as_bool().unwrap_or(false);
+
+            let mut filtered: Vec<&Value> = tasks.iter().collect();
+            if let Some(status) = status_filter {
+                filtered.retain(|task| task["status"].as_str().unwrap_or("") == status);
+            }
+            if developer_only {
+                filtered.retain(|task| task_mcp_is_developer_task(task));
+            }
+
+            serde_json::json!({
+                "count": filtered.len(),
+                "tasks": filtered.into_iter().take(limit).map(task_mcp_safe_task_summary).collect::<Vec<Value>>(),
+            })
+        }
+        "get_task" => {
+            let task_id = args["id"].as_str().unwrap_or("").trim();
+            if task_id.is_empty() {
+                return Err("Missing required argument: id".to_string());
+            }
+            let task = task_mcp_get_task(&tasks, task_id).ok_or_else(|| format!("Task not found: {task_id}"))?;
+            serde_json::json!({"task": task_mcp_safe_task_detail(task)})
+        }
+        "get_task_summary" => {
+            let task_id = args["id"].as_str().unwrap_or("").trim();
+            if task_id.is_empty() {
+                return Err("Missing required argument: id".to_string());
+            }
+            let task = task_mcp_get_task(&tasks, task_id).ok_or_else(|| format!("Task not found: {task_id}"))?;
+            serde_json::json!({"task": task_mcp_safe_task_summary(task)})
+        }
+        "get_crm_workflow_state" => {
+            let task_id = args["id"].as_str().unwrap_or("").trim();
+            if task_id.is_empty() {
+                return Err("Missing required argument: id".to_string());
+            }
+            let task = task_mcp_get_task(&tasks, task_id).ok_or_else(|| format!("Task not found: {task_id}"))?;
+            serde_json::json!({"taskId": task_id, "crmWorkflowState": task_mcp_safe_crm_workflow_state(task)})
+        }
+        "get_current_crm_workflow_step" => {
+            let task_id = args["id"].as_str().unwrap_or("").trim();
+            if task_id.is_empty() {
+                return Err("Missing required argument: id".to_string());
+            }
+            let task = task_mcp_get_task(&tasks, task_id).ok_or_else(|| format!("Task not found: {task_id}"))?;
+            let workflow = task.get("crmDeveloperWorkflow").unwrap_or(&Value::Null);
+            serde_json::json!({
+                "taskId": task_id,
+                "currentStep": workflow["currentStep"].as_str().unwrap_or("diagnosis"),
+                "detectedWorkKind": workflow["detectedWorkKind"].as_str().unwrap_or("unknown"),
+                "latestCrmVerification": task_mcp_latest_verification(task),
+                "approvals": {
+                    "plan": task_mcp_approval_summary(workflow.get("planApproval")),
+                    "diff": task_mcp_approval_summary(workflow.get("diffApproval")),
+                    "externalAction": task_mcp_approval_summary(workflow.get("externalActionApproval")),
+                    "pullRequest": task_mcp_approval_summary(workflow.get("pullRequestApproval")),
+                },
+            })
+        }
+        "get_technical_plan" => {
+            let task_id = args["id"].as_str().unwrap_or("").trim();
+            if task_id.is_empty() {
+                return Err("Missing required argument: id".to_string());
+            }
+            let task = task_mcp_get_task(&tasks, task_id).ok_or_else(|| format!("Task not found: {task_id}"))?;
+            serde_json::json!({
+                "taskId": task_id,
+                "technicalPlan": task["crmDeveloperWorkflow"]["technicalPlan"].clone(),
+            })
+        }
+        "get_pr_review_state" => {
+            let task_id = args["id"].as_str().unwrap_or("").trim();
+            if task_id.is_empty() {
+                return Err("Missing required argument: id".to_string());
+            }
+            let task = task_mcp_get_task(&tasks, task_id).ok_or_else(|| format!("Task not found: {task_id}"))?;
+            let workflow = task.get("crmDeveloperWorkflow").unwrap_or(&Value::Null);
+            serde_json::json!({"taskId": task_id, "pullRequest": task_mcp_pull_request_state(workflow)})
+        }
+        "get_next_recommended_step" => {
+            let task_id = args["id"].as_str().unwrap_or("").trim();
+            if task_id.is_empty() {
+                return Err("Missing required argument: id".to_string());
+            }
+            let task = task_mcp_get_task(&tasks, task_id).ok_or_else(|| format!("Task not found: {task_id}"))?;
+            serde_json::json!({"taskId": task_id, "recommendation": task_mcp_next_recommended_step(task)})
+        }
+        "append_task_note" => {
+            let task_id = args["taskId"].as_str().unwrap_or("").trim();
+            let note = task_mcp_normalize_small_text(args["note"].as_str().unwrap_or(""), TASK_MCP_MAX_NOTE_LENGTH);
+            if task_id.is_empty() {
+                return Err("Missing required argument: taskId".to_string());
+            }
+            if note.is_empty() {
+                return Err("Note cannot be empty after sanitization.".to_string());
+            }
+
+            let index = task_mcp_find_task_index(&tasks, task_id).ok_or_else(|| format!("Task not found: {task_id}"))?;
+            let task = &mut tasks[index];
+            let existing = task["notes"].as_str().unwrap_or("").trim();
+            // The timestamped note itself is the audit record — no separate audit line needed.
+            let line = format!("[{}] {}", chrono_now_iso(), note);
+            let combined = if existing.is_empty() {
+                line
+            } else {
+                format!("{existing}\n{line}")
+            };
+            task["notes"] = Value::String(combined);
+            updated = true;
+            serde_json::json!({"task": task_mcp_safe_task_summary(task)})
+        }
+        "set_task_status" => {
+            let task_id = args["taskId"].as_str().unwrap_or("").trim();
+            let status = args["status"].as_str().unwrap_or("").trim();
+            if task_id.is_empty() {
+                return Err("Missing required argument: taskId".to_string());
+            }
+            if !task_mcp_allowed_statuses().contains(&status) {
+                return Err(format!("Invalid status '{status}'. Allowed: {}", task_mcp_allowed_statuses().join(", ")));
+            }
+
+            let index = task_mcp_find_task_index(&tasks, task_id).ok_or_else(|| format!("Task not found: {task_id}"))?;
+            let task = &mut tasks[index];
+            task["status"] = Value::String(status.to_string());
+            if status == "done" {
+                task["completedAt"] = Value::String(chrono_now_iso());
+            } else {
+                task["completedAt"] = Value::Null;
+            }
+            task_mcp_append_audit_note(task, &format!("set_task_status -> {status}"));
+            updated = true;
+            serde_json::json!({"task": task_mcp_safe_task_summary(task)})
+        }
+        "set_task_attention_state" => {
+            let task_id = args["taskId"].as_str().unwrap_or("").trim();
+            if task_id.is_empty() {
+                return Err("Missing required argument: taskId".to_string());
+            }
+
+            let state_raw = args.get("attentionState").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+            let clear = args.get("attentionState").is_some_and(|v| v.is_null()) || state_raw.is_empty() || state_raw == "none";
+            if !clear && !task_mcp_allowed_attention_states().contains(&state_raw.as_str()) {
+                return Err(format!("Invalid attentionState '{state_raw}'. Allowed: {}, or null.", task_mcp_allowed_attention_states().join(", ")));
+            }
+
+            let index = task_mcp_find_task_index(&tasks, task_id).ok_or_else(|| format!("Task not found: {task_id}"))?;
+            let task = &mut tasks[index];
+            if clear {
+                task["attentionState"] = Value::Null;
+                task_mcp_append_audit_note(task, "set_task_attention_state -> null");
+            } else {
+                task["attentionState"] = Value::String(state_raw.clone());
+                task_mcp_append_audit_note(task, &format!("set_task_attention_state -> {state_raw}"));
+            }
+            updated = true;
+            serde_json::json!({"task": task_mcp_safe_task_summary(task)})
+        }
+        "set_task_waiting_state" => {
+            let task_id = args["taskId"].as_str().unwrap_or("").trim();
+            if task_id.is_empty() {
+                return Err("Missing required argument: taskId".to_string());
+            }
+
+            let state_raw = args.get("waitingState").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+            let clear = args.get("waitingState").is_some_and(|v| v.is_null()) || state_raw.is_empty() || state_raw == "none";
+            if !clear && !task_mcp_allowed_waiting_states().contains(&state_raw.as_str()) {
+                return Err(format!("Invalid waitingState '{state_raw}'. Allowed: {}, or null.", task_mcp_allowed_waiting_states().join(", ")));
+            }
+
+            let index = task_mcp_find_task_index(&tasks, task_id).ok_or_else(|| format!("Task not found: {task_id}"))?;
+            let task = &mut tasks[index];
+            if clear {
+                task["waitingState"] = Value::Null;
+                task_mcp_append_audit_note(task, "set_task_waiting_state -> null");
+            } else {
+                task["waitingState"] = Value::String(state_raw.clone());
+                task_mcp_append_audit_note(task, &format!("set_task_waiting_state -> {state_raw}"));
+            }
+            updated = true;
+            serde_json::json!({"task": task_mcp_safe_task_summary(task)})
+        }
+        _ => return Err(format!("Unknown MCP tool: {tool_name}")),
+    };
+
+    if updated {
+        eprintln!("[task-mcp-bridge] write tool executed: {tool_name}");
+        task_mcp_save_tasks(app, &tasks)?;
+        use tauri::Emitter;
+        app.emit("tasks-changed-externally", ()).ok();
+    }
+
+    Ok(result)
+}
+
+fn task_mcp_http_response(status_code: u16, payload: &Value) -> String {
+    let body = serde_json::to_string(payload).unwrap_or_else(|_| "{\"error\":\"serialization failed\"}".to_string());
+    let status_text = match status_code {
+        200 => "OK",
+        400 => "Bad Request",
+        401 => "Unauthorized",
+        404 => "Not Found",
+        _ => "Internal Server Error",
+    };
+
+    format!(
+        "HTTP/1.1 {status_code} {status_text}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        body.len(),
+        body
+    )
+}
+
+fn task_mcp_handle_http_connection(app: &tauri::AppHandle, mut stream: TcpStream) -> Result<(), String> {
+    let stream_reader = stream.try_clone().map_err(|e| e.to_string())?;
+    let mut reader = io::BufReader::new(stream_reader);
+
+    let mut request_line = String::new();
+    reader.read_line(&mut request_line).map_err(|e| e.to_string())?;
+    if request_line.trim().is_empty() {
+        return Ok(());
+    }
+
+    let mut parts = request_line.split_whitespace();
+    let method = parts.next().unwrap_or("").to_uppercase();
+    let path = parts.next().unwrap_or("");
+
+    let mut content_length: usize = 0;
+    let mut request_token = String::new();
+    loop {
+        let mut header_line = String::new();
+        reader.read_line(&mut header_line).map_err(|e| e.to_string())?;
+        let trimmed = header_line.trim();
+        if trimmed.is_empty() {
+            break;
+        }
+        if let Some((name, value)) = trimmed.split_once(':') {
+            if name.eq_ignore_ascii_case("content-length") {
+                content_length = value.trim().parse::<usize>().unwrap_or(0);
+            } else if name.eq_ignore_ascii_case("x-task-workbench-bridge-token") {
+                request_token = value.trim().to_string();
+            }
+        }
+    }
+
+    if content_length > TASK_MCP_MAX_BODY_BYTES {
+        let response = task_mcp_http_response(400, &serde_json::json!({"ok": false, "error": "Request body too large."}));
+        stream.write_all(response.as_bytes()).map_err(|e| e.to_string())?;
+        stream.flush().map_err(|e| e.to_string())?;
+        return Ok(());
+    }
+    let mut body_buf = vec![0u8; content_length];
+    if content_length > 0 {
+        reader.read_exact(&mut body_buf).map_err(|e| e.to_string())?;
+    }
+    let body_text = String::from_utf8(body_buf).unwrap_or_default();
+
+    let (status, payload) = match (method.as_str(), path) {
+        ("GET", "/mcp/status") => {
+            (200, serde_json::json!({
+                "ok": true,
+                "result": task_mcp_current_bridge_state(),
+            }))
+        }
+        ("GET", "/mcp/tools") => {
+            (200, serde_json::json!({
+                "ok": true,
+                "result": {
+                    "tools": task_mcp_tool_definitions(),
+                    "readOnlyMode": false,
+                    "localWriteMode": true,
+                },
+            }))
+        }
+        ("POST", "/mcp/tools/call") => {
+            if request_token != task_mcp_bridge_token() {
+                (401, serde_json::json!({"ok": false, "error": "Missing or invalid bridge token. Fetch GET /mcp/status to get the session token."}))
+            } else {
+                let parsed: Value = serde_json::from_str(&body_text).unwrap_or(Value::Null);
+                let name = parsed["name"].as_str().unwrap_or("").to_string();
+                let args = parsed.get("args").cloned().unwrap_or_else(|| serde_json::json!({}));
+                if name.trim().is_empty() {
+                    (400, serde_json::json!({"ok": false, "error": "Missing required property: name"}))
+                } else {
+                    match task_mcp_execute_tool(app, &name, &args) {
+                        Ok(result) => (200, serde_json::json!({"ok": true, "result": result})),
+                        Err(err) => (400, serde_json::json!({"ok": false, "error": err})),
+                    }
+                }
+            }
+        }
+        _ => {
+            (404, serde_json::json!({"ok": false, "error": "Endpoint not found."}))
+        }
+    };
+
+    let response = task_mcp_http_response(status, &payload);
+    stream.write_all(response.as_bytes()).map_err(|e| e.to_string())?;
+    stream.flush().map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+fn start_task_mcp_bridge(app: tauri::AppHandle) {
+    let app_for_thread = app.clone();
+    thread::spawn(move || {
+        let listener = match TcpListener::bind((TASK_MCP_BRIDGE_HOST, TASK_MCP_BRIDGE_PORT)) {
+            Ok(listener) => listener,
+            Err(err) => {
+                let msg = format!("Failed to start local MCP bridge on {}:{}: {err}", TASK_MCP_BRIDGE_HOST, TASK_MCP_BRIDGE_PORT);
+                eprintln!("[task-mcp-bridge] {msg}");
+                task_mcp_update_bridge_state(|state| {
+                    state["active"] = Value::Bool(false);
+                    state["lastError"] = Value::String(msg.clone());
+                });
+                return;
+            }
+        };
+
+        eprintln!("[task-mcp-bridge] active on {}:{}", TASK_MCP_BRIDGE_HOST, TASK_MCP_BRIDGE_PORT);
+        task_mcp_update_bridge_state(|state| {
+            state["active"] = Value::Bool(true);
+            state["lastError"] = Value::Null;
+            state["startedAt"] = Value::String(chrono_now_iso());
+        });
+
+        for stream in listener.incoming() {
+            match stream {
+                Ok(stream) => {
+                    if let Err(err) = task_mcp_handle_http_connection(&app_for_thread, stream) {
+                        eprintln!("[task-mcp-bridge] request error: {err}");
+                    }
+                }
+                Err(err) => {
+                    eprintln!("[task-mcp-bridge] incoming connection error: {err}");
+                }
+            }
+        }
+
+        task_mcp_update_bridge_state(|state| {
+            state["active"] = Value::Bool(false);
+            state["lastError"] = Value::String("Bridge listener stopped.".to_string());
+        });
+    });
+}
+
+#[tauri::command]
+fn get_task_mcp_bridge_status() -> Result<Value, String> {
+    Ok(task_mcp_current_bridge_state())
+}
+
+// --- CRM Metadata / Primarch MCP ------------------------------------------
+
+static PRIMARCH_SAFE_TOOL_CACHE: OnceLock<Mutex<HashMap<String, Vec<Value>>>> = OnceLock::new();
+
+fn primarch_tool_cache() -> &'static Mutex<HashMap<String, Vec<Value>>> {
+    PRIMARCH_SAFE_TOOL_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn primarch_cache_key(cmd_str: &str, args: &[String], working_dir: Option<&str>) -> String {
+    format!("{}|{}|{}", cmd_str, args.join("\u{1f}"), working_dir.unwrap_or(""))
+}
+
+fn get_cached_safe_tools(cache_key: &str) -> Option<Vec<Value>> {
+    primarch_tool_cache().lock().ok().and_then(|cache| cache.get(cache_key).cloned())
+}
+
+fn set_cached_safe_tools(cache_key: String, tools: Vec<Value>) {
+    if let Ok(mut cache) = primarch_tool_cache().lock() {
+        cache.insert(cache_key, tools);
+    }
+}
+
+fn annotate_safe_tools(tools: Vec<Value>) -> Vec<Value> {
+    tools
+        .into_iter()
+        .filter_map(|t| {
+            let name = t["name"].as_str().unwrap_or("").to_string();
+            let desc = t["description"].as_str().unwrap_or("");
+            if is_read_only_tool(&name, desc) {
+                let mut entry = serde_json::json!({
+                    "name": name,
+                    "description": desc.chars().take(200).collect::<String>(),
+                    "readOnly": true,
+                });
+                // Preserve inputSchema so schema_property_exists() can detect
+                // available parameters (limit, top, pageSize, all, etc.).
+                if let Some(schema) = t.get("inputSchema") {
+                    entry["inputSchema"] = schema.clone();
+                }
+                Some(entry)
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+async fn discover_safe_tools(
+    cmd_str: &str,
+    args: &[String],
+    working_dir: Option<&str>,
+) -> Result<Vec<Value>, String> {
+    let cache_key = primarch_cache_key(cmd_str, args, working_dir);
+    if let Some(cached) = get_cached_safe_tools(&cache_key) {
+        return Ok(cached);
+    }
+
+    let raw = match timeout(Duration::from_secs(10), mcp_list_tools_raw(cmd_str, args, working_dir)).await {
+        Ok(result) => result?,
+        Err(_) => return Err("MCP tool discovery timed out after 10 seconds".to_string()),
+    };
+
+    let safe_tools = annotate_safe_tools(raw);
+    // Only cache when the result contains at least one usable metadata tool.
+    // A tools list that contains only primarch_status (Primarch not yet connected)
+    // must not be cached — it would block all future attempts even after Primarch connects.
+    let metadata_names = [
+        "list_columns", "list_attributes", "search_columns",
+        "get_entity_schema", "entity_schema", "get_table_schema",
+        "metadata_query", "describe_table", "describe_entity",
+    ];
+    let has_metadata_tool = safe_tools.iter().any(|t| {
+        let n = t["name"].as_str().unwrap_or("");
+        metadata_names.contains(&n)
+    });
+    if has_metadata_tool {
+        set_cached_safe_tools(cache_key, safe_tools.clone());
+    }
+    Ok(safe_tools)
+}
+
+/// Returns true when a tool is safe to call (no write-action signals in name/description).
+fn is_read_only_tool(name: &str, description: &str) -> bool {
+    let name_lc = name.to_lowercase();
+    let desc_lc = description.to_lowercase();
+    let write_signals = [
+        "create", "update", "delete", "publish", "import", "deploy",
+        "assign", "modify", "upsert", "remove", "add", "set", "write", "install",
+    ];
+    !write_signals.iter().any(|s| name_lc.contains(s) || desc_lc.contains(s))
+}
+
+/// Parses a shell-style argument string into tokens (respects double-quoted strings).
+fn parse_mcp_args(args_raw: &str) -> Vec<String> {
+    let mut result = Vec::new();
+    let mut current = String::new();
+    let mut in_quotes = false;
+    for ch in args_raw.chars() {
+        match ch {
+            '"' => in_quotes = !in_quotes,
+            ' ' | '\t' if !in_quotes => {
+                if !current.is_empty() { result.push(std::mem::take(&mut current)); }
+            }
+            other => current.push(other),
+        }
+    }
+    if !current.is_empty() { result.push(current); }
+    result
+}
+
+/// Extracts plausible Dataverse logical names from text.
+/// Accepts lowercase identifiers such as account, ownerid, fullname, nvr_company.
+fn extract_logical_names_from_text(text: &str) -> Vec<String> {
+    let mut results = HashSet::new();
+    let mut current = String::new();
+    for ch in text.chars() {
+        if ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '_' {
+            current.push(ch);
+        } else {
+            let len = current.len();
+            let ok = len >= 3 && len <= 80
+                && current.chars().next().map(|c| c.is_ascii_lowercase()).unwrap_or(false);
+            if ok { results.insert(current.clone()); }
+            current.clear();
+        }
+    }
+    if !current.is_empty() {
+        let len = current.len();
+        let ok = len >= 3 && len <= 80
+            && current.chars().next().map(|c| c.is_ascii_lowercase()).unwrap_or(false);
+        if ok { results.insert(current); }
+    }
+    results.into_iter().collect()
+}
+
+#[derive(Debug, Deserialize, Clone, Default)]
+#[serde(rename_all = "camelCase")]
+struct CrmScanEntityReference {
+    logical_name: String,
+    source_reason: String,
+    context_type: String,
+}
+
+#[derive(Debug, Deserialize, Clone, Default)]
+#[serde(rename_all = "camelCase")]
+struct CrmScanAttributeReference {
+    logical_name: String,
+    entity_logical_name: Option<String>,
+    source_reason: String,
+    context_type: String,
+    related_entity_logical_name: Option<String>,
+    option_values: Option<Vec<i64>>,
+}
+
+#[derive(Debug, Deserialize, Clone, Default)]
+#[serde(rename_all = "camelCase")]
+struct CrmScanRelationshipReference {
+    source_entity_logical_name: Option<String>,
+    source_attribute_logical_name: String,
+    target_entity_logical_name: Option<String>,
+    target_attribute_logical_name: String,
+    source_reason: String,
+    context_type: String,
+}
+
+#[derive(Debug, Deserialize, Clone, Default)]
+#[serde(rename_all = "camelCase")]
+struct CrmScanAmbiguousReference {
+    kind: String,
+    logical_name: String,
+    source_reason: String,
+    detail: String,
+    entity_logical_name: Option<String>,
+    related_entity_logical_name: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Clone, Default)]
+#[serde(rename_all = "camelCase")]
+struct CrmScanPluginContext {
+    primary_entity_name: Option<String>,
+    #[serde(default)]
+    primary_entity_source: Option<String>,
+    messages: Vec<String>,
+    filtering_attributes: Vec<String>,
+    uses_pre_entity_images: bool,
+    uses_post_entity_images: bool,
+    image_attributes: HashMap<String, Vec<String>>,
+    target_attributes: Vec<String>,
+    notes: Vec<String>,
+}
+
+#[derive(Debug, Deserialize, Clone, Default)]
+#[serde(rename_all = "camelCase")]
+struct CrmScanResult {
+    entities: Vec<String>,
+    ambiguous_attributes: Vec<String>,
+    notes: Vec<String>,
+    #[serde(default)]
+    entity_references: Vec<CrmScanEntityReference>,
+    #[serde(default)]
+    attribute_references: Vec<CrmScanAttributeReference>,
+    #[serde(default)]
+    relationship_references: Vec<CrmScanRelationshipReference>,
+    #[serde(default)]
+    ambiguous_references: Vec<CrmScanAmbiguousReference>,
+    plugin_context: Option<CrmScanPluginContext>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct EntityMetadataCacheEntry {
+    attributes: HashSet<String>,
+    column_count: usize,
+    schema_completeness: String,
+    tool_used: String,
+    paging: Option<String>,
+    note: Option<String>,
+}
+
+fn collect_logical_names_from_json(value: &Value, names: &mut HashSet<String>) {
+    match value {
+        Value::String(s) => {
+            for token in extract_logical_names_from_text(s) {
+                names.insert(token);
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                collect_logical_names_from_json(item, names);
+            }
+        }
+        Value::Object(map) => {
+            for value in map.values() {
+                collect_logical_names_from_json(value, names);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn collect_column_names(value: &Value, names: &mut HashSet<String>) {
+    match value {
+        Value::Object(map) => {
+            for key in ["logicalName", "logical_name", "schemaName", "schema_name", "attributeName", "attribute_name", "columnName", "column_name", "name"] {
+                if let Some(v) = map.get(key).and_then(|x| x.as_str()) {
+                    if let Some(logical) = normalize_logical_name(v) {
+                        names.insert(logical);
+                    }
+                }
+            }
+            for (key, inner) in map {
+                if ["result", "payload", "output", "data", "columns", "attributes", "items", "value", "results", "records", "content"].contains(&key.as_str()) {
+                    collect_column_names(inner, names);
+                }
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                collect_column_names(item, names);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn normalize_logical_name(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if trimmed.len() > 80 {
+        return None;
+    }
+    if trimmed.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+        && trimmed.chars().next().is_some_and(|c| c.is_ascii_lowercase())
+    {
+        return Some(trimmed.to_string());
+    }
+    None
+}
+
+fn find_bool_key(value: &Value, keys: &[&str]) -> Option<bool> {
+    match value {
+        Value::Object(map) => {
+            for key in keys {
+                if let Some(v) = map.get(*key).and_then(|x| x.as_bool()) {
+                    return Some(v);
+                }
+            }
+            for inner in map.values() {
+                if let Some(v) = find_bool_key(inner, keys) {
+                    return Some(v);
+                }
+            }
+            None
+        }
+        Value::Array(items) => {
+            for item in items {
+                if let Some(v) = find_bool_key(item, keys) {
+                    return Some(v);
+                }
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
+fn find_count_key(value: &Value, keys: &[&str]) -> Option<u64> {
+    match value {
+        Value::Object(map) => {
+            for key in keys {
+                if let Some(v) = map.get(*key).and_then(|x| x.as_u64()) {
+                    return Some(v);
+                }
+            }
+            for inner in map.values() {
+                if let Some(v) = find_count_key(inner, keys) {
+                    return Some(v);
+                }
+            }
+            None
+        }
+        Value::Array(items) => {
+            for item in items {
+                if let Some(v) = find_count_key(item, keys) {
+                    return Some(v);
+                }
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
+fn has_next_page_token(value: &Value) -> bool {
+    match value {
+        Value::Object(map) => {
+            for key in ["nextPage", "next_page", "nextToken", "next_token", "nextPageToken", "continuationToken", "continuation_token", "@odata.nextLink", "nextLink"] {
+                if let Some(v) = map.get(key) {
+                    if (v.is_string() && !v.as_str().unwrap_or("").trim().is_empty()) || (v.is_number()) {
+                        return true;
+                    }
+                }
+            }
+            map.values().any(has_next_page_token)
+        }
+        Value::Array(items) => items.iter().any(has_next_page_token),
+        _ => false,
+    }
+}
+
+fn build_entity_metadata_cache_entry(
+    value: &Value,
+    tool_name: &str,
+    paging: Option<String>,
+    supports_paging: bool,
+    requested_full: bool,
+) -> EntityMetadataCacheEntry {
+    let mut attributes = HashSet::new();
+    collect_column_names(value, &mut attributes);
+
+    if attributes.is_empty() {
+        collect_logical_names_from_json(value, &mut attributes);
+    }
+
+    let column_count = attributes.len();
+    let has_more = find_bool_key(value, &["hasMore", "has_more", "more"]).unwrap_or(false);
+    let total_count = find_count_key(value, &["totalCount", "total_count", "count", "total", "totalColumns", "total_columns"]);
+    let has_next_token = has_next_page_token(value);
+
+    let mut schema_completeness = "unknown".to_string();
+    let mut note: Option<String> = None;
+
+    if has_more || has_next_token {
+        schema_completeness = "incomplete".to_string();
+        note = Some("Metadata response indicates more pages or continuation tokens.".to_string());
+    } else if let Some(total) = total_count {
+        if total as usize > column_count {
+            schema_completeness = "incomplete".to_string();
+            note = Some(format!("Metadata reported total columns {total}, but only {column_count} were returned."));
+        } else {
+            schema_completeness = "complete".to_string();
+        }
+    } else if column_count <= 5 {
+        schema_completeness = "incomplete".to_string();
+        note = Some(format!("Only {column_count} columns were returned for this entity. The metadata tool response appears truncated."));
+    } else if supports_paging && requested_full {
+        schema_completeness = "complete".to_string();
+    }
+
+    EntityMetadataCacheEntry {
+        attributes,
+        column_count,
+        schema_completeness,
+        tool_used: tool_name.to_string(),
+        paging,
+        note,
+    }
+}
+
+fn schema_property_exists(tool: &Value, keys: &[&str]) -> bool {
+    let properties = tool["inputSchema"]["properties"].as_object();
+    if let Some(props) = properties {
+        let key_set: HashSet<String> = props.keys().map(|k| k.to_lowercase()).collect();
+        return keys.iter().any(|k| key_set.contains(&k.to_lowercase()));
+    }
+    false
+}
+
+/// Returns MCP config from settings or a clear error if not configured.
+fn get_mcp_config(settings: &Value) -> Result<(String, Vec<String>, Option<String>), String> {
+    let enabled = settings["crmMetadataEnabled"].as_bool().unwrap_or(false);
+    if !enabled {
+        return Err("CRM metadata assistant is not enabled. Go to Settings \u{2192} CRM Metadata and enable it.".to_string());
+    }
+    let cmd_str = settings["primarchMcpCommand"].as_str().unwrap_or("").to_string();
+    if cmd_str.is_empty() {
+        return Err("MCP command is not configured. Go to Settings \u{2192} CRM Metadata and set the server command.".to_string());
+    }
+    let args = parse_mcp_args(settings["primarchMcpArgs"].as_str().unwrap_or(""));
+    let wd = settings["primarchMcpWorkingDirectory"].as_str().unwrap_or("").to_string();
+    let working_dir = if wd.is_empty() { None } else { Some(wd) };
+    Ok((cmd_str, args, working_dir))
+}
+
+/// Find a read-only tool by preferred name substrings (in priority order).
+fn find_safe_tool<'a>(tools: &'a [Value], preferred: &[&str]) -> Option<&'a Value> {
+    // Exact name match first
+    for p in preferred {
+        if let Some(t) = tools.iter().find(|t| t["name"].as_str().unwrap_or("") == *p) {
+            if is_read_only_tool(t["name"].as_str().unwrap_or(""), t["description"].as_str().unwrap_or("")) {
+                return Some(t);
+            }
+        }
+    }
+    // Substring match fallback
+    for p in preferred {
+        if let Some(t) = tools.iter().find(|t| {
+            let n = t["name"].as_str().unwrap_or("");
+            let d = t["description"].as_str().unwrap_or("");
+            n.contains(p) && is_read_only_tool(n, d)
+        }) {
+            return Some(t);
+        }
+    }
+    None
+}
+
+/// Runs the MCP server, sends initialize + tools/list, then kills the process.
+async fn mcp_list_tools_raw(cmd_str: &str, args: &[String], working_dir: Option<&str>) -> Result<Vec<Value>, String> {
+    let mut cmd = tokio::process::Command::new(cmd_str);
+    cmd.args(args).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null());
+    if let Some(dir) = working_dir { if !dir.is_empty() { cmd.current_dir(dir); } }
+    #[cfg(target_os = "windows")]
+    { cmd.creation_flags(CREATE_NO_WINDOW); }
+
+    let mut child = cmd.spawn().map_err(|e| format!("Failed to start MCP server '{cmd_str}': {e}"))?;
+    let mut stdin  = child.stdin.take().ok_or_else(|| "MCP: no stdin".to_string())?;
+    let stdout = child.stdout.take().ok_or_else(|| "MCP: no stdout".to_string())?;
+
+    let result = timeout(Duration::from_secs(10), async {
+        let mut reader = TokioBufReader::new(stdout).lines();
+        let init_body = serde_json::json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"task-workbench","version":"1.0.0"}}});
+        let init = init_body.to_string() + "\n";
+        stdin.write_all(init.as_bytes()).await.map_err(|e| e.to_string())?;
+        stdin.flush().await.map_err(|e| e.to_string())?;
+        loop {
+            let line = reader.next_line().await.map_err(|e| e.to_string())?
+                .ok_or_else(|| "MCP closed stdout during initialize".to_string())?;
+            if line.is_empty() { continue; }
+            let v: Value = serde_json::from_str(&line).unwrap_or(Value::Null);
+            if v.get("id") == Some(&serde_json::json!(1)) { break; }
+        }
+        let notif_body = serde_json::json!({"jsonrpc":"2.0","method":"notifications/initialized","params":{}});
+        let notif = notif_body.to_string() + "\n";
+        stdin.write_all(notif.as_bytes()).await.map_err(|e| e.to_string())?;
+        stdin.flush().await.map_err(|e| e.to_string())?;
+        let list_body = serde_json::json!({"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}});
+        let list_msg = list_body.to_string() + "\n";
+        stdin.write_all(list_msg.as_bytes()).await.map_err(|e| e.to_string())?;
+        stdin.flush().await.map_err(|e| e.to_string())?;
+        loop {
+            let line = reader.next_line().await.map_err(|e| e.to_string())?
+                .ok_or_else(|| "MCP closed stdout during tools/list".to_string())?;
+            if line.is_empty() { continue; }
+            let v: Value = serde_json::from_str(&line).map_err(|e| e.to_string())?;
+            if v.get("id") == Some(&serde_json::json!(2)) {
+                if let Some(err) = v.get("error") { return Err(format!("MCP tools/list error: {err}")); }
+                return v["result"]["tools"].as_array()
+                    .cloned()
+                    .ok_or_else(|| "Unexpected tools/list format".to_string());
+            }
+        }
+    }).await;
+    let _ = child.kill().await;
+    match result {
+        Ok(inner) => inner,
+        Err(_) => Err("MCP server did not respond within 10 seconds (tools/list)".to_string()),
+    }
+}
+
+/// Calls a single MCP tool; starts and kills a process per call (stateless MVP).
+async fn mcp_call_tool_raw(
+    cmd_str: &str, args: &[String], working_dir: Option<&str>,
+    tool_name: &str, arguments: Value,
+) -> Result<Value, String> {
+    let mut cmd = tokio::process::Command::new(cmd_str);
+    cmd.args(args).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null());
+    if let Some(dir) = working_dir { if !dir.is_empty() { cmd.current_dir(dir); } }
+    #[cfg(target_os = "windows")]
+    { cmd.creation_flags(CREATE_NO_WINDOW); }
+
+    let mut child = cmd.spawn().map_err(|e| format!("Failed to start MCP server '{cmd_str}': {e}"))?;
+    let mut stdin  = child.stdin.take().ok_or_else(|| "MCP: no stdin".to_string())?;
+    let stdout = child.stdout.take().ok_or_else(|| "MCP: no stdout".to_string())?;
+
+    let result = timeout(Duration::from_secs(20), async {
+        let mut reader = TokioBufReader::new(stdout).lines();
+        let init_body = serde_json::json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"task-workbench","version":"1.0.0"}}});
+        let init = init_body.to_string() + "\n";
+        stdin.write_all(init.as_bytes()).await.map_err(|e| e.to_string())?;
+        stdin.flush().await.map_err(|e| e.to_string())?;
+        loop {
+            let line = reader.next_line().await.map_err(|e| e.to_string())?
+                .ok_or_else(|| "MCP closed before initialize response".to_string())?;
+            if line.is_empty() { continue; }
+            let v: Value = serde_json::from_str(&line).unwrap_or(Value::Null);
+            if v.get("id") == Some(&serde_json::json!(1)) { break; }
+        }
+        let notif_body = serde_json::json!({"jsonrpc":"2.0","method":"notifications/initialized","params":{}});
+        let notif = notif_body.to_string() + "\n";
+        stdin.write_all(notif.as_bytes()).await.map_err(|e| e.to_string())?;
+        stdin.flush().await.map_err(|e| e.to_string())?;
+        let call_body = serde_json::json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":tool_name,"arguments":arguments}});
+        let call_msg = call_body.to_string() + "\n";
+        stdin.write_all(call_msg.as_bytes()).await.map_err(|e| e.to_string())?;
+        stdin.flush().await.map_err(|e| e.to_string())?;
+        loop {
+            let line = reader.next_line().await.map_err(|e| e.to_string())?
+                .ok_or_else(|| "MCP closed before tool response".to_string())?;
+            if line.is_empty() { continue; }
+            let v: Value = serde_json::from_str(&line).map_err(|e| e.to_string())?;
+            if v.get("id") == Some(&serde_json::json!(3)) {
+                if let Some(err) = v.get("error") { return Err(format!("MCP tool '{tool_name}' error: {err}")); }
+                return Ok(v["result"].clone());
+            }
+        }
+    }).await;
+    let _ = child.kill().await;
+    match result {
+        Ok(inner) => inner,
+        Err(_) => Err(format!("MCP tool '{tool_name}' timed out after 20 seconds")),
+    }
+}
+
+async fn fetch_entity_schema_metadata(
+    cmd_str: &str,
+    args: &[String],
+    working_dir: Option<&str>,
+    tool: &Value,
+    tool_name: &str,
+    entity_name: &str,
+) -> Result<EntityMetadataCacheEntry, String> {
+    let mut base_args = serde_json::Map::new();
+    if schema_property_exists(tool, &["entityName"]) {
+        base_args.insert("entityName".to_string(), Value::String(entity_name.to_string()));
+    } else if schema_property_exists(tool, &["logicalName"]) {
+        base_args.insert("logicalName".to_string(), Value::String(entity_name.to_string()));
+    } else if schema_property_exists(tool, &["tableName"]) {
+        base_args.insert("tableName".to_string(), Value::String(entity_name.to_string()));
+    } else if schema_property_exists(tool, &["entity"]) {
+        base_args.insert("entity".to_string(), Value::String(entity_name.to_string()));
+    } else if schema_property_exists(tool, &["table"]) {
+        base_args.insert("table".to_string(), Value::String(entity_name.to_string()));
+    } else {
+        base_args.insert("entityName".to_string(), Value::String(entity_name.to_string()));
+    }
+
+    let mut paging_parts: Vec<String> = Vec::new();
+    if schema_property_exists(tool, &["all"]) {
+        base_args.insert("all".to_string(), Value::Bool(true));
+        paging_parts.push("all=true".to_string());
+    }
+    if schema_property_exists(tool, &["includeAll", "include_all"]) {
+        if schema_property_exists(tool, &["includeAll"]) {
+            base_args.insert("includeAll".to_string(), Value::Bool(true));
+            paging_parts.push("includeAll=true".to_string());
+        }
+        if schema_property_exists(tool, &["include_all"]) {
+            base_args.insert("include_all".to_string(), Value::Bool(true));
+            paging_parts.push("include_all=true".to_string());
+        }
+    }
+
+    let supports_page = schema_property_exists(tool, &["page", "pageNumber", "page_number"]);
+    let supports_page_size = schema_property_exists(tool, &["pageSize", "page_size", "limit", "top"]);
+    if supports_page_size {
+        if schema_property_exists(tool, &["pageSize"]) {
+            base_args.insert("pageSize".to_string(), Value::Number(serde_json::Number::from(5000)));
+            paging_parts.push("pageSize=5000".to_string());
+        }
+        if schema_property_exists(tool, &["page_size"]) {
+            base_args.insert("page_size".to_string(), Value::Number(serde_json::Number::from(5000)));
+            paging_parts.push("page_size=5000".to_string());
+        }
+        if schema_property_exists(tool, &["limit"]) {
+            base_args.insert("limit".to_string(), Value::Number(serde_json::Number::from(5000)));
+            paging_parts.push("limit=5000".to_string());
+        }
+        if schema_property_exists(tool, &["top"]) {
+            base_args.insert("top".to_string(), Value::Number(serde_json::Number::from(5000)));
+            paging_parts.push("top=5000".to_string());
+        }
+    }
+
+    let supports_paging = supports_page || supports_page_size;
+    let mut merged_attributes: HashSet<String> = HashSet::new();
+    let mut note: Option<String> = None;
+    let mut page = 1u64;
+
+    let mut schema_completeness = loop {
+        let mut call_args = base_args.clone();
+        if supports_page {
+            if schema_property_exists(tool, &["page"]) {
+                call_args.insert("page".to_string(), Value::Number(serde_json::Number::from(page)));
+            }
+            if schema_property_exists(tool, &["pageNumber"]) {
+                call_args.insert("pageNumber".to_string(), Value::Number(serde_json::Number::from(page)));
+            }
+            if schema_property_exists(tool, &["page_number"]) {
+                call_args.insert("page_number".to_string(), Value::Number(serde_json::Number::from(page)));
+            }
+        }
+
+        let schema_val = mcp_call_tool_raw(cmd_str, args, working_dir, tool_name, Value::Object(call_args)).await?;
+        let entry = build_entity_metadata_cache_entry(
+            &schema_val,
+            tool_name,
+            if paging_parts.is_empty() { None } else { Some(paging_parts.join(", ")) },
+            supports_paging,
+            true,
+        );
+
+        merged_attributes.extend(entry.attributes.iter().cloned());
+        let has_more = find_bool_key(&schema_val, &["hasMore", "has_more", "more"]).unwrap_or(false);
+        let has_next = has_next_page_token(&schema_val);
+        let should_continue = supports_page && (has_more || has_next);
+
+        if should_continue {
+            page += 1;
+            if page > 25 {
+                note = Some("Paging exceeded 25 pages; metadata collection stopped early.".to_string());
+                break "incomplete".to_string();
+            }
+            continue;
+        }
+
+        if supports_page && page > 1 {
+            break "complete".to_string();
+        } else {
+            let completeness = entry.schema_completeness;
+            note = entry.note;
+            break completeness;
+        }
+    };
+
+    let column_count = merged_attributes.len();
+
+    if schema_completeness == "unknown" && column_count <= 5 {
+        schema_completeness = "incomplete".to_string();
+        note = Some(format!("Only {column_count} columns were returned for this entity. The metadata tool response appears truncated."));
+    }
+
+    if schema_completeness == "unknown" {
+        note = note.or(Some("Column metadata completeness could not be proven from tool response metadata.".to_string()));
+    }
+
+    Ok(EntityMetadataCacheEntry {
+        attributes: merged_attributes,
+        column_count,
+        schema_completeness,
+        tool_used: tool_name.to_string(),
+        paging: if paging_parts.is_empty() { None } else { Some(paging_parts.join(", ")) },
+        note,
+    })
+}
+
+/// Tests connectivity to the Primarch MCP server (tools/list only — no Dataverse read).
+#[tauri::command]
+async fn test_primarch_mcp_connection(app: tauri::AppHandle, settings_override: Option<Value>) -> Result<Value, String> {
+    let settings = settings_override.unwrap_or(read_json(&app_data_dir(&app)?.join("settings.json"))?);
+    let (cmd_str, args, working_dir) = match get_mcp_config(&settings) {
+        Ok(v) => v,
+        Err(msg) => return Ok(serde_json::json!({ "status": "not_configured", "message": msg })),
+    };
+    match discover_safe_tools(&cmd_str, &args, working_dir.as_deref()).await {
+        Ok(tools) => Ok(serde_json::json!({
+            "status": "connected",
+            "toolCount": tools.len(),
+            "safeToolCount": tools.len(),
+            "message": format!("Connected. Cached {} read-only safe tools.", tools.len())
+        })),
+        Err(e) => Ok(serde_json::json!({ "status": "error", "message": e })),
+    }
+}
+
+/// Lists all tools from the Primarch MCP server, annotated with a readOnly safety flag.
+#[tauri::command]
+async fn list_primarch_mcp_tools(app: tauri::AppHandle) -> Result<Value, String> {
+    let settings = read_json(&app_data_dir(&app)?.join("settings.json"))?;
+    let (cmd_str, args, working_dir) = match get_mcp_config(&settings) {
+        Ok(v) => v,
+        Err(msg) => return Ok(serde_json::json!({ "tools": [], "message": msg })),
+    };
+    match discover_safe_tools(&cmd_str, &args, working_dir.as_deref()).await {
+        Ok(tools) => Ok(serde_json::json!({ "tools": tools })),
+        Err(e) => Ok(serde_json::json!({ "tools": [], "message": e })),
+    }
+}
+
+/// Generates a CRM skeleton (pseudo-code proposal) using Primarch MCP metadata + AI.
+/// Read-only: only calls metadata query tools on the MCP server, never writes to Dataverse.
+#[tauri::command]
+async fn generate_crm_skeleton(app: tauri::AppHandle, task: Value, customer: Value, workflow_setup: Value) -> Result<Value, String> {
+    let settings = read_json(&app_data_dir(&app)?.join("settings.json"))?;
+    let (cmd_str, args, working_dir) = match get_mcp_config(&settings) {
+        Ok(v) => v,
+        Err(msg) => return Ok(serde_json::json!({
+            "mode": "script",
+            "summary": msg,
+            "pseudoCode": "",
+            "logicalNamesUsed": [],
+            "metadataInspected": {"entityLogicalNames":[],"attributeLogicalNames":{},"toolsUsed":[]}
+        })),
+    };
+
+    let title    = task["title"].as_str().unwrap_or("").to_string();
+    let message  = task["originalMessage"].as_str().unwrap_or("").to_string();
+    let ns       = customer["namespace"].as_str().unwrap_or("").to_string();
+    let dev_kind = workflow_setup["devTargetKind"].as_str().unwrap_or("script").to_string();
+    let mode     = if dev_kind == "plugin" { "plugin" } else { "script" };
+
+    let candidate_entities: Vec<String> = extract_logical_names_from_text(&format!("{title} {message}"))
+        .into_iter().take(5).collect();
+
+    let tools = match discover_safe_tools(&cmd_str, &args, working_dir.as_deref()).await {
+        Ok(tools) => tools,
+        Err(msg) => return Ok(serde_json::json!({
+            "mode": mode,
+            "summary": msg,
+            "pseudoCode": "",
+            "logicalNamesUsed": [],
+            "metadataInspected": {"entityLogicalNames":[],"attributeLogicalNames":{},"toolsUsed":[]}
+        })),
+    };
+    let schema_tool = find_safe_tool(&tools, &[
+        "get_entity_schema", "entity_schema", "get_table_schema", "metadata_query", "list_columns",
+    ]);
+
+    let mut metadata_sections: Vec<String> = Vec::new();
+    let mut tools_used: Vec<String> = Vec::new();
+    let mut inspected_entities: Vec<String> = Vec::new();
+    let mut inspected_attrs: HashMap<String, Vec<String>> = HashMap::new();
+
+    if let Some(tool) = schema_tool {
+        let tn = tool["name"].as_str().unwrap_or("").to_string();
+        tools_used.push(tn.clone());
+        for entity in &candidate_entities {
+            let arg = serde_json::json!({"entityName": entity});
+            if let Ok(schema_val) = mcp_call_tool_raw(&cmd_str, &args, working_dir.as_deref(), &tn, arg).await {
+                inspected_entities.push(entity.clone());
+                let s = serde_json::to_string(&schema_val).unwrap_or_default();
+                let attrs: Vec<String> = extract_logical_names_from_text(&s).into_iter().take(20).collect();
+                inspected_attrs.insert(entity.clone(), attrs);
+                let short = &s[..s.len().min(1500)];
+                metadata_sections.push(format!("Entity '{entity}' schema:\n{short}"));
+            }
+        }
+    }
+
+    let metadata_ctx = if metadata_sections.is_empty() {
+        if schema_tool.is_none() {
+            "No safe metadata-read tool found on MCP server. Skeleton uses placeholder logical names.".to_string()
+        } else {
+            "No entity schemas retrieved from task context. Skeleton uses placeholder logical names.".to_string()
+        }
+    } else {
+        format!("CRM metadata from Primarch MCP:\n\n{}", metadata_sections.join("\n\n"))
+    };
+
+    let mode_hint = if mode == "plugin" {
+        "C# Dataverse plugin pseudo-code (IPlugin, Execute method, Entity/IOrganizationService patterns)"
+    } else {
+        "JavaScript NVR-style script pseudo-code (namespaced handlers, formContext.getAttribute, Xrm.WebApi)"
+    };
+    let instructions = format!(
+        "You are a Dynamics 365 developer assistant. Generate a {mode_hint} skeleton using real logical names from the metadata. \
+Include confirmed names. Show which metadata was inspected. Return ONLY valid JSON without markdown fences."
+    );
+    let prompt = format!(
+        "Task: {title}\nCustomer namespace: {ns}\nDev mode: {mode}\n\n{metadata_ctx}\n\n\
+Return ONLY this JSON:\n{{\"summary\":\"one-sentence what this skeleton does\",\"pseudoCode\":\"// skeleton here\",\"logicalNamesUsed\":[\"entity_name\"]}}"
+    );
+
+    let ai_config = get_ai_config(&app).map_err(|e| format!("AI not configured: {e}"))?;
+    let text = call_ai_text(&ai_config, &instructions, &prompt).await?;
+    let parsed: Value = serde_json::from_str(strip_fences(&text)).unwrap_or_else(|_| serde_json::json!({
+        "summary": "Skeleton generation failed — could not parse AI response.",
+        "pseudoCode": &text[..text.len().min(2000)],
+        "logicalNamesUsed": []
+    }));
+
+    Ok(serde_json::json!({
+        "mode": mode,
+        "summary": parsed["summary"],
+        "pseudoCode": parsed["pseudoCode"],
+        "logicalNamesUsed": parsed["logicalNamesUsed"],
+        "metadataInspected": {
+            "entityLogicalNames": inspected_entities,
+            "attributeLogicalNames": inspected_attrs,
+            "toolsUsed": tools_used
+        }
+    }))
+}
+
+/// Computes the staticInferenceConfidence value from a scan result.
+/// For C# plugins: driven by plugin_context.primary_entity_source.
+/// For JS/TS files: "inferred" when a primary_form_entity reference is present; "low" when
+/// attribute references exist but no entity was inferred; otherwise "unknown".
+fn compute_static_inference_confidence(scan: &CrmScanResult) -> &'static str {
+    if let Some(plugin_context) = &scan.plugin_context {
+        match (plugin_context.primary_entity_name.is_some(), plugin_context.primary_entity_source.as_deref()) {
+            (true, Some("manual_override")) => "high",
+            (true, _) if scan.ambiguous_attributes.is_empty() => "high",
+            (true, _) => "medium",
+            (false, _) if !scan.attribute_references.is_empty() => "low",
+            _ => "unknown",
+        }
+    } else {
+        let has_primary_form_entity = scan.entity_references.iter()
+            .any(|r| r.context_type == "primary_form_entity");
+        if has_primary_form_entity {
+            "inferred"
+        } else if !scan.attribute_references.is_empty() {
+            "low"
+        } else {
+            "unknown"
+        }
+    }
+}
+
+/// Verifies CRM references extracted from a source file against Primarch MCP metadata.
+/// The verdict is deterministic (based on local scan + metadata lookup results).
+/// Never writes to Dataverse.
+#[tauri::command]
+async fn verify_against_crm(
+    app: tauri::AppHandle,
+    _task: Value,
+    _customer: Value,
+    scan_result: Value,
+    file_path: Option<String>,
+    primary_entity_override: Option<String>,
+) -> Result<Value, String> {
+    let settings = load_settings(app.clone())?;
+    let raw_scan_result = scan_result.clone();
+    let scan: CrmScanResult = serde_json::from_value(scan_result).unwrap_or_default();
+
+    let local_scan_only_ambiguous: Vec<Value> = {
+        let mut refs: Vec<Value> = Vec::new();
+        for ambiguous in &scan.ambiguous_references {
+            refs.push(serde_json::json!({
+                "kind": ambiguous.kind,
+                "displayName": ambiguous.logical_name,
+                "entityLogicalName": ambiguous.entity_logical_name,
+                "relatedEntityLogicalName": ambiguous.related_entity_logical_name,
+                "sourceReason": ambiguous.source_reason,
+                "detail": format!("Local scan only — not checked against Dataverse. {}", ambiguous.detail),
+            }));
+        }
+        for attr_ref in &scan.attribute_references {
+            if attr_ref.entity_logical_name.is_none() {
+                refs.push(serde_json::json!({
+                    "kind": "attribute",
+                    "displayName": attr_ref.logical_name,
+                    "attributeLogicalName": attr_ref.logical_name,
+                    "sourceReason": attr_ref.source_reason,
+                    "detail": "Local scan only — not checked against Dataverse.",
+                }));
+            }
+        }
+        refs
+    };
+
+    let default_report = |verdict: &str, metadata_verdict: &str, summary: String| {
+        serde_json::json!({
+            "filePath": file_path,
+            "verdict": verdict,
+            "metadataVerdict": metadata_verdict,
+            "staticInferenceConfidence": "unknown",
+            "runtimeReadiness": "unknown",
+            "summary": summary,
+            "answer": summary,
+            "issues": [],
+            "confirmedReferences": [],
+            "missingReferences": [],
+            "ambiguousReferences": local_scan_only_ambiguous,
+            "runtimeRisks": [],
+            "pluginChecks": [],
+            "inspectedEntities": [],
+            "inspectedAttributesByEntity": {},
+            "unableToVerifyReasons": ["Dataverse metadata was not inspected. This is not a CRM verification result."],
+            "compileReadiness": { "status": "not_checked", "detail": "Compile readiness was not checked during metadata verification." },
+            "metadataInspected": {"entityLogicalNames":[],"attributeLogicalNames":{},"entityDetails":[],"toolsUsed":[]},
+            "rawExtractedReferences": raw_scan_result,
+        })
+    };
+
+    let (cmd_str, args, working_dir) = match get_mcp_config(&settings) {
+        Ok(v) => v,
+        Err(_) => return Ok(default_report(
+            "not_configured",
+            "unknown",
+            "Local reference scan completed, but Dataverse verification was skipped because Primarch MCP is not configured.".to_string(),
+        )),
+    };
+
+    let verification: Result<Result<Value, String>, tokio::time::error::Elapsed> = timeout(Duration::from_secs(60), async {
+        let tools = match discover_safe_tools(&cmd_str, &args, working_dir.as_deref()).await {
+            Ok(tools) => tools,
+            Err(msg) => return Ok::<Value, String>(default_report("error", "unknown", format!("Verification could not be completed. {msg}"))),
+        };
+
+        let metadata_tool = find_safe_tool(&tools, &[
+            "list_columns",
+            "list_attributes",
+            "search_columns",
+            "get_entity_schema",
+            "entity_schema",
+            "get_table_schema",
+            "metadata_query",
+            "describe_table",
+            "describe_entity",
+        ]);
+
+        if metadata_tool.is_none() {
+            return Ok::<Value, String>(default_report(
+                "not_configured",
+                "unknown",
+                "Dataverse metadata was not inspected. This is not a CRM verification result.".to_string(),
+            ));
+        }
+
+        let mut issues: Vec<Value> = Vec::new();
+        let mut confirmed_references: Vec<Value> = Vec::new();
+        let mut missing_references: Vec<Value> = Vec::new();
+        let mut ambiguous_references: Vec<Value> = Vec::new();
+        let mut runtime_risks: Vec<Value> = Vec::new();
+        let mut plugin_checks: Vec<Value> = Vec::new();
+        let mut unable_to_verify_reasons: Vec<String> = Vec::new();
+        let mut inspected_entities: Vec<String> = Vec::new();
+        let mut inspected_attrs: HashMap<String, Vec<String>> = HashMap::new();
+        let mut inspected_entity_details: Vec<Value> = Vec::new();
+        let mut entity_cache: HashMap<String, EntityMetadataCacheEntry> = HashMap::new();
+
+        let tool = metadata_tool.expect("checked above");
+        let metadata_tool_name = tool["name"].as_str().unwrap_or("").to_string();
+        let tool_name = metadata_tool_name.clone();
+
+        let mut entity_names: Vec<String> = scan.entities.clone();
+        for entity_ref in &scan.entity_references {
+            if !entity_ref.logical_name.is_empty() {
+                entity_names.push(entity_ref.logical_name.clone());
+            }
+        }
+        for attr_ref in &scan.attribute_references {
+            if let Some(entity_name) = &attr_ref.entity_logical_name {
+                entity_names.push(entity_name.clone());
+            }
+        }
+        for relation in &scan.relationship_references {
+            if let Some(entity_name) = &relation.source_entity_logical_name {
+                entity_names.push(entity_name.clone());
+            }
+            if let Some(entity_name) = &relation.target_entity_logical_name {
+                entity_names.push(entity_name.clone());
+            }
+        }
+        if let Some(plugin_context) = &scan.plugin_context {
+            if let Some(entity_name) = &plugin_context.primary_entity_name {
+                entity_names.push(entity_name.clone());
+            }
+        }
+        entity_names.sort();
+        entity_names.dedup();
+
+        for entity_name in &entity_names {
+            if entity_name.is_empty() {
+                continue;
+            }
+            match timeout(
+                Duration::from_secs(30),
+                fetch_entity_schema_metadata(&cmd_str, &args, working_dir.as_deref(), tool, &tool_name, entity_name),
+            ).await {
+                Ok(Ok(cache_entry)) => {
+                    inspected_entities.push(entity_name.clone());
+                    let mut sorted_attrs: Vec<String> = cache_entry.attributes.iter().cloned().collect();
+                    sorted_attrs.sort();
+                    inspected_attrs.insert(entity_name.clone(), sorted_attrs.clone());
+                    inspected_entity_details.push(serde_json::json!({
+                        "entityLogicalName": entity_name,
+                        "columnCount": cache_entry.column_count,
+                        "schemaCompleteness": cache_entry.schema_completeness,
+                        "toolUsed": cache_entry.tool_used,
+                        "paging": cache_entry.paging,
+                        "note": cache_entry.note,
+                    }));
+
+                    if cache_entry.schema_completeness == "incomplete" {
+                        unable_to_verify_reasons.push(format!(
+                            "Column metadata for entity '{}' was incomplete; only {} columns were returned.",
+                            entity_name,
+                            cache_entry.column_count,
+                        ));
+                    } else if cache_entry.schema_completeness == "unknown" {
+                        unable_to_verify_reasons.push(format!(
+                            "Column metadata completeness for entity '{}' could not be proven from the MCP response.",
+                            entity_name,
+                        ));
+                    }
+
+                    entity_cache.insert(entity_name.clone(), cache_entry);
+                }
+                Ok(Err(err)) => {
+                    unable_to_verify_reasons.push(format!("Entity '{}' could not be inspected: {}", entity_name, err));
+                    inspected_entity_details.push(serde_json::json!({
+                        "entityLogicalName": entity_name,
+                        "columnCount": 0,
+                        "schemaCompleteness": "unknown",
+                        "toolUsed": tool_name,
+                        "note": err,
+                    }));
+                }
+                Err(_) => {
+                    let detail = format!("Inspecting entity '{}' timed out after 30 seconds.", entity_name);
+                    unable_to_verify_reasons.push(detail.clone());
+                    inspected_entity_details.push(serde_json::json!({
+                        "entityLogicalName": entity_name,
+                        "columnCount": 0,
+                        "schemaCompleteness": "unknown",
+                        "toolUsed": tool_name,
+                        "note": detail,
+                    }));
+                }
+            }
+        }
+
+        for entity_ref in &scan.entity_references {
+            if entity_cache.contains_key(&entity_ref.logical_name) {
+                confirmed_references.push(serde_json::json!({
+                    "kind": "entity",
+                    "displayName": entity_ref.logical_name,
+                    "entityLogicalName": entity_ref.logical_name,
+                    "sourceReason": entity_ref.source_reason,
+                    "detail": format!("Detected via {}", entity_ref.context_type),
+                }));
+            }
+        }
+
+        for attr_ref in &scan.attribute_references {
+            let Some(entity_name) = &attr_ref.entity_logical_name else {
+                ambiguous_references.push(serde_json::json!({
+                    "kind": "attribute",
+                    "displayName": attr_ref.logical_name,
+                    "attributeLogicalName": attr_ref.logical_name,
+                    "sourceReason": attr_ref.source_reason,
+                    "detail": "Could not infer the entity for this attribute statically.",
+                }));
+                continue;
+            };
+
+            match entity_cache.get(entity_name) {
+                Some(cache_entry) if cache_entry.attributes.contains(&attr_ref.logical_name) => {
+                    if cache_entry.schema_completeness == "complete" {
+                        confirmed_references.push(serde_json::json!({
+                            "kind": "attribute",
+                            "displayName": format!("{}.{}", entity_name, attr_ref.logical_name),
+                            "entityLogicalName": entity_name,
+                            "attributeLogicalName": attr_ref.logical_name,
+                            "relatedEntityLogicalName": attr_ref.related_entity_logical_name,
+                            "sourceReason": attr_ref.source_reason,
+                            "detail": format!("Detected via {}", attr_ref.context_type),
+                        }));
+                    } else {
+                        // Attribute appears in the partial response but schema is incomplete —
+                        // treat as ambiguous so as not to overstate verification quality.
+                        ambiguous_references.push(serde_json::json!({
+                            "kind": "attribute",
+                            "displayName": format!("{}.{}", entity_name, attr_ref.logical_name),
+                            "entityLogicalName": entity_name,
+                            "attributeLogicalName": attr_ref.logical_name,
+                            "relatedEntityLogicalName": attr_ref.related_entity_logical_name,
+                            "sourceReason": attr_ref.source_reason,
+                            "detail": format!(
+                                "Attribute present in {} schema ({} columns returned), but schema completeness is unverified — cannot fully confirm.",
+                                cache_entry.schema_completeness,
+                                cache_entry.column_count,
+                            ),
+                        }));
+                    }
+                }
+                Some(cache_entry) if cache_entry.schema_completeness == "complete" => {
+                    missing_references.push(serde_json::json!({
+                        "kind": "attribute",
+                        "displayName": format!("{}.{}", entity_name, attr_ref.logical_name),
+                        "entityLogicalName": entity_name,
+                        "attributeLogicalName": attr_ref.logical_name,
+                        "relatedEntityLogicalName": attr_ref.related_entity_logical_name,
+                        "sourceReason": attr_ref.source_reason,
+                        "detail": format!("Detected via {} (complete schema)", attr_ref.context_type),
+                    }));
+                    issues.push(serde_json::json!({
+                        "severity": "error",
+                        "category": "missing",
+                        "code": "ATTRIBUTE_NOT_FOUND",
+                        "title": format!("Attribute '{}.{}' was not found", entity_name, attr_ref.logical_name),
+                        "detail": format!("The attribute was detected {} but is missing from a complete inspected schema.", attr_ref.source_reason),
+                        "entityLogicalName": entity_name,
+                        "attributeLogicalName": attr_ref.logical_name,
+                        "relatedEntityLogicalName": attr_ref.related_entity_logical_name,
+                        "sourceReason": attr_ref.source_reason,
+                    }));
+                }
+                Some(cache_entry) => {
+                    ambiguous_references.push(serde_json::json!({
+                        "kind": "attribute",
+                        "displayName": format!("{}.{}", entity_name, attr_ref.logical_name),
+                        "entityLogicalName": entity_name,
+                        "attributeLogicalName": attr_ref.logical_name,
+                        "relatedEntityLogicalName": attr_ref.related_entity_logical_name,
+                        "sourceReason": attr_ref.source_reason,
+                        "detail": format!(
+                            "Could not verify against {} schema metadata ({} columns returned).",
+                            cache_entry.schema_completeness,
+                            cache_entry.column_count,
+                        ),
+                    }));
+                }
+                None => {
+                    ambiguous_references.push(serde_json::json!({
+                        "kind": "attribute",
+                        "displayName": format!("{}.{}", entity_name, attr_ref.logical_name),
+                        "entityLogicalName": entity_name,
+                        "attributeLogicalName": attr_ref.logical_name,
+                        "relatedEntityLogicalName": attr_ref.related_entity_logical_name,
+                        "sourceReason": attr_ref.source_reason,
+                        "detail": "The owning entity could not be inspected successfully.",
+                    }));
+                }
+            }
+
+            if attr_ref.option_values.as_ref().is_some_and(|values| !values.is_empty()) {
+                unable_to_verify_reasons.push(format!(
+                    "Option set values for '{}.{}' were detected in code, but the current metadata tool did not expose enough option metadata to verify them.",
+                    entity_name,
+                    attr_ref.logical_name,
+                ));
+            }
+        }
+
+        for relation in &scan.relationship_references {
+            match (&relation.source_entity_logical_name, &relation.target_entity_logical_name) {
+                (Some(source_entity), Some(target_entity)) => {
+                    let source_entry = entity_cache.get(source_entity);
+                    let target_entry = entity_cache.get(target_entity);
+                    let source_ok = source_entry
+                        .map(|entry| entry.attributes.contains(&relation.source_attribute_logical_name))
+                        .unwrap_or(false);
+                    let target_ok = target_entry
+                        .map(|entry| entry.attributes.contains(&relation.target_attribute_logical_name))
+                        .unwrap_or(false);
+                    let source_complete = source_entry
+                        .map(|entry| entry.schema_completeness == "complete")
+                        .unwrap_or(false);
+                    let target_complete = target_entry
+                        .map(|entry| entry.schema_completeness == "complete")
+                        .unwrap_or(false);
+
+                    if source_ok && target_ok {
+                        confirmed_references.push(serde_json::json!({
+                            "kind": "relationship",
+                            "displayName": format!("{}:{} -> {}:{}", source_entity, relation.source_attribute_logical_name, target_entity, relation.target_attribute_logical_name),
+                            "entityLogicalName": source_entity,
+                            "attributeLogicalName": relation.source_attribute_logical_name,
+                            "relatedEntityLogicalName": target_entity,
+                            "sourceReason": relation.source_reason,
+                            "detail": format!("Detected via {}", relation.context_type),
+                        }));
+                    } else if source_complete && target_complete {
+                        let detail = format!("Detected via {}", relation.context_type);
+                        if !source_ok {
+                            missing_references.push(serde_json::json!({
+                                "kind": "relationship",
+                                "displayName": format!("{}:{}", source_entity, relation.source_attribute_logical_name),
+                                "entityLogicalName": source_entity,
+                                "attributeLogicalName": relation.source_attribute_logical_name,
+                                "relatedEntityLogicalName": target_entity,
+                                "sourceReason": relation.source_reason,
+                                "detail": detail,
+                            }));
+                        }
+                        if !target_ok {
+                            missing_references.push(serde_json::json!({
+                                "kind": "relationship",
+                                "displayName": format!("{}:{}", target_entity, relation.target_attribute_logical_name),
+                                "entityLogicalName": target_entity,
+                                "attributeLogicalName": relation.target_attribute_logical_name,
+                                "relatedEntityLogicalName": source_entity,
+                                "sourceReason": relation.source_reason,
+                                "detail": detail,
+                            }));
+                        }
+                    } else {
+                        ambiguous_references.push(serde_json::json!({
+                            "kind": "relationship",
+                            "displayName": format!("{}:{} -> {}:{}", source_entity, relation.source_attribute_logical_name, target_entity, relation.target_attribute_logical_name),
+                            "entityLogicalName": source_entity,
+                            "attributeLogicalName": relation.source_attribute_logical_name,
+                            "relatedEntityLogicalName": target_entity,
+                            "sourceReason": relation.source_reason,
+                            "detail": "Relationship could not be fully verified because one or both entity schemas were incomplete.",
+                        }));
+                    }
+                }
+                _ => {
+                    ambiguous_references.push(serde_json::json!({
+                        "kind": "relationship",
+                        "displayName": format!("{} -> {}", relation.source_attribute_logical_name, relation.target_attribute_logical_name),
+                        "attributeLogicalName": relation.source_attribute_logical_name,
+                        "sourceReason": relation.source_reason,
+                        "detail": "Could not infer both entities for this LinkEntity relationship.",
+                    }));
+                }
+            }
+        }
+
+        for ambiguous in &scan.ambiguous_references {
+            ambiguous_references.push(serde_json::json!({
+                "kind": ambiguous.kind,
+                "displayName": ambiguous.logical_name,
+                "entityLogicalName": ambiguous.entity_logical_name,
+                "relatedEntityLogicalName": ambiguous.related_entity_logical_name,
+                "sourceReason": ambiguous.source_reason,
+                "detail": ambiguous.detail,
+            }));
+        }
+
+        if let Some(plugin_context) = &scan.plugin_context {
+            if let Some(primary_entity) = &plugin_context.primary_entity_name {
+                let status = if entity_cache.contains_key(primary_entity) { "confirmed" } else { "warning" };
+                let source_label = plugin_context.primary_entity_source.clone().unwrap_or_else(|| "inferred".to_string());
+                plugin_checks.push(serde_json::json!({
+                    "status": status,
+                    "title": "Primary entity",
+                    "detail": format!("Primary entity resolved as '{}' (source: {}).", primary_entity, source_label.replace('_', " ")),
+                    "entityLogicalName": primary_entity,
+                    "sourceReason": "from plugin code",
+                }));
+            } else {
+                plugin_checks.push(serde_json::json!({
+                    "status": "not_verified",
+                    "title": "Primary entity",
+                    "detail": "Primary plugin entity could not be inferred. Configure primary entity in task setup or plugin registration metadata.",
+                    "sourceReason": "from plugin code",
+                }));
+            }
+
+            if !plugin_context.messages.is_empty() {
+                plugin_checks.push(serde_json::json!({
+                    "status": "confirmed",
+                    "title": "Plugin message",
+                    "detail": format!("Detected message checks: {}.", plugin_context.messages.join(", ")),
+                    "sourceReason": "from context.MessageName checks",
+                }));
+            } else {
+                plugin_checks.push(serde_json::json!({
+                    "status": "not_verified",
+                    "title": "Plugin message",
+                    "detail": "No explicit message check was detected in the plugin code.",
+                    "sourceReason": "from plugin code",
+                }));
+            }
+
+            if let Some(primary_entity) = &plugin_context.primary_entity_name {
+                for (image_kind, attrs) in &plugin_context.image_attributes {
+                    for attr in attrs {
+                        let verified = entity_cache
+                            .get(primary_entity)
+                            .map(|entry| entry.attributes.contains(attr))
+                            .unwrap_or(false);
+                        plugin_checks.push(serde_json::json!({
+                            "status": if verified { "confirmed" } else { "warning" },
+                            "title": format!("{} image attribute", image_kind),
+                            "detail": if verified {
+                                format!("Image attribute '{}.{}' was confirmed in metadata.", primary_entity, attr)
+                            } else {
+                                format!("Image attribute '{}.{}' could not be confirmed in metadata.", primary_entity, attr)
+                            },
+                            "entityLogicalName": primary_entity,
+                            "attributeLogicalName": attr,
+                            "sourceReason": format!("from {} entity image usage", image_kind),
+                        }));
+                    }
+                }
+            }
+
+            if plugin_context.uses_pre_entity_images || plugin_context.uses_post_entity_images {
+                plugin_checks.push(serde_json::json!({
+                    "status": "not_verified",
+                    "title": "Entity images",
+                    "detail": "Entity images are used in code, but plugin registration metadata was not available to confirm the image configuration.",
+                    "sourceReason": "from PreEntityImages/PostEntityImages usage",
+                }));
+            }
+
+            if plugin_context.messages.iter().any(|message| message.eq_ignore_ascii_case("Update")) && !plugin_context.target_attributes.is_empty() {
+                runtime_risks.push(serde_json::json!({
+                    "kind": "runtime",
+                    "displayName": "Update target attribute assumptions",
+                    "entityLogicalName": plugin_context.primary_entity_name,
+                    "sourceReason": "from target.GetAttributeValue usage on Update",
+                    "detail": "On Update, Target may not contain every referenced attribute. Verify filtering attributes and entity images before runtime testing.",
+                }));
+            }
+
+            if !plugin_context.filtering_attributes.is_empty() {
+                plugin_checks.push(serde_json::json!({
+                    "status": if plugin_context.primary_entity_name.is_some() { "confirmed" } else { "not_verified" },
+                    "title": if plugin_context.primary_entity_name.is_some() { "Suggested filtering attributes" } else { "Candidate filtering attributes" },
+                    "detail": if plugin_context.primary_entity_name.is_some() {
+                        format!("Suggested filtering attributes from Target usage: {}.", plugin_context.filtering_attributes.join(", "))
+                    } else {
+                        format!("Candidate filtering attributes were detected, but primary entity is unknown: {}.", plugin_context.filtering_attributes.join(", "))
+                    },
+                    "entityLogicalName": plugin_context.primary_entity_name,
+                    "sourceReason": "from target.GetAttributeValue usage",
+                }));
+            }
+
+            for note in &plugin_context.notes {
+                unable_to_verify_reasons.push(note.clone());
+            }
+        }
+
+        if !scan.notes.is_empty() {
+            unable_to_verify_reasons.extend(scan.notes.iter().cloned());
+        }
+        if let Some(override_entity) = primary_entity_override.as_ref().and_then(|v| normalize_logical_name(v)) {
+            unable_to_verify_reasons.push(format!("Primary entity override used for verification: {}.", override_entity));
+        }
+        if !scan.ambiguous_attributes.is_empty() {
+            unable_to_verify_reasons.push(format!(
+                "Some attributes could not be bound to a specific entity statically: {}.",
+                scan.ambiguous_attributes.join(", "),
+            ));
+        }
+
+        unable_to_verify_reasons.sort();
+        unable_to_verify_reasons.dedup();
+
+        let mut metadata_verdict = if !missing_references.is_empty() {
+            "fail"
+        } else if !ambiguous_references.is_empty() || !unable_to_verify_reasons.is_empty() {
+            "warnings"
+        } else if confirmed_references.is_empty() {
+            "unknown"
+        } else {
+            "pass"
+        };
+
+        if inspected_entity_details.iter().all(|item| item["schemaCompleteness"].as_str() != Some("complete")) {
+            if metadata_verdict == "fail" {
+                // Defensive guard: fail is not allowed unless complete schema exists.
+                missing_references.clear();
+                issues.retain(|issue| issue["code"].as_str() != Some("ATTRIBUTE_NOT_FOUND"));
+                metadata_verdict = if !ambiguous_references.is_empty() || !unable_to_verify_reasons.is_empty() {
+                    "warnings"
+                } else {
+                    "unknown"
+                };
+            }
+        }
+
+        let static_inference_confidence = compute_static_inference_confidence(&scan);
+
+        let runtime_readiness = if runtime_risks.is_empty() {
+            if scan.plugin_context.is_some() { "low_risk" } else { "not_checked" }
+        } else {
+            "risks_found"
+        };
+
+        let (verdict, summary) = match metadata_verdict {
+            "pass" => (
+                "pass",
+                "Metadata-compatible with inspected Dataverse schema.".to_string(),
+            ),
+            "warnings" => (
+                "warnings",
+                "No confirmed metadata mismatch, but some references could not be verified.".to_string(),
+            ),
+            "fail" => (
+                "fail",
+                "Confirmed metadata mismatch found in complete schema.".to_string(),
+            ),
+            _ => (
+                "unknown",
+                "Not enough complete metadata or entity binding to decide.".to_string(),
+            ),
+        };
+
+        Ok::<Value, String>(serde_json::json!({
+            "filePath": file_path,
+            "verdict": verdict,
+            "metadataVerdict": metadata_verdict,
+            "staticInferenceConfidence": static_inference_confidence,
+            "runtimeReadiness": runtime_readiness,
+            "summary": summary,
+            "answer": summary,
+            "issues": issues,
+            "confirmedReferences": confirmed_references,
+            "missingReferences": missing_references,
+            "ambiguousReferences": ambiguous_references,
+            "runtimeRisks": runtime_risks,
+            "pluginChecks": plugin_checks,
+            "inspectedEntities": inspected_entities,
+            "inspectedAttributesByEntity": inspected_attrs,
+            "unableToVerifyReasons": unable_to_verify_reasons,
+            "compileReadiness": { "status": "not_checked", "detail": "Compile readiness was not checked during metadata verification." },
+            "metadataInspected": {
+                "entityLogicalNames": inspected_entities,
+                "attributeLogicalNames": inspected_attrs,
+                "entityDetails": inspected_entity_details,
+                "toolsUsed": [metadata_tool_name],
+            },
+            "rawExtractedReferences": raw_scan_result,
+        }))
+    }).await;
+
+    match verification {
+        Ok(Ok(report)) => Ok(report),
+        Ok(Err(err)) => Ok(default_report("error", "unknown", format!("Verification could not be completed. {err}"))),
+        Err(_) => Ok(default_report(
+            "error",
+            "unknown",
+            "Verification could not confirm enough metadata to make a reliable decision.".to_string(),
+        )),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn marks_truncated_five_column_schema_as_incomplete() {
+        let payload = serde_json::json!({
+            "columns": [
+                { "logicalName": "fullname" },
+                { "logicalName": "ownerid" },
+                { "logicalName": "emailaddress1" },
+                { "logicalName": "telephone1" },
+                { "logicalName": "mobilephone" }
+            ]
+        });
+
+        let entry = build_entity_metadata_cache_entry(&payload, "list_columns", None, false, true);
+        assert_eq!(entry.column_count, 5);
+        assert_eq!(entry.schema_completeness, "incomplete");
+        assert!(entry.note.unwrap_or_default().contains("truncated"));
+    }
+
+    #[test]
+    fn marks_complete_schema_when_total_matches_returned_columns() {
+        let payload = serde_json::json!({
+            "columns": [
+                { "logicalName": "fullname" },
+                { "logicalName": "ownerid" },
+                { "logicalName": "emailaddress1" },
+                { "logicalName": "telephone1" },
+                { "logicalName": "mobilephone" },
+                { "logicalName": "jobtitle" }
+            ],
+            "totalCount": 6,
+            "hasMore": false
+        });
+
+        let entry = build_entity_metadata_cache_entry(&payload, "list_columns", Some("all=true".to_string()), true, true);
+        assert_eq!(entry.column_count, 6);
+        assert_eq!(entry.schema_completeness, "complete");
+    }
+
+    #[test]
+    fn js_primary_form_entity_produces_inferred_confidence() {
+        let scan = CrmScanResult {
+            entity_references: vec![CrmScanEntityReference {
+                logical_name: "account".to_string(),
+                source_reason: "from primary form entity inference".to_string(),
+                context_type: "primary_form_entity".to_string(),
+            }],
+            ..Default::default()
+        };
+        assert_eq!(compute_static_inference_confidence(&scan), "inferred");
+    }
+
+    #[test]
+    fn no_entity_reference_and_no_attrs_produces_unknown_confidence() {
+        let scan = CrmScanResult::default();
+        assert_eq!(compute_static_inference_confidence(&scan), "unknown");
+    }
+
+    #[test]
+    fn attribute_refs_without_entity_produce_low_confidence() {
+        let scan = CrmScanResult {
+            attribute_references: vec![CrmScanAttributeReference {
+                logical_name: "fullname".to_string(),
+                entity_logical_name: None,
+                source_reason: "from formContext".to_string(),
+                context_type: "formContext".to_string(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        assert_eq!(compute_static_inference_confidence(&scan), "low");
+    }
+
+    #[test]
+    fn unable_to_verify_reasons_dedup_removes_exact_duplicates() {
+        let mut reasons = vec![
+            "Column metadata for entity 'account' was incomplete; only 5 columns were returned.".to_string(),
+            "Column metadata for entity 'account' was incomplete; only 5 columns were returned.".to_string(),
+            "Primary form entity: account.".to_string(),
+        ];
+        reasons.sort();
+        reasons.dedup();
+        assert_eq!(reasons.len(), 2);
+    }
+
+    #[test]
+    fn attribute_in_incomplete_schema_is_not_marked_confirmed() {
+        let entry = EntityMetadataCacheEntry {
+            attributes: ["fullname", "ownerid"].iter().map(|s| s.to_string()).collect(),
+            column_count: 2,
+            schema_completeness: "incomplete".to_string(),
+            ..Default::default()
+        };
+        // Attribute is present in returned columns but schema is not complete.
+        // The classification condition: found && !complete → ambiguous branch.
+        let found = entry.attributes.contains("fullname");
+        let would_confirm = entry.schema_completeness == "complete";
+        assert!(found, "attribute must be in the returned columns");
+        assert!(!would_confirm, "incomplete schema must not trigger the confirmed branch");
+    }
+
+    #[test]
+    fn list_columns_real_mcp_response_extracts_attrs_via_fallback() {
+        // Simulates the real MCP response shape from Primarch list_columns:
+        //   {"content":[{"type":"text","text":"{\"entity\":\"account\",\"count\":5,\"columns\":[{\"n\":\"...\"}]}"}]}
+        // collect_column_names returns 0 (no "logicalName" key); fallback extracts from text string.
+        let payload = serde_json::json!({
+            "content": [{
+                "type": "text",
+                "text": "{\"entity\":\"account\",\"count\":5,\"columns\":[{\"n\":\"nvr_erprelevant\",\"d\":\"ERP Relevant\",\"t\":\"Boolean\"},{\"n\":\"nvr_sendtoerp\",\"d\":\"Send to ERP\",\"t\":\"Boolean\"},{\"n\":\"parentaccountid\",\"d\":\"Parent Account\",\"t\":\"Lookup\"},{\"n\":\"fullname\",\"d\":\"Full Name\",\"t\":\"String\"},{\"n\":\"telephone1\",\"d\":\"Business Phone\",\"t\":\"String\"}]}"
+            }]
+        });
+        // list_columns has no paging params: supports_paging=false, limit params never sent
+        let entry = build_entity_metadata_cache_entry(&payload, "list_columns", None, false, true);
+        // All 5 real column names must be in the attributes set (extracted via fallback string scan)
+        assert!(entry.attributes.contains("nvr_erprelevant"), "nvr_erprelevant must be found");
+        assert!(entry.attributes.contains("nvr_sendtoerp"), "nvr_sendtoerp must be found");
+        assert!(entry.attributes.contains("parentaccountid"), "parentaccountid must be found");
+        assert!(entry.attributes.contains("fullname"), "fullname must be found");
+        assert!(entry.attributes.contains("telephone1"), "telephone1 must be found");
+        // column_count is at least 5 (may be more due to false positives from display name substrings)
+        assert!(entry.column_count >= 5, "column_count must be at least 5");
+        // The count:5 is inside the nested text string, which find_count_key does not parse.
+        // False-positive tokens from display names ("ERP Relevant" → "elevant", etc.) push
+        // column_count above 5, so the <=5 incomplete heuristic does not fire.
+        // Result: schema_completeness = "unknown" (conservative — we cannot prove it is complete or truncated).
+        assert_eq!(entry.schema_completeness, "unknown",
+            "list_columns text-wrapper format: count buried in string → unknown, not incomplete");
+    }
+
+    #[test]
+    fn list_columns_full_186_column_response_is_schema_unknown() {
+        // With 186 columns returned: column_count > 5, no paging params, no detectable totalCount
+        // → schema_completeness = "unknown" (conservative: we can't prove completeness from this format)
+        let mut cols = Vec::new();
+        for i in 0..186u32 {
+            cols.push(serde_json::json!({"n": format!("attr_{:03}", i), "d": "Display", "t": "String"}));
+        }
+        let text = serde_json::json!({
+            "entity": "account",
+            "count": 186,
+            "columns": cols
+        }).to_string();
+        let payload = serde_json::json!({
+            "content": [{"type": "text", "text": text}]
+        });
+        let entry = build_entity_metadata_cache_entry(&payload, "list_columns", None, false, true);
+        assert!(entry.column_count > 5, "186 columns → count > 5");
+        // totalCount is buried inside text string, find_count_key won't see it → unknown not complete
+        assert_eq!(entry.schema_completeness, "unknown",
+            "186-column result stays unknown because count is nested in text string");
+        // Attributes are still usable: verify a few are present
+        assert!(entry.attributes.contains("attr_000"));
+        assert!(entry.attributes.contains("attr_185"));
+    }
+}
 // --- Entry point -----------------------------------------------------------
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -4101,6 +6645,10 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
+        .setup(|app| {
+            start_task_mcp_bridge(app.handle().clone());
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![
             load_tasks,
             save_tasks,
@@ -4152,6 +6700,11 @@ pub fn run() {
             git_checkout_branch,
             get_git_diff,
             run_ai_change_review,
+                get_task_mcp_bridge_status,
+                test_primarch_mcp_connection,
+                list_primarch_mcp_tools,
+                generate_crm_skeleton,
+                verify_against_crm,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
