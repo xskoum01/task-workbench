@@ -101,6 +101,16 @@ export interface TaskDevModePanelProps {
    * remain explicit buttons outside the review tool.
    */
   onChangeReviewComplete?: (review: AiFileReviewResult) => void;
+  /**
+   * When true, the Script/Plugin mode toggle is hidden.
+   * Use in the visible developer setup section where the mode is already known from the workflow.
+   */
+  hideModeToggle?: boolean;
+  /**
+   * When true, the Run AI Review button is hidden.
+   * Use in the always-visible section to keep review actions inside Assistant Tools only.
+   */
+  hideAiReview?: boolean;
 }
 
 export interface TaskDevModePanelHandle {
@@ -158,6 +168,8 @@ export default forwardRef<TaskDevModePanelHandle, TaskDevModePanelProps>(functio
   initialReview,
   onReviewSaved,
   onChangeReviewComplete,
+  hideModeToggle = false,
+  hideAiReview = false,
 }: TaskDevModePanelProps, ref: React.Ref<TaskDevModePanelHandle>) {
   // --- collapse toggle ---
   const [expanded, setExpanded] = useState(!autoCollapsed);
@@ -926,21 +938,23 @@ export default forwardRef<TaskDevModePanelHandle, TaskDevModePanelProps>(functio
 
       {expanded && (
         <>
-      {/* Mode toggle */}
-      <div className="detail-devmode-toggle">
-        <button
-          className={`btn btn-sm ${devMode === 'script' ? 'btn-primary' : 'btn-secondary'}`}
-          onClick={() => setDevMode('script')}
-        >
-          Script
-        </button>
-        <button
-          className={`btn btn-sm ${devMode === 'plugin' ? 'btn-primary' : 'btn-secondary'}`}
-          onClick={() => setDevMode('plugin')}
-        >
-          Plugin
-        </button>
-      </div>
+      {/* Mode toggle — hidden when the parent already controls mode via defaultMode */}
+      {!hideModeToggle && (
+        <div className="detail-devmode-toggle">
+          <button
+            className={`btn btn-sm ${devMode === 'script' ? 'btn-primary' : 'btn-secondary'}`}
+            onClick={() => setDevMode('script')}
+          >
+            Script
+          </button>
+          <button
+            className={`btn btn-sm ${devMode === 'plugin' ? 'btn-primary' : 'btn-secondary'}`}
+            onClick={() => setDevMode('plugin')}
+          >
+            Plugin
+          </button>
+        </div>
+      )}
 
       {devMode === 'plugin' ? (
         <>
@@ -1088,8 +1102,8 @@ export default forwardRef<TaskDevModePanelHandle, TaskDevModePanelProps>(functio
         </button>
       )}
 
-      {/* AI Review — shown when reviewer configs are available */}
-      {allReviewers.length > 0 && (
+      {/* AI Review — hidden when the parent surfaces this inside Assistant Tools */}
+      {!hideAiReview && allReviewers.length > 0 && (
         <button
           className="btn btn-secondary btn-sm btn-full"
           onClick={handleOpenReviewModal}

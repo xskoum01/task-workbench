@@ -3671,40 +3671,56 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
           )}
 
 
-          {/* BRANCH + TARGET FILE — quick-open buttons for the artifact and repository */}
+          {/* BRANCH + TARGET FILE — branch selector, plugin/script target, open buttons */}
           {(resolvedArtifactForAiKit || repoRootForGit || hasRepo || (effectiveMode === 'developer' && plan.requiresDevTools && (hasRepo || hasVscodePath))) && (
             <div className="detail-action-group">
               <div className="detail-action-group-label">
-                {plan.targetKind === 'plugin' ? 'Plugin file' : plan.targetKind === 'script' ? 'Script file' : 'Repository'}
+                {plan.targetKind === 'plugin' ? 'Plugin file' : plan.targetKind === 'script' ? 'Script file' : 'Branch + Target file'}
               </div>
-              <div className="detail-action-grid">
-                {effectiveMode === 'developer' && plan.requiresDevTools && plan.targetKind === 'plugin' && (
-                  <button
-                    className="btn btn-secondary btn-sm btn-full"
-                    onClick={() => devModePanelRef.current?.openPlugin()}
-                    title="Open plugin project in Visual Studio"
-                  >
-                    <Icon name="terminal" size={13} /> Open Plugin in Visual Studio
-                  </button>
-                )}
-                {effectiveMode === 'developer' && plan.requiresDevTools && plan.targetKind === 'script' && (
-                  <button
-                    className="btn btn-secondary btn-sm btn-full"
-                    onClick={() => devModePanelRef.current?.openScript()}
-                    title="Open script file in VS Code"
-                  >
-                    <Icon name="terminal" size={13} /> Open Script in VS Code
-                  </button>
-                )}
-                {(hasRepo || repoRootForGit) && (
+
+              {/* Dev setup controls: branch selector + plugin/script target selector + open buttons */}
+              {effectiveMode === 'developer' && (hasRepo || hasVscodePath) && plan.requiresDevTools && (
+                <TaskDevModePanel
+                  ref={devModePanelRef}
+                  task={task}
+                  customer={customer}
+                  pluginsDir={pluginsDir}
+                  repoRootForGit={repoRootForGit}
+                  defaultMode={devTarget.kind === 'plugin' ? 'plugin' : 'script'}
+                  scriptOpenPath={task.workflowSetup?.scriptPath ?? customer?.scriptFolder ?? effectiveVscodePath}
+                  onError={setFsError}
+                  autoCollapsed={false}
+                  hideModeToggle
+                  hideAiReview
+                  selectedPluginProject={selectedPluginProject}
+                  onSelectedPluginChange={handleSelectedPluginChange}
+                  onPluginProjectMissing={handlePluginProjectMissing}
+                  pluginRefreshTick={devPanelRefreshTick}
+                  reviewerConfigs={plan.requiresAiFileReview ? settings.aiReviewers : undefined}
+                  artifactPath={task.workflowSetup?.artifactPath}
+                  initialReview={task.aiFileReviews?.[0]}
+                  onReviewSaved={handleReviewSaved}
+                  onChangeReviewComplete={async (review) => {
+                    const existing = task.aiFileReviews ?? [];
+                    await updateTask(task.id, {
+                      aiFileReviews: [review, ...existing].slice(0, 5),
+                    });
+                    setFeedback('AI review complete');
+                  }}
+                />
+              )}
+
+              {/* Open Repository for non-dev or generic tasks */}
+              {!(effectiveMode === 'developer' && plan.requiresDevTools) && (hasRepo || repoRootForGit) && (
+                <div className="detail-action-grid">
                   <button
                     className="btn btn-secondary btn-sm btn-full"
                     onClick={() => handleOpenRepository(repoRootForGit ?? customer?.repositoryRoot)}
                   >
                     <Icon name="folder" size={13} /> Open Repository
                   </button>
-                )}
-              </div>
+                </div>
+              )}
             </div>
           )}
 
@@ -3989,38 +4005,6 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
                         </button>
                       </div>
                     )}
-                  </div>
-                )}
-
-                {/* Dev Tools — branch, plugin selector, mode toggle, AI review */}
-                {effectiveMode === 'developer' && (hasRepo || hasVscodePath) && plan.requiresDevTools && (
-                  <div style={{ marginTop: 8 }}>
-                    <TaskDevModePanel
-                      ref={devModePanelRef}
-                      task={task}
-                      customer={customer}
-                      pluginsDir={pluginsDir}
-                      repoRootForGit={repoRootForGit}
-                      defaultMode={devTarget.kind === 'plugin' ? 'plugin' : 'script'}
-                      scriptOpenPath={task.workflowSetup?.scriptPath ?? customer?.scriptFolder ?? effectiveVscodePath}
-                      onError={setFsError}
-                      autoCollapsed={true}
-                      selectedPluginProject={selectedPluginProject}
-                      onSelectedPluginChange={handleSelectedPluginChange}
-                      onPluginProjectMissing={handlePluginProjectMissing}
-                      pluginRefreshTick={devPanelRefreshTick}
-                      reviewerConfigs={plan.requiresAiFileReview ? settings.aiReviewers : undefined}
-                      artifactPath={task.workflowSetup?.artifactPath}
-                      initialReview={task.aiFileReviews?.[0]}
-                      onReviewSaved={handleReviewSaved}
-                      onChangeReviewComplete={async (review) => {
-                        const existing = task.aiFileReviews ?? [];
-                        await updateTask(task.id, {
-                          aiFileReviews: [review, ...existing].slice(0, 5),
-                        });
-                        setFeedback('AI review complete');
-                      }}
-                    />
                   </div>
                 )}
 
