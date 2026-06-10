@@ -139,7 +139,7 @@ export default function SettingsPage() {
     lastError?: string;
   } | null>(null);
 
-  type SettingsTab = 'general' | 'workspace' | 'ai' | 'crm' | 'm365';
+  type SettingsTab = 'general' | 'workspace' | 'ai' | 'crm' | 'm365' | 'aikit';
   const [activeTab, setActiveTab] = useState<SettingsTab>('general');
 
   type McpSetupTool = 'claude-code' | 'claude-desktop' | 'cursor' | 'vscode-copilot' | 'windsurf' | 'codex';
@@ -151,6 +151,7 @@ export default function SettingsPage() {
     { id: 'ai',        label: 'AI',             icon: 'search'         },
     { id: 'crm',       label: 'CRM Metadata',   icon: 'folder'         },
     { id: 'm365',      label: 'Microsoft 365',  icon: 'mail'           },
+    { id: 'aikit',     label: 'AI Kit',         icon: 'layers'         },
   ];
 
   useEffect(() => {
@@ -400,6 +401,70 @@ export default function SettingsPage() {
     if (activeTab !== 'crm') return;
     void refreshTaskMcpBridgeStatus();
   }, [activeTab]);
+
+  // --- AI Kit validation state ---------------------------------------------
+
+  const AI_KIT_REQUIRED_FILES = [
+    'AGENTS.md',
+    'ai-rules/crm-plugin-rules.md',
+    'ai-rules/crm-javascript-rules.md',
+    'ai-rules/crm-ribbon-rules.md',
+    'ai-rules/crm-other-rules.md',
+    'ai-rules/known-pr-review-comments.md',
+    'ai-rules/crm-code-review-checklist.md',
+    'prompts/pp-implement-crm-task.md',
+    'prompts/pp-review-diff.md',
+  ];
+
+  type AiKitValidationStatus = 'not-validated' | 'valid' | 'invalid';
+  const [aiKitValidationStatus, setAiKitValidationStatus] = useState<AiKitValidationStatus>('not-validated');
+  const [aiKitValidationMessage, setAiKitValidationMessage] = useState<string>('');
+  const [aiKitValidating, setAiKitValidating] = useState(false);
+
+  async function handleChooseAiKitFolder() {
+    try {
+      const picked = await tauriApi.pickFolder();
+      if (picked) {
+        set('powerPlatformAiKitPath', picked);
+        setAiKitValidationStatus('not-validated');
+        setAiKitValidationMessage('');
+      }
+    } catch (err) {
+      console.warn('pickFolder unavailable:', err);
+    }
+  }
+
+  async function handleValidateAiKit() {
+    const kitPath = draft.powerPlatformAiKitPath?.trim();
+    if (!kitPath) {
+      setAiKitValidationStatus('invalid');
+      setAiKitValidationMessage('Path is not set.');
+      return;
+    }
+    setAiKitValidating(true);
+    setAiKitValidationMessage('');
+    try {
+      const sep = kitPath.endsWith('/') || kitPath.endsWith('\\') ? '' : '/';
+      const missing: string[] = [];
+      for (const rel of AI_KIT_REQUIRED_FILES) {
+        const full = `${kitPath}${sep}${rel}`;
+        const exists = await tauriApi.checkPathExists(full).catch(() => false);
+        if (!exists) missing.push(rel);
+      }
+      if (missing.length === 0) {
+        setAiKitValidationStatus('valid');
+        setAiKitValidationMessage('All required files found.');
+      } else {
+        setAiKitValidationStatus('invalid');
+        setAiKitValidationMessage(`Missing: ${missing.join(', ')}`);
+      }
+    } catch (err) {
+      setAiKitValidationStatus('invalid');
+      setAiKitValidationMessage(String(err));
+    } finally {
+      setAiKitValidating(false);
+    }
+  }
 
   // Normalise to forward slashes for all snippet use.
   const taskMcpServerPath = (taskMcpBridge?.serverPath ?? 'mcp/task-workbench-mcp.mjs').replace(/\\/g, '/');
@@ -1416,6 +1481,97 @@ export default function SettingsPage() {
                 </p>
               </SettingsBlock>
             )}
+          </>
+        )}
+
+        {/* ── Power Platform AI Kit ────────────────────────────────────────── */}
+        {activeTab === 'aikit' && (
+          <>
+            <SettingsBlock
+              icon="layers"
+              title="Power Platform AI Kit"
+              description="Local Power Platform AI Kit repository path — source of truth for CRM development rules"
+            >
+              <SettingsField label="Repository path">
+                <div style={{ display: 'flex', gap: 6, alignItems: 'center', flexWrap: 'wrap' }}>
+                  <input
+                    className="form-input"
+                    type="text"
+                    placeholder="C:\repos\power-platform-ai-kit"
+                    value={draft.powerPlatformAiKitPath ?? ''}
+                    onChange={(e) => {
+                      set('powerPlatformAiKitPath', e.target.value || undefined);
+                      setAiKitValidationStatus('not-validated');
+                      setAiKitValidationMessage('');
+                    }}
+                    style={{ flex: 1, minWidth: 260 }}
+                  />
+                  <button
+                    className="btn btn-ghost btn-sm"
+                    type="button"
+                    onClick={handleChooseAiKitFolder}
+                    title="Browse for folder"
+                  >
+                    <Icon name="folder" size={13} /> Browse
+                  </button>
+                  {draft.powerPlatformAiKitPath && (
+                    <button
+                      className="btn btn-ghost btn-sm"
+                      type="button"
+                      onClick={() => tauriApi.openPath(draft.powerPlatformAiKitPath!).catch(() => {})}
+                      title="Open in file explorer"
+                    >
+                      Open
+                    </button>
+                  )}
+                </div>
+              </SettingsField>
+
+              <div className="settings-action-row" style={{ marginTop: 8 }}>
+                <button
+                  className="btn btn-secondary btn-sm"
+                  onClick={handleValidateAiKit}
+                  disabled={aiKitValidating || !draft.powerPlatformAiKitPath?.trim()}
+                >
+                  {aiKitValidating ? <><span className="btn-spinner" /> Validating…</> : 'Validate'}
+                </button>
+                {aiKitValidationStatus !== 'not-validated' && (
+                  <span
+                    className={`repo-status-badge ${
+                      aiKitValidationStatus === 'valid' ? 'repo-status-linked' : 'repo-status-missing'
+                    }`}
+                  >
+                    {aiKitValidationStatus === 'valid' ? 'Valid kit' : 'Invalid kit'}
+                  </span>
+                )}
+              </div>
+
+              {aiKitValidationMessage && (
+                <div
+                  className="settings-field-hint"
+                  style={{
+                    marginTop: 6,
+                    color: aiKitValidationStatus === 'valid' ? 'var(--color-done, #3fb950)' : 'var(--color-blocked, #e05555)',
+                  }}
+                >
+                  {aiKitValidationMessage}
+                </div>
+              )}
+
+              {!draft.powerPlatformAiKitPath && (
+                <p className="settings-hint">
+                  Set the path to the local Power Platform AI Kit repository. Used by Implement with AI Kit,
+                  Review Diff with AI Kit, and Apply AI Review Fixes actions.
+                </p>
+              )}
+
+              <div className="settings-field-hint" style={{ marginTop: 8 }}>
+                Required files: AGENTS.md, ai-rules/crm-plugin-rules.md, ai-rules/crm-javascript-rules.md,
+                ai-rules/crm-ribbon-rules.md, ai-rules/crm-other-rules.md,
+                ai-rules/known-pr-review-comments.md, ai-rules/crm-code-review-checklist.md,
+                prompts/pp-implement-crm-task.md, prompts/pp-review-diff.md
+              </div>
+            </SettingsBlock>
           </>
         )}
 

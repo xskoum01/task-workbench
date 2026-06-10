@@ -29,6 +29,7 @@ const READ_ONLY_TOOL_NAMES = new Set([
   'get_pr_review_state',
   'get_next_recommended_step',
   'prepare_commit_for_task',
+  'get_power_platform_ai_kit_status',
 ]);
 
 const TOOL_DEFINITIONS = [
@@ -637,6 +638,19 @@ const TOOL_DEFINITIONS = [
     },
   },
   {
+    name: 'get_power_platform_ai_kit_status',
+    description:
+      'Read-only. Returns the Power Platform AI Kit configuration status: whether a kit path is configured, ' +
+      'whether all required rule files are present, and which files are available. ' +
+      'Does NOT call AI, modify files, or perform any write action. ' +
+      'Use this to check if AI Kit integration is available before planning AI-assisted implementation or review steps.',
+    inputSchema: {
+      type: 'object',
+      properties: {},
+      additionalProperties: false,
+    },
+  },
+  {
     name: 'mark_testing_confirmed_prepare_commit',
     description:
       'WRITE (local task state only) — marks consultant testing as confirmed and sets the next step ' +
@@ -741,6 +755,25 @@ async function resolveTasksFile() {
   }
   const first = defaultDataDirCandidates()[0];
   return first ? path.join(first, 'tasks.json') : undefined;
+}
+
+async function resolveSettingsFile() {
+  for (const dir of defaultDataDirCandidates()) {
+    const filePath = path.join(dir, 'settings.json');
+    if (await fileExists(filePath)) return filePath;
+  }
+  return undefined;
+}
+
+async function loadSettings() {
+  const settingsFile = await resolveSettingsFile();
+  if (!settingsFile) return null;
+  try {
+    const raw = await fs.readFile(settingsFile, 'utf8');
+    return JSON.parse(raw);
+  } catch {
+    return null;
+  }
 }
 
 async function loadTasks() {
@@ -1277,6 +1310,42 @@ async function callToolFallback(name, args = {}) {
     case 'get_next_recommended_step': {
       const task = getTaskById(tasks, args.id);
       return task ? { ...common, taskId: task.id, recommendation: nextRecommendedStep(task) } : { ...common, error: `Task not found: ${args.id}` };
+    }
+    case 'get_power_platform_ai_kit_status': {
+      const settings = await loadSettings();
+      const kitPath = (settings?.powerPlatformAiKitPath ?? '').trim();
+      if (!kitPath) {
+        return { ...common, configured: false, kitPath: null, valid: false, statusMessage: 'Power Platform AI Kit path is not configured.' };
+      }
+      const requiredFiles = [
+        'AGENTS.md',
+        'ai-rules/crm-plugin-rules.md',
+        'ai-rules/crm-javascript-rules.md',
+        'ai-rules/crm-ribbon-rules.md',
+        'ai-rules/crm-other-rules.md',
+        'ai-rules/known-pr-review-comments.md',
+        'ai-rules/crm-code-review-checklist.md',
+        'prompts/pp-implement-crm-task.md',
+        'prompts/pp-review-diff.md',
+      ];
+      const normalised = kitPath.replace(/[\\/]+$/, '').replace(/\\/g, '/');
+      const fileStatus = await Promise.all(
+        requiredFiles.map(async (rel) => {
+          const full = path.join(normalised.replace(/\//g, path.sep), rel);
+          return { file: rel, present: await fileExists(full) };
+        }),
+      );
+      const missingFiles = fileStatus.filter((f) => !f.present).map((f) => f.file);
+      const valid = missingFiles.length === 0;
+      return {
+        ...common,
+        configured: true,
+        kitPath,
+        valid,
+        missingFiles,
+        availableFiles: fileStatus.filter((f) => f.present).map((f) => f.file),
+        statusMessage: valid ? 'Valid kit — all required files found.' : `Invalid kit: missing ${missingFiles.join(', ')}`,
+      };
     }
     default:
       throw new Error(`Tool '${name}' is not available in read-only fallback mode.`);

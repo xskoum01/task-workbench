@@ -85,8 +85,16 @@ import {
   type CrmExternalExecutionPreview,
 } from '../lib/crmDeveloperWorkflow';
 import CrmExecutionPreviewModal from './CrmExecutionPreviewModal';
+import AiKitActionsPanel, { type AiKitActionsPanelHandle } from './AiKitActionsPanel';
 import { resolveTaskDevTarget, getPluginsDir } from '../lib/resolveTaskDevTarget';
+import {
+  detectTaskKindFromTask as detectAiKitTaskKind,
+  loadAiKitContext,
+  buildDiffReviewInstructions as buildAiKitDiffReviewInstructions,
+  type PowerPlatformAiKitContext,
+} from '../lib/powerPlatformAiKit';
 import TaskModeSwitch from './TaskModeSwitch';
+import { getAiKitWorkflowState, getAiKitActionLabel } from '../lib/aiKitWorkflow';
 import { inferTaskMode } from '../lib/taskMode';
 import { BUCKET_META, computePlanning, effectiveBucket } from '../lib/planning';
 import { isOverdue, formatRelativeDate } from '../lib/dates';
@@ -725,6 +733,11 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
   const [showStartDevModal, setShowStartDevModal] = useState(false);
   // Testing actions modal
   const [showTestingActionsModal, setShowTestingActionsModal] = useState(false);
+  // AI Kit testing gate — warning shown before moving to consultant testing when review is missing/failed.
+  const [aiKitTestingGate, setAiKitTestingGate] = useState<{
+    severity: 'fail' | 'warn' | 'no-review';
+    onConfirm: () => Promise<void>;
+  } | null>(null);
   // Git commit modal
   const [showGitCommitModal, setShowGitCommitModal] = useState(false);
   // When true, GitCommitModal was opened from the Testing → Prepare commit guided flow
@@ -775,7 +788,6 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
   const [showCrmVerificationModal, setShowCrmVerificationModal] = useState(false);
   const [showPrimarchVerifyModal, setShowPrimarchVerifyModal] = useState(false);
   const [showAdvancedWorkflow, setShowAdvancedWorkflow]       = useState(false);
-  const [showPhaseActions, setShowPhaseActions]               = useState(false);
   const [primarchVerifySteps, setPrimarchVerifySteps] = useState<PrimarchVerifyStep[]>(createPrimarchVerifySteps());
   const [primarchVerifyResult, setPrimarchVerifyResult] = useState<CrmVerificationReport | null>(null);
   const [primarchVerifyError, setPrimarchVerifyError] = useState<string | null>(null);
@@ -793,6 +805,7 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
   const primarchActionBusyRef = useRef(false);
   const primarchVerifyIgnoreResultRef = useRef(false);
   const primarchVerifyRunIdRef = useRef(0);
+  const aiKitPanelRef = useRef<AiKitActionsPanelHandle>(null);
 
   useEffect(() => {
     setPrimarchActionLoading(null);
@@ -1495,6 +1508,26 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
   const plan = buildTaskWorkflowPlan(task, heuristicDevTarget.kind);
   const { mode: effectiveMode } = inferTaskMode(task);
 
+  // AI Kit guided workflow state — derived from task notes, reviews, and settings.
+  const resolvedArtifactForAiKit = task.workflowSetup?.artifactPath ?? task.workflowSetup?.scriptPath;
+  const aiKitWorkflowState = getAiKitWorkflowState(
+    task,
+    settings?.powerPlatformAiKitPath,
+    resolvedArtifactForAiKit,
+  );
+
+  // When in Development and AI Kit has a recommendation, override the stepper label.
+  const aiKitStepperOverride =
+    (task.status === 'in-progress' && plan.requiresDevTools && aiKitWorkflowState.recommendedAction)
+      ? getAiKitActionLabel(aiKitWorkflowState.recommendedAction)
+      : undefined;
+
+  // Effective workflow action — AI Kit recommendation takes precedence during Development.
+  const effectiveWorkflowAction =
+    (task.status === 'in-progress' && plan.requiresDevTools && aiKitWorkflowState.recommendedAction)
+      ? aiKitWorkflowState.recommendedAction
+      : plan.currentAction;
+
   async function handleSetMode(mode: 'developer' | 'general') {
     await updateTask(task.id, { taskMode: mode });
   }
@@ -1911,6 +1944,28 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
     setFeedback('Moved to consultant testing');
   }
 
+  /**
+   * Gated version of handleMarkWaitingForConsultantTesting.
+   * When AI Kit is configured and the latest review is missing, WARN, or FAIL,
+   * shows a warning before proceeding.
+   */
+  async function handleContinueToTestingWithGate() {
+    if (aiKitWorkflowState.isConfigured) {
+      const v = aiKitWorkflowState.latestReviewVerdict;
+      const noReview = !aiKitWorkflowState.latestReviewIsAiKit && aiKitWorkflowState.hasImplementationActivity;
+      const severity =
+        v === 'needs_changes' ? 'fail' :
+        v === 'comment'       ? 'warn' :
+        noReview              ? 'no-review' :
+        null;
+      if (severity) {
+        setAiKitTestingGate({ severity, onConfirm: handleMarkWaitingForConsultantTesting });
+        return;
+      }
+    }
+    await handleMarkWaitingForConsultantTesting();
+  }
+
   // --- Testing phase actions (from Testing step click) ---
 
   /** Moves the task back to active development from consultant testing. */
@@ -2318,6 +2373,18 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
       const dvReport = task.crmVerificationReports?.[0];
       const buildChk = task.implementationVerification?.buildCheck;
 
+      // ¦¦ AI Kit context (optional, falls back to built-in rules) ¦¦¦¦¦¦¦¦¦¦¦¦
+      let aiKitCtx: PowerPlatformAiKitContext | null = null;
+      const aiKitPath = settings?.powerPlatformAiKitPath?.trim();
+      if (aiKitPath) {
+        try {
+          const taskKind = detectAiKitTaskKind(task);
+          aiKitCtx = await loadAiKitContext(aiKitPath, taskKind, true, true);
+        } catch {
+          // AI Kit not configured or invalid — fall back to built-in rules silently
+        }
+      }
+
       // ¦¦ Repo root candidates ¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦
       const repoCandidates = [
         setup?.repositoryRoot,
@@ -2504,8 +2571,11 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
           '- Chování odpovídá původnímu požadavku a technickému plánu',
         ].join('\n');
 
-        const reviewerName = isScript ? 'Script Internal Check' : 'Plugin Internal Check';
-        const instructions = buildInstructions(modeLabel, gitInfo) + diffRules;
+        const reviewerName = aiKitCtx
+          ? (isScript ? 'Script AI Kit Review' : 'Plugin AI Kit Review')
+          : (isScript ? 'Script Internal Check' : 'Plugin Internal Check');
+        const aiKitPrefix = aiKitCtx ? buildAiKitDiffReviewInstructions(aiKitCtx) + '\n\n' : '';
+        const instructions = aiKitPrefix + buildInstructions(modeLabel, gitInfo) + diffRules;
         const taskCtx = `${task.title}. ${gitCtx.summary}`;
         const fileName = `local changes (${gitCtx.currentBranch} › ${gitCtx.baseBranch})`;
 
@@ -2585,8 +2655,11 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
           '7. Depth/recursion guard kde potřeba',
           '8. Implementace odpovídá popisu úkolu',
         ].join('\n');
-        const fileReviewerName = isScript ? 'Script Internal Check' : 'Plugin Internal Check';
-        const instructions = buildInstructions(modeLabel) + fileRules;
+        const fileReviewerName = aiKitCtx
+          ? (isScript ? 'Script AI Kit Review' : 'Plugin AI Kit Review')
+          : (isScript ? 'Script Internal Check' : 'Plugin Internal Check');
+        const fileAiKitPrefix = aiKitCtx ? buildAiKitDiffReviewInstructions(aiKitCtx) + '\n\n' : '';
+        const instructions = fileAiKitPrefix + buildInstructions(modeLabel) + fileRules;
 
         const result = await tauriApi.runAiFileReview(
           artifactPath,
@@ -2660,7 +2733,7 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
    * Uses the centralized workflow plan so the action matches the stage.
    */
   function runCurrentStageAction() {
-    switch (plan.currentAction) {
+    switch (effectiveWorkflowAction) {
       case 'analyze':
         // For developer workflows (any non-general workflowKind) with status 'new':
         // always show the setup modal so the user can re-confirm the target before analyzing.
@@ -2675,11 +2748,14 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
           handleAnalyze();
         }
         break;
-      case 'confirm-setup':          setShowSetupModal(true);  break;
-      case 'start-development':      handleStartDevelopment(); break;
-      case 'verify-implementation':  handleVerifyImplementation(); break;
-      case 'mark-waiting-review':    handleMarkWaitingForReview(); break;
-      case 'mark-done':      handleMarkDone();          break;
+      case 'confirm-setup':           setShowSetupModal(true);  break;
+      case 'start-development':       handleStartDevelopment(); break;
+      case 'implement-with-ai-kit':   aiKitPanelRef.current?.startImplement(); break;
+      case 'review-diff-with-ai-kit': aiKitPanelRef.current?.startReviewDiff(); break;
+      case 'apply-ai-review-fixes':   aiKitPanelRef.current?.startApplyFixes(); break;
+      case 'verify-implementation':   handleVerifyImplementation(); break;
+      case 'mark-waiting-review':     handleMarkWaitingForReview(); break;
+      case 'mark-done':               handleMarkDone();          break;
       default: break;
     }
   }
@@ -2802,7 +2878,6 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
   const hasScript  = !!customer?.scriptFolder;
   // Show VS Code button whenever any path is resolvable (including CRM folder)
   const hasVscodePath = !!effectiveVscodePath;
-  const hasAnyPath = hasRepo || hasPlugin || hasScript || hasVscodePath;
   const primarchMetadataConfigured = !!settings.crmMetadataEnabled
     && !!(settings.primarchMcpCommand ?? '').trim()
     && !!(settings.primarchMcpArgs ?? '').trim();
@@ -2880,6 +2955,7 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
           onRunCurrentAction={runCurrentStageAction}
           isRunning={!!aiLoading}
           onTestingAction={() => setShowTestingActionsModal(true)}
+          actionLabelOverride={aiKitStepperOverride}
         />
 
         {/* ---- Two-column inner layout ---- */}
@@ -3547,36 +3623,41 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
             <div className="detail-fs-error">! {aiError}</div>
           )}
 
-          {/* WORKFLOW — primary actions: Analyze + Done */}
-          <div className="detail-action-group">
-            <div className="detail-action-group-label">Workflow</div>
-            <div className="detail-action-grid">
-              {task.status === 'new' && (
-                <button
-                  className="btn btn-primary btn-sm"
-                  onClick={runCurrentStageAction}
-                  disabled={!!aiLoading}
-                  title={plan.isDeveloperAwaitingSetup ? 'Confirm developer setup before analysis' : 'Analyze task with AI'}
-                >
-                  {aiLoading === 'analyze'
-                    ? <><span className="btn-spinner" /> Analysing…</>
-                    : <><Icon name="search" size={13} /> {plan.isDeveloperAwaitingSetup ? 'Confirm Setup' : 'Analyze'}</>}
-                </button>
-              )}
-              {task.status !== 'new' && task.status !== 'done' && (
-                <button
-                  className="btn btn-secondary btn-sm"
-                  onClick={handleAnalyze}
-                  disabled={!!aiLoading}
-                  title="Run AI analysis again"
-                >
-                  {aiLoading === 'analyze'
-                    ? <><span className="btn-spinner" /> Analysing…</>
-                    : <><Icon name="search" size={13} /> Analyze</>}
-                </button>
-              )}
-
-              {task.status !== 'done' && (
+          {/* WORKFLOW — primary action driven by process flow + AI Kit recommendation */}
+          {task.status !== 'done' && (
+            <div className="detail-action-group">
+              <div className="detail-action-group-label">Workflow</div>
+              <div className="detail-action-grid">
+                {effectiveWorkflowAction !== 'none' && (
+                  <button
+                    className="btn btn-primary btn-sm"
+                    onClick={runCurrentStageAction}
+                    disabled={!!aiLoading}
+                    title={
+                      plan.isDeveloperAwaitingSetup && effectiveWorkflowAction === 'analyze'
+                        ? 'Confirm developer setup before analysis'
+                        : `Run: ${aiKitStepperOverride ?? plan.currentActionLabel}`
+                    }
+                  >
+                    {aiLoading === 'analyze'
+                      ? <><span className="btn-spinner" /> Analysing…</>
+                      : <>
+                          <Icon name={
+                            effectiveWorkflowAction === 'analyze' ? 'search'
+                            : effectiveWorkflowAction === 'confirm-setup' ? 'settings'
+                            : effectiveWorkflowAction === 'start-development' ? 'play'
+                            : effectiveWorkflowAction === 'implement-with-ai-kit' ? 'layers'
+                            : effectiveWorkflowAction === 'review-diff-with-ai-kit' ? 'search'
+                            : effectiveWorkflowAction === 'apply-ai-review-fixes' ? 'check'
+                            : effectiveWorkflowAction === 'verify-implementation' ? 'check'
+                            : effectiveWorkflowAction === 'mark-waiting-review' ? 'pause'
+                            : 'check'
+                          } size={13} />
+                          {' '}{aiKitStepperOverride ?? plan.currentActionLabel}
+                        </>
+                    }
+                  </button>
+                )}
                 <button
                   className="btn btn-secondary btn-sm"
                   onClick={handleMarkDone}
@@ -3585,195 +3666,44 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
                 >
                   <Icon name="check" size={13} /> Done
                 </button>
-              )}
-            </div>
-          </div>
-
-          {/* PHASE ACTIONS — secondary transitions, collapsed by default */}
-          {task.status !== 'done' && (
-            <div className="detail-action-group">
-              <button
-                className="td-advanced-btn"
-                onClick={() => setShowPhaseActions((v) => !v)}
-              >
-                {showPhaseActions ? '^ Hide phase actions' : 'ˇ More phase actions'}
-              </button>
-              {showPhaseActions && (
-                <div className="detail-action-grid" style={{ marginTop: 4 }}>
-                  {effectiveMode === 'developer' && (
-                    <button
-                      className="btn btn-secondary btn-sm"
-                      onClick={() => setShowSetupModal(true)}
-                      disabled={!!aiLoading}
-                      title="Review or adjust workflow setup"
-                    >
-                      <Icon name="settings" size={13} /> Confirm Setup
-                    </button>
-                  )}
-                  {task.status === 'analyzed' && plan.workflowKind !== 'general' && (
-                    <button
-                      className="btn btn-secondary btn-sm"
-                      onClick={handleStartDevelopment}
-                      disabled={!!aiLoading}
-                      title="Move the task into Development without opening external tools"
-                    >
-                      <Icon name="play" size={13} /> Start Development
-                    </button>
-                  )}
-                  {task.status === 'in-progress' && (plan.targetKind === 'plugin' || plan.targetKind === 'script') && (
-                    <button
-                      className="btn btn-secondary btn-sm"
-                      onClick={handleVerifyImplementation}
-                      disabled={!!aiLoading}
-                      title="Open implementation verification checks before code review"
-                    >
-                      <Icon name="check" size={13} /> Verify Implementation
-                    </button>
-                  )}
-                  {task.status === 'in-progress' && (
-                    <button
-                      className="btn btn-secondary btn-sm"
-                      onClick={handleMarkWaitingForReview}
-                      disabled={!!aiLoading}
-                      title="Mark this task as waiting for code review"
-                    >
-                      <Icon name="pause" size={13} /> Waiting for Code Review
-                    </button>
-                  )}
-                  {task.waitingState === 'consultant-testing' && (
-                    <button
-                      className="btn btn-secondary btn-sm"
-                      onClick={() => handleStatusChange('in-progress')}
-                      disabled={!!aiLoading}
-                      title="Move this task back to active development"
-                    >
-                      <Icon name="play" size={13} /> Back to Development
-                    </button>
-                  )}
-                  <button
-                    className="btn btn-secondary btn-sm"
-                    onClick={handleMarkPrComments}
-                    disabled={!!aiLoading}
-                    title="Mark review comments as active work"
-                  >
-                    <Icon name="message-square" size={13} /> PR Comments
-                  </button>
-                </div>
-              )}
+              </div>
             </div>
           )}
 
-          {/* ASSISTANT TOOLS */}
-          {effectiveMode === 'developer' && plan.requiresDevTools && (
-            <div className="detail-action-group">
-              <div className="detail-action-group-label">Assistant Tools</div>
-              <div className="detail-action-grid">
-                <button
-                  className={`btn btn-sm ${plan.draftIsPrimaryAction ? 'btn-primary' : 'btn-secondary'}`}
-                  onClick={handleGenerateDraft}
-                  disabled={!!aiLoading}
-                  title={devTarget.kind === 'plugin'
-                    ? 'Generate C# plugin class draft and open a preview'
-                    : plan.draftIsPrimaryAction
-                      ? 'Generate a script draft and open a preview'
-                      : 'Generate a patch suggestion and open a preview'}
-                >
-                  {aiLoading === 'draft'
-                    ? <><span className="btn-spinner" /> Generating…</>
-                    : <><Icon name="layers" size={13} /> {plan.draftIsPrimaryAction ? 'Generate Draft' : 'Patch Suggestion'}</>}
-                </button>
 
-                {skeletonPreview && (
+          {/* BRANCH + TARGET FILE — quick-open buttons for the artifact and repository */}
+          {(resolvedArtifactForAiKit || repoRootForGit || hasRepo || (effectiveMode === 'developer' && plan.requiresDevTools && (hasRepo || hasVscodePath))) && (
+            <div className="detail-action-group">
+              <div className="detail-action-group-label">
+                {plan.targetKind === 'plugin' ? 'Plugin file' : plan.targetKind === 'script' ? 'Script file' : 'Repository'}
+              </div>
+              <div className="detail-action-grid">
+                {effectiveMode === 'developer' && plan.requiresDevTools && plan.targetKind === 'plugin' && (
                   <button
-                    className="btn btn-secondary btn-sm"
-                    onClick={handleApplyDraft}
-                    disabled={!!aiLoading}
-                    title="Open the draft preview where Save to File is explicit"
+                    className="btn btn-secondary btn-sm btn-full"
+                    onClick={() => devModePanelRef.current?.openPlugin()}
+                    title="Open plugin project in Visual Studio"
                   >
-                    <Icon name="check" size={13} /> Preview / Apply Draft
+                    <Icon name="terminal" size={13} /> Open Plugin in Visual Studio
                   </button>
                 )}
-
-                <button
-                  className="btn btn-secondary btn-sm"
-                  onClick={() => devModePanelRef.current?.openReviewModal()}
-                  disabled={!!aiLoading}
-                  title="Open AI review tools without changing workflow state"
-                >
-                  <Icon name="search" size={13} /> Run AI Review
-                </button>
-
-              </div>
-            </div>
-          )}
-
-          {/* PRIMARCH */}
-          {effectiveMode === 'developer' && plan.requiresDevTools && (
-            <div className="detail-action-group">
-              <div className="detail-action-group-label">Primarch</div>
-              <div style={{ marginBottom: 8 }}>
-                <label className="form-label" htmlFor="primarch-primary-entity-override">Primary entity override (optional)</label>
-                <input
-                  id="primarch-primary-entity-override"
-                  className="form-input"
-                  type="text"
-                  placeholder="account, contact, nvr_accountcompanyrelation"
-                  value={primarchPrimaryEntityOverride}
-                  onChange={(e) => setPrimarchPrimaryEntityOverride(e.target.value)}
-                />
-                <div className="settings-field-hint" style={{ marginTop: 4 }}>
-                  Used only for this task verification run unless you explicitly save it in task setup.
-                </div>
-              </div>
-              <div className="detail-action-grid">
-                <button
-                  className="btn btn-secondary btn-sm"
-                  onClick={handleGenerateCrmSkeleton}
-                  disabled={!!primarchActionLoading}
-                  title="Generate metadata-based CRM pseudo-code skeleton (read-only)"
-                >
-                  {primarchActionLoading === 'skeleton'
-                    ? <><span className="btn-spinner" /> Generating…</>
-                    : <><Icon name="layers" size={13} /> Generate CRM Skeleton</>}
-                </button>
-
-                <button
-                  className="btn btn-secondary btn-sm"
-                  onClick={handleVerifyAgainstCrm}
-                  disabled={!!primarchActionLoading || !settings.crmMetadataEnabled || !(settings.primarchMcpCommand ?? '').trim() || !(settings.primarchMcpArgs ?? '').trim()}
-                  title={(!settings.crmMetadataEnabled || !(settings.primarchMcpCommand ?? '').trim() || !(settings.primarchMcpArgs ?? '').trim())
-                    ? 'Configure and save CRM metadata assistant settings first.'
-                    : 'Verify current artifact references against CRM metadata (read-only)'}
-                >
-                  {primarchActionLoading === 'verify'
-                    ? <><span className="btn-spinner" /> Verifying…</>
-                    : <><Icon name="check" size={13} /> Verify against CRM</>}
-                </button>
-              </div>
-            </div>
-          )}
-
-          {/* SCRIPT ASSISTANT panel removed — draft generation now runs via service directly */}
-
-          {isPluginCreate && pluginsDir && (
-            <div className="detail-action-group">
-              <div className="detail-action-group-label">Plugin Project Helper</div>
-              {!selectedPluginProject && (
-                <div className="detail-devmode-hint" style={{ color: 'var(--color-warning, #d29922)', marginBottom: 6 }}>
-                  Plugin project was not found. Create it manually or use the helper below.
-                </div>
-              )}
-              <div className="detail-action-grid">
-                <button
-                  className="btn btn-secondary btn-sm"
-                  onClick={async () => {
-                    const folders = await tauriApi.listSubfolders(pluginsDir).catch(() => [] as string[]);
-                    setPluginProjectsForModal(folders);
-                    setShowCreatePlugin(true);
-                  }}
-                >
-                  <Icon name="folder" size={13} /> Create Plugin Project
-                </button>
+                {effectiveMode === 'developer' && plan.requiresDevTools && plan.targetKind === 'script' && (
+                  <button
+                    className="btn btn-secondary btn-sm btn-full"
+                    onClick={() => devModePanelRef.current?.openScript()}
+                    title="Open script file in VS Code"
+                  >
+                    <Icon name="terminal" size={13} /> Open Script in VS Code
+                  </button>
+                )}
+                {(hasRepo || repoRootForGit) && (
+                  <button
+                    className="btn btn-secondary btn-sm btn-full"
+                    onClick={() => handleOpenRepository(repoRootForGit ?? customer?.repositoryRoot)}
+                  >
+                    <Icon name="folder" size={13} /> Open Repository
+                  </button>
+                )}
               </div>
             </div>
           )}
@@ -3786,13 +3716,6 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
                 : task.adoContext?.type === 'work-item'
                   ? (task.adoContext.workItemUrl ?? null)
                   : null;
-            console.log(
-              `[ado-link] TaskDetail render check`,
-              `taskId=${task.id}`,
-              `adoType=${task.adoContext?.type ?? 'none'}`,
-              `prUrl=${task.adoContext?.prUrl ?? 'none'}`,
-              `resolvedUrl=${adoUrl ?? 'none'}`,
-            );
             if (!adoUrl) return null;
             return (
               <div className="detail-action-group">
@@ -3808,95 +3731,305 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
             );
           })()}
 
-          {/* FILESYSTEM — only rendered when the customer has at least one path */}
-          {hasAnyPath && (
+          {/* ASSISTANT TOOLS — collapsed by default, same <details>/<summary> pattern as Raw notes / Activity log */}
+          {effectiveMode === 'developer' && plan.requiresDevTools && (
             <div className="detail-action-group">
-              <div className="detail-action-group-label">Filesystem</div>
+              <details>
+                <summary style={{ cursor: 'pointer', userSelect: 'none' }}>
+                  <span className="detail-action-group-label" style={{ display: 'inline' }}>Assistant Tools</span>
+                </summary>
 
-              {hasRepo && (
-                <button
-                  className="btn btn-secondary btn-sm btn-full"
-                  onClick={() => handleOpenRepository(customer?.repositoryRoot)}
-                >
-                  <Icon name="folder" size={13} /> Open Repository
-                </button>
-              )}
+                {/* Phase Actions — secondary workflow transitions */}
+                {task.status !== 'done' && (
+                  <div style={{ marginTop: 8 }}>
+                    <div className="detail-action-group-label">Phase Actions</div>
+                    <div className="detail-action-grid">
+                      {task.status !== 'new' && effectiveWorkflowAction !== 'analyze' && (
+                        <button
+                          className="btn btn-secondary btn-sm"
+                          onClick={handleAnalyze}
+                          disabled={!!aiLoading}
+                          title="Run AI analysis again"
+                        >
+                          {aiLoading === 'analyze'
+                            ? <><span className="btn-spinner" /> Analysing…</>
+                            : <><Icon name="search" size={13} /> Re-analyze</>}
+                        </button>
+                      )}
+                      {effectiveMode === 'developer' && (
+                        <button
+                          className="btn btn-secondary btn-sm"
+                          onClick={() => setShowSetupModal(true)}
+                          disabled={!!aiLoading}
+                          title="Review or adjust workflow setup"
+                        >
+                          <Icon name="settings" size={13} /> Confirm Setup
+                        </button>
+                      )}
+                      {task.status === 'analyzed' && plan.workflowKind !== 'general' && (
+                        <button
+                          className="btn btn-secondary btn-sm"
+                          onClick={handleStartDevelopment}
+                          disabled={!!aiLoading}
+                          title="Move the task into Development without opening external tools"
+                        >
+                          <Icon name="play" size={13} /> Start Development
+                        </button>
+                      )}
+                      {task.status === 'in-progress' && (plan.targetKind === 'plugin' || plan.targetKind === 'script') && (
+                        <button
+                          className="btn btn-secondary btn-sm"
+                          onClick={handleVerifyImplementation}
+                          disabled={!!aiLoading}
+                          title="Open implementation verification checks before code review"
+                        >
+                          <Icon name="check" size={13} /> Verify Implementation
+                        </button>
+                      )}
+                      {task.status === 'in-progress' && (
+                        <button
+                          className="btn btn-secondary btn-sm"
+                          onClick={handleMarkWaitingForReview}
+                          disabled={!!aiLoading}
+                          title="Mark this task as waiting for code review"
+                        >
+                          <Icon name="pause" size={13} /> Waiting for Code Review
+                        </button>
+                      )}
+                      {task.waitingState === 'consultant-testing' && (
+                        <button
+                          className="btn btn-secondary btn-sm"
+                          onClick={() => handleStatusChange('in-progress')}
+                          disabled={!!aiLoading}
+                          title="Move this task back to active development"
+                        >
+                          <Icon name="play" size={13} /> Back to Development
+                        </button>
+                      )}
+                      <button
+                        className="btn btn-secondary btn-sm"
+                        onClick={handleMarkPrComments}
+                        disabled={!!aiLoading}
+                        title="Mark review comments as active work"
+                      >
+                        <Icon name="message-square" size={13} /> PR Comments
+                      </button>
+                      {repoRootForGit && (
+                        <button
+                          className="btn btn-secondary btn-sm"
+                          onClick={() => setShowGitCommitModal(true)}
+                          title="Stage files, review changes, and commit / push to the repository"
+                        >
+                          <Icon name="layers" size={13} /> Prepare Commit
+                        </button>
+                      )}
+                    </div>
+                  </div>
+                )}
 
-              {repoRootForGit ? (
-                <button
-                  className="btn btn-secondary btn-sm btn-full"
-                  onClick={() => setShowGitCommitModal(true)}
-                  title="Stage files, review changes, and commit / push to the repository"
-                >
-                  <Icon name="layers" size={13} /> Prepare Commit
-                </button>
-              ) : (
-                <div style={{ fontSize: 12, color: 'var(--color-text-muted)', padding: '2px 0' }}>
-                  Git repository not detected for this task.
+                {/* AI Code Tools: draft generation and review */}
+                <div style={{ marginTop: 8 }}>
+                  <div className="detail-action-group-label">AI Code Tools</div>
+                  <div className="detail-action-grid">
+                    <button
+                      className={`btn btn-sm ${plan.draftIsPrimaryAction ? 'btn-primary' : 'btn-secondary'}`}
+                      onClick={handleGenerateDraft}
+                      disabled={!!aiLoading}
+                      title={devTarget.kind === 'plugin'
+                        ? 'Generate C# plugin class draft and open a preview'
+                        : plan.draftIsPrimaryAction
+                          ? 'Generate a script draft and open a preview'
+                          : 'Generate a patch suggestion and open a preview'}
+                    >
+                      {aiLoading === 'draft'
+                        ? <><span className="btn-spinner" /> Generating…</>
+                        : <><Icon name="layers" size={13} /> {plan.draftIsPrimaryAction ? 'Generate Draft' : 'Patch Suggestion'}</>}
+                    </button>
+                    {skeletonPreview && (
+                      <button
+                        className="btn btn-secondary btn-sm"
+                        onClick={handleApplyDraft}
+                        disabled={!!aiLoading}
+                        title="Open the draft preview where Save to File is explicit"
+                      >
+                        <Icon name="check" size={13} /> Preview / Apply Draft
+                      </button>
+                    )}
+                    <button
+                      className="btn btn-secondary btn-sm"
+                      onClick={() => devModePanelRef.current?.openReviewModal()}
+                      disabled={!!aiLoading}
+                      title="Open AI review tools without changing workflow state"
+                    >
+                      <Icon name="search" size={13} /> Run AI Review
+                    </button>
+                  </div>
                 </div>
-              )}
 
-              {hasScript && (
-                <button
-                  className="btn btn-secondary btn-sm btn-full"
-                  onClick={() => handleOpenPath(customer?.scriptFolder, 'script folder')}
-                >
-                  <Icon name="file-text" size={13} /> Open Script Folder
-                </button>
-              )}
-
-              {effectiveMode === 'developer' && plan.isDeveloperAwaitingSetup && (
-                <div className="detail-dev-setup-prompt">
-                  <span className="detail-dev-setup-text">Choose Plugin or Script target to enable developer tools.</span>
-                  <button
-                    className="btn btn-secondary btn-sm"
-                    onClick={() => setShowSetupModal(true)}
-                  >
-                    Confirm developer setup
-                  </button>
+                {/* Primarch — CRM metadata tools */}
+                <div style={{ marginTop: 8 }}>
+                  <div className="detail-action-group-label">Primarch</div>
+                  <div style={{ marginBottom: 8 }}>
+                    <label className="form-label" htmlFor="primarch-primary-entity-override">Primary entity override (optional)</label>
+                    <input
+                      id="primarch-primary-entity-override"
+                      className="form-input"
+                      type="text"
+                      placeholder="account, contact, nvr_accountcompanyrelation"
+                      value={primarchPrimaryEntityOverride}
+                      onChange={(e) => setPrimarchPrimaryEntityOverride(e.target.value)}
+                    />
+                    <div className="settings-field-hint" style={{ marginTop: 4 }}>
+                      Used only for this task verification run unless you explicitly save it in task setup.
+                    </div>
+                  </div>
+                  <div className="detail-action-grid">
+                    <button
+                      className="btn btn-secondary btn-sm"
+                      onClick={handleGenerateCrmSkeleton}
+                      disabled={!!primarchActionLoading}
+                      title="Generate metadata-based CRM pseudo-code skeleton (read-only)"
+                    >
+                      {primarchActionLoading === 'skeleton'
+                        ? <><span className="btn-spinner" /> Generating…</>
+                        : <><Icon name="layers" size={13} /> Generate CRM Skeleton</>}
+                    </button>
+                    <button
+                      className="btn btn-secondary btn-sm"
+                      onClick={handleVerifyAgainstCrm}
+                      disabled={!!primarchActionLoading || !settings.crmMetadataEnabled || !(settings.primarchMcpCommand ?? '').trim() || !(settings.primarchMcpArgs ?? '').trim()}
+                      title={(!settings.crmMetadataEnabled || !(settings.primarchMcpCommand ?? '').trim() || !(settings.primarchMcpArgs ?? '').trim())
+                        ? 'Configure and save CRM metadata assistant settings first.'
+                        : 'Verify current artifact references against CRM metadata (read-only)'}
+                    >
+                      {primarchActionLoading === 'verify'
+                        ? <><span className="btn-spinner" /> Verifying…</>
+                        : <><Icon name="check" size={13} /> Verify against CRM</>}
+                    </button>
+                  </div>
                 </div>
-              )}
 
-              {effectiveMode === 'developer' && (hasRepo || hasVscodePath) && plan.requiresDevTools && (
-                <TaskDevModePanel
-                  ref={devModePanelRef}
-                  task={task}
-                  customer={customer}
-                  pluginsDir={pluginsDir}
-                  repoRootForGit={repoRootForGit}
-                  defaultMode={devTarget.kind === 'plugin' ? 'plugin' : 'script'}
-                  scriptOpenPath={task.workflowSetup?.scriptPath ?? customer?.scriptFolder ?? effectiveVscodePath}
-                  onError={setFsError}
-                  autoCollapsed={false}
-                  selectedPluginProject={selectedPluginProject}
-                  onSelectedPluginChange={handleSelectedPluginChange}
-                  onPluginProjectMissing={handlePluginProjectMissing}
-                  pluginRefreshTick={devPanelRefreshTick}
-                  reviewerConfigs={plan.requiresAiFileReview ? settings.aiReviewers : undefined}
-                  artifactPath={task.workflowSetup?.artifactPath}
-                  initialReview={task.aiFileReviews?.[0]}
-                  onReviewSaved={handleReviewSaved}
-                  onChangeReviewComplete={async (review) => {
-                    // Diff review completed — save the review only. Waiting for code review
-                    // is an explicit workflow state button.
-                    const existing = task.aiFileReviews ?? [];
-                    await updateTask(task.id, {
-                      aiFileReviews: [review, ...existing].slice(0, 5),
-                    });
-                    setFeedback('AI review complete');
-                  }}
-                />
-              )}
+                {/* AI Kit Actions */}
+                <div style={{ marginTop: 8 }}>
+                  <div className="detail-action-group-label">AI Kit Actions</div>
+                  {aiKitWorkflowState.isConfigured && task.status === 'in-progress' && (
+                    <div style={{
+                      fontSize: 11.5,
+                      color: aiKitWorkflowState.latestReviewVerdict === 'needs_changes'
+                        ? 'var(--color-blocked, #e05555)'
+                        : aiKitWorkflowState.latestReviewVerdict === 'comment'
+                        ? 'var(--color-warning, #d29922)'
+                        : aiKitWorkflowState.latestReviewVerdict === 'pass'
+                        ? 'var(--color-done, #3fb950)'
+                        : 'var(--text-muted)',
+                      marginBottom: 6,
+                      lineHeight: 1.4,
+                    }}>
+                      {aiKitWorkflowState.statusText}
+                    </div>
+                  )}
+                  <AiKitActionsPanel
+                    ref={aiKitPanelRef}
+                    task={task}
+                    customer={customer}
+                    aiKitPath={settings?.powerPlatformAiKitPath}
+                    repoRootForGit={repoRootForGit}
+                    artifactPath={task.workflowSetup?.artifactPath ?? task.workflowSetup?.scriptPath}
+                    onTaskUpdate={async (updates) => {
+                      await updateTask(task.id, updates);
+                    }}
+                    onError={(msg) => setFsError(msg)}
+                  />
+                </div>
 
-              {/* Filesystem error strip */}
-              {fsError && (
-                <div className="detail-fs-error">! {fsError}</div>
-              )}
+                {/* Plugin Project Helper */}
+                {isPluginCreate && pluginsDir && (
+                  <div style={{ marginTop: 8 }}>
+                    <div className="detail-action-group-label">Plugin Project Helper</div>
+                    {!selectedPluginProject && (
+                      <div className="detail-devmode-hint" style={{ color: 'var(--color-warning, #d29922)', marginBottom: 6 }}>
+                        Plugin project was not found. Create it manually or use the helper below.
+                      </div>
+                    )}
+                    <div className="detail-action-grid">
+                      <button
+                        className="btn btn-secondary btn-sm"
+                        onClick={async () => {
+                          const folders = await tauriApi.listSubfolders(pluginsDir).catch(() => [] as string[]);
+                          setPluginProjectsForModal(folders);
+                          setShowCreatePlugin(true);
+                        }}
+                      >
+                        <Icon name="folder" size={13} /> Create Plugin Project
+                      </button>
+                    </div>
+                  </div>
+                )}
+
+                {/* Filesystem: script folder and dev setup prompt */}
+                {(hasScript || plan.isDeveloperAwaitingSetup) && (
+                  <div style={{ marginTop: 8 }}>
+                    <div className="detail-action-group-label">Filesystem</div>
+                    {hasScript && (
+                      <button
+                        className="btn btn-secondary btn-sm btn-full"
+                        onClick={() => handleOpenPath(customer?.scriptFolder, 'script folder')}
+                      >
+                        <Icon name="file-text" size={13} /> Open Script Folder
+                      </button>
+                    )}
+                    {plan.isDeveloperAwaitingSetup && (
+                      <div className="detail-dev-setup-prompt">
+                        <span className="detail-dev-setup-text">Choose Plugin or Script target to enable developer tools.</span>
+                        <button
+                          className="btn btn-secondary btn-sm"
+                          onClick={() => setShowSetupModal(true)}
+                        >
+                          Confirm developer setup
+                        </button>
+                      </div>
+                    )}
+                  </div>
+                )}
+
+                {/* Dev Tools — branch, plugin selector, mode toggle, AI review */}
+                {effectiveMode === 'developer' && (hasRepo || hasVscodePath) && plan.requiresDevTools && (
+                  <div style={{ marginTop: 8 }}>
+                    <TaskDevModePanel
+                      ref={devModePanelRef}
+                      task={task}
+                      customer={customer}
+                      pluginsDir={pluginsDir}
+                      repoRootForGit={repoRootForGit}
+                      defaultMode={devTarget.kind === 'plugin' ? 'plugin' : 'script'}
+                      scriptOpenPath={task.workflowSetup?.scriptPath ?? customer?.scriptFolder ?? effectiveVscodePath}
+                      onError={setFsError}
+                      autoCollapsed={true}
+                      selectedPluginProject={selectedPluginProject}
+                      onSelectedPluginChange={handleSelectedPluginChange}
+                      onPluginProjectMissing={handlePluginProjectMissing}
+                      pluginRefreshTick={devPanelRefreshTick}
+                      reviewerConfigs={plan.requiresAiFileReview ? settings.aiReviewers : undefined}
+                      artifactPath={task.workflowSetup?.artifactPath}
+                      initialReview={task.aiFileReviews?.[0]}
+                      onReviewSaved={handleReviewSaved}
+                      onChangeReviewComplete={async (review) => {
+                        const existing = task.aiFileReviews ?? [];
+                        await updateTask(task.id, {
+                          aiFileReviews: [review, ...existing].slice(0, 5),
+                        });
+                        setFeedback('AI review complete');
+                      }}
+                    />
+                  </div>
+                )}
+
+              </details>
             </div>
           )}
 
-          {/* Show fs error even when no paths configured (e.g. from workflow actions) */}
-          {!hasAnyPath && fsError && (
+          {/* Filesystem errors from any action */}
+          {fsError && (
             <div className="detail-fs-error">! {fsError}</div>
           )}
 
@@ -4116,7 +4249,72 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
           }}
           onStartDevelopment={handleStartDevelopmentConfirmed}
           onClose={() => setShowStartDevModal(false)}
+          aiKitPath={settings?.powerPlatformAiKitPath}
+          onImplementWithAiKit={() => {
+            setShowStartDevModal(false);
+            // Start development first if not already in-progress, then trigger implement.
+            if (task.status !== 'in-progress') {
+              handleStartDevelopmentConfirmed().then(() => {
+                aiKitPanelRef.current?.startImplement();
+              }).catch(() => {});
+            } else {
+              aiKitPanelRef.current?.startImplement();
+            }
+          }}
         />
+      )}
+
+      {/* AI Kit testing gate — warning before moving to consultant testing */}
+      {aiKitTestingGate && (
+        <Modal
+          title="AI Kit Review Warning"
+          onClose={() => setAiKitTestingGate(null)}
+        >
+          <div style={{ fontSize: 13, lineHeight: 1.6 }}>
+            {aiKitTestingGate.severity === 'fail' && (
+              <p style={{ color: 'var(--color-blocked, #e05555)', margin: '0 0 12px 0' }}>
+                The latest AI Kit review returned <strong>FAIL</strong> — there are blocking issues
+                that should be fixed before sending to consultant testing.
+                Apply AI Review Fixes or resolve the issues manually first.
+              </p>
+            )}
+            {aiKitTestingGate.severity === 'warn' && (
+              <p style={{ color: 'var(--color-warning, #d29922)', margin: '0 0 12px 0' }}>
+                The latest AI Kit review returned <strong>WARN</strong> — there are warnings
+                that should be addressed. You may continue to testing, but consider applying fixes first.
+              </p>
+            )}
+            {aiKitTestingGate.severity === 'no-review' && (
+              <p style={{ color: 'var(--color-warning, #d29922)', margin: '0 0 12px 0' }}>
+                No AI Kit diff review has been run for the current changes.
+                Consider running "Review Diff with AI Kit" before sending to testing.
+              </p>
+            )}
+            <div style={{ display: 'flex', gap: 8 }}>
+              {aiKitTestingGate.severity === 'fail' ? (
+                <button
+                  className="btn btn-danger btn-sm"
+                  onClick={async () => { await aiKitTestingGate.onConfirm(); setAiKitTestingGate(null); }}
+                >
+                  Override — Continue to Testing
+                </button>
+              ) : (
+                <button
+                  className="btn btn-primary btn-sm"
+                  onClick={async () => { await aiKitTestingGate.onConfirm(); setAiKitTestingGate(null); }}
+                >
+                  Continue to Testing
+                </button>
+              )}
+              <button
+                className="btn btn-ghost btn-sm"
+                onClick={() => setAiKitTestingGate(null)}
+              >
+                Cancel
+              </button>
+            </div>
+          </div>
+        </Modal>
       )}
 
       {/* Git commit modal */}
@@ -4255,7 +4453,7 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
           onRunDataverseCheck={handleRunDataverseCheckForImpl}
           onRunAiCodeReview={handleRunAiCodeReviewForImpl}
           onUpdate={handleUpdateImplVerification}
-          onContinueToTesting={handleMarkWaitingForConsultantTesting}
+          onContinueToTesting={handleContinueToTestingWithGate}
           onProceedToReview={async () => {
             await handleMarkWaitingForReview();
             setShowImplVerifyModal(false);

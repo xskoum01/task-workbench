@@ -116,6 +116,10 @@ export interface TaskDevModePanelHandle {
    * Does NOT immediately run the review — user presses Run inside the modal.
    */
   openReviewModal(): Promise<void>;
+  /** Opens the selected plugin project in Visual Studio (same as the panel's own Open button). */
+  openPlugin(): Promise<void>;
+  /** Opens the script file/folder in VS Code (same as the panel's own Open button). */
+  openScript(): Promise<void>;
 }
 
 // ---------------------------------------------------------------------------
@@ -896,6 +900,12 @@ export default forwardRef<TaskDevModePanelHandle, TaskDevModePanelProps>(functio
     },
     openReviewModal: async () => {
       await handleOpenReviewModal();
+    },
+    openPlugin: async () => {
+      await handleOpenPlugin();
+    },
+    openScript: async () => {
+      await handleOpenScript();
     },
   }));
 

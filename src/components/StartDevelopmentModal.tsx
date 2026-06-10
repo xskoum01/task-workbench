@@ -63,6 +63,10 @@ interface Props {
   /** Moves task to in-progress + appends audit note. */
   onStartDevelopment: () => Promise<void>;
   onClose: () => void;
+  /** Absolute path to the AI Kit repo from settings — when set, shows AI Kit section. */
+  aiKitPath?: string;
+  /** Called when user clicks "Implement with AI Kit" in this modal. */
+  onImplementWithAiKit?: () => void;
 }
 
 // ---------------------------------------------------------------------------
@@ -117,16 +121,18 @@ export default function StartDevelopmentModal({
   onOpenPlugin, onGenerateDraft, onGenerateDraftGuided, onGenerateDraftAndOpen,
   onCreatePlugin, onProjectCreated,
   onStartDevelopment, onClose,
+  aiKitPath, onImplementWithAiKit,
 }: Props) {
-  const [pluginExists,      setPluginExists]      = useState<boolean | null>(null);
-  const [starting,          setStarting]          = useState(false);
-  const [opening,           setOpening]           = useState(false);
-  const [creating,          setCreating]          = useState(false);
-  const [creatingAndDraft,  setCreatingAndDraft]  = useState(false);
-  const [creatingAndOpen,   setCreatingAndOpen]   = useState(false);
-  const [progressMsg,       setProgressMsg]       = useState<string | null>(null);
-  const [createMsg,         setCreateMsg]         = useState<{ ok: boolean; text: string } | null>(null);
-  const [fsError,           setFsError]           = useState<string | null>(null);
+  const [pluginExists,        setPluginExists]        = useState<boolean | null>(null);
+  const [starting,            setStarting]            = useState(false);
+  const [opening,             setOpening]             = useState(false);
+  const [creating,            setCreating]            = useState(false);
+  const [creatingAndDraft,    setCreatingAndDraft]    = useState(false);
+  const [creatingAndOpen,     setCreatingAndOpen]     = useState(false);
+  const [creatingAndAiKit,    setCreatingAndAiKit]    = useState(false);
+  const [progressMsg,         setProgressMsg]         = useState<string | null>(null);
+  const [createMsg,           setCreateMsg]           = useState<{ ok: boolean; text: string } | null>(null);
+  const [fsError,             setFsError]             = useState<string | null>(null);
 
   // Check whether the selected plugin project folder exists on disk.
   useEffect(() => {
@@ -236,6 +242,20 @@ export default function StartDevelopmentModal({
     }
   }
 
+  // ── Create + Implement with AI Kit ───────────────────────────────────────
+  async function handleCreateAndImplementWithAiKit() {
+    if (!onImplementWithAiKit) return;
+    if (isPlugin && pluginExists !== true) {
+      setCreatingAndAiKit(true);
+      setCreateMsg(null);
+      const ok = await createProjectNow();
+      setCreatingAndAiKit(false);
+      if (!ok) return;
+    }
+    onImplementWithAiKit();
+    onClose();
+  }
+
   // ── Existing action handlers ──────────────────────────────────────────────
   async function handleStartDev() {
     setStarting(true);
@@ -265,7 +285,7 @@ export default function StartDevelopmentModal({
   }
 
   // ── Render ────────────────────────────────────────────────────────────────
-  const anyBusy = creating || creatingAndDraft || creatingAndOpen || starting || opening;
+  const anyBusy = creating || creatingAndDraft || creatingAndOpen || creatingAndAiKit || starting || opening;
 
   return (
     <Modal
@@ -393,6 +413,26 @@ export default function StartDevelopmentModal({
                   </button>
                 )}
 
+                {/* Create + Implement with AI Kit + Open */}
+                {!!aiKitPath && !!onImplementWithAiKit && !noPluginSelected && (
+                  <button
+                    className="btn btn-secondary btn-sm"
+                    onClick={handleCreateAndImplementWithAiKit}
+                    disabled={anyBusy || !setupConfirmed}
+                    title={
+                      !setupConfirmed ? 'Confirm setup before using this action'
+                      : pluginExists !== true
+                        ? `Create project '${selectedPluginProject}', then implement using AI Kit rules`
+                        : 'Implement using AI Kit rules — reads artifact, proposes changes, requires confirmation'
+                    }
+                    type="button"
+                  >
+                    {creatingAndAiKit
+                      ? <><span className="btn-spinner" /> Creating project…</>
+                      : <><Icon name="layers" size={13} /> Create + Implement with AI Kit + Open</>}
+                  </button>
+                )}
+
                 {/* Open existing project in Visual Studio */}
                 {canOpenPlugin && (
                   <button
@@ -441,6 +481,19 @@ export default function StartDevelopmentModal({
               <p style={{ margin: 0, fontSize: 12, color: 'var(--text-muted)' }}>
                 No script target configured. Use Confirm Setup to select a script file.
               </p>
+            )}
+
+            {/* Script: Implement with AI Kit + Open */}
+            {isScript && !!aiKitPath && !!onImplementWithAiKit && (
+              <button
+                className="btn btn-secondary btn-sm"
+                onClick={() => { onImplementWithAiKit(); onClose(); }}
+                disabled={anyBusy}
+                type="button"
+                title="Implement using AI Kit rules — reads artifact, proposes changes, requires confirmation"
+              >
+                <Icon name="layers" size={13} /> Implement with AI Kit + Open
+              </button>
             )}
 
             {/* Script-only draft generation (no project creation needed) */}

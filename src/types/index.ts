@@ -836,6 +836,14 @@ export interface AppSettings {
   primarchMcpLastStatus?: 'not_configured' | 'connected' | 'error';
   /** Last MCP connection error message (redacted of secrets). */
   primarchMcpLastError?: string;
+
+  // ── Power Platform AI Kit ─────────────────────────────────────────────────
+  /**
+   * Absolute path to the local Power Platform AI Kit repository.
+   * Used as the source of truth for CRM development rules, reviewer prompts,
+   * and known PR review comments. Never committed or pushed by the app.
+   */
+  powerPlatformAiKitPath?: string;
 }
 
 // ── AI Reviewer types ─────────────────────────────────────────────────────────

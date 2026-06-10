@@ -722,6 +722,60 @@ export function runAiChangeReview(
 }
 
 // ---------------------------------------------------------------------------
+// Power Platform AI Kit commands
+// ---------------------------------------------------------------------------
+
+export interface AiKitImplementationResult {
+  /** True when the model returned valid JSON. */
+  ok: boolean;
+  /** Parsed result when ok=true. */
+  result?: {
+    proposedContent: string;
+    summary: string;
+    changedSections?: string[];
+    risks?: string[];
+    testScenarios?: string[];
+    /** Set when the model asked for clarification instead of implementing. */
+    clarificationNeeded?: string;
+    /** Fix-mode: issues addressed. */
+    fixedIssues?: string[];
+    /** Fix-mode: issues skipped with reason. */
+    skippedIssues?: string[];
+  };
+  /** Raw model text when JSON parsing failed (ok=false). */
+  rawText?: string;
+}
+
+/**
+ * Runs AI Kit implementation against the provided artifact content.
+ *
+ * The artifact file is NOT read or written by this command.
+ * The frontend reads the current file content, passes it in, and writes
+ * the proposed content after user confirmation.
+ *
+ * @param artifactContent  Current content of the target file.
+ * @param taskContext      Structured task context string.
+ * @param instructions     Full system instructions (assembled from AI Kit rules).
+ * @param modelOverride    Optional model name. Pass '' to use global model.
+ * @param temperature      Sampling temperature (0.0 = use default).
+ */
+export function runAiKitImplementation(
+  artifactContent: string,
+  taskContext: string,
+  instructions: string,
+  modelOverride: string,
+  temperature: number,
+): Promise<AiKitImplementationResult> {
+  return invoke<AiKitImplementationResult>('run_ai_kit_implementation', {
+    artifactContent,
+    taskContext,
+    instructions,
+    modelOverride,
+    temperature,
+  });
+}
+
+// ---------------------------------------------------------------------------
 // Microsoft 365 — OAuth2 PKCE sign-in and Microsoft Graph API
 //
 // All token handling lives in Rust (lib.rs). The frontend only sees account

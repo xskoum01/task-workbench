@@ -2039,6 +2039,61 @@ Pravidla:
     }
 }
 
+/// AI Kit implementation command.
+///
+/// Takes the current artifact file content, task context, and pre-assembled AI Kit
+/// instructions (already loaded and assembled by the frontend), calls the AI, and
+/// returns the proposed new file content plus a structured summary.
+///
+/// The artifact file is NOT read or written by this command — the frontend is
+/// responsible for reading it before the call and writing the result after user
+/// confirmation.
+///
+/// # Parameters
+/// - `artifact_content`  - Current content of the target file.
+/// - `task_context`      - Structured task context string (title, description, setup, etc.).
+/// - `instructions`      - Full system instructions string (assembled from AI Kit rules).
+/// - `model_override`    - Optional model name override. Empty = use global model.
+/// - `temperature`       - Sampling temperature (0.0 = use default 0.2).
+#[tauri::command]
+async fn run_ai_kit_implementation(
+    app: tauri::AppHandle,
+    artifact_content: String,
+    task_context: String,
+    instructions: String,
+    model_override: String,
+    temperature: f64,
+) -> Result<Value, String> {
+    let mut ai_config = get_ai_config(&app)?;
+    if !model_override.trim().is_empty() {
+        ai_config.model = model_override.trim().to_string();
+    }
+
+    const MAX_BYTES: usize = 150 * 1024;
+    let content_trimmed = if artifact_content.len() > MAX_BYTES {
+        let boundary = (0..=MAX_BYTES).rev().find(|&i| artifact_content.is_char_boundary(i)).unwrap_or(0);
+        format!("{}\n\n… [file truncated at 150 KB]", &artifact_content[..boundary])
+    } else {
+        artifact_content.clone()
+    };
+
+    let prompt = format!(
+        "{task_context}\n\n## CURRENT FILE CONTENT\n\n```\n{content_trimmed}\n```\n\nImplement the required changes according to the task and rules above. Return ONLY the JSON response — no prose, no fences."
+    );
+
+    let temp_opt = if temperature > 0.0 { Some(temperature) } else { None };
+    let text = call_ai_text_with_temperature(&ai_config, &instructions, &prompt, temp_opt).await?;
+    let stripped = strip_json_fences(text.trim());
+
+    match serde_json::from_str::<Value>(stripped) {
+        Ok(parsed) => Ok(serde_json::json!({ "ok": true, "result": parsed, "rawText": null })),
+        Err(_) => {
+            // Return raw text so the frontend can show it to the user even when JSON parsing fails.
+            Ok(serde_json::json!({ "ok": false, "result": null, "rawText": text }))
+        }
+    }
+}
+
 /// Creates a new plugin project directory from a local template folder.
 /// Copies the template tree into target_dir/<project_name>, replacing
 /// __PROJECT_NAME__ and __NAMESPACE__ placeholders in file contents and names.
@@ -11395,6 +11450,7 @@ pub fn run() {
             git_checkout_branch,
             get_git_diff,
             run_ai_change_review,
+            run_ai_kit_implementation,
                 get_task_mcp_bridge_status,
                 test_primarch_mcp_connection,
                 list_primarch_mcp_tools,

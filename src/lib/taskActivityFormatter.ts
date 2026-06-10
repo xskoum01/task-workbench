@@ -36,6 +36,11 @@ const TEXT = {
   gitBranchPushedAndMovedToReview: 'Git v\u011btev byla pushnuta a \u00fakol p\u0159esunut do Code Review / Waiting for PR.',
   gitCommitAndPush: 'Vytvo\u0159en Git commit a v\u011btev byla pushnuta.',
   testingConfirmedCommitPushedMovedToReview: 'Zm\u011bny byly commitnuty a pushnuty; \u00fakol p\u0159esunut do Code Review / Waiting for PR.',
+  aiKitImplementationGenerated: 'Naprogramov\u00e1no podle zad\u00e1n\u00ed pomoc\u00ed AI Kitu.',
+  aiKitDiffReviewedPass: 'Diff zkontrolov\u00e1n podle AI Kitu: PASS.',
+  aiKitDiffReviewedWarn: 'Diff zkontrolov\u00e1n podle AI Kitu: WARN.',
+  aiKitDiffReviewedFail: 'Diff zkontrolov\u00e1n podle AI Kitu: FAIL.',
+  aiKitReviewFixesApplied: 'P\u0159ipom\u00ednky z AI review byly opraveny pomoc\u00ed AI Kitu.',
 };
 
 function formatTimestamp(rawTimestamp: string | undefined): string | undefined {
@@ -167,6 +172,19 @@ export function formatTaskActivityNote(rawNote: string, index = 0): FormattedTas
     return { id: `${index}-${raw}`, timestampLabel, source: 'MCP / Git', message: `${TEXT.gitCommitAndPush} (${mcpGitBothMatch[1]})`, raw };
   }
 
+  if (body === 'UI: ai-kit-implementation-generated') {
+    return { id: `${index}-${raw}`, timestampLabel, source: 'AI Kit', message: TEXT.aiKitImplementationGenerated, raw };
+  }
+  const aiKitDiffReviewMatch = /^UI: ai-kit-diff-reviewed -> (PASS|WARN|FAIL)$/i.exec(body);
+  if (aiKitDiffReviewMatch) {
+    const verdict = aiKitDiffReviewMatch[1].toUpperCase();
+    const msg = verdict === 'PASS' ? TEXT.aiKitDiffReviewedPass : verdict === 'WARN' ? TEXT.aiKitDiffReviewedWarn : TEXT.aiKitDiffReviewedFail;
+    return { id: `${index}-${raw}`, timestampLabel, source: 'AI Kit', message: msg, raw };
+  }
+  if (body === 'UI: ai-kit-review-fixes-applied') {
+    return { id: `${index}-${raw}`, timestampLabel, source: 'AI Kit', message: TEXT.aiKitReviewFixesApplied, raw };
+  }
+
   return {
     id: `${index}-${raw}`,
     timestampLabel,
@@ -201,7 +219,10 @@ export function isTaskActivityLine(line: string): boolean {
     /^MCP local write: create_branch_for_task -> .+$/i.test(body) ||
     /^MCP local write: commit_task_changes -> .+$/i.test(body) ||
     /^MCP local write: push_task_branch -> .+$/i.test(body) ||
-    /^MCP local write: commit_and_push_task_changes -> .+$/i.test(body)
+    /^MCP local write: commit_and_push_task_changes -> .+$/i.test(body) ||
+    body === 'UI: ai-kit-implementation-generated' ||
+    /^UI: ai-kit-diff-reviewed -> (PASS|WARN|FAIL)$/i.test(body) ||
+    body === 'UI: ai-kit-review-fixes-applied'
   );
 }
 

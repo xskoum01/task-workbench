@@ -13,9 +13,14 @@ interface WorkflowStepperProps {
    * When provided, the Testing step becomes clickable even though it has no next action.
    */
   onTestingAction?: () => void;
+  /**
+   * When set, overrides the actionLabel shown on the currently active step.
+   * Used by the AI Kit workflow to surface the recommended action in the stepper.
+   */
+  actionLabelOverride?: string;
 }
 
-export function WorkflowStepper({ displayPhase, stages, onRunCurrentAction, isRunning, onTestingAction }: WorkflowStepperProps) {
+export function WorkflowStepper({ displayPhase, stages, onRunCurrentAction, isRunning, onTestingAction, actionLabelOverride }: WorkflowStepperProps) {
   const isBlocked    = displayPhase === 'blocked';
   const currentIndex = isBlocked ? -1 : stages.findIndex((s) => s.id === displayPhase);
 
@@ -37,6 +42,9 @@ export function WorkflowStepper({ displayPhase, stages, onRunCurrentAction, isRu
           ? (stage.next != null ? onRunCurrentAction : onTestingAction)
           : undefined;
 
+        // Use override label for the active step when provided.
+        const displayLabel = isActive && actionLabelOverride ? actionLabelOverride : stage.actionLabel;
+
         return (
           <button
             key={stage.id}
@@ -47,10 +55,10 @@ export function WorkflowStepper({ displayPhase, stages, onRunCurrentAction, isRu
             title={
               hasClickAction
                 ? isRunning
-                  ? `Running: ${stage.actionLabel}…`
+                  ? `Running: ${displayLabel}…`
                   : isTestingStep
                     ? 'Click to view testing actions'
-                    : `Click to run: ${stage.actionLabel}`
+                    : `Click to run: ${displayLabel}`
                 : isCompleted
                   ? stage.label
                   : `Not yet reached: ${stage.label}`
@@ -67,7 +75,7 @@ export function WorkflowStepper({ displayPhase, stages, onRunCurrentAction, isRu
               {isActive && isRunning && (
                 <span className="workflow-bpf-spinner" aria-hidden="true" />
               )}
-              {isCompleted ? 'Done' : stage.actionLabel}
+              {isCompleted ? 'Done' : displayLabel}
             </span>
           </button>
         );
