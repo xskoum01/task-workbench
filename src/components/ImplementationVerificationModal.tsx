@@ -134,6 +134,8 @@ interface Props {
   task: Task;
   customer: Customer | undefined;
   selectedPluginProject: string;
+  /** The development target kind for this task — determines which readiness checks apply. */
+  targetKind?: 'plugin' | 'script' | 'repo';
   /** Resolved artifact path (explicit or inferred). Shown in context section. */
   resolvedArtifactPath: string | null;
   /** True when `resolvedArtifactPath` was inferred (not explicitly set). */
@@ -158,7 +160,7 @@ interface Props {
 // ---------------------------------------------------------------------------
 
 export default function ImplementationVerificationModal({
-  task, customer, selectedPluginProject,
+  task, customer, selectedPluginProject, targetKind = 'plugin',
   resolvedArtifactPath, artifactInferred,
   buildCheckRunning, dataverseCheckRunning, aiCodeReviewRunning,
   onRunBuildCheck, onRunDataverseCheck, onRunAiCodeReview,
@@ -475,9 +477,9 @@ export default function ImplementationVerificationModal({
           {currentNext && <div style={{ marginTop: 4, color: 'var(--text-muted)' }}><span style={{ marginRight: 4 }}>Next:</span>{currentNext}</div>}
         </section>
 
-        {/* 1. Build / Project Readiness */}
+        {/* 1. Build / Project Readiness (or Script File Readiness for script tasks) */}
         <section style={sectionStyle}>
-          <SectionHeader num="1" title="Build / Project Readiness" status={bldStatus} />
+          <SectionHeader num="1" title={targetKind === 'script' ? 'Script File Readiness' : 'Build / Project Readiness'} status={bldStatus} />
 
           {iv?.buildCheck?.summary && bldStatus !== 'skipped' && bldStatus !== 'manually-verified' && (
             <div style={hintStyle}>{iv.buildCheck.summary}</div>
@@ -508,8 +510,12 @@ export default function ImplementationVerificationModal({
               {bldStatus !== 'manually-verified' && (
                 <button className="btn btn-secondary btn-sm" onClick={handleBuildRun}
                   disabled={anyBusy || buildCheckRunning} type="button"
-                  title="Check project files and attempt msbuild">
-                  {buildCheckRunning ? <><span className="btn-spinner" /> Checking</> : <><Icon name="search" size={12} /> Run Build Check</>}
+                  title={targetKind === 'script' ? 'Verify script file exists and is readable' : 'Check project files and attempt msbuild'}>
+                  {buildCheckRunning
+                    ? <><span className="btn-spinner" /> Checking</>
+                    : targetKind === 'script'
+                      ? <><Icon name="search" size={12} /> Check Script File</>
+                      : <><Icon name="search" size={12} /> Run Build Check</>}
                 </button>
               )}
               {(bldStatus === 'not-run' || bldStatus === 'passed' || bldStatus === 'warnings' || bldStatus === 'failed') && (

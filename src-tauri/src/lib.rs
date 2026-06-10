@@ -1105,6 +1105,33 @@ fn git_commit_preview_impl(repo_root: &str, task_json: Option<&Value>) -> Result
         ));
     }
 
+    // Count commits ahead of the remote so the UI can show a push-only button
+    // when the working tree is clean but there are unpushed commits.
+    let ahead_count: u32 = if is_feature {
+        if has_upstream {
+            run_git_ro(repo, &["rev-list", "--count", "@{u}..HEAD"])
+                .and_then(|s| s.trim().parse().ok())
+                .unwrap_or(0)
+        } else if let Some(ref base) = base_branch {
+            // No upstream yet — count commits ahead of the remote base branch.
+            run_git_ro(repo, &["rev-list", "--count", &format!("{base}..HEAD")])
+                .and_then(|s| s.trim().parse().ok())
+                .unwrap_or(0)
+        } else {
+            0
+        }
+    } else {
+        0
+    };
+
+    // True when the working tree is clean but there are local commits ready to push.
+    let pushable_without_commit = is_feature
+        && changed.is_empty()
+        && noise.is_empty()
+        && ahead_count > 0
+        && has_merge_base
+        && remote_url.is_some();
+
     Ok(serde_json::json!({
         "ok": true,
         "repoRoot": canonical_root,
@@ -1121,6 +1148,8 @@ fn git_commit_preview_impl(repo_root: &str, task_json: Option<&Value>) -> Result
         "hasUpstream": has_upstream,
         "upstreamBranch": upstream_branch,
         "upstreamMatchesCurrentBranch": upstream_matches,
+        "aheadCount": ahead_count,
+        "pushableWithoutCommit": pushable_without_commit,
     }))
 }
 
@@ -6116,6 +6145,7 @@ fn task_mcp_read_only_tool_definitions() -> Vec<Value> {
         serde_json::json!({"name":"get_technical_plan",        "description":"Get the persisted local technical implementation plan for a task.","readOnly":true}),
         serde_json::json!({"name":"get_pr_review_state",       "description":"Get sanitized local pull-request review state.","readOnly":true}),
         serde_json::json!({"name":"get_next_recommended_step", "description":"Get conservative next local workflow step for a task.","readOnly":true}),
+        serde_json::json!({"name":"prepare_commit_for_task",   "description":"Read-only Git preview. Does not stage, commit, push, create branch, or create PR.","readOnly":true}),
     ]
 }
 
@@ -6146,6 +6176,10 @@ fn task_mcp_local_write_tool_definitions() -> Vec<Value> {
         serde_json::json!({"name":"update_task_checklist_item",          "description":"Set status of a local workflow checklist item. Strict key and status enum validation.","readOnly":false}),
         serde_json::json!({"name":"set_task_next_step",                  "description":"Set the AI-recommended next action and reason. Does not overwrite analysis or plan.","readOnly":false}),
         serde_json::json!({"name":"create_branch_for_task",              "description":"This modifies the local Git repository by creating and switching to a new branch. Creates a local branch only — no commit, no push, no PR, no GitHub/Azure DevOps API calls.","readOnly":false}),
+        serde_json::json!({"name":"commit_task_changes",                 "description":"WRITE — stages the specified files and creates a Git commit in the task repository. Does NOT push. Use push_task_branch or commit_and_push_task_changes to push afterwards.","readOnly":false}),
+        serde_json::json!({"name":"push_task_branch",                    "description":"WRITE — pushes the current branch of the task repository to origin. Push to main/master is blocked. No force push.","readOnly":false}),
+        serde_json::json!({"name":"commit_and_push_task_changes",        "description":"WRITE — stages files, creates a Git commit, and pushes the current branch in one step. No PR creation. Set moveToReviewAfterPush=true to also move the task to Code Review / Waiting for code review.","readOnly":false}),
+        serde_json::json!({"name":"mark_testing_confirmed_prepare_commit","description":"WRITE (local task state only) — marks consultant testing as confirmed and sets the next step to Prepare commit and push. Does NOT commit, push, or move the task to Code Review.","readOnly":false}),
     ]
 }
 
@@ -7666,6 +7700,51 @@ fn task_mcp_execute_tool(app: &tauri::AppHandle, tool_name: &str, args: &Value) 
             let (artifact_path, artifact_inferred) = mcp_resolve_artifact_path(
                 app, &task_snapshot, persist_inferred, &mut tasks, task_index
             )?;
+
+            // Detect script tasks — JS/TS files are not handled by the C# scanner.
+            let lower_path = artifact_path.to_lowercase();
+            if lower_path.ends_with(".js") || lower_path.ends_with(".ts") {
+                let now = chrono_now_iso();
+                let file_name: String = artifact_path.replace('\\', "/")
+                    .split('/').last().unwrap_or(artifact_path.as_str()).to_string();
+                let msg = format!(
+                    "Dataverse check is not supported for script files ({file_name}). \
+                     Use the in-app Verify Implementation modal, which handles JavaScript/TypeScript directly."
+                );
+                let report_id = format!("mcp-{}", now.replace(':', "-"));
+                {
+                    let task = &mut tasks[task_index];
+                    let existing: Vec<Value> = task["crmVerificationReports"]
+                        .as_array().cloned().unwrap_or_default();
+                    let report_entry = serde_json::json!({
+                        "id": report_id,
+                        "createdAt": now,
+                        "verdict": "unknown",
+                        "summary": msg,
+                        "answer": msg,
+                        "filePath": artifact_path,
+                    });
+                    let mut reports = vec![report_entry];
+                    reports.extend(existing.into_iter().take(4));
+                    task["crmVerificationReports"] = Value::Array(reports);
+                    task["mcpNextStep"] = serde_json::json!({
+                        "action": "Use the in-app Verify Implementation modal for JavaScript/TypeScript Dataverse checks",
+                        "reason": "MCP Dataverse check does not support JS/TS files.",
+                        "updatedAt": now,
+                    });
+                    task_mcp_append_audit_note(task, "run_dataverse_check_for_task -> unknown (script file, not supported by MCP scanner)");
+                }
+                task_mcp_save_tasks(app, &tasks)?;
+                return Ok(serde_json::json!({
+                    "ok": true,
+                    "verdict": "unknown",
+                    "status": "not-supported",
+                    "message": msg,
+                    "taskId": task_id,
+                    "artifactPath": artifact_path,
+                    "artifactInferred": artifact_inferred,
+                }));
+            }
 
             // Read the source file.
             let content = fs::read_to_string(&artifact_path)
@@ -11007,6 +11086,11 @@ fn mcp_resolve_artifact_path(
 ) -> Result<(String, bool), String> {
     // 1. Explicit path
     if let Some(p) = task["workflowSetup"]["artifactPath"].as_str().filter(|s| !s.trim().is_empty()) {
+        return Ok((p.replace('\\', "/"), false));
+    }
+
+    // 1b. scriptPath fallback for script tasks (old data may only have scriptPath set).
+    if let Some(p) = task["workflowSetup"]["scriptPath"].as_str().filter(|s| !s.trim().is_empty()) {
         return Ok((p.replace('\\', "/"), false));
     }
 

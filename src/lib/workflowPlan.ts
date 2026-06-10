@@ -123,7 +123,7 @@ export function buildTaskWorkflowPlan(task: Task, heuristicKind?: DevKind): Task
     // Include Development, Testing, and Review so any status shows an active step.
     stages = [S_NEW, S_ANA_DONE, S_IN_PROGRESS_GEN, S_TESTING, S_FOR_REVIEW, S_DONE];
   } else {
-    const devStage = (devKind === 'plugin' && !!confirmedKind) ? S_IN_PROGRESS_PLUGIN : S_IN_PROGRESS;
+    const devStage = ((devKind === 'plugin' || devKind === 'script') && !!confirmedKind) ? S_IN_PROGRESS_PLUGIN : S_IN_PROGRESS;
     stages = [isDeveloperAwaitingSetup ? S_NEW_CONFIRM : S_NEW, S_ANA_START, devStage, S_TESTING, S_FOR_REVIEW, S_DONE];
   }
 
@@ -149,7 +149,7 @@ export function buildTaskWorkflowPlan(task: Task, heuristicKind?: DevKind): Task
       if (isCode) {
         // Plugin tasks get "Verify Implementation" as the primary Development action.
         // Script/other dev tasks keep "Mark Waiting for Review".
-        currentAction = (devKind === 'plugin' && !!confirmedKind)
+        currentAction = ((devKind === 'plugin' || devKind === 'script') && !!confirmedKind)
           ? 'verify-implementation'
           : 'mark-waiting-review';
       } else {

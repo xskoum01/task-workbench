@@ -1277,6 +1277,10 @@ export interface GitCommitPreview {
   upstreamBranch?: string;
   /** True when the upstream ref matches origin/<currentBranch>. */
   upstreamMatchesCurrentBranch?: boolean;
+  /** Number of local commits ahead of the remote (upstream or base branch). */
+  aheadCount?: number;
+  /** True when the working tree is clean and there are unpushed commits ready to push. */
+  pushableWithoutCommit?: boolean;
 }
 
 export interface GitCommitResult {

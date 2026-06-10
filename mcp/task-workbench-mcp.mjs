@@ -519,10 +519,12 @@ const TOOL_DEFINITIONS = [
   {
     name: 'run_dataverse_check_for_task',
     description:
-      'Run a read-only Dataverse metadata check for a plugin task. ' +
-      'Task Workbench resolves the implementation artifact, scans it for Dataverse logical-name ' +
+      'Run a read-only Dataverse metadata check for a task (plugin or script). ' +
+      'For plugin (C#) tasks: Task Workbench resolves the implementation artifact, scans it for Dataverse logical-name ' +
       'references (entities, attributes, lookups), and verifies them against the connected ' +
       'Dataverse environment through the configured Primarch MCP integration. ' +
+      'For script (JS/TS) tasks: returns a structured "not-supported" result — use the in-app ' +
+      'Verify Implementation modal instead, which handles JavaScript/TypeScript directly. ' +
       'The verification report is saved to the local task state. ' +
       'This tool is READ-ONLY: no Dataverse writes, no Git writes, no file modifications ' +
       'other than persisting the report and optionally the inferred artifact path to local task state.',
@@ -611,7 +613,7 @@ const TOOL_DEFINITIONS = [
       'Equivalent to commit_task_changes followed by push_task_branch. ' +
       'Push to main/master is blocked. No force push. No PR creation. ' +
       'Only call this when the user has explicitly requested a commit and push. ' +
-      'Set moveToReviewAfterPush=true to also move the task to Review / Waiting for code review ' +
+      'Set moveToReviewAfterPush=true to also move the task to Code Review / Waiting for code review ' +
       'after a successful push (default: false).',
     inputSchema: {
       type: 'object',
@@ -626,7 +628,7 @@ const TOOL_DEFINITIONS = [
         moveToReviewAfterPush: {
           type: 'boolean',
           description:
-            'When true, moves the task to Review / Waiting for code review after a successful commit and push. ' +
+            'When true, moves the task to Code Review / Waiting for code review after a successful commit and push. ' +
             'Default: false. Only takes effect after a successful push.',
         },
       },
@@ -638,10 +640,10 @@ const TOOL_DEFINITIONS = [
     name: 'mark_testing_confirmed_prepare_commit',
     description:
       'WRITE (local task state only) — marks consultant testing as confirmed and sets the next step ' +
-      'to "Prepare commit and push". Does NOT commit, push, or move the task to Review. ' +
+      'to "Prepare commit and push". Does NOT commit, push, or move the task to Code Review. ' +
       'Use this when the consultant has confirmed the change and the developer needs to prepare a commit ' +
       'before requesting code review. ' +
-      'To commit+push and move to Review in one step, use commit_and_push_task_changes with moveToReviewAfterPush=true.',
+      'To commit+push and move to Code Review in one step, use commit_and_push_task_changes with moveToReviewAfterPush=true.',
     inputSchema: {
       type: 'object',
       properties: {

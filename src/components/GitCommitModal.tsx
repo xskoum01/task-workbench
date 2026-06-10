@@ -35,6 +35,12 @@ interface GitCommitModalProps {
    * record the activity note.
    */
   onBranchCreated?: (note: string) => void;
+  /**
+   * Guided mode — called after a push-only operation (no new commit).
+   * Receives the pre-built activity note and branch name.
+   * When set, the push button label becomes "Push Branch and Move to Code Review".
+   */
+  onPushOnlySuccess?: (note: string, branch: string | undefined) => Promise<void>;
 }
 
 export default function GitCommitModal({
@@ -47,6 +53,7 @@ export default function GitCommitModal({
   onPostCommitPushSuccess,
   onCommitOnlySuccess,
   onBranchCreated,
+  onPushOnlySuccess,
 }: GitCommitModalProps) {
   const [preview, setPreview]             = useState<GitCommitPreview | null>(null);
   const [loading, setLoading]             = useState(true);
@@ -158,6 +165,28 @@ export default function GitCommitModal({
     }
   }
 
+  async function handlePushOnly() {
+    if (!preview || working) return;
+    setWorking(true);
+    setResultMessage(null);
+    setResultError(null);
+    try {
+      const r = await tauriApi.pushTaskBranch(repoRoot);
+      const note = `UI: git-branch-pushed-and-moved-to-code-review -> ${r.branch ?? preview.branch ?? '?'}`;
+      if (onPushOnlySuccess) {
+        await onPushOnlySuccess(note, r.branch ?? preview.branch);
+      } else {
+        onActivityNote?.(note);
+      }
+      setResultMessage(r.summary ?? `Branch ${r.branch ?? preview.branch} pushed.`);
+      await loadPreview();
+    } catch (e) {
+      setResultError(String(e));
+    } finally {
+      setWorking(false);
+    }
+  }
+
   const isMainMaster   = preview?.branch === 'main' || preview?.branch === 'master';
   const hasFiles       = (preview?.changedFiles.length ?? 0) > 0;
   const noneSelected   = selectedFiles.size === 0;
@@ -167,6 +196,9 @@ export default function GitCommitModal({
   const noMergeBaseOnFeature = !isMainMaster && baseBranch !== undefined && hasMergeBase === false;
   // Block Commit+Push (and Move to Review) when push would produce an unresolvable PR.
   const pushBlocked    = isMainMaster || noMergeBaseOnFeature;
+
+  const pushableWithoutCommit = preview?.pushableWithoutCommit === true;
+  const aheadCount            = preview?.aheadCount ?? 0;
 
   const branchValidationError = branchInput.trim() ? validateBranchName(branchInput.trim()) : null;
 
@@ -391,7 +423,7 @@ export default function GitCommitModal({
           )}
         </div>
 
-        <div className="modal-footer" style={{ justifyContent: 'space-between' }}>
+        <div className="modal-footer" style={{ justifyContent: 'space-between', flexWrap: 'wrap', rowGap: 6 }}>
           <button
             type="button"
             className="btn btn-ghost"
@@ -400,7 +432,7 @@ export default function GitCommitModal({
           >
             Refresh
           </button>
-          <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+          <div style={{ display: 'flex', gap: 6, alignItems: 'center', flexWrap: 'wrap', justifyContent: 'flex-end' }}>
             <button type="button" className="btn btn-ghost" onClick={onClose} disabled={working}>
               Cancel
             </button>
@@ -428,8 +460,27 @@ export default function GitCommitModal({
                       : 'Commit selected files and push branch'
               }
             >
-              {working ? 'Working…' : postCommitPushAction ? 'Commit + Push and Move to Code Review' : 'Commit + Push'}
+              {working ? 'Working…' : postCommitPushAction ? 'Commit + Push → Code Review' : 'Commit + Push'}
             </button>
+            {pushableWithoutCommit && (
+              <button
+                type="button"
+                className="btn btn-primary"
+                onClick={() => void handlePushOnly()}
+                disabled={loading || working}
+                title={
+                  onPushOnlySuccess
+                    ? 'Push the current branch and move the task to Code Review'
+                    : `Push ${aheadCount} commit${aheadCount !== 1 ? 's' : ''} to origin`
+                }
+              >
+                {working
+                  ? 'Working…'
+                  : onPushOnlySuccess
+                    ? 'Push → Code Review'
+                    : 'Push Branch'}
+              </button>
+            )}
           </div>
         </div>
       </div>

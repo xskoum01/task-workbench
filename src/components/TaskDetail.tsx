@@ -1724,6 +1724,9 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
    * Persists the artifact path only. State changes and IDE opening stay explicit.
    */
   async function completeScriptDraft(writtenFilePath: string) {
+    const now  = new Date().toISOString();
+    const note = `[${now}] UI: script-draft-generated`;
+    const existing = task.notes ?? '';
     await updateTask(task.id, {
       workflowSetup: {
         ...task.workflowSetup,
@@ -1731,6 +1734,7 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
         artifactPath: writtenFilePath,
       },
       crmDeveloperWorkflow: buildCrmDeveloperWorkflowStateAfterDraftRegenerated(task),
+      notes: existing ? `${existing}\n${note}` : note,
     });
     setSkeletonPreview(null);
     setShowSkeleton(false);
@@ -1795,7 +1799,8 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
     setShowImplVerifyModal(true);
     // Kick off artifact path resolution as soon as the modal opens so the modal shows
     // the correct path without the user having to run a check first.
-    const explicit = task.workflowSetup?.artifactPath;
+    // For script tasks, fall back to scriptPath when artifactPath is not set.
+    const explicit = task.workflowSetup?.artifactPath ?? task.workflowSetup?.scriptPath;
     if (explicit) {
       setModalArtifactPath(explicit);
       setModalArtifactInferred(false);
@@ -2040,6 +2045,44 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
   }
 
   /**
+   * Guided mode post-action: called by GitCommitModal after a push-only operation.
+   * Moves the task to Code Review / Waiting for code review and opens Azure DevOps.
+   */
+  async function handleGitPushOnlyMoveToReview(pushNote: string, branch: string | undefined) {
+    const now = new Date().toISOString();
+    await updateTask(task.id, {
+      status:         'ready-for-review',
+      waitingState:   'code-review',
+      attentionState: null,
+      mcpNextStep: {
+        action:    'Wait for code review',
+        reason:    'Branch pushed. Task moved to code review.',
+        updatedAt: now,
+      },
+      notes: appendActivityNote(task.notes, pushNote),
+    });
+    setShowGitCommitModal(false);
+    setGitCommitGuidedMode(false);
+
+    const resolution = buildAzureDevOpsRepoUrl(task, customer ?? null);
+    if (resolution?.kind === 'repo') {
+      tauriApi.openExternalUrl(resolution.url).then(() => {
+        setFeedback(`Branch ${branch ?? '?'} pushed — task moved to Code Review. Repository opened.`);
+      }).catch(() => {
+        setFeedback(`Branch ${branch ?? '?'} pushed — task moved to Code Review. Could not open repository.`);
+      });
+    } else if (resolution?.kind === 'work-item') {
+      tauriApi.openExternalUrl(resolution.url).then(() => {
+        setFeedback(`Branch ${branch ?? '?'} pushed — task moved to Code Review. Work item opened.`);
+      }).catch(() => {
+        setFeedback(`Branch ${branch ?? '?'} pushed — task moved to Code Review.`);
+      });
+    } else {
+      setFeedback(`Branch ${branch ?? '?'} pushed — task moved to Code Review. No Azure DevOps URL configured.`);
+    }
+  }
+
+  /**
    * Tries to find a single candidate .cs implementation file in the plugin project folder
    * when `task.workflowSetup.artifactPath` is not set (e.g. existing tasks).
    *
@@ -2079,7 +2122,8 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
    * actions find it without re-running inference.
    */
   async function resolveArtifactPath(): Promise<string | null> {
-    const explicit = task.workflowSetup?.artifactPath;
+    // For script tasks, fall back to scriptPath when artifactPath is not set.
+    const explicit = task.workflowSetup?.artifactPath ?? task.workflowSetup?.scriptPath;
     if (explicit) return explicit;
     const inferred = await inferArtifactPath();
     if (inferred) {
@@ -2166,6 +2210,52 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
    * task.implementationVerification.buildCheck.
    */
   async function handleRunBuildCheckForImpl(): Promise<void> {
+    const targetKind = task.workflowSetup?.devTargetKind ?? 'plugin';
+
+    if (targetKind === 'script') {
+      const artifactPath = await resolveArtifactPath();
+      if (!artifactPath) {
+        setFeedback('No script file path found. Save a generated draft first.');
+        return;
+      }
+      setImplVerifyBuildRunning(true);
+      try {
+        const content = await tauriApi.readFileContent(artifactPath);
+        const lineCount = content.split('\n').length;
+        const fileName = artifactPath.replace(/\\/g, '/').split('/').pop() ?? artifactPath;
+        const now = new Date().toISOString();
+        await updateTask(task.id, {
+          implementationVerification: {
+            ...task.implementationVerification,
+            buildCheck: {
+              status: 'passed',
+              runAt: now,
+              summary: `Script file found: ${fileName} (${lineCount} lines).`,
+              findings: [
+                `pass|Script file exists|${fileName}`,
+                `pass|File readable|${lineCount} lines`,
+              ],
+            },
+            updatedAt: now,
+          },
+        });
+        setFeedback('Script file check: passed.');
+      } catch (e) {
+        setFeedback(`Script file check failed: ${String(e)}`);
+        const now = new Date().toISOString();
+        await updateTask(task.id, {
+          implementationVerification: {
+            ...task.implementationVerification,
+            buildCheck: { status: 'failed', runAt: now, summary: `File check failed: ${String(e)}` },
+            updatedAt: now,
+          },
+        }).catch(() => {});
+      } finally {
+        setImplVerifyBuildRunning(false);
+      }
+      return;
+    }
+
     if (!pluginsDir || !selectedPluginProject) {
       setFeedback('No plugin project selected.');
       return;
@@ -2223,6 +2313,7 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
       const setup    = task.workflowSetup;
       // Resolve artifact path (explicit or inferred from project folder).
       const artifactPath = await resolveArtifactPath();
+      const isScript = !!artifactPath && /\.[jt]s$/i.test(artifactPath);
       const techPlan = task.crmDeveloperWorkflow?.technicalPlan;
       const dvReport = task.crmVerificationReports?.[0];
       const buildChk = task.implementationVerification?.buildCheck;
@@ -2369,7 +2460,25 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
           gitCtx.flaggedPaths.length > 0 ? `UPOZORNĚNÍ — přidány podezřelé soubory: ${gitCtx.flaggedPaths.join(', ')}` : '',
         ].filter(Boolean).join('\n');
 
-        const diffRules = [
+        const diffRules = isScript ? [
+          '',
+          '=== PRAVIDLA REVIEW (DIFF — JAVASCRIPT/TYPESCRIPT) ===',
+          'Zkontroluj scope diffu:',
+          '- Jen očekávané soubory byly změněny',
+          '- Žádné nesouvisející soubory',
+          '- Žádné .github/copilot-instructions.md přidány',
+          '',
+          'Zkontroluj script správnost:',
+          '- Funkce odpovídá Dataverse WebAPI konvencím (pokud relevantní)',
+          '- Logické názvy jsou konstanty nebo správně zapsané literály',
+          '- Žádné hardcoded OrgUrl, credentials nebo secrety',
+          '- Error handling přítomen kde je nutný',
+          '- Žádné zbytečné console.log v produkčním kódu',
+          '',
+          'Zkontroluj business alignment:',
+          '- Diff implementuje úkol a nic navíc',
+          '- Chování odpovídá původnímu požadavku a technickému plánu',
+        ].join('\n') : [
           '',
           '=== PRAVIDLA REVIEW (DIFF) ===',
           'Zkontroluj scope diffu:',
@@ -2395,6 +2504,7 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
           '- Chování odpovídá původnímu požadavku a technickému plánu',
         ].join('\n');
 
+        const reviewerName = isScript ? 'Script Internal Check' : 'Plugin Internal Check';
         const instructions = buildInstructions(modeLabel, gitInfo) + diffRules;
         const taskCtx = `${task.title}. ${gitCtx.summary}`;
         const fileName = `local changes (${gitCtx.currentBranch} › ${gitCtx.baseBranch})`;
@@ -2403,7 +2513,7 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
           gitCtx.diff,
           taskCtx,
           fileName,
-          'Plugin Internal Check',
+          reviewerName,
           instructions,
           '',  // use configured model
           0.2,
@@ -2430,7 +2540,7 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
         const reviewEntry: AiFileReviewResult = {
           ...result,
           id: `impl-review-${now}`,
-          reviewerName: 'Plugin Internal Check',
+          reviewerName,
           filePath:     fileName,
           reviewMode:   'change',
         };
@@ -2452,7 +2562,17 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
       // ¦¦ Mode C: Single file fallback ¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦
       } else if (artifactPath) {
         const modeLabel  = 'Single file review';
-        const fileRules  = [
+        const fileRules  = isScript ? [
+          '',
+          '=== PRAVIDLA REVIEW (SOUBOR — JAVASCRIPT/TYPESCRIPT) ===',
+          'Zkontroluj script strukturu:',
+          '1. Funkce odpovídá Dataverse WebAPI konvencím (pokud relevantní)',
+          '2. Logické názvy jsou konstanty nebo správně zapsané literály',
+          '3. Žádné hardcoded OrgUrl, credentials nebo secrety',
+          '4. Error handling přítomen kde je nutný',
+          '5. Žádné zbytečné console.log v produkčním kódu',
+          '6. Implementace odpovídá popisu úkolu',
+        ].join('\n') : [
           '',
           '=== PRAVIDLA REVIEW (SOUBOR) ===',
           'Zkontroluj plugin strukturu:',
@@ -2465,11 +2585,12 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
           '7. Depth/recursion guard kde potřeba',
           '8. Implementace odpovídá popisu úkolu',
         ].join('\n');
+        const fileReviewerName = isScript ? 'Script Internal Check' : 'Plugin Internal Check';
         const instructions = buildInstructions(modeLabel) + fileRules;
 
         const result = await tauriApi.runAiFileReview(
           artifactPath,
-          'Plugin Internal Check',
+          fileReviewerName,
           instructions,
           '',
           0.2,
@@ -2486,7 +2607,7 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
         const reviewEntry: AiFileReviewResult = {
           ...result,
           id: `impl-review-${now}`,
-          reviewerName: 'Plugin Internal Check',
+          reviewerName: fileReviewerName,
           filePath:     artifactPath,
           reviewMode:   'file',
         };
@@ -2506,7 +2627,7 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
         setFeedback(`AI code review (file): ${implStatus}.`);
 
       } else {
-        setFeedback('No artifact file and no git repository found. Configure the plugin project first.');
+        setFeedback('No artifact file and no git repository found. Save a draft or configure the artifact path first.');
       }
     } catch (e) {
       setFeedback(`AI code review failed: ${String(e)}`);
@@ -3499,7 +3620,7 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
                       <Icon name="play" size={13} /> Start Development
                     </button>
                   )}
-                  {task.status === 'in-progress' && plan.targetKind === 'plugin' && (
+                  {task.status === 'in-progress' && (plan.targetKind === 'plugin' || plan.targetKind === 'script') && (
                     <button
                       className="btn btn-secondary btn-sm"
                       onClick={handleVerifyImplementation}
@@ -4007,6 +4128,7 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
           postCommitPushAction={gitCommitGuidedMode ? 'move-to-review-and-open-ado' : undefined}
           onPostCommitPushSuccess={gitCommitGuidedMode ? handleGitCommitMoveToReview : undefined}
           onCommitOnlySuccess={gitCommitGuidedMode ? handleGitCommitOnlyGuided : undefined}
+          onPushOnlySuccess={gitCommitGuidedMode ? handleGitPushOnlyMoveToReview : undefined}
           onClose={() => { setShowGitCommitModal(false); setGitCommitGuidedMode(false); }}
           onActivityNote={(note) => void handleGitActivityNote(note)}
         />
@@ -4123,8 +4245,9 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
           task={task}
           customer={customer}
           selectedPluginProject={selectedPluginProject}
-          resolvedArtifactPath={modalArtifactPath ?? task.workflowSetup?.artifactPath ?? null}
-          artifactInferred={modalArtifactInferred && !task.workflowSetup?.artifactPath}
+          targetKind={task.workflowSetup?.devTargetKind ?? 'plugin'}
+          resolvedArtifactPath={modalArtifactPath ?? task.workflowSetup?.artifactPath ?? task.workflowSetup?.scriptPath ?? null}
+          artifactInferred={modalArtifactInferred && !task.workflowSetup?.artifactPath && !task.workflowSetup?.scriptPath}
           buildCheckRunning={implVerifyBuildRunning}
           dataverseCheckRunning={implVerifyDvRunning}
           aiCodeReviewRunning={implVerifyAiRunning}

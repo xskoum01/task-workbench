@@ -23,6 +23,7 @@ const TEXT = {
   resultFailed: 'chyba',
   resultPassed: 'bez chyb',
   pluginDraftCreated: 'Vytvo\u0159en plugin projekt a vygenerov\u00e1n draft.',
+  scriptDraftGenerated: 'Vygenerov\u00e1n JavaScript draft.',
   developmentStarted: 'V\u00fdvoj byl zah\u00e1jen.',
   testingConfirmed: 'Konzultantsk\u00e9 testov\u00e1n\u00ed potvrzeno.',
   testingFailed: 'Konzultantsk\u00e9 testov\u00e1n\u00ed nepro\u0161lo.',
@@ -32,6 +33,7 @@ const TEXT = {
   gitBranchCreated: 'Vytvo\u0159ena Git v\u011btev.',
   gitCommitCreated: 'Vytvo\u0159en Git commit.',
   gitBranchPushed: 'Git v\u011btev byla pushnuta.',
+  gitBranchPushedAndMovedToReview: 'Git v\u011btev byla pushnuta a \u00fakol p\u0159esunut do Code Review / Waiting for PR.',
   gitCommitAndPush: 'Vytvo\u0159en Git commit a v\u011btev byla pushnuta.',
   testingConfirmedCommitPushedMovedToReview: 'Zm\u011bny byly commitnuty a pushnuty; \u00fakol p\u0159esunut do Code Review / Waiting for PR.',
 };
@@ -88,6 +90,16 @@ export function formatTaskActivityNote(rawNote: string, index = 0): FormattedTas
     };
   }
 
+  if (body === 'UI: script-draft-generated') {
+    return {
+      id: `${index}-${raw}`,
+      timestampLabel,
+      source: 'Script Draft',
+      message: TEXT.scriptDraftGenerated,
+      raw,
+    };
+  }
+
   if (body === 'Development started from Start Development modal.') {
     return {
       id: `${index}-${raw}`,
@@ -134,6 +146,10 @@ export function formatTaskActivityNote(rawNote: string, index = 0): FormattedTas
   if (gitPushMatch) {
     return { id: `${index}-${raw}`, timestampLabel, source: 'Git', message: `${TEXT.gitBranchPushed} (${gitPushMatch[1]})`, raw };
   }
+  const gitPushMovedToReviewMatch = /^UI: git-branch-pushed-and-moved-to-code-review -> (.+)$/i.exec(body);
+  if (gitPushMovedToReviewMatch) {
+    return { id: `${index}-${raw}`, timestampLabel, source: 'Git / Code Review', message: `${TEXT.gitBranchPushedAndMovedToReview} (${gitPushMovedToReviewMatch[1]})`, raw };
+  }
   const gitCommitPushMatch = /^UI: git-commit-and-push -> (.+)$/i.exec(body);
   if (gitCommitPushMatch) {
     return { id: `${index}-${raw}`, timestampLabel, source: 'Git', message: `${TEXT.gitCommitAndPush} (${gitCommitPushMatch[1]})`, raw };
@@ -170,6 +186,7 @@ export function isTaskActivityLine(line: string): boolean {
     /^MCP local write:\s*run_dataverse_check_for_task\s*->\s*.+$/i.test(body) ||
     body === 'Plugin project created and draft generated from Start Development workflow.' ||
     body === 'Development started from Start Development modal.' ||
+    body === 'UI: script-draft-generated' ||
     body === 'UI: consultant-testing-confirmed' ||
     body === 'UI: consultant-testing-failed' ||
     body === 'UI: consultant-testing-confirmed-and-moved-to-review' ||
@@ -179,6 +196,7 @@ export function isTaskActivityLine(line: string): boolean {
     /^UI: git-branch-created -> .+$/i.test(body) ||
     /^UI: git-commit-created -> .+$/i.test(body) ||
     /^UI: git-branch-pushed -> .+$/i.test(body) ||
+    /^UI: git-branch-pushed-and-moved-to-code-review -> .+$/i.test(body) ||
     /^UI: git-commit-and-push -> .+$/i.test(body) ||
     /^MCP local write: create_branch_for_task -> .+$/i.test(body) ||
     /^MCP local write: commit_task_changes -> .+$/i.test(body) ||
