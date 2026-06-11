@@ -20,6 +20,8 @@ use sha2::{Digest, Sha256};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use rand::Rng;
 
+mod ai_model_capabilities;
+
 // --- Helpers ---------------------------------------------------------------
 
 /// Attempts to resolve the latest stable version of a NuGet package.
@@ -1488,6 +1490,8 @@ fn get_ai_settings(app: &tauri::AppHandle) -> Result<(String, String), String> {
 }
 
 /// OpenAI Responses API call with optional temperature.
+/// Temperature is only included when the model's capability profile supports it.
+/// Unknown models use a conservative profile (temperature omitted) to avoid HTTP 400 errors.
 async fn call_openai_with_temperature(
     api_key: &str,
     model: &str,
@@ -1504,11 +1508,22 @@ async fn call_openai_with_temperature(
     if !instructions.is_empty() {
         body["instructions"] = serde_json::Value::String(instructions.to_string());
     }
+
+    // Only include temperature when both the caller requested it and the model supports it.
     if let Some(t) = temperature {
         if t > 0.0 {
-            body["temperature"] = serde_json::Value::from(t.clamp(0.0, 2.0));
+            if let Some(clamped) = ai_model_capabilities::clamp_temperature("openai", model, t) {
+                body["temperature"] = serde_json::Value::from(clamped);
+            }
+            // If clamp_temperature returns None, the model does not support temperature —
+            // the parameter is intentionally omitted from the request body.
         }
     }
+
+    // Collect parameter names sent (excluding api_key which travels in the Authorization header).
+    let sent_params: Vec<String> = body.as_object()
+        .map(|o| o.keys().cloned().collect())
+        .unwrap_or_default();
 
     let resp = client
         .post("https://api.openai.com/v1/responses")
@@ -1517,12 +1532,24 @@ async fn call_openai_with_temperature(
         .json(&body)
         .send()
         .await
-        .map_err(|e| format!("Network error: {e}"))?;
+        .map_err(|e| format!("Network error calling OpenAI (model: {model}): {e}"))?;
 
     if !resp.status().is_success() {
         let status = resp.status().as_u16();
-        let text = resp.text().await.unwrap_or_default();
-        return Err(format!("OpenAI API error {status}: {text}"));
+        let api_error = resp.text().await.unwrap_or_default();
+        let params_str = sent_params.join(", ");
+        let mut msg = format!(
+            "OpenAI API error {status} [model: {model}, params sent: {{{params_str}}}]: {api_error}"
+        );
+        if status == 400 && api_error.contains("Unsupported parameter") {
+            msg.push_str(
+                "\n\nNote: an unsupported parameter was rejected by the model. \
+                 Task Workbench omits unsupported parameters automatically for recognized \
+                 models. If this error persists, the model name may not be recognized — \
+                 try using a known model such as gpt-4.1-mini."
+            );
+        }
+        return Err(msg);
     }
 
     let json: Value = resp.json().await.map_err(|e| e.to_string())?;
@@ -1538,6 +1565,7 @@ async fn call_openai_with_temperature(
 }
 
 /// Calls the Anthropic Messages API and returns the text of the first content block.
+/// All current Claude models support temperature; it is clamped to [0.0, 1.0].
 async fn call_anthropic_text(
     api_key: &str,
     model: &str,
@@ -1557,9 +1585,15 @@ async fn call_anthropic_text(
     }
     if let Some(t) = temperature {
         if t > 0.0 {
-            body["temperature"] = serde_json::Value::from(t.clamp(0.0, 1.0));
+            if let Some(clamped) = ai_model_capabilities::clamp_temperature("anthropic", model, t) {
+                body["temperature"] = serde_json::Value::from(clamped);
+            }
         }
     }
+
+    let sent_params: Vec<String> = body.as_object()
+        .map(|o| o.keys().cloned().collect())
+        .unwrap_or_default();
 
     let resp = client
         .post("https://api.anthropic.com/v1/messages")
@@ -1569,12 +1603,15 @@ async fn call_anthropic_text(
         .json(&body)
         .send()
         .await
-        .map_err(|e| format!("Network error: {e}"))?;
+        .map_err(|e| format!("Network error calling Anthropic (model: {model}): {e}"))?;
 
     if !resp.status().is_success() {
         let status = resp.status().as_u16();
-        let text = resp.text().await.unwrap_or_default();
-        return Err(format!("Anthropic API error {status}: {text}"));
+        let api_error = resp.text().await.unwrap_or_default();
+        let params_str = sent_params.join(", ");
+        return Err(format!(
+            "Anthropic API error {status} [model: {model}, params sent: {{{params_str}}}]: {api_error}"
+        ));
     }
 
     let json: Value = resp.json().await.map_err(|e| e.to_string())?;

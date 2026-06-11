@@ -993,6 +993,9 @@ export default function SettingsPage() {
                   onChange={(e) => set('openaiModel', e.target.value)}
                   style={{ maxWidth: 280 }}
                 />
+                <div className="settings-field-hint">
+                  Some models (e.g. gpt-5.5, o1, o3) do not accept sampling parameters such as temperature. Unsupported parameters are omitted automatically.
+                </div>
               </SettingsField>
 
               <SettingsField label="OpenAI API Key">
