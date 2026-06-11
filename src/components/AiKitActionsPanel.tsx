@@ -28,6 +28,7 @@ import {
   type AiKitTaskKind,
   type PowerPlatformAiKitContext,
 } from '../lib/powerPlatformAiKit';
+import { checkCrmJavaScriptConventions, type ConventionViolation } from '../lib/conventionGuard';
 import { isPathInsideDir } from '../lib/pathUtils';
 import { getAiKitWorkflowState, getAiKitActionLabel } from '../lib/aiKitWorkflow';
 import { buildRepositoryContextForTask } from '../lib/repositoryContext';
@@ -179,6 +180,10 @@ interface ActionState {
   isCreateMode: boolean;
   /** True while git diff is being collected after a successful file write. */
   postApplyDiffLoading: boolean;
+  /** Convention violations found in proposed content by the local guard. Blocks Apply when non-empty. */
+  conventionViolations: ConventionViolation[];
+  /** Feedback text to include in a re-generation prompt when violations were detected. */
+  violationFeedback: string | null;
 }
 
 const INITIAL_STATE: ActionState = {
@@ -201,6 +206,8 @@ const INITIAL_STATE: ActionState = {
   postApplyDiffWarning: null,
   isCreateMode: false,
   postApplyDiffLoading: false,
+  conventionViolations: [],
+  violationFeedback: null,
 };
 
 function tryExtractRequestedTargetPath(text: string | undefined): string | null {
@@ -347,7 +354,9 @@ const AiKitActionsPanel = forwardRef<AiKitActionsPanelHandle, AiKitActionsPanelP
       if (!validation.valid) throw new Error(validation.statusMessage);
 
       const taskKind = detectTaskKindFromTask(task);
-      const kitContext = await loadAiKitContext(aiKitPath!, taskKind, false, true);
+      // forReview=true: ensures known-pr-review-comments.md and crm-code-review-checklist.md
+      // are loaded alongside the implementation prompt template.
+      const kitContext = await loadAiKitContext(aiKitPath!, taskKind, true, true);
       const prepared = await prepareImplementInput(
         {
           taskKind,
@@ -377,12 +386,15 @@ const AiKitActionsPanel = forwardRef<AiKitActionsPanelHandle, AiKitActionsPanelP
     }
   }
 
-  async function runImplement() {
+  async function runImplement(opts?: { violationFeedback?: string }) {
     const runErr = validateRunState({ kitContext: state.kitContext, artifactContent: state.artifactContent, taskKind: state.taskKind });
     if (runErr) { setError(runErr); return; }
-    setState((s) => ({ ...s, phase: 'running' }));
+    setState((s) => ({ ...s, phase: 'running', conventionViolations: [], violationFeedback: null }));
     try {
-      const instructions = buildImplementInstructions(state.kitContext!, { createMode: state.isCreateMode });
+      const instructions = buildImplementInstructions(state.kitContext!, {
+        createMode: state.isCreateMode,
+        violationFeedback: opts?.violationFeedback,
+      });
       const taskContext = buildTaskContextString(task, customer, state.taskKind!);
       const result = await tauriApi.runAiKitImplementation(
         state.artifactContent!,
@@ -403,6 +415,8 @@ const AiKitActionsPanel = forwardRef<AiKitActionsPanelHandle, AiKitActionsPanelP
             resultRisks: [],
             testScenarios: [],
             rawText: null,
+            conventionViolations: [],
+            violationFeedback: null,
           }));
           return;
         }
@@ -414,9 +428,25 @@ const AiKitActionsPanel = forwardRef<AiKitActionsPanelHandle, AiKitActionsPanelP
           resultSummary: result.rawText ? 'Model returned unstructured text.' : 'Implementation failed.',
           resultRisks: [],
           testScenarios: [],
+          conventionViolations: [],
+          violationFeedback: null,
         }));
         return;
       }
+
+      // Run deterministic convention guard before enabling Apply.
+      // Only runs for script tasks — plugin/ribbon violations are caught by review.
+      let guardViolations: ConventionViolation[] = [];
+      let guardFeedback: string | null = null;
+      if (state.taskKind === 'script') {
+        const guard = checkCrmJavaScriptConventions(
+          result.result!.proposedContent,
+          state.artifactContent ?? undefined,
+        );
+        guardViolations = guard.violations;
+        guardFeedback = guard.hasBlockingViolations ? guard.feedbackForRegeneration : null;
+      }
+
       setState((s) => ({
         ...s,
         phase: 'result',
@@ -426,6 +456,8 @@ const AiKitActionsPanel = forwardRef<AiKitActionsPanelHandle, AiKitActionsPanelP
         testScenarios: result.result!.testScenarios ?? [],
         rawText: null,
         clarificationNeeded: null,
+        conventionViolations: guardViolations,
+        violationFeedback: guardFeedback,
       }));
     } catch (e) {
       setError(String(e));
@@ -940,7 +972,7 @@ const AiKitActionsPanel = forwardRef<AiKitActionsPanelHandle, AiKitActionsPanelP
                 <div style={{ display: 'flex', gap: 8 }}>
                   <button
                     className="btn btn-primary btn-sm"
-                    onClick={state.action === 'implement' ? runImplement : runApplyFixes}
+                    onClick={state.action === 'implement' ? () => runImplement() : runApplyFixes}
                     disabled={isRunning}
                   >
                     {confirmRunLabel}
@@ -1034,6 +1066,30 @@ const AiKitActionsPanel = forwardRef<AiKitActionsPanelHandle, AiKitActionsPanelP
                         </ul>
                       </div>
                     )}
+
+                    {/* Convention violation blocking warning */}
+                    {state.conventionViolations.length > 0 && (
+                      <div style={{
+                        marginBottom: 12,
+                        border: '1px solid var(--color-blocked, #e05555)',
+                        borderRadius: 4,
+                        padding: '8px 12px',
+                        background: 'rgba(224, 85, 85, 0.05)',
+                      }}>
+                        <div style={{ color: 'var(--color-blocked, #e05555)', fontWeight: 600, marginBottom: 4 }}>
+                          AI Kit convention violation: proposed content introduces early return / guard-clause return.
+                        </div>
+                        <ul style={{ margin: '4px 0 0 16px', padding: 0, fontSize: 11 }}>
+                          {state.conventionViolations.flatMap((v) => v.matchedLines).map((line, i) => (
+                            <li key={i}><code style={{ fontFamily: 'monospace' }}>{line.trim()}</code></li>
+                          ))}
+                        </ul>
+                        <div style={{ marginTop: 6, color: 'var(--text-muted)', fontSize: 11 }}>
+                          Apply is blocked. Use Regenerate with Violation Feedback to fix this.
+                        </div>
+                      </div>
+                    )}
+
                     <div style={{ marginBottom: 8 }}>
                       <strong>Proposed content:</strong>
                       <pre style={{
@@ -1053,14 +1109,24 @@ const AiKitActionsPanel = forwardRef<AiKitActionsPanelHandle, AiKitActionsPanelP
                   </>
                 )}
 
-                <div style={{ display: 'flex', gap: 8, marginTop: 8 }}>
+                <div style={{ display: 'flex', gap: 8, marginTop: 8, flexWrap: 'wrap' }}>
                   {state.proposedContent && !state.clarificationNeeded && (
                     <button
                       className="btn btn-primary btn-sm"
                       onClick={state.action === 'implement' ? applyImplementation : applyFixes}
-                      disabled={isRunning}
+                      disabled={isRunning || state.conventionViolations.length > 0}
+                      title={state.conventionViolations.length > 0 ? 'Apply blocked: convention violation detected. Regenerate first.' : undefined}
                     >
                       <Icon name="check" size={13} /> Apply to File
+                    </button>
+                  )}
+                  {state.violationFeedback && state.action === 'implement' && (
+                    <button
+                      className="btn btn-secondary btn-sm"
+                      onClick={() => runImplement({ violationFeedback: state.violationFeedback! })}
+                      disabled={isRunning}
+                    >
+                      Regenerate with Violation Feedback
                     </button>
                   )}
                   <button className="btn btn-ghost btn-sm" onClick={reset} disabled={isRunning}>Discard</button>

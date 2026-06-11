@@ -23,9 +23,9 @@ export interface PowerPlatformAiKitContext {
   agentInstructions: string;
   /** Content of the task-kind-specific rules file. */
   taskRules: string;
-  /** Content of known-pr-review-comments.md (review actions only). */
+  /** Content of known-pr-review-comments.md — always loaded (needed for both implementation and review). */
   reviewRules?: string;
-  /** Content of crm-code-review-checklist.md (review actions only). */
+  /** Content of crm-code-review-checklist.md — always loaded. */
   checklist?: string;
   /** Content of prompts/pp-implement-crm-task.md. */
   implementPromptTemplate?: string;
@@ -163,10 +163,14 @@ async function tryRead(kitPath: string, rel: string): Promise<string | null> {
 /**
  * Loads the AI Kit context for the given task kind.
  *
- * @param kitPath     Absolute path to the AI Kit repository root.
- * @param taskKind    Detected task kind (determines which rules file to load).
- * @param forReview   When true, also loads known-pr-review-comments and checklist.
- * @param includePrompts  When true, also loads prompt templates.
+ * known-pr-review-comments.md and crm-code-review-checklist.md are always
+ * loaded — they apply to both implementation and review to prevent common
+ * PR issues from being introduced during generation.
+ *
+ * @param kitPath         Absolute path to the AI Kit repository root.
+ * @param taskKind        Detected task kind (determines which rules file to load).
+ * @param forReview       When true, also loads the review prompt template (pp-review-diff.md).
+ * @param includePrompts  When true, also loads both prompt templates.
  */
 export async function loadAiKitContext(
   kitPath: string,
@@ -191,18 +195,18 @@ export async function loadAiKitContext(
   const rulesFile = RULES_MAP[taskKind];
   const taskRules = await load(rulesFile);
 
-  let reviewRules: string | undefined;
-  let checklist: string | undefined;
-  if (forReview) {
-    reviewRules = await load('ai-rules/known-pr-review-comments.md');
-    checklist   = await load('ai-rules/crm-code-review-checklist.md');
-  }
+  // Always load PR review comments and checklist — they prevent common issues
+  // during implementation as well as review.
+  const reviewRules = await load('ai-rules/known-pr-review-comments.md');
+  const checklist   = await load('ai-rules/crm-code-review-checklist.md');
 
   let implementPromptTemplate: string | undefined;
   let reviewPromptTemplate: string | undefined;
   if (includePrompts) {
     implementPromptTemplate = await load('prompts/pp-implement-crm-task.md');
     reviewPromptTemplate    = await load('prompts/pp-review-diff.md');
+  } else if (forReview) {
+    reviewPromptTemplate = await load('prompts/pp-review-diff.md');
   }
 
   return {
@@ -219,12 +223,175 @@ export async function loadAiKitContext(
 }
 
 // ---------------------------------------------------------------------------
+// Section-aware markdown assembly
+// ---------------------------------------------------------------------------
+
+const CRITICAL_HEADING_KEYWORDS = [
+  'early return',
+  'single return',
+  'guard clause',
+  'guard-clause',
+  'mandatory',
+  'do not',
+  'must not',
+  'forbidden',
+  'never use',
+  'required',
+  'pr-005',
+];
+
+function isHeadingCritical(heading: string): boolean {
+  const lower = heading.toLowerCase();
+  return CRITICAL_HEADING_KEYWORDS.some((kw) => lower.includes(kw));
+}
+
+interface MarkdownSection {
+  heading: string;
+  body: string;
+  isCritical: boolean;
+}
+
+function splitMarkdownSections(content: string): MarkdownSection[] {
+  const sections: MarkdownSection[] = [];
+  const lines = content.split('\n');
+  let heading = '';
+  let bodyLines: string[] = [];
+
+  function flush(): void {
+    const body = bodyLines.join('\n');
+    if (heading || body.trim()) {
+      sections.push({ heading, body, isCritical: isHeadingCritical(heading) });
+    }
+  }
+
+  for (const line of lines) {
+    if (/^#{1,4} /.test(line)) {
+      flush();
+      heading = line;
+      bodyLines = [];
+    } else {
+      bodyLines.push(line);
+    }
+  }
+  flush();
+
+  return sections;
+}
+
+/**
+ * Assembles markdown content for inclusion in an AI prompt.
+ *
+ * Strategy:
+ * - If content fits within maxChars, return it unchanged.
+ * - Otherwise include sections in file order until budget runs out.
+ * - Any critical sections (early return, single return, mandatory, etc.) that
+ *   were cut from the middle of the file are appended at the end so they are
+ *   never silently dropped.
+ *
+ * This guarantees critical rules survive even when they appear late in large files.
+ */
+export function assembleMarkdownForPrompt(content: string, maxChars: number): string {
+  if (!content) return '';
+  if (content.length <= maxChars) return content;
+
+  const sections = splitMarkdownSections(content);
+  const included: string[] = [];
+  const deferredCritical: MarkdownSection[] = [];
+  let budget = maxChars;
+
+  for (const s of sections) {
+    const text = s.heading ? `${s.heading}\n${s.body}` : s.body;
+    if (text.length + 2 <= budget) {
+      included.push(text);
+      budget -= text.length + 2;
+    } else if (s.isCritical) {
+      deferredCritical.push(s);
+    }
+    // Non-critical sections beyond budget are dropped silently.
+  }
+
+  // Append critical sections that didn't fit in their original position.
+  for (const s of deferredCritical) {
+    const text = `${s.heading}\n${s.body}`;
+    included.push(text);
+  }
+
+  const truncNote = deferredCritical.length > 0
+    ? `\n[AI Kit assembler: non-critical sections truncated; ${deferredCritical.length} critical section(s) preserved from later in file]`
+    : `\n[AI Kit assembler: content truncated at ${maxChars} chars]`;
+
+  return included.join('\n\n') + truncNote;
+}
+
+// ---------------------------------------------------------------------------
+// Critical AI Kit rules block
+// ---------------------------------------------------------------------------
+
+/**
+ * Builds an explicit "CRITICAL AI KIT RULES" block for the given task kind.
+ * These rules must appear before the full file content to reinforce key conventions.
+ */
+export function buildCriticalAiKitRules(taskKind: AiKitTaskKind): string {
+  const lines: string[] = [];
+  lines.push('## CRITICAL AI KIT RULES');
+  lines.push('These rules are non-negotiable. They must be followed even when not explicitly repeated in the rules files below.');
+  lines.push('');
+
+  if (taskKind === 'script') {
+    lines.push('**No early returns / guard-clause returns:**');
+    lines.push('- Do NOT write `return;` as a guard at the start or middle of a function.');
+    lines.push('- Do NOT write `if (!x) return;` or `if (!x) { return; }` patterns.');
+    lines.push('- Use positive if/else: `if (allDepsExist) { ... logic ... }` — no return needed when deps are absent.');
+    lines.push('');
+    lines.push('**Single return per function (where reasonably possible):**');
+    lines.push('- Structure logic so all branches exit naturally at the function end.');
+    lines.push('- Nested positive conditions are preferred over guard-clause returns.');
+    lines.push('');
+    lines.push('**Do not silently return when CRM attributes/controls are missing:**');
+    lines.push('- If `getAttribute(...)` or `getControl(...)` may be null, wrap the entire logic in a positive check.');
+    lines.push('- If implementation cannot be safe without missing metadata, set clarificationNeeded.');
+    lines.push('');
+    lines.push('**Preserve existing file style:**');
+    lines.push('- Match indentation, naming, and function declaration style of the existing file exactly.');
+    lines.push('- Do NOT introduce namespace / IIFE / class / module / "use strict" unless the existing file uses it.');
+    lines.push('');
+    lines.push('**Use exact names from the task:**');
+    lines.push('- Use attribute logical names, control names, and option set values exactly as stated in the task or technical plan.');
+  } else if (taskKind === 'plugin') {
+    lines.push('**No early returns as default flow style:**');
+    lines.push('- Avoid `return;` as primary flow control. Use positive conditions.');
+    lines.push('- Reserve early returns only for exceptional error conditions explicitly required by the plan.');
+    lines.push('');
+    lines.push('**No over-guarding:**');
+    lines.push('- Do not add defensive null-checks or guard-clause returns unless the approved plan requires them.');
+    lines.push('');
+    lines.push('**No invented metadata:**');
+    lines.push('- Do not invent entity names, attribute names, option set values, or relationship names.');
+    lines.push('- Use only what is explicitly stated in the task and technical plan.');
+    lines.push('');
+    lines.push('**No placeholders or TODOs:**');
+    lines.push('- Do not write `// TODO`, `// Placeholder`, or stub implementations.');
+    lines.push('- If a section needs missing metadata, set clarificationNeeded instead.');
+    lines.push('');
+    lines.push('**Preserve existing project/class style:**');
+    lines.push('- Match the namespace, class structure, and patterns of the existing plugin project.');
+  } else {
+    lines.push('- No early returns as default flow style. Use positive conditions.');
+    lines.push('- Preserve existing file style exactly.');
+    lines.push('- Use exact names from the task — no invented metadata.');
+    lines.push('- No placeholder/TODO code.');
+  }
+
+  return lines.join('\n');
+}
+
+// ---------------------------------------------------------------------------
 // Prompt builders
 // ---------------------------------------------------------------------------
 
 export function buildImplementInstructions(
   ctx: PowerPlatformAiKitContext,
-  options?: { createMode?: boolean },
+  options?: { createMode?: boolean; violationFeedback?: string },
 ): string {
   const parts: string[] = [];
   const createMode = !!options?.createMode;
@@ -249,33 +416,45 @@ export function buildImplementInstructions(
   }
   parts.push('');
 
+  parts.push(buildCriticalAiKitRules(ctx.taskKind));
+  parts.push('');
+
+  if (options?.violationFeedback) {
+    parts.push('## VIOLATION FEEDBACK FROM PREVIOUS GENERATION');
+    parts.push('Your previous output violated AI Kit conventions. Correct these issues before generating again:');
+    parts.push(options.violationFeedback);
+    parts.push('');
+  }
+
   if (ctx.agentInstructions) {
-    parts.push('## AGENT INSTRUCTIONS (from AGENTS.md)');
-    parts.push(ctx.agentInstructions.slice(0, 3000));
+    parts.push('## AGENT INSTRUCTIONS (AGENTS.md)');
+    parts.push(assembleMarkdownForPrompt(ctx.agentInstructions, 3000));
     parts.push('');
   }
 
   if (ctx.taskRules) {
-    parts.push(`## CRM DEVELOPMENT RULES (${RULES_MAP[ctx.taskKind]})`);
-    parts.push(ctx.taskRules.slice(0, 4000));
+    parts.push(`## TASK-KIND RULES (${RULES_MAP[ctx.taskKind]})`);
+    parts.push(assembleMarkdownForPrompt(ctx.taskRules, 5000));
     parts.push('');
   }
 
   if (ctx.reviewRules) {
-    parts.push('## KNOWN PR REVIEW COMMENTS (avoid these issues)');
-    parts.push(ctx.reviewRules.slice(0, 2000));
+    parts.push('## KNOWN PR REVIEW COMMENTS (ai-rules/known-pr-review-comments.md)');
+    parts.push('Avoid introducing any of the following patterns during implementation:');
+    parts.push(assembleMarkdownForPrompt(ctx.reviewRules, 3000));
     parts.push('');
   }
 
   if (ctx.checklist) {
-    parts.push('## CRM CODE REVIEW CHECKLIST (satisfy all applicable items)');
-    parts.push(ctx.checklist.slice(0, 2000));
+    parts.push('## CRM CODE REVIEW CHECKLIST (ai-rules/crm-code-review-checklist.md)');
+    parts.push('Satisfy all applicable checklist items:');
+    parts.push(assembleMarkdownForPrompt(ctx.checklist, 3000));
     parts.push('');
   }
 
   if (ctx.implementPromptTemplate) {
-    parts.push('## IMPLEMENTATION PROMPT TEMPLATE');
-    parts.push(ctx.implementPromptTemplate.slice(0, 2000));
+    parts.push('## IMPLEMENTATION PROMPT TEMPLATE (prompts/pp-implement-crm-task.md)');
+    parts.push(assembleMarkdownForPrompt(ctx.implementPromptTemplate, 3000));
     parts.push('');
   }
 
@@ -309,31 +488,31 @@ export function buildDiffReviewInstructions(ctx: PowerPlatformAiKitContext): str
 
   if (ctx.agentInstructions) {
     parts.push('## AGENT INSTRUCTIONS');
-    parts.push(ctx.agentInstructions.slice(0, 2000));
+    parts.push(assembleMarkdownForPrompt(ctx.agentInstructions, 2000));
     parts.push('');
   }
 
   if (ctx.taskRules) {
     parts.push('## CRM DEVELOPMENT RULES (Power Platform AI Kit)');
-    parts.push(ctx.taskRules.slice(0, 3000));
+    parts.push(assembleMarkdownForPrompt(ctx.taskRules, 3000));
     parts.push('');
   }
 
   if (ctx.reviewRules) {
     parts.push('## KNOWN PR REVIEW COMMENTS (check diff for these patterns)');
-    parts.push(ctx.reviewRules.slice(0, 2000));
+    parts.push(assembleMarkdownForPrompt(ctx.reviewRules, 2000));
     parts.push('');
   }
 
   if (ctx.checklist) {
     parts.push('## CRM CODE REVIEW CHECKLIST (verify applicable items)');
-    parts.push(ctx.checklist.slice(0, 2000));
+    parts.push(assembleMarkdownForPrompt(ctx.checklist, 2000));
     parts.push('');
   }
 
   if (ctx.reviewPromptTemplate) {
     parts.push('## REVIEW PROMPT TEMPLATE');
-    parts.push(ctx.reviewPromptTemplate.slice(0, 2000));
+    parts.push(assembleMarkdownForPrompt(ctx.reviewPromptTemplate, 2000));
     parts.push('');
   }
 
@@ -363,13 +542,13 @@ export function buildApplyFixesInstructions(ctx: PowerPlatformAiKitContext, revi
 
   if (ctx.taskRules) {
     parts.push('## CRM DEVELOPMENT RULES');
-    parts.push(ctx.taskRules.slice(0, 2000));
+    parts.push(assembleMarkdownForPrompt(ctx.taskRules, 2000));
     parts.push('');
   }
 
   if (ctx.reviewRules) {
     parts.push('## KNOWN PR REVIEW COMMENTS');
-    parts.push(ctx.reviewRules.slice(0, 1500));
+    parts.push(assembleMarkdownForPrompt(ctx.reviewRules, 1500));
     parts.push('');
   }
 
