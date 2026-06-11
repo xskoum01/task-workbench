@@ -21,6 +21,7 @@ use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use rand::Rng;
 
 mod ai_model_capabilities;
+mod openai_response_parser;
 
 // --- Helpers ---------------------------------------------------------------
 
@@ -731,6 +732,7 @@ fn is_untracked_relevant(path: &str) -> bool {
 }
 
 #[derive(Serialize, Debug)]
+#[serde(rename_all = "camelCase")]
 struct GitReviewContext {
     repo_root: String,
     current_branch: String,
@@ -940,6 +942,126 @@ fn collect_git_review_context(
         noise_files,
         flagged_paths,
         summary,
+    })
+}
+
+// --- File-specific git review context ----------------------------------------
+
+#[derive(Serialize, Debug)]
+#[serde(rename_all = "camelCase")]
+struct GitFileReviewContext {
+    repo_root: String,
+    current_branch: String,
+    base_branch: String,
+    file_rel_path: String,
+    /// Combined diff: committed branch changes + staged + unstaged for this file only.
+    diff: String,
+    has_committed: bool,
+    has_staged: bool,
+    has_unstaged: bool,
+    /// true when the file is not tracked by git at all (new, never staged/committed).
+    is_untracked: bool,
+}
+
+/// Collects a read-only, file-specific git diff review context.
+///
+/// Unlike `collect_git_review_context` which gathers the full branch diff,
+/// this command focuses on a single file to avoid pulling in unrelated changes.
+///
+/// Read-only commands used:
+///   `git rev-parse --show-toplevel`
+///   `git branch --show-current`
+///   `git rev-parse --verify <branch>`
+///   `git diff <base>...HEAD -- <file>`    (committed branch changes for this file)
+///   `git diff --cached -- <file>`         (staged changes)
+///   `git diff -- <file>`                  (unstaged changes)
+///   `git ls-files --error-unmatch <file>` (check whether tracked)
+///
+/// Never runs: add, commit, push, checkout, merge, rebase, or any write command.
+#[tauri::command]
+fn collect_git_file_review_context(
+    repo_root: String,
+    file_path: String,
+) -> Result<GitFileReviewContext, String> {
+    // 1. Resolve actual git root.
+    let actual_root = run_git_ro(&repo_root, &["rev-parse", "--show-toplevel"])
+        .map(|s| s.trim().replace('\\', "/").trim_end_matches('/').to_string())
+        .ok_or_else(|| format!("Not a git repository: {repo_root}"))?;
+    let repo = actual_root.as_str();
+
+    // 2. Current branch and base branch.
+    let current_branch = run_git_ro(repo, &["branch", "--show-current"])
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "unknown".to_string());
+    let base = detect_base_branch(repo);
+
+    // 3. Make file path repo-relative.
+    let fp_norm = file_path.replace('\\', "/");
+    let repo_prefix = format!("{}/", actual_root);
+    let file_rel = if fp_norm.starts_with(&repo_prefix) {
+        fp_norm[repo_prefix.len()..].to_string()
+    } else if !fp_norm.contains('/') && !fp_norm.contains('\\') {
+        // Bare filename — use as-is.
+        fp_norm.clone()
+    } else {
+        return Err(format!(
+            "File is outside the repository root.\nFile: {fp_norm}\nRepo: {actual_root}"
+        ));
+    };
+
+    // 4. Check if HEAD exists (unborn branch has no commits yet).
+    let head_exists = run_git_ro(repo, &["rev-parse", "--verify", "HEAD"]).is_some();
+
+    // 5. Committed branch changes for this file vs base.
+    let base_range = format!("{}...HEAD", base);
+    let committed_diff = if head_exists {
+        run_git_ro(repo, &["diff", &base_range, "--", &file_rel])
+            .map(|s| cap_utf8(s, 30_000))
+            .unwrap_or_default()
+    } else {
+        String::new()
+    };
+    let has_committed = !committed_diff.is_empty();
+
+    // 6. Staged changes for this file.
+    let staged_diff = run_git_ro(repo, &["diff", "--cached", "--", &file_rel])
+        .map(|s| cap_utf8(s, 15_000))
+        .unwrap_or_default();
+    let has_staged = !staged_diff.is_empty();
+
+    // 7. Unstaged changes for this file.
+    let unstaged_diff = run_git_ro(repo, &["diff", "--", &file_rel])
+        .map(|s| cap_utf8(s, 15_000))
+        .unwrap_or_default();
+    let has_unstaged = !unstaged_diff.is_empty();
+
+    // 8. Determine whether the file is tracked by git.
+    //    `git ls-files --error-unmatch` exits 0 when tracked, non-0 when not in the index.
+    let is_untracked = run_git_ro(repo, &["ls-files", "--error-unmatch", &file_rel]).is_none();
+
+    // 9. Combine all diffs with section headers.
+    let mut diff_parts: Vec<String> = Vec::new();
+    if has_committed {
+        diff_parts.push(format!("=== BRANCH DIFF ({base} → HEAD) — {file_rel} ===\n{committed_diff}"));
+    }
+    if has_staged {
+        diff_parts.push(format!("=== STAGED CHANGES — {file_rel} ===\n{staged_diff}"));
+    }
+    if has_unstaged {
+        diff_parts.push(format!("=== UNSTAGED CHANGES — {file_rel} ===\n{unstaged_diff}"));
+    }
+    let diff = diff_parts.join("\n\n");
+
+    Ok(GitFileReviewContext {
+        repo_root: actual_root,
+        current_branch,
+        base_branch: base,
+        file_rel_path: file_rel,
+        diff,
+        has_committed,
+        has_staged,
+        has_unstaged,
+        is_untracked,
     })
 }
 
@@ -1554,14 +1676,8 @@ async fn call_openai_with_temperature(
 
     let json: Value = resp.json().await.map_err(|e| e.to_string())?;
 
-    // Responses API: output[0].content[0].text
-    json["output"][0]["content"][0]["text"]
-        .as_str()
-        .map(|s| s.to_string())
-        .ok_or_else(|| {
-            let snippet = json.to_string();
-            format!("Unexpected OpenAI response format: {}", &snippet[..snippet.len().min(300)])
-        })
+    openai_response_parser::extract_openai_response_text(&json)
+        .map_err(|_| openai_response_parser::sanitize_openai_response_error(&json, model))
 }
 
 /// Calls the Anthropic Messages API and returns the text of the first content block.
@@ -11561,6 +11677,7 @@ pub fn run() {
             get_teams_recent_messages,
             get_teams_self_chat_messages,
             collect_git_review_context,
+            collect_git_file_review_context,
             read_file_content,
             list_directory_files,
             list_files_with_paths,

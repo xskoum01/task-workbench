@@ -58,18 +58,32 @@ function SettingsBlock({
   );
 }
 
-/** Label + control row inside a settings block */
+/** Label + control row inside a settings block.
+ *
+ * When `hint` is provided the children and hint text are wrapped in a
+ * `.settings-field-control` column container so the hint appears below
+ * the input rather than beside it in the flex row.
+ */
 function SettingsField({
   label,
+  hint,
   children,
 }: {
   label: string;
+  hint?: string;
   children: React.ReactNode;
 }) {
   return (
     <div className="settings-form-row">
       <label className="form-label">{label}</label>
-      {children}
+      {hint ? (
+        <div className="settings-field-control">
+          {children}
+          <div className="settings-field-hint">{hint}</div>
+        </div>
+      ) : (
+        children
+      )}
     </div>
   );
 }
@@ -984,18 +998,17 @@ export default function SettingsPage() {
                 </select>
               </SettingsField>
 
-              <SettingsField label="OpenAI Model">
+              <SettingsField
+                label="OpenAI Model"
+                hint="Some models (e.g. gpt-5.5, o1, o3) do not accept sampling parameters such as temperature. Unsupported parameters are omitted automatically."
+              >
                 <input
                   className="form-input"
                   type="text"
                   placeholder="gpt-4.1-mini"
                   value={draft.openaiModel ?? ''}
                   onChange={(e) => set('openaiModel', e.target.value)}
-                  style={{ maxWidth: 280 }}
                 />
-                <div className="settings-field-hint">
-                  Some models (e.g. gpt-5.5, o1, o3) do not accept sampling parameters such as temperature. Unsupported parameters are omitted automatically.
-                </div>
               </SettingsField>
 
               <SettingsField label="OpenAI API Key">

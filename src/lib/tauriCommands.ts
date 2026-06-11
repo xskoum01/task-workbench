@@ -648,6 +648,43 @@ export function collectGitReviewContext(
   });
 }
 
+/**
+ * File-specific git review context. Unlike `GitReviewContext` (full branch diff),
+ * this contains only changes to a single file — avoiding unrelated files being sent to AI.
+ */
+export interface GitFileReviewContext {
+  repoRoot: string;
+  currentBranch: string;
+  baseBranch: string;
+  /** Repo-relative file path, e.g. "Scripts/nvr_account_events.js". */
+  fileRelPath: string;
+  /** Combined diff for this file: committed branch changes + staged + unstaged. */
+  diff: string;
+  hasCommitted: boolean;
+  hasStaged: boolean;
+  hasUnstaged: boolean;
+  /** True when the file is not tracked by git (new/never staged). */
+  isUntracked: boolean;
+}
+
+/**
+ * Collects a read-only, file-specific git diff context.
+ *
+ * Runs only safe read-only git commands for the selected file:
+ *   git diff <base>...HEAD -- <file>    (committed branch changes)
+ *   git diff --cached -- <file>         (staged)
+ *   git diff -- <file>                  (unstaged)
+ *   git ls-files --error-unmatch <file> (check if tracked)
+ *
+ * Never runs write commands.
+ */
+export function collectGitFileReviewContext(
+  repoRoot: string,
+  filePath: string,
+): Promise<GitFileReviewContext> {
+  return invoke('collect_git_file_review_context', { repoRoot, filePath });
+}
+
 /** Returns the name of the currently checked-out branch. */
 export function getGitBranch(repoPath: string): Promise<string> {
   return invoke<string>('get_git_branch', { repoPath });

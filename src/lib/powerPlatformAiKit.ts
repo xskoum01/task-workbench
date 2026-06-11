@@ -349,7 +349,8 @@ export function buildCriticalAiKitRules(taskKind: AiKitTaskKind): string {
     lines.push('');
     lines.push('**Do not silently return when CRM attributes/controls are missing:**');
     lines.push('- If `getAttribute(...)` or `getControl(...)` may be null, wrap the entire logic in a positive check.');
-    lines.push('- If implementation cannot be safe without missing metadata, set clarificationNeeded.');
+    lines.push('- If a field/attribute name comes from the task assignment but was not confirmed by Dataverse verification, still use the exact name from the task. Add "Metadata not confirmed: [field_name]" to risks or testScenarios — do NOT set clarificationNeeded for this.');
+    lines.push('- Only set clarificationNeeded when the task does not specify what field names or entity names to use at all.');
     lines.push('');
     lines.push('**Preserve existing file style:**');
     lines.push('- Match indentation, naming, and function declaration style of the existing file exactly.');
@@ -371,7 +372,7 @@ export function buildCriticalAiKitRules(taskKind: AiKitTaskKind): string {
     lines.push('');
     lines.push('**No placeholders or TODOs:**');
     lines.push('- Do not write `// TODO`, `// Placeholder`, or stub implementations.');
-    lines.push('- If a section needs missing metadata, set clarificationNeeded instead.');
+    lines.push('- If field/attribute names from the task were not confirmed by Dataverse verification, still use the exact names stated in the task. Add "Metadata not confirmed: [field_name]" to risks or testScenarios — do NOT set clarificationNeeded for unconfirmed metadata.');
     lines.push('');
     lines.push('**Preserve existing project/class style:**');
     lines.push('- Match the namespace, class structure, and patterns of the existing plugin project.');
@@ -407,13 +408,28 @@ export function buildImplementInstructions(
   parts.push('- Do NOT write to Dataverse, Azure DevOps, GitHub, or any external system.');
   parts.push('- Only change the single target file provided.');
   parts.push('- Do NOT use DateTime.UtcNow, Guid.NewGuid(), random number generators, or timestamp values as business identifiers or sequence numbers unless the task explicitly requires it.');
-  parts.push('- Do NOT add placeholder methods, TODO comments ("// TODO", "// Placeholder", "// Implement"), or stub implementations. If a section cannot be implemented without missing metadata, set clarificationNeeded instead.');
+  parts.push('- Do NOT add placeholder methods, TODO comments ("// TODO", "// Placeholder", "// Implement"), or stub implementations.');
   parts.push('- In PreOperation Create/Update plugins, prefer setting attributes on context.InputParameters["Target"] directly rather than calling service.Update() on the primary entity, unless the plan explicitly specifies Update.');
   parts.push('- Use the exact field names, entity names, and business logic specified in the task assignment and technical plan — no approximations.');
   if (createMode) {
     parts.push('- Create mode: current file content may be empty or missing; generate the complete initial file content for the resolved artifact path.');
     parts.push('- Do NOT switch to a different file path even if task text mentions alternatives.');
   }
+  parts.push('');
+
+  parts.push('## CLARIFICATION POLICY');
+  parts.push('Set clarificationNeeded ONLY when the task assignment itself is ambiguous or impossible:');
+  parts.push('- Target file/artifact path cannot be determined from the task');
+  parts.push('- Requirement is directly contradictory or physically impossible');
+  parts.push('- Required attribute/entity/field names are NOT stated anywhere in the task text at all');
+  parts.push('- Business logic cannot be inferred without additional clarification from the requester');
+  parts.push('');
+  parts.push('Do NOT set clarificationNeeded for:');
+  parts.push('- Failed or missing Dataverse metadata verification');
+  parts.push('- Primarch MCP unavailable or metadata not yet verified');
+  parts.push('- Field names from the task assignment that were not confirmed in Dataverse schema');
+  parts.push('- Any verification check result — Dataverse checks happen in Verify Implementation, not here');
+  parts.push('When field names from the task were not confirmed by Dataverse verification, use them as-is and list "Metadata not confirmed: [field_name]" in risks or testScenarios.');
   parts.push('');
 
   parts.push(buildCriticalAiKitRules(ctx.taskKind));
@@ -466,7 +482,7 @@ export function buildImplementInstructions(
   "changedSections": ["<description of each changed section>"],
   "risks": ["<risk1>", "<risk2>"],
   "testScenarios": ["<test scenario 1>", "<test scenario 2>"],
-  "clarificationNeeded": "<set to a non-empty string listing the exact missing Dataverse metadata or business logic that prevents implementation; omit or leave empty string if not needed>"
+  "clarificationNeeded": "<set ONLY when the task assignment itself is ambiguous or impossible — e.g., no artifact path resolvable, contradictory requirement, or required field names not stated in task text at all. Do NOT set for failed/missing Dataverse verification — use exact field names from task and note any unconfirmed fields in risks or testScenarios instead>"
 }`);
 
   return parts.join('\n');

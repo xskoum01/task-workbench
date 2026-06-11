@@ -173,4 +173,118 @@ describe('buildRepositoryContextForTask', () => {
       'Artifact is outside the repository root.\nFile: C:/other/place/AccountPlugin.cs\nRepo: C:/repos/customer'
     );
   });
+
+  // ── Relative-path rejection ────────────────────────────────────────────────
+
+  it('ignores relative workflowSetup.repositoryRoot and adds a warning with the offending value', () => {
+    const task = makeTask({
+      workflowSetup: { repositoryRoot: 'VSK-Test' },
+    });
+    const customer = makeCustomer({
+      resolvedRepositoryPath: 'C:/CRM/VSK-Test',
+    });
+
+    const result = buildRepositoryContextForTask(task, customer, {});
+
+    // Relative value must be rejected
+    expect(result.repoRoot).toBe('C:/CRM/VSK-Test');
+    expect(result.repoRootSource).toBe('customer-resolved');
+    expect(result.warnings.some((w) => w.includes('VSK-Test') && w.includes('relative'))).toBe(true);
+  });
+
+  it('falls back to customer.resolvedRepositoryPath when workflowSetup.repositoryRoot is relative', () => {
+    const task = makeTask({
+      workflowSetup: { repositoryRoot: 'VSK-Test' },
+    });
+    const customer = makeCustomer({
+      resolvedRepositoryPath: 'C:/repos/customer-resolved',
+    });
+
+    const result = buildRepositoryContextForTask(task, customer, {});
+
+    expect(result.repoRoot).toBe('C:/repos/customer-resolved');
+    expect(result.repoRootSource).toBe('customer-resolved');
+  });
+
+  it('falls back to crmBaseDirectory + folderName when workflowSetup.repositoryRoot is relative', () => {
+    const task = makeTask({
+      workflowSetup: { repositoryRoot: 'VSK-Test' },
+    });
+    const customer = makeCustomer({ folderName: 'vsk-test' });
+
+    const result = buildRepositoryContextForTask(task, customer, {
+      crmBaseDirectory: 'C:/CRM',
+    });
+
+    expect(result.repoRoot).toBe('C:/CRM/vsk-test');
+    expect(result.repoRootSource).toBe('base-dir-computed');
+  });
+
+  it('absolute workflowSetup.repositoryRoot takes priority over customer fallbacks', () => {
+    const task = makeTask({
+      workflowSetup: { repositoryRoot: 'C:/repos/from-setup-absolute' },
+    });
+    const customer = makeCustomer({
+      resolvedRepositoryPath: 'C:/repos/from-customer',
+    });
+
+    const result = buildRepositoryContextForTask(task, customer, {});
+
+    expect(result.repoRoot).toBe('C:/repos/from-setup-absolute');
+    expect(result.repoRootSource).toBe('workflow-setup');
+    expect(result.warnings.filter((w) => w.includes('relative'))).toHaveLength(0);
+  });
+
+  it('ignores relative customer.repositoryRoot and adds a warning', () => {
+    const task = makeTask();
+    const customer = makeCustomer({ repositoryRoot: 'relative-folder' });
+
+    const result = buildRepositoryContextForTask(task, customer, {});
+
+    expect(result.repoRoot).toBeNull();
+    expect(result.warnings.some((w) => w.includes('relative-folder') && w.includes('relative'))).toBe(true);
+  });
+
+  it('artifact inside the absolute fallback repo root passes insideRepo', () => {
+    const task = makeTask({
+      workflowSetup: {
+        repositoryRoot: 'relative-only',
+        artifactPath: 'C:/repos/customer/Scripts/nvr_account.js',
+      },
+    });
+    const customer = makeCustomer({ resolvedRepositoryPath: 'C:/repos/customer' });
+
+    const result = buildRepositoryContextForTask(task, customer, {});
+
+    expect(result.repoRoot).toBe('C:/repos/customer');
+    expect(result.insideRepo).toBe(true);
+    expect(result.blockers.filter((b) => b.includes('outside'))).toHaveLength(0);
+  });
+
+  it('artifact outside the absolute repo root still produces a blocker after relative-path fallback', () => {
+    const task = makeTask({
+      workflowSetup: {
+        repositoryRoot: 'relative-only',
+        artifactPath: 'C:/other/place/nvr_account.js',
+      },
+    });
+    const customer = makeCustomer({ resolvedRepositoryPath: 'C:/repos/customer' });
+
+    const result = buildRepositoryContextForTask(task, customer, {});
+
+    expect(result.insideRepo).toBe(false);
+    expect(result.blockers.some((b) => b.includes('outside'))).toBe(true);
+  });
+
+  it('warning text includes the ignored relative path for workflowSetup', () => {
+    const task = makeTask({
+      workflowSetup: { repositoryRoot: 'VSK-Test' },
+    });
+
+    const result = buildRepositoryContextForTask(task, makeCustomer(), {});
+
+    const relativeWarning = result.warnings.find((w) => w.includes('VSK-Test'));
+    expect(relativeWarning).toBeDefined();
+    expect(relativeWarning).toContain('relative');
+  });
 });

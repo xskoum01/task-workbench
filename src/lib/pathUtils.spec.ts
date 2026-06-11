@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { isPathInsideDir } from './pathUtils';
+import { isPathInsideDir, isAbsolutePath } from './pathUtils';
 
 describe('isPathInsideDir', () => {
   it('file at repo root level is inside repo', () => {
@@ -66,5 +66,71 @@ describe('isPathInsideDir', () => {
       'C:/repos/customer-repo/Plugins/Plugin.cs',
       'C:/repos/power-platform-ai-kit',
     )).toBe(false);
+  });
+});
+
+describe('isAbsolutePath', () => {
+  // --- Windows absolute ---
+  it('Windows drive letter with backslash is absolute', () => {
+    expect(isAbsolutePath('C:\\Users\\dev\\repo')).toBe(true);
+  });
+
+  it('Windows drive letter with forward slash is absolute', () => {
+    expect(isAbsolutePath('C:/Users/dev/repo')).toBe(true);
+  });
+
+  it('Windows drive letter uppercase is absolute', () => {
+    expect(isAbsolutePath('D:/CRM/VSK-Test')).toBe(true);
+  });
+
+  it('Windows drive letter lowercase is absolute', () => {
+    expect(isAbsolutePath('c:/repos/customer')).toBe(true);
+  });
+
+  // --- UNC paths ---
+  it('UNC path with backslashes is absolute', () => {
+    expect(isAbsolutePath('\\\\server\\share')).toBe(true);
+  });
+
+  it('UNC path with forward slashes is absolute', () => {
+    expect(isAbsolutePath('//server/share')).toBe(true);
+  });
+
+  // --- Unix absolute ---
+  it('Unix path starting with / is absolute', () => {
+    expect(isAbsolutePath('/home/user/repo')).toBe(true);
+  });
+
+  it('Unix root / is absolute', () => {
+    expect(isAbsolutePath('/')).toBe(true);
+  });
+
+  // --- Relative paths ---
+  it('bare folder name is relative', () => {
+    expect(isAbsolutePath('VSK-Test')).toBe(false);
+  });
+
+  it('relative path with subdirectories is relative', () => {
+    expect(isAbsolutePath('CRM/VSK-Test')).toBe(false);
+  });
+
+  it('relative path with backslash is relative', () => {
+    expect(isAbsolutePath('relative\\path')).toBe(false);
+  });
+
+  it('empty string is relative', () => {
+    expect(isAbsolutePath('')).toBe(false);
+  });
+
+  it('whitespace-only string is relative', () => {
+    expect(isAbsolutePath('   ')).toBe(false);
+  });
+
+  it('dot-relative path is relative', () => {
+    expect(isAbsolutePath('./local/path')).toBe(false);
+  });
+
+  it('parent-relative path is relative', () => {
+    expect(isAbsolutePath('../sibling/path')).toBe(false);
   });
 });

@@ -38,6 +38,8 @@ export function deriveDataverseCheckStatus(task: Task): ImplCheckStatus {
   if (v === 'pass') return 'passed';
   if (v === 'warnings') return 'warnings';
   if (v === 'fail') return 'failed';
+  // not_configured: assistant is set up but MCP has no metadata tools — treat as warnings
+  if (v === 'not_configured') return 'warnings';
   return 'not-run';
 }
 

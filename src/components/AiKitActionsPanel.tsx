@@ -105,13 +105,20 @@ function buildTaskContextString(task: Task, customer: Customer | undefined, task
 
   const dvReport = task.crmVerificationReports?.[0];
   if (dvReport) {
-    lines.push('## DATAVERSE VERIFICATION');
-    lines.push(`Verdict: ${dvReport.verdict}`);
-    if (dvReport.summary) lines.push(dvReport.summary.slice(0, 300));
+    // Include verification results as implementation risks only — NOT as a hard blocker.
+    // Dataverse checks belong to the Verify Implementation phase, not code generation.
+    // The AI must still implement using exact field names from the task assignment.
+    lines.push('## DATAVERSE VERIFICATION (informational — does not block implementation)');
+    lines.push(`Previous check result: ${dvReport.verdict}`);
+    if (dvReport.summary) lines.push(`Note: ${dvReport.summary.slice(0, 300)}`);
     const missing = (dvReport.missingReferences ?? [])
       .map((r) => `${r.kind}: ${r.displayName}`)
       .slice(0, 5);
-    if (missing.length) { lines.push('Missing references:'); missing.forEach((m) => lines.push(`- ${m}`)); }
+    if (missing.length) {
+      lines.push('Fields/references not confirmed in Dataverse (use names from task assignment anyway):');
+      missing.forEach((m) => lines.push(`- ${m}`));
+    }
+    lines.push('Action: list unconfirmed fields in risks or testScenarios. Still implement using exact names from the task assignment.');
     lines.push('');
   }
 

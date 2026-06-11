@@ -17,3 +17,21 @@ export function isPathInsideDir(filePath: string, dirPath: string): boolean {
   const normDir  = norm(dirPath);
   return normFile === normDir || normFile.startsWith(normDir + '/');
 }
+
+/**
+ * Returns true when the path is absolute.
+ *
+ * Recognised absolute forms:
+ *   - Windows drive letter:  C:\ or C:/
+ *   - UNC:                   \\ or //
+ *   - Unix / POSIX:          /
+ *
+ * Any other string (e.g. "VSK-Test", "relative/path") is considered relative.
+ */
+export function isAbsolutePath(path: string): boolean {
+  const p = path.trim();
+  if (/^[a-zA-Z]:[\\/]/.test(p)) return true; // Windows: C:\ or C:/
+  if (p.startsWith('\\\\') || p.startsWith('//')) return true; // UNC
+  if (p.startsWith('/')) return true; // Unix / POSIX
+  return false;
+}

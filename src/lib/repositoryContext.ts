@@ -7,7 +7,7 @@
  * single source of truth for what the AI Kit can and cannot do.
  */
 import type { Task, Customer } from '../types';
-import { isPathInsideDir } from './pathUtils';
+import { isPathInsideDir, isAbsolutePath } from './pathUtils';
 import { detectTaskKindFromTask, type AiKitTaskKind } from './powerPlatformAiKit';
 
 // ---------------------------------------------------------------------------
@@ -82,25 +82,42 @@ export function buildRepositoryContextForTask(
   let repoRoot: string | null = null;
   let repoRootSource: RepoRootSource | null = null;
 
-  // 1. User-confirmed override in workflow setup
+  // 1. User-confirmed override in workflow setup — must be absolute.
+  //    Relative values (e.g. "VSK-Test") are silently wrong for boundary checks;
+  //    warn and fall through so a reliable absolute path can be found below.
   if (setup?.repositoryRoot?.trim()) {
-    repoRoot = setup.repositoryRoot.trim();
-    repoRootSource = 'workflow-setup';
+    const raw = setup.repositoryRoot.trim();
+    if (isAbsolutePath(raw)) {
+      repoRoot = raw.replace(/\\/g, '/');
+      repoRootSource = 'workflow-setup';
+    } else {
+      warnings.push(`workflowSetup.repositoryRoot is relative and was ignored: ${raw}`);
+    }
   }
 
-  // 2. Customer resolved path (base-dir + folderName, computed at load time)
+  // 2. Customer resolved path (base-dir + folderName, computed at load time).
+  //    Should always be absolute; skip silently when it is not.
   if (!repoRoot && customer?.resolvedRepositoryPath?.trim()) {
-    repoRoot = customer.resolvedRepositoryPath.trim();
-    repoRootSource = 'customer-resolved';
+    const raw = customer.resolvedRepositoryPath.trim();
+    if (isAbsolutePath(raw)) {
+      repoRoot = raw.replace(/\\/g, '/');
+      repoRootSource = 'customer-resolved';
+    }
   }
 
-  // 3. Customer direct repository root field
+  // 3. Customer direct repository root field — must be absolute.
   if (!repoRoot && customer?.repositoryRoot?.trim()) {
-    repoRoot = customer.repositoryRoot.trim();
-    repoRootSource = 'customer-direct';
+    const raw = customer.repositoryRoot.trim();
+    if (isAbsolutePath(raw)) {
+      repoRoot = raw.replace(/\\/g, '/');
+      repoRootSource = 'customer-direct';
+    } else {
+      warnings.push(`customer.repositoryRoot is relative and was ignored: ${raw}`);
+    }
   }
 
-  // 4. Runtime derivation from global base directory + customer folder name
+  // 4. Runtime derivation from global base directory + customer folder name.
+  //    Always produces an absolute path when crmBaseDirectory is absolute.
   if (!repoRoot && settings.crmBaseDirectory?.trim() && customer?.folderName?.trim()) {
     const base   = settings.crmBaseDirectory.trim().replace(/[\\/]+$/, '').replace(/\\/g, '/');
     const folder = customer.folderName.trim();
@@ -176,8 +193,9 @@ export function buildRepositoryContextForTask(
   }
 
   if (insideRepo === false) {
+    const normArtifact = artifactPath!.replace(/\\/g, '/');
     blockers.push(
-      `Artifact is outside the repository root.\nFile: ${artifactPath}\nRepo: ${repoRoot}`
+      `Artifact is outside the repository root.\nFile: ${normArtifact}\nRepo: ${repoRoot}`
     );
   }
 

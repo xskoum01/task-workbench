@@ -223,16 +223,18 @@ describe('buildImplementInstructions', () => {
     expect(result).toMatch(/create mode/i);
   });
 
-  it('sections appear in correct order: MANDATORY → CRITICAL → AGENTS → TASK-KIND → PR COMMENTS → CHECKLIST', () => {
+  it('sections appear in correct order: MANDATORY → CLARIFICATION POLICY → CRITICAL → AGENTS → TASK-KIND → PR COMMENTS → CHECKLIST', () => {
     const result = buildImplementInstructions(makeCtx());
-    const mandatoryPos = result.indexOf('MANDATORY CONSTRAINTS');
-    const criticalPos = result.indexOf('CRITICAL AI KIT RULES');
-    const agentsPos = result.indexOf('AGENT INSTRUCTIONS');
-    const taskRulesPos = result.indexOf('TASK-KIND RULES');
-    const prCommentsPos = result.indexOf('KNOWN PR REVIEW COMMENTS');
-    const checklistPos = result.indexOf('CRM CODE REVIEW CHECKLIST');
+    const mandatoryPos       = result.indexOf('MANDATORY CONSTRAINTS');
+    const clarificationPos   = result.indexOf('CLARIFICATION POLICY');
+    const criticalPos        = result.indexOf('CRITICAL AI KIT RULES');
+    const agentsPos          = result.indexOf('AGENT INSTRUCTIONS');
+    const taskRulesPos       = result.indexOf('TASK-KIND RULES');
+    const prCommentsPos      = result.indexOf('KNOWN PR REVIEW COMMENTS');
+    const checklistPos       = result.indexOf('CRM CODE REVIEW CHECKLIST');
 
-    expect(mandatoryPos).toBeLessThan(criticalPos);
+    expect(mandatoryPos).toBeLessThan(clarificationPos);
+    expect(clarificationPos).toBeLessThan(criticalPos);
     expect(criticalPos).toBeLessThan(agentsPos);
     expect(agentsPos).toBeLessThan(taskRulesPos);
     expect(taskRulesPos).toBeLessThan(prCommentsPos);
@@ -254,6 +256,88 @@ describe('buildImplementInstructions', () => {
     expect(result).toContain('OUTPUT FORMAT');
     expect(result).toContain('proposedContent');
     expect(result).toContain('clarificationNeeded');
+  });
+
+  // ── Clarification policy tests ──────────────────────────────────────────────
+
+  it('includes CLARIFICATION POLICY section', () => {
+    const result = buildImplementInstructions(makeCtx());
+    expect(result).toContain('## CLARIFICATION POLICY');
+  });
+
+  it('CLARIFICATION POLICY lists Dataverse verification failure as a reason NOT to set clarificationNeeded', () => {
+    const result = buildImplementInstructions(makeCtx());
+    const policyStart = result.indexOf('## CLARIFICATION POLICY');
+    const nextSection = result.indexOf('\n## ', policyStart + 1);
+    const policyBlock = result.slice(policyStart, nextSection > -1 ? nextSection : undefined);
+    expect(policyBlock).toMatch(/Do NOT set clarificationNeeded/);
+    expect(policyBlock).toContain('Failed or missing Dataverse metadata verification');
+  });
+
+  it('CLARIFICATION POLICY says field names not confirmed in Dataverse schema must not trigger clarificationNeeded', () => {
+    const result = buildImplementInstructions(makeCtx());
+    const policyStart = result.indexOf('## CLARIFICATION POLICY');
+    const nextSection = result.indexOf('\n## ', policyStart + 1);
+    const policyBlock = result.slice(policyStart, nextSection > -1 ? nextSection : undefined);
+    expect(policyBlock).toContain('Field names from the task assignment that were not confirmed in Dataverse schema');
+  });
+
+  it('CLARIFICATION POLICY instructs to list unconfirmed metadata in risks or testScenarios', () => {
+    const result = buildImplementInstructions(makeCtx());
+    const policyStart = result.indexOf('## CLARIFICATION POLICY');
+    const nextSection = result.indexOf('\n## ', policyStart + 1);
+    const policyBlock = result.slice(policyStart, nextSection > -1 ? nextSection : undefined);
+    expect(policyBlock).toMatch(/risks or testScenarios/);
+    expect(policyBlock).toContain('Metadata not confirmed');
+  });
+
+  it('OUTPUT FORMAT clarificationNeeded description does not say to use it for missing Dataverse metadata', () => {
+    const result = buildImplementInstructions(makeCtx());
+    const outputFormatStart = result.indexOf('OUTPUT FORMAT');
+    const outputFormatBlock = result.slice(outputFormatStart);
+    const clarificationLine = outputFormatBlock
+      .split('\n')
+      .find((l) => l.includes('"clarificationNeeded":') && l.includes('<'));
+    expect(clarificationLine).toBeDefined();
+    // Must say "Do NOT set for failed/missing Dataverse verification"
+    expect(clarificationLine).toMatch(/Do NOT set for failed/i);
+    // Must NOT tell AI to put missing Dataverse metadata here
+    expect(clarificationLine).not.toMatch(/missing Dataverse metadata.*trigger|missing metadata.*clarification/i);
+  });
+
+  it('script task CRITICAL AI KIT RULES say to use exact field names and add to risks — not set clarificationNeeded', () => {
+    const result = buildImplementInstructions(makeCtx({ taskKind: 'script' }));
+    const criticalStart = result.indexOf('## CRITICAL AI KIT RULES');
+    const nextSection = result.indexOf('\n## ', criticalStart + 1);
+    const criticalBlock = result.slice(criticalStart, nextSection > -1 ? nextSection : undefined);
+    // Must say to use exact name from task
+    expect(criticalBlock).toMatch(/exact name from the task/);
+    // Must say to add to risks or testScenarios
+    expect(criticalBlock).toMatch(/risks or testScenarios/);
+    // Must explicitly say NOT to set clarificationNeeded for this
+    expect(criticalBlock).toMatch(/do NOT set clarificationNeeded for this/);
+  });
+
+  it('plugin task CRITICAL AI KIT RULES say to use exact names and add to risks — not set clarificationNeeded', () => {
+    const result = buildImplementInstructions(makeCtx({ taskKind: 'plugin' }));
+    const criticalStart = result.indexOf('## CRITICAL AI KIT RULES');
+    const nextSection = result.indexOf('\n## ', criticalStart + 1);
+    const criticalBlock = result.slice(criticalStart, nextSection > -1 ? nextSection : undefined);
+    // Must say to add to risks or testScenarios
+    expect(criticalBlock).toMatch(/risks or testScenarios/);
+    // Must explicitly say NOT to set clarificationNeeded for unconfirmed metadata
+    expect(criticalBlock).toMatch(/do NOT set clarificationNeeded for unconfirmed metadata/i);
+    // Must NOT say "set clarificationNeeded instead" in context of missing metadata
+    expect(criticalBlock).not.toMatch(/needs missing metadata.*clarificationNeeded|metadata.*set clarificationNeeded instead/);
+  });
+
+  it('MANDATORY CONSTRAINTS do not instruct to set clarificationNeeded for missing metadata', () => {
+    const result = buildImplementInstructions(makeCtx());
+    const mandatoryStart = result.indexOf('## MANDATORY CONSTRAINTS');
+    const nextSection = result.indexOf('\n## ', mandatoryStart + 1);
+    const mandatoryBlock = result.slice(mandatoryStart, nextSection > -1 ? nextSection : undefined);
+    // Must NOT say "set clarificationNeeded" in the MANDATORY CONSTRAINTS section
+    expect(mandatoryBlock).not.toMatch(/set clarificationNeeded instead/);
   });
 });
 

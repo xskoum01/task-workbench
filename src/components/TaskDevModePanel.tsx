@@ -111,6 +111,8 @@ export interface TaskDevModePanelProps {
    * Use in the always-visible section to keep review actions inside Assistant Tools only.
    */
   hideAiReview?: boolean;
+  /** Called when the user selects a script file from the file dropdown. */
+  onScriptFileSelected?: (path: string) => void;
 }
 
 export interface TaskDevModePanelHandle {
@@ -170,6 +172,7 @@ export default forwardRef<TaskDevModePanelHandle, TaskDevModePanelProps>(functio
   onChangeReviewComplete,
   hideModeToggle = false,
   hideAiReview = false,
+  onScriptFileSelected,
 }: TaskDevModePanelProps, ref: React.Ref<TaskDevModePanelHandle>) {
   // --- collapse toggle ---
   const [expanded, setExpanded] = useState(!autoCollapsed);
@@ -214,6 +217,26 @@ export default forwardRef<TaskDevModePanelHandle, TaskDevModePanelProps>(functio
   const [branchLoading, setBranchLoading]   = useState(false);
   const [branchSwitching, setBranchSwitching] = useState(false);
   const [branchError, setBranchError]       = useState<string | null>(null);
+
+  // --- script files ---
+  const [scriptFiles, setScriptFiles]               = useState<tauriApi.FileEntry[]>([]);
+  const [scriptFilesLoaded, setScriptFilesLoaded]   = useState(false);
+  const [scriptFilesLoading, setScriptFilesLoading] = useState(false);
+  const [selectedScriptFile, setSelectedScriptFile] = useState<string>('');
+  const [scriptFileUserSelected, setScriptFileUserSelected] = useState(false);
+
+  function updateSelectedScriptFile(path: string) {
+    setScriptFileUserSelected(true);
+    setSelectedScriptFile(path);
+    onScriptFileSelected?.(path);
+  }
+
+  function handleRefreshScriptFiles() {
+    setScriptFiles([]);
+    setScriptFilesLoaded(false);
+    setSelectedScriptFile('');
+    setScriptFileUserSelected(false);
+  }
 
   // Diff-based change review (Update / Fix workflows).
   const [diffModalOpen, setDiffModalOpen]     = useState(false);
@@ -308,6 +331,12 @@ export default forwardRef<TaskDevModePanelHandle, TaskDevModePanelProps>(functio
     setBranchDirty(false);
     setBranchLoading(false);
     setBranchError(null);
+    // Reset script file state
+    setScriptFiles([]);
+    setScriptFilesLoaded(false);
+    setScriptFilesLoading(false);
+    setSelectedScriptFile('');
+    setScriptFileUserSelected(false);
     // Reset review state
     setReviewModalOpen(false);
     setReviewFilePath('');
@@ -351,6 +380,19 @@ export default forwardRef<TaskDevModePanelHandle, TaskDevModePanelProps>(functio
       setReviewInferError(null);
     }
   }, [artifactPath, reviewPathUserEdited]);
+
+  // Auto-fill selectedScriptFile from artifactPath or scriptOpenPath when not manually set.
+  // scriptOpenPath already carries task.workflowSetup.scriptPath as its first-priority value.
+  useEffect(() => {
+    if (scriptFileUserSelected) return;
+    const candidate = artifactPath || scriptOpenPath;
+    if (!candidate) return;
+    const lower = candidate.toLowerCase();
+    const isFile = lower.endsWith('.js') || lower.endsWith('.ts')
+                || lower.endsWith('.jsx') || lower.endsWith('.tsx');
+    if (isFile) setSelectedScriptFile(candidate);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [artifactPath, scriptOpenPath]);
 
   // Load plugin project subfolders when mode = plugin.
   // Hydrates from the session cache immediately when available (no loading spinner,
@@ -416,7 +458,7 @@ export default forwardRef<TaskDevModePanelHandle, TaskDevModePanelProps>(functio
   // In 'after-paint' mode the first git call is deferred until after the browser
   // paints the panel shell, so expanding a task row is never blocked.
   useEffect(() => {
-    if (devMode !== 'plugin' || !effectiveRepoRoot || currentBranch !== null) return;
+    if ((devMode !== 'plugin' && devMode !== 'script') || !effectiveRepoRoot || currentBranch !== null) return;
 
     // Cache hit — apply synchronously, no loading spinner.
     const cached = getCachedBranchInfo(effectiveRepoRoot);
@@ -478,6 +520,48 @@ export default forwardRef<TaskDevModePanelHandle, TaskDevModePanelProps>(functio
     return () => { cancelled = true; cancelSchedule(); };
   }, [devMode, effectiveRepoRoot, currentBranch, loadStrategy]);
 
+  // Load script files when mode = script and a repo root is available.
+  // Uses listFilesWithPaths to recursively discover .js/.ts files, excluding common
+  // build/dependency directories. Auto-selects the persisted artifact/script path when found.
+  useEffect(() => {
+    if (devMode !== 'script' || !effectiveRepoRoot || scriptFilesLoaded) return;
+    let cancelled = false;
+    setScriptFilesLoading(true);
+    const EXCLUDED_DIRS = ['node_modules', 'dist', 'build', 'target', '.git', '.vs', 'bin', 'obj'];
+    function doLoad() {
+      tauriApi.listFilesWithPaths(effectiveRepoRoot!, ['js', 'ts'], true, EXCLUDED_DIRS)
+        .then((files) => {
+          if (cancelled) return;
+          setScriptFiles(files);
+          setScriptFilesLoaded(true);
+          // Auto-select the persisted script/artifact path if it matches a discovered file.
+          if (!scriptFileUserSelected) {
+            const preselect = artifactPath || scriptOpenPath;
+            if (preselect) {
+              const normPre = preselect.replace(/\\/g, '/');
+              const match = files.find(
+                (f) => f.path === normPre || f.path.toLowerCase() === normPre.toLowerCase(),
+              );
+              if (match) setSelectedScriptFile(match.path);
+            }
+          }
+        })
+        .catch(() => {
+          if (cancelled) return;
+          setScriptFiles([]);
+          setScriptFilesLoaded(true);
+        })
+        .finally(() => {
+          if (!cancelled) setScriptFilesLoading(false);
+        });
+    }
+    const cancelSchedule = loadStrategy === 'after-paint'
+      ? scheduleAfterPaint(doLoad)
+      : (doLoad(), () => {});
+    return () => { cancelled = true; cancelSchedule(); };
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [devMode, effectiveRepoRoot, scriptFilesLoaded, loadStrategy]);
+
   // Scan selected plugin folder for a Visual Studio solution.
   useEffect(() => {
     if (!selectedPlugin || !pluginsDir) { setPluginOpenHint(null); return; }
@@ -517,7 +601,15 @@ export default forwardRef<TaskDevModePanelHandle, TaskDevModePanelProps>(functio
       setCachedBranchInfo(effectiveRepoRoot, { currentBranch: newBranch, branches, dirty: false });
       setBranch(newBranch);
       setBranchDirty(false);
-      loadPluginProjects(true);
+      if (devMode === 'plugin') {
+        loadPluginProjects(true);
+      } else if (devMode === 'script') {
+        // Re-scan script files after branch switch — different branches may have different files.
+        setScriptFiles([]);
+        setScriptFilesLoaded(false);
+        setSelectedScriptFile('');
+        setScriptFileUserSelected(false);
+      }
     } catch (err) {
       setBranchError(String(err));
     } finally {
@@ -526,8 +618,8 @@ export default forwardRef<TaskDevModePanelHandle, TaskDevModePanelProps>(functio
   }
 
   async function handleOpenScript() {
-    // Prefer the specific artifact file (created or selected), fall back to scriptOpenPath.
-    const filePath = artifactPath ?? scriptOpenPath;
+    // Priority: user-selected script file > apply-draft artifact > configured script path.
+    const filePath = selectedScriptFile || artifactPath || scriptOpenPath;
     if (!filePath) { onError('No script path configured for this customer.'); return; }
 
     // Determine whether filePath is a concrete file or just a folder.
@@ -658,7 +750,9 @@ export default forwardRef<TaskDevModePanelHandle, TaskDevModePanelProps>(functio
     if (artifactPath) return artifactPath;
 
     if (devMode === 'script') {
-      const base = scriptOpenPath ?? '';
+      // User-selected file from the dropdown takes top priority.
+      if (selectedScriptFile) return selectedScriptFile;
+      const base = artifactPath || scriptOpenPath || '';
       if (!base) return '';
       // Detect whether base is a concrete script file.
       const lower = base.toLowerCase();
@@ -849,7 +943,7 @@ export default forwardRef<TaskDevModePanelHandle, TaskDevModePanelProps>(functio
     }
 
     // Create workflows: review the full artifact file (existing behaviour).
-    const path = (reviewFilePath.trim() || artifactPath || '').trim();
+    const path = (reviewFilePath.trim() || selectedScriptFile || artifactPath || '').trim();
     if (!path) { setReviewError('Enter the file path to review.'); return false; }
     const reviewer = getActiveReviewer();
     if (!reviewer) { setReviewError('No matching reviewer. Configure one in Settings → AI Reviewers.'); return false; }
@@ -1104,24 +1198,125 @@ export default forwardRef<TaskDevModePanelHandle, TaskDevModePanelProps>(functio
           </div>
         </>
       ) : (
-        <div className="detail-action-grid">
-          <button
-            className="btn btn-secondary btn-sm"
-            onClick={handleOpenScript}
-            disabled={!scriptOpenPath}
-          >
-            <Icon name="terminal" size={13} /> Open Script in VS Code
-          </button>
+        <>
+          {/* Branch panel — same structure as plugin mode */}
           {effectiveRepoRoot && (
+            <div className="detail-devmode-branch">
+              <div className="detail-devmode-branch-current" style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
+                <span>Branch:{' '}</span>
+                <span className="detail-devmode-branch-name">
+                  {branchLoading ? '…' : (currentBranch ?? 'unknown')}
+                </span>
+                {branchDirty && !branchLoading && (
+                  <span className="detail-devmode-branch-dirty" title="Uncommitted changes present">
+                    {' '}(dirty)
+                  </span>
+                )}
+                <button
+                  className="btn btn-ghost btn-sm"
+                  onClick={handleRefreshBranch}
+                  disabled={branchLoading || branchSwitching}
+                  title="Refresh branch info"
+                  style={{ marginLeft: 'auto', padding: '0 4px' }}
+                >
+                  <Icon name="refresh-cw" size={11} />
+                </button>
+              </div>
+              {branchError && (
+                <div className="detail-devmode-branch-error" title={branchError}>
+                  {/not a git repository/i.test(branchError)
+                    ? 'Git repository not detected for this path.'
+                    : branchError}
+                </div>
+              )}
+              {!branchLoading && !branchError && branches.length > 1 && (
+                <div className="detail-devmode-branch-row">
+                  <select
+                    className="form-select detail-devmode-branch-select"
+                    value={selectedBranch}
+                    onChange={(e) => setSelectedBranch(e.target.value)}
+                    disabled={branchSwitching}
+                  >
+                    {branches.map((b) => (
+                      <option key={b} value={b}>{b}</option>
+                    ))}
+                  </select>
+                  <button
+                    className="btn btn-secondary btn-sm"
+                    onClick={handleSwitchBranch}
+                    disabled={branchSwitching || !selectedBranch || selectedBranch === currentBranch}
+                    title="Switch to selected branch"
+                  >
+                    {branchSwitching ? <><span className="btn-spinner" /> Switching…</> : 'Switch'}
+                  </button>
+                </div>
+              )}
+            </div>
+          )}
+
+          {/* Script file selector */}
+          {scriptFilesLoading && (
+            <div className="detail-devmode-hint">Scanning for script files…</div>
+          )}
+          {!scriptFilesLoading && scriptFilesLoaded && scriptFiles.length === 0 && (
+            <div className="detail-devmode-hint" style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+              <span>No .js/.ts files found{effectiveRepoRoot ? ` in ${effectiveRepoRoot}` : ''}.</span>
+              <button
+                className="btn btn-ghost btn-sm"
+                onClick={handleRefreshScriptFiles}
+                title="Refresh script file list"
+              >
+                <Icon name="refresh-cw" size={11} /> Refresh
+              </button>
+            </div>
+          )}
+          {!scriptFilesLoading && scriptFiles.length > 0 && (
+            <div style={{ display: 'flex', gap: 4, alignItems: 'center' }}>
+              <select
+                className="form-select"
+                style={{ flex: 1 }}
+                value={selectedScriptFile}
+                onChange={(e) => updateSelectedScriptFile(e.target.value)}
+              >
+                <option value="">— select script file —</option>
+                {scriptFiles.map((f) => (
+                  <option key={f.path} value={f.path}>{f.name}</option>
+                ))}
+              </select>
+              <button
+                className="btn btn-ghost btn-sm"
+                onClick={handleRefreshScriptFiles}
+                title="Refresh script file list"
+              >
+                <Icon name="refresh-cw" size={11} />
+              </button>
+            </div>
+          )}
+          {selectedScriptFile && (
+            <div className="detail-devmode-hint" title={selectedScriptFile}>
+              {selectedScriptFile.replace(/\\/g, '/').split('/').pop()}
+            </div>
+          )}
+
+          <div className="detail-action-grid">
             <button
               className="btn btn-secondary btn-sm"
-              onClick={async () => { try { await tauriApi.openPath(effectiveRepoRoot); } catch (e) { onError(String(e)); } }}
-              title={effectiveRepoRoot}
+              onClick={handleOpenScript}
+              disabled={!selectedScriptFile && !artifactPath && !scriptOpenPath}
             >
-              <Icon name="folder" size={13} /> Open Repository
+              <Icon name="terminal" size={13} /> Open Script in VS Code
             </button>
-          )}
-        </div>
+            {effectiveRepoRoot && (
+              <button
+                className="btn btn-secondary btn-sm"
+                onClick={async () => { try { await tauriApi.openPath(effectiveRepoRoot); } catch (e) { onError(String(e)); } }}
+                title={effectiveRepoRoot}
+              >
+                <Icon name="folder" size={13} /> Open Repository
+              </button>
+            )}
+          </div>
+        </>
       )}
 
       {/* AI Review — hidden when the parent surfaces this inside Assistant Tools */}

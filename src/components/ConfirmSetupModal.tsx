@@ -331,10 +331,16 @@ export default function ConfirmSetupModal({
   const isEditMode = workIntent !== 'create';
 
   const selectedCustomer = customers.find((c) => c.id === customerId);
+  // Use the first absolute repo path available. When only folderName is set,
+  // resolve it to a full absolute path with crmBaseDirectory so we never save
+  // a bare folder name like "VSK-Test" as workflowSetup.repositoryRoot.
   const repoHint =
     selectedCustomer?.resolvedRepositoryPath ??
     selectedCustomer?.repositoryRoot ??
-    selectedCustomer?.folderName ?? '';
+    (crmBaseDirectory && selectedCustomer?.folderName
+      ? `${crmBaseDirectory.replace(/[\\/]+$/, '')}/${selectedCustomer.folderName}`
+      : undefined) ??
+    '';
 
   // --- Create + Script file name state ---
   // File name (base name only) for the new script file in Create + Script workflow.

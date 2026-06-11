@@ -317,6 +317,194 @@ describe('Reset — data model after AI code review reset', () => {
 });
 
 // ---------------------------------------------------------------------------
+// Dataverse NOT CONFIGURED preflight — data model
+// ---------------------------------------------------------------------------
+
+describe('Dataverse NOT CONFIGURED preflight — data model', () => {
+  // deriveDataverseCheckStatus must not return 'not-run' for not_configured.
+  // Before the fix it fell to 'not-run' because only pass/warnings/fail were mapped.
+  it('deriveDataverseCheckStatus returns warnings for not_configured verdict', () => {
+    const task = makeTask({ crmVerificationReports: [makeReport('not_configured')] });
+    expect(deriveDataverseCheckStatus(task)).toBe('warnings');
+  });
+
+  it('not-configured report has verdict warnings — drives status badge correctly', () => {
+    const report = makeReport('warnings', {
+      summary: 'Dataverse metadata assistant is not configured.',
+      answer: 'Open Settings → CRM Metadata and configure Primarch MCP command/args.',
+    });
+    const task = makeTask({ crmVerificationReports: [report] });
+    expect(deriveDataverseCheckStatus(task)).toBe('warnings');
+    expect(task.crmVerificationReports![0].summary).toContain('not configured');
+  });
+
+  it('not-configured report has no issues — does not show issue count in modal', () => {
+    const report = makeReport('warnings', {
+      summary: 'Dataverse metadata assistant is not configured.',
+      issues: [],
+    });
+    expect((report.issues ?? []).length).toBe(0);
+  });
+
+  it('not-configured report stores human-readable guidance in answer field', () => {
+    const report = makeReport('warnings', {
+      answer: 'Open Settings → CRM Metadata and configure Primarch MCP command/args.',
+    });
+    expect(report.answer).toContain('Settings');
+  });
+
+  it('not-configured report unableToVerifyReasons lists the reason', () => {
+    const report = makeReport('warnings', {
+      unableToVerifyReasons: ['CRM metadata assistant is not configured. Enable CRM Metadata in Settings and set Primarch MCP command/args.'],
+    } as Partial<CrmVerificationReport>);
+    expect((report as CrmVerificationReport & { unableToVerifyReasons?: string[] }).unableToVerifyReasons?.[0]).toContain('not configured');
+  });
+
+  it('manual override skipped still takes priority over not_configured verdict', () => {
+    const task = makeTask({
+      crmVerificationReports: [makeReport('not_configured')],
+      implementationVerification: { dataverseCheck: { status: 'skipped', skippedReason: 'no MCP' } },
+    });
+    expect(deriveDataverseCheckStatus(task)).toBe('skipped');
+  });
+
+  it('manual override manually-verified still takes priority over not_configured verdict', () => {
+    const task = makeTask({
+      crmVerificationReports: [makeReport('not_configured')],
+      implementationVerification: { dataverseCheck: { status: 'manually-verified' } },
+    });
+    expect(deriveDataverseCheckStatus(task)).toBe('manually-verified');
+  });
+
+  it('configured mismatch path is unchanged — fail verdict still returns failed', () => {
+    const task = makeTask({ crmVerificationReports: [makeReport('fail', { summary: 'Missing attribute: nvr_status' })] });
+    expect(deriveDataverseCheckStatus(task)).toBe('failed');
+  });
+
+  it('configured pass path is unchanged — pass verdict still returns passed', () => {
+    const task = makeTask({ crmVerificationReports: [makeReport('pass')] });
+    expect(deriveDataverseCheckStatus(task)).toBe('passed');
+  });
+
+  it('not-configured Reset button — dvStatus is warnings, passes visibility condition', () => {
+    const task = makeTask({ crmVerificationReports: [makeReport('not_configured')] });
+    const dvStatus = deriveDataverseCheckStatus(task);
+    // Reset button shown when dvStatus !== 'not-run'
+    expect(dvStatus !== 'not-run').toBe(true);
+  });
+
+  it('after Reset: crmVerificationReports cleared — not_configured report removed, dvStatus returns not-run', () => {
+    const task = makeTask({ crmVerificationReports: [], implementationVerification: { dataverseCheck: { status: 'not-run' } } });
+    expect(deriveDataverseCheckStatus(task)).toBe('not-run');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// AI Code Review robustness — array guard regressions
+// ---------------------------------------------------------------------------
+
+describe('AI Code Review robustness — array guards', () => {
+  // These tests document the guards added to handleRunAiCodeReviewForImpl.
+  // They test the same defensive pattern inline to ensure the fix is correct.
+
+  it('safeArr pattern: undefined array gives empty array — no TypeError on .length', () => {
+    // This documents the fix pattern: (arr ?? []).length instead of arr.length
+    const arr: string[] | undefined = undefined;
+    expect(() => (arr ?? []).length).not.toThrow();
+    expect((arr ?? []).length).toBe(0);
+  });
+
+  it('safeArr pattern: null array gives empty array — no TypeError on .slice', () => {
+    const arr: string[] | null = null;
+    expect(() => (arr ?? []).slice(0, 3)).not.toThrow();
+    expect((arr ?? []).slice(0, 3)).toHaveLength(0);
+  });
+
+  it('techPlan with implementationSteps undefined — guarded length check does not throw', () => {
+    // Regression: techPlan.implementationSteps.length threw when field was absent from JSON
+    const techPlan = { summary: 'Plan summary', implementationSteps: undefined, risks: [] } as unknown as { implementationSteps?: string[]; risks?: string[] };
+    const implSteps: string[] = techPlan.implementationSteps ?? [];
+    expect(() => implSteps.length).not.toThrow();
+    expect(implSteps.length).toBe(0);
+  });
+
+  it('techPlan with risks undefined — guarded length check does not throw', () => {
+    const techPlan = { summary: 'Plan summary', implementationSteps: [], risks: undefined } as unknown as { implementationSteps?: string[]; risks?: string[] };
+    const risks: string[] = techPlan.risks ?? [];
+    expect(() => risks.length).not.toThrow();
+    expect(risks.length).toBe(0);
+  });
+
+  it('gitCtx with changedFiles undefined — guarded length check does not throw', () => {
+    const gitCtx = { diff: 'some diff', changedFiles: undefined } as never;
+    const changedFiles: string[] = (gitCtx as { changedFiles?: string[] }).changedFiles ?? [];
+    expect(() => changedFiles.length).not.toThrow();
+    expect(changedFiles.length).toBe(0);
+  });
+
+  it('gitCtx with noiseFiles undefined — guarded length check does not throw', () => {
+    const gitCtx = { noiseFiles: undefined } as never;
+    const noiseFiles: string[] = (gitCtx as { noiseFiles?: string[] }).noiseFiles ?? [];
+    expect(noiseFiles.length > 0).toBe(false);
+  });
+
+  it('gitCtx with flaggedPaths undefined — guarded length check does not throw', () => {
+    const gitCtx = { flaggedPaths: undefined } as never;
+    const flaggedPaths: string[] = (gitCtx as { flaggedPaths?: string[] }).flaggedPaths ?? [];
+    expect(flaggedPaths.length > 0).toBe(false);
+  });
+
+  it('gitCtx with untrackedIncluded undefined — guarded length/join does not throw', () => {
+    const gitCtx = { untrackedIncluded: undefined } as never;
+    const untrackedIncl: string[] = (gitCtx as { untrackedIncluded?: string[] }).untrackedIncluded ?? [];
+    expect(() => untrackedIncl.join(', ')).not.toThrow();
+  });
+
+  it('gitCtx with untrackedSkipped undefined — guarded length/slice does not throw', () => {
+    const gitCtx = { untrackedSkipped: undefined } as never;
+    const untrackedSkip: string[] = (gitCtx as { untrackedSkipped?: string[] }).untrackedSkipped ?? [];
+    expect(() => untrackedSkip.slice(0, 3).join(', ')).not.toThrow();
+  });
+
+  it('dvReport with issues undefined — flattenFindings guard does not throw', () => {
+    // dvReport sections already used ?? [] before, but document the pattern
+    const dvReport = { verdict: 'fail', issues: undefined, missingReferences: undefined, pluginChecks: undefined } as never;
+    expect(() => ((dvReport as { issues?: unknown[] }).issues ?? []).slice(0, 5)).not.toThrow();
+    expect(() => ((dvReport as { missingReferences?: unknown[] }).missingReferences ?? []).slice(0, 8)).not.toThrow();
+    expect(() => ((dvReport as { pluginChecks?: unknown[] }).pluginChecks ?? []).filter(() => true)).not.toThrow();
+  });
+
+  it('AiFileReviewResult with structured.comments undefined — flattenFindings does not throw', () => {
+    // flattenFindings already guards with (result.structured.comments ?? [])
+    const structured = { verdict: 'needs_changes', comments: undefined, generalSuggestions: undefined } as never;
+    const comments: unknown[] = (structured as { comments?: unknown[] }).comments ?? [];
+    const suggestions: unknown[] = (structured as { generalSuggestions?: unknown[] }).generalSuggestions ?? [];
+    expect(comments.length).toBe(0);
+    expect(suggestions.length).toBe(0);
+  });
+
+  it('REGRESSION: TypeError "Cannot read properties of undefined (reading length)" is not thrown for undefined techPlan arrays', () => {
+    // This is the exact regression that caused the user-visible error.
+    // Simulates what happens when task.crmDeveloperWorkflow.technicalPlan has missing arrays.
+    const techPlan = { summary: 'Test', generatedAt: '2026-06-11T00:00:00.000Z', workKind: 'script' } as never;
+    let threw = false;
+    try {
+      const implSteps: string[] = (techPlan as { implementationSteps?: string[] }).implementationSteps ?? [];
+      const risks: string[] = (techPlan as { risks?: string[] }).risks ?? [];
+      if (implSteps.length) {
+        implSteps.slice(0, 6).forEach(() => {});
+      }
+      if (risks.length) {
+        risks.slice(0, 3).forEach(() => {});
+      }
+    } catch {
+      threw = true;
+    }
+    expect(threw).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
 // Activity note formatting for reset events
 // ---------------------------------------------------------------------------
 

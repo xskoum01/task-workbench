@@ -95,6 +95,7 @@ import {
 } from '../lib/powerPlatformAiKit';
 import TaskModeSwitch from './TaskModeSwitch';
 import { getAiKitWorkflowState } from '../lib/aiKitWorkflow';
+import { selectImplReviewSource } from '../lib/implReviewSource';
 import { inferTaskMode } from '../lib/taskMode';
 import { BUCKET_META, computePlanning, effectiveBucket } from '../lib/planning';
 import { isOverdue, formatRelativeDate } from '../lib/dates';
@@ -1644,6 +1645,11 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
   function handleSelectedPluginChange(plugin: string) {
     updateTask(task.id, { selectedPluginProject: plugin || undefined }).catch(() => {});
   }
+  function handleScriptFileSelected(path: string) {
+    updateTask(task.id, {
+      workflowSetup: { ...task.workflowSetup, scriptPath: path || undefined },
+    }).catch(() => {});
+  }
 
   /**
    * Called by TaskDevModePanel when a refresh reveals the persisted plugin project
@@ -2335,6 +2341,44 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
       setFeedback('No artifact file path found. Save a generated draft first or confirm the plugin setup.');
       return;
     }
+
+    // Preflight: do not call Primarch/Dataverse if CRM metadata assistant is not configured.
+    const isCrmConfigured = !!settings?.crmMetadataEnabled
+      && !!(settings?.primarchMcpCommand ?? '').trim()
+      && !!(settings?.primarchMcpArgs ?? '').trim();
+    if (!isCrmConfigured) {
+      const now = new Date().toISOString();
+      const notConfiguredReport: CrmVerificationReport = {
+        id: `dv-not-configured-${Date.now()}`,
+        createdAt: now,
+        filePath,
+        verdict: 'warnings',
+        metadataVerdict: 'unknown',
+        staticInferenceConfidence: 'unknown',
+        runtimeReadiness: 'unknown',
+        summary: 'Dataverse metadata assistant is not configured.',
+        answer: 'Open Settings → CRM Metadata and configure Primarch MCP command/args.',
+        issues: [],
+        confirmedReferences: [],
+        missingReferences: [],
+        ambiguousReferences: [],
+        runtimeRisks: [],
+        pluginChecks: [],
+        inspectedEntities: [],
+        inspectedAttributesByEntity: {},
+        unableToVerifyReasons: [
+          'CRM metadata assistant is not configured. Enable CRM Metadata in Settings and set Primarch MCP command/args.',
+        ],
+        metadataInspected: { entityLogicalNames: [], attributeLogicalNames: {}, toolsUsed: [] },
+      };
+      const existing = task.crmVerificationReports ?? [];
+      await updateTask(task.id, {
+        crmVerificationReports: [notConfiguredReport, ...existing].slice(0, 5),
+      });
+      setFeedback('Dataverse metadata assistant is not configured. Configure Settings → CRM Metadata / Primarch MCP.');
+      return;
+    }
+
     setImplVerifyDvRunning(true);
     try {
       const override = (
@@ -2500,47 +2544,32 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
     setImplVerifyAiRunning(true);
     try {
       const setup    = task.workflowSetup;
-      // Resolve artifact path (explicit or inferred from project folder).
+      // Resolve artifact path FIRST — drives mode selection.
       const artifactPath = await resolveArtifactPath();
       const isScript = !!artifactPath && /\.[jt]s$/i.test(artifactPath);
       const techPlan = task.crmDeveloperWorkflow?.technicalPlan;
       const dvReport = task.crmVerificationReports?.[0];
       const buildChk = task.implementationVerification?.buildCheck;
 
-      // ¦¦ AI Kit context (optional, falls back to built-in rules) ¦¦¦¦¦¦¦¦¦¦¦¦
+      // AI Kit context (optional, falls back to built-in rules)
       let aiKitCtx: PowerPlatformAiKitContext | null = null;
       const aiKitPath = settings?.powerPlatformAiKitPath?.trim();
       if (aiKitPath) {
         try {
           const taskKind = detectAiKitTaskKind(task);
           aiKitCtx = await loadAiKitContext(aiKitPath, taskKind, true, true);
-        } catch {
-          // AI Kit not configured or invalid — fall back to built-in rules silently
-        }
+        } catch { /* AI Kit not configured or invalid */ }
       }
 
-      // ¦¦ Repo root candidates ¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦
+      // Repo root candidates
       const repoCandidates = [
         setup?.repositoryRoot,
         customer?.resolvedRepositoryPath,
         customer?.repositoryRoot,
-        pluginsDir,  // plugin folder might be inside a git repo
+        pluginsDir,
       ].filter((p): p is string => !!p);
 
-      // ¦¦ Try to collect local branch diff (Mode B) ¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦
-      let gitCtx: import('../lib/tauriCommands').GitReviewContext | null = null;
-      for (const candidate of repoCandidates) {
-        try {
-          const ctx = await tauriApi.collectGitReviewContext(candidate);
-          if (ctx.diff.trim() || ctx.changedFiles.length > 0) {
-            gitCtx = ctx;
-            break;
-          }
-        } catch { /* not a git repo or git unavailable — try next */ }
-      }
-
-      // ¦¦ Build shared instructions context ¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦
-      // (used in both diff and file review modes)
+      // Shared context builder (used in all review modes)
       function buildInstructions(reviewMode: string, gitInfo?: string): string {
         const ctx: string[] = [];
         ctx.push('You are an expert Dynamics 365 / Power Platform CRM developer and code reviewer.');
@@ -2579,13 +2608,15 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
         if (techPlan) {
           ctx.push('=== TECHNICKÝ PLÁN ===');
           if (techPlan.summary) ctx.push(techPlan.summary.slice(0, 500));
-          if (techPlan.implementationSteps.length) {
+          const implSteps = techPlan.implementationSteps ?? [];
+          if (implSteps.length) {
             ctx.push('Kroky implementace:');
-            techPlan.implementationSteps.slice(0, 6).forEach((s) => ctx.push(`- ${s}`));
+            implSteps.slice(0, 6).forEach((s) => ctx.push(`- ${s}`));
           }
-          if (techPlan.risks.length) {
+          const risks = techPlan.risks ?? [];
+          if (risks.length) {
             ctx.push('Rizika:');
-            techPlan.risks.slice(0, 3).forEach((r) => ctx.push(`- ${r}`));
+            risks.slice(0, 3).forEach((r) => ctx.push(`- ${r}`));
           }
           ctx.push('');
         }
@@ -2631,7 +2662,6 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
         return ctx.join('\n');
       }
 
-      // ¦¦ Shared function to flatten AI result into findings ¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦
       function flattenFindings(result: AiFileReviewResult): string[] {
         if (!result.structured) {
           return result.markdown ? [result.markdown.slice(0, 400)] : [];
@@ -2647,95 +2677,180 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
         ];
       }
 
-      // ¦¦ Mode B: Local branch diff review ¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦
-      if (gitCtx) {
-        const modeLabel = 'Local branch diff';
-        const gitInfo = [
-          `=== GIT CONTEXT ===`,
-          `Větev: ${gitCtx.currentBranch} › base: ${gitCtx.baseBranch}`,
-          `Změněné soubory (${gitCtx.changedFiles.length}): ${gitCtx.changedFiles.slice(0, 10).join(', ')}`,
-          gitCtx.hasCommitted  ? 'Zahrnuje: odevzdané změny větve' : '',
-          gitCtx.hasStaged     ? 'Zahrnuje: staged změny' : '',
-          gitCtx.hasUnstaged   ? 'Zahrnuje: unstaged změny' : '',
-          gitCtx.noiseFiles.length > 0 ? `POZOR — noise soubory v diff: ${gitCtx.noiseFiles.slice(0, 5).join(', ')}` : '',
-          gitCtx.flaggedPaths.length > 0 ? `UPOZORNĚNÍ — přidány podezřelé soubory: ${gitCtx.flaggedPaths.join(', ')}` : '',
-        ].filter(Boolean).join('\n');
+      // ── Find repo root for the artifact file ──────────────────────────────
+      let repoRootForArtifact: string | undefined;
+      if (artifactPath) {
+        for (const candidate of repoCandidates) {
+          const hasGit = await tauriApi.checkPathExists(
+            `${candidate.replace(/[\\/]+$/, '')}/.git`
+          ).catch(() => false);
+          if (hasGit) { repoRootForArtifact = candidate; break; }
+        }
+        if (!repoRootForArtifact) {
+          const norm = artifactPath.replace(/\\/g, '/');
+          const parts = norm.split('/');
+          for (let i = parts.length - 1; i > 0; i--) {
+            const candidate = parts.slice(0, i).join('/');
+            if (!candidate) break;
+            const hasGit = await tauriApi.checkPathExists(`${candidate}/.git`).catch(() => false);
+            if (hasGit) { repoRootForArtifact = candidate; break; }
+          }
+        }
+      }
 
-        const diffRules = isScript ? [
-          '',
-          '=== PRAVIDLA REVIEW (DIFF — JAVASCRIPT/TYPESCRIPT) ===',
-          'Zkontroluj scope diffu:',
-          '- Jen očekávané soubory byly změněny',
-          '- Žádné nesouvisející soubory',
-          '- Žádné .github/copilot-instructions.md přidány',
-          '',
-          'Zkontroluj script správnost:',
-          '- Funkce odpovídá Dataverse WebAPI konvencím (pokud relevantní)',
-          '- Logické názvy jsou konstanty nebo správně zapsané literály',
-          '- Žádné hardcoded OrgUrl, credentials nebo secrety',
-          '- Error handling přítomen kde je nutný',
-          '- Žádné zbytečné console.log v produkčním kódu',
-          '',
-          'Zkontroluj business alignment:',
-          '- Diff implementuje úkol a nic navíc',
-          '- Chování odpovídá původnímu požadavku a technickému plánu',
-        ].join('\n') : [
-          '',
-          '=== PRAVIDLA REVIEW (DIFF) ===',
-          'Zkontroluj scope diffu:',
-          '- Jen očekávané soubory byly změněny',
-          '- Žádné nesouvisející soubory',
-          '- Žádné .github/copilot-instructions.md přidány',
-          '- Žádné .vs/, bin/, obj/, packages/ soubory v commitu',
-          '- Generovaný .cs soubor je zahrnut v .csproj jako Compile Include',
-          '',
-          'Zkontroluj plugin správnost:',
-          '- IPlugin implementace, Execute metoda',
-          '- Přístup k Target, MessageName/Stage/Entity assumptions',
-          '- PreOperation Create: Target atributy přímo, ne service.Update(target)',
-          '- Tracing, exception handling, konstanty pro logické názvy',
-          '- Namespace odpovídá projektu',
-          '',
-          'Zkontroluj Dataverse správnost:',
-          '- Logické názvy v diffu odpovídají ověřeným názvům z Dataverse checku',
-          '- Žádné neověřené logické názvy',
-          '',
-          'Zkontroluj business alignment:',
-          '- Diff implementuje úkol a nic navíc',
-          '- Chování odpovídá původnímu požadavku a technickému plánu',
-        ].join('\n');
+      // ── File-specific git diff for the artifact ───────────────────────────
+      let fileGitCtx: tauriApi.GitFileReviewContext | null = null;
+      if (artifactPath && repoRootForArtifact) {
+        try {
+          fileGitCtx = await tauriApi.collectGitFileReviewContext(repoRootForArtifact, artifactPath);
+        } catch { /* not a git repo or command failed */ }
+      }
+
+      // ── File content for new/untracked/unchanged files ────────────────────
+      let fileContent: string | null = null;
+      if (artifactPath && !fileGitCtx?.diff.trim()) {
+        try { fileContent = await tauriApi.readFileContent(artifactPath); } catch { /* ignore */ }
+      }
+
+      // ── Branch diff — ONLY when no artifact is selected ──────────────────
+      // When an artifact is selected, we never send unrelated branch changes to AI.
+      let branchGitCtx: tauriApi.GitReviewContext | null = null;
+      if (!artifactPath) {
+        for (const candidate of repoCandidates) {
+          try {
+            const ctx = await tauriApi.collectGitReviewContext(candidate);
+            if (ctx.diff.trim() || (ctx.changedFiles ?? []).length > 0) {
+              branchGitCtx = ctx;
+              break;
+            }
+          } catch { /* not a git repo — try next */ }
+        }
+      }
+
+      // ── Select review source ──────────────────────────────────────────────
+      const source = selectImplReviewSource(artifactPath, fileGitCtx, fileContent, branchGitCtx);
+
+      // ── Rules strings (reused across file-diff and file-content modes) ────
+      const scriptDiffRules = [
+        '',
+        '=== PRAVIDLA REVIEW (DIFF — JAVASCRIPT/TYPESCRIPT) ===',
+        'Zkontroluj scope diffu:',
+        '- Jen očekávané soubory byly změněny',
+        '- Žádné nesouvisející soubory',
+        '- Žádné .github/copilot-instructions.md přidány',
+        '',
+        'Zkontroluj script správnost:',
+        '- Funkce odpovídá Dataverse WebAPI konvencím (pokud relevantní)',
+        '- Logické názvy jsou konstanty nebo správně zapsané literály',
+        '- Žádné hardcoded OrgUrl, credentials nebo secrety',
+        '- Error handling přítomen kde je nutný',
+        '- Žádné zbytečné console.log v produkčním kódu',
+        '',
+        'Zkontroluj business alignment:',
+        '- Diff implementuje úkol a nic navíc',
+        '- Chování odpovídá původnímu požadavku a technickému plánu',
+      ].join('\n');
+
+      const pluginDiffRules = [
+        '',
+        '=== PRAVIDLA REVIEW (DIFF) ===',
+        'Zkontroluj scope diffu:',
+        '- Jen očekávané soubory byly změněny',
+        '- Žádné nesouvisející soubory',
+        '- Žádné .github/copilot-instructions.md přidány',
+        '- Žádné .vs/, bin/, obj/, packages/ soubory v commitu',
+        '- Generovaný .cs soubor je zahrnut v .csproj jako Compile Include',
+        '',
+        'Zkontroluj plugin správnost:',
+        '- IPlugin implementace, Execute metoda',
+        '- Přístup k Target, MessageName/Stage/Entity assumptions',
+        '- PreOperation Create: Target atributy přímo, ne service.Update(target)',
+        '- Tracing, exception handling, konstanty pro logické názvy',
+        '- Namespace odpovídá projektu',
+        '',
+        'Zkontroluj Dataverse správnost:',
+        '- Logické názvy v diffu odpovídají ověřeným názvům z Dataverse checku',
+        '- Žádné neověřené logické názvy',
+        '',
+        'Zkontroluj business alignment:',
+        '- Diff implementuje úkol a nic navíc',
+        '- Chování odpovídá původnímu požadavku a technickému plánu',
+      ].join('\n');
+
+      const scriptFileRules = [
+        '',
+        '=== PRAVIDLA REVIEW (SOUBOR — JAVASCRIPT/TYPESCRIPT) ===',
+        'Zkontroluj script strukturu:',
+        '1. Funkce odpovídá Dataverse WebAPI konvencím (pokud relevantní)',
+        '2. Logické názvy jsou konstanty nebo správně zapsané literály',
+        '3. Žádné hardcoded OrgUrl, credentials nebo secrety',
+        '4. Error handling přítomen kde je nutný',
+        '5. Žádné zbytečné console.log v produkčním kódu',
+        '6. Implementace odpovídá popisu úkolu',
+      ].join('\n');
+
+      const pluginFileRules = [
+        '',
+        '=== PRAVIDLA REVIEW (SOUBOR) ===',
+        'Zkontroluj plugin strukturu:',
+        '1. IPlugin, Execute(IServiceProvider), ITracingService, IPluginExecutionContext, Target null check',
+        '2. MessageName/PrimaryEntityName/Stage ověřeny nebo dokumentovány',
+        '3. PreOperation Create: Target přímo, ne service.Update(target)',
+        '4. Logické názvy = konstanty/readonly, ne inline literály',
+        '5. Namespace odpovídá projektu',
+        '6. Tracing, exception handling, žádné TODO-only',
+        '7. Depth/recursion guard kde potřeba',
+        '8. Implementace odpovídá popisu úkolu',
+      ].join('\n');
+
+      // ── Mode: file-diff — artifact has changed lines ──────────────────────
+      if (source.mode === 'file-diff') {
+        const fileLabel = source.fileRelPath
+          ?? artifactPath!.replace(/\\/g, '/').split('/').pop()
+          ?? 'file';
+        const branchLabel = source.currentBranch && source.baseBranch
+          ? ` (${source.currentBranch} › ${source.baseBranch})`
+          : '';
+        const modeLabel = `Selected file diff${branchLabel}: ${fileLabel}`;
+
+        const gitInfo = [
+          '=== GIT CONTEXT (file-specific) ===',
+          source.currentBranch
+            ? `Větev: ${source.currentBranch}${source.baseBranch ? ` › base: ${source.baseBranch}` : ''}`
+            : '',
+          `Soubor: ${fileLabel}`,
+          source.hasCommitted ? 'Zahrnuje: odevzdané změny větve' : '',
+          source.hasStaged    ? 'Zahrnuje: staged změny' : '',
+          source.hasUnstaged  ? 'Zahrnuje: unstaged změny' : '',
+        ].filter(Boolean).join('\n');
 
         const reviewerName = aiKitCtx
           ? (isScript ? 'Script AI Kit Review' : 'Plugin AI Kit Review')
           : (isScript ? 'Script Internal Check' : 'Plugin Internal Check');
         const aiKitPrefix = aiKitCtx ? buildAiKitDiffReviewInstructions(aiKitCtx) + '\n\n' : '';
-        const instructions = aiKitPrefix + buildInstructions(modeLabel, gitInfo) + diffRules;
-        const taskCtx = `${task.title}. ${gitCtx.summary}`;
-        const fileName = `local changes (${gitCtx.currentBranch} › ${gitCtx.baseBranch})`;
+        const instructions = aiKitPrefix
+          + buildInstructions(modeLabel, gitInfo)
+          + (isScript ? scriptDiffRules : pluginDiffRules);
 
         const result = await tauriApi.runAiChangeReview(
-          gitCtx.diff,
-          taskCtx,
-          fileName,
+          source.diff!,
+          task.title,
+          fileLabel,
           reviewerName,
           instructions,
-          '',  // use configured model
+          '',
           0.2,
         );
 
         const verdict    = result.structured?.verdict;
         const implStatus = verdict === 'pass' ? 'passed' : verdict === 'needs_changes' ? 'failed' : 'warnings';
 
-        // Prepend review source metadata as the first findings entries for display
         const metaFindings: string[] = [
-          `Review source: Local read-only git diff (${gitCtx.currentBranch} › ${gitCtx.baseBranch})`,
-          `[info] Changed files (${gitCtx.changedFiles.length}): ${gitCtx.changedFiles.slice(0, 6).join(', ')}${gitCtx.changedFiles.length > 6 ? '…' : ''}`,
-          ...(gitCtx.hasStaged    ? ['[info] Staged changes included'] : []),
-          ...(gitCtx.hasUnstaged  ? ['[info] Unstaged changes included'] : []),
-          ...(gitCtx.hasUntracked ? [`[info] Untracked files included (${gitCtx.untrackedIncluded.length}): ${gitCtx.untrackedIncluded.join(', ')}`] : []),
-          ...(gitCtx.untrackedSkipped.length > 0 ? [`[info] Untracked files skipped: ${gitCtx.untrackedSkipped.slice(0, 3).join(', ')}`] : []),
-          ...(gitCtx.noiseFiles.length  > 0 ? [`[warning] Noise files in diff: ${gitCtx.noiseFiles.slice(0, 3).join(', ')}`] : []),
-          ...(gitCtx.flaggedPaths.length > 0 ? [`[warning] Flagged paths added: ${gitCtx.flaggedPaths.join(', ')}`] : []),
+          `Review source: Selected file diff (${fileLabel})`,
+          ...(branchLabel ? [`[info] Branch:${branchLabel}`] : []),
+          ...(source.hasCommitted ? ['[info] Committed branch changes included'] : []),
+          ...(source.hasStaged    ? ['[info] Staged changes included'] : []),
+          ...(source.hasUnstaged  ? ['[info] Unstaged changes included'] : []),
         ];
         const findings = [...metaFindings, ...flattenFindings(result)];
 
@@ -2743,9 +2858,9 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
         const existing = task.aiFileReviews ?? [];
         const reviewEntry: AiFileReviewResult = {
           ...result,
-          id: `impl-review-${now}`,
+          id:           `impl-review-${now}`,
           reviewerName,
-          filePath:     fileName,
+          filePath:     source.fileRelPath ?? fileLabel,
           reviewMode:   'change',
         };
         await updateTask(task.id, {
@@ -2756,49 +2871,34 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
               status:   implStatus,
               reviewId: reviewEntry.id,
               runAt:    now,
-              summary:  result.structured?.summary ?? gitCtx.summary,
+              summary:  result.structured?.summary ?? fileLabel,
               findings,
             },
             updatedAt: now,
           },
         });
-        setFeedback(`AI code review (branch diff): ${implStatus}.`);
+        setFeedback(`AI code review (file diff): ${implStatus}.`);
 
-      // ¦¦ Mode C: Single file fallback ¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦¦
-      } else if (artifactPath) {
-        const modeLabel  = 'Single file review';
-        const fileRules  = isScript ? [
-          '',
-          '=== PRAVIDLA REVIEW (SOUBOR — JAVASCRIPT/TYPESCRIPT) ===',
-          'Zkontroluj script strukturu:',
-          '1. Funkce odpovídá Dataverse WebAPI konvencím (pokud relevantní)',
-          '2. Logické názvy jsou konstanty nebo správně zapsané literály',
-          '3. Žádné hardcoded OrgUrl, credentials nebo secrety',
-          '4. Error handling přítomen kde je nutný',
-          '5. Žádné zbytečné console.log v produkčním kódu',
-          '6. Implementace odpovídá popisu úkolu',
-        ].join('\n') : [
-          '',
-          '=== PRAVIDLA REVIEW (SOUBOR) ===',
-          'Zkontroluj plugin strukturu:',
-          '1. IPlugin, Execute(IServiceProvider), ITracingService, IPluginExecutionContext, Target null check',
-          '2. MessageName/PrimaryEntityName/Stage ověřeny nebo dokumentovány',
-          '3. PreOperation Create: Target přímo, ne service.Update(target)',
-          '4. Logické názvy = konstanty/readonly, ne inline literály',
-          '5. Namespace odpovídá projektu',
-          '6. Tracing, exception handling, žádné TODO-only',
-          '7. Depth/recursion guard kde potřeba',
-          '8. Implementace odpovídá popisu úkolu',
-        ].join('\n');
-        const fileReviewerName = aiKitCtx
+      // ── Mode: file-content — new/untracked/unchanged file ─────────────────
+      } else if (source.mode === 'file-content') {
+        const fileLabel = source.fileRelPath
+          ?? artifactPath!.replace(/\\/g, '/').split('/').pop()
+          ?? 'file';
+        const modeLabel = source.isUntracked
+          ? `New file review (untracked): ${fileLabel}`
+          : `File content review: ${fileLabel}`;
+
+        const reviewerName = aiKitCtx
           ? (isScript ? 'Script AI Kit Review' : 'Plugin AI Kit Review')
           : (isScript ? 'Script Internal Check' : 'Plugin Internal Check');
-        const fileAiKitPrefix = aiKitCtx ? buildAiKitDiffReviewInstructions(aiKitCtx) + '\n\n' : '';
-        const instructions = fileAiKitPrefix + buildInstructions(modeLabel) + fileRules;
+        const aiKitPrefix = aiKitCtx ? buildAiKitDiffReviewInstructions(aiKitCtx) + '\n\n' : '';
+        const instructions = aiKitPrefix
+          + buildInstructions(modeLabel)
+          + (isScript ? scriptFileRules : pluginFileRules);
 
         const result = await tauriApi.runAiFileReview(
-          artifactPath,
-          fileReviewerName,
+          artifactPath!,
+          reviewerName,
           instructions,
           '',
           0.2,
@@ -2807,16 +2907,19 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
         const verdict    = result.structured?.verdict;
         const implStatus = verdict === 'pass' ? 'passed' : verdict === 'needs_changes' ? 'failed' : 'warnings';
 
-        const metaFindings = [`Review source: Single file fallback (${artifactPath.replace(/\\/g, '/').split('/').pop()})`];
+        const sourceLabel = source.isUntracked
+          ? `Selected file content (new/untracked): ${fileLabel}`
+          : `Selected file content: ${fileLabel}`;
+        const metaFindings = [`Review source: ${sourceLabel}`];
         const findings = [...metaFindings, ...flattenFindings(result)];
 
         const now = new Date().toISOString();
         const existing = task.aiFileReviews ?? [];
         const reviewEntry: AiFileReviewResult = {
           ...result,
-          id: `impl-review-${now}`,
-          reviewerName: fileReviewerName,
-          filePath:     artifactPath,
+          id:           `impl-review-${now}`,
+          reviewerName,
+          filePath:     source.fileRelPath ?? fileLabel,
           reviewMode:   'file',
         };
         await updateTask(task.id, {
@@ -2834,6 +2937,88 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
           },
         });
         setFeedback(`AI code review (file): ${implStatus}.`);
+
+      // ── Mode: branch-diff — no artifact, fallback to whole branch ─────────
+      } else if (source.mode === 'branch-diff') {
+        const bCtx = source.branchContext!;
+        const branchFrom = bCtx.currentBranch || 'unknown';
+        const branchTo   = bCtx.baseBranch    || 'unknown';
+        const modeLabel  = `Branch diff (no selected artifact): ${branchFrom} › ${branchTo}`;
+        const _changedFiles  = bCtx.changedFiles    ?? [];
+        const _noiseFiles    = bCtx.noiseFiles      ?? [];
+        const _flaggedPaths  = bCtx.flaggedPaths    ?? [];
+        const _untrackedIncl = bCtx.untrackedIncluded ?? [];
+        const _untrackedSkip = bCtx.untrackedSkipped  ?? [];
+
+        const gitInfo = [
+          '=== GIT CONTEXT (full branch) ===',
+          `Větev: ${branchFrom} › base: ${branchTo}`,
+          `Změněné soubory (${_changedFiles.length}): ${_changedFiles.slice(0, 10).join(', ')}`,
+          bCtx.hasCommitted  ? 'Zahrnuje: odevzdané změny větve' : '',
+          bCtx.hasStaged     ? 'Zahrnuje: staged změny' : '',
+          bCtx.hasUnstaged   ? 'Zahrnuje: unstaged změny' : '',
+          _noiseFiles.length > 0    ? `POZOR — noise soubory v diff: ${_noiseFiles.slice(0, 5).join(', ')}` : '',
+          _flaggedPaths.length > 0  ? `UPOZORNĚNÍ — přidány podezřelé soubory: ${_flaggedPaths.join(', ')}` : '',
+        ].filter(Boolean).join('\n');
+
+        const reviewerName = aiKitCtx
+          ? (isScript ? 'Script AI Kit Review' : 'Plugin AI Kit Review')
+          : (isScript ? 'Script Internal Check' : 'Plugin Internal Check');
+        const aiKitPrefix = aiKitCtx ? buildAiKitDiffReviewInstructions(aiKitCtx) + '\n\n' : '';
+        const instructions = aiKitPrefix
+          + buildInstructions(modeLabel, gitInfo)
+          + (isScript ? scriptDiffRules : pluginDiffRules);
+        const fileName = `local changes (${branchFrom} › ${branchTo})`;
+
+        const result = await tauriApi.runAiChangeReview(
+          bCtx.diff,
+          `${task.title}. ${bCtx.summary}`,
+          fileName,
+          reviewerName,
+          instructions,
+          '',
+          0.2,
+        );
+
+        const verdict    = result.structured?.verdict;
+        const implStatus = verdict === 'pass' ? 'passed' : verdict === 'needs_changes' ? 'failed' : 'warnings';
+
+        const metaFindings: string[] = [
+          `Review source: Branch diff (${branchFrom} › ${branchTo})`,
+          `[info] Changed files (${_changedFiles.length}): ${_changedFiles.slice(0, 6).join(', ')}${_changedFiles.length > 6 ? '…' : ''}`,
+          ...(bCtx.hasStaged    ? ['[info] Staged changes included'] : []),
+          ...(bCtx.hasUnstaged  ? ['[info] Unstaged changes included'] : []),
+          ...(_untrackedIncl.length > 0 ? [`[info] Untracked files included (${_untrackedIncl.length}): ${_untrackedIncl.join(', ')}`] : []),
+          ...(_untrackedSkip.length > 0 ? [`[info] Untracked files skipped: ${_untrackedSkip.slice(0, 3).join(', ')}`] : []),
+          ...(_noiseFiles.length   > 0  ? [`[warning] Noise files in diff: ${_noiseFiles.slice(0, 3).join(', ')}`] : []),
+          ...(_flaggedPaths.length > 0  ? [`[warning] Flagged paths added: ${_flaggedPaths.join(', ')}`] : []),
+        ];
+        const findings = [...metaFindings, ...flattenFindings(result)];
+
+        const now = new Date().toISOString();
+        const existing = task.aiFileReviews ?? [];
+        const reviewEntry: AiFileReviewResult = {
+          ...result,
+          id:           `impl-review-${now}`,
+          reviewerName,
+          filePath:     fileName,
+          reviewMode:   'change',
+        };
+        await updateTask(task.id, {
+          aiFileReviews: [reviewEntry, ...existing].slice(0, 5),
+          implementationVerification: {
+            ...task.implementationVerification,
+            aiCodeReview: {
+              status:   implStatus,
+              reviewId: reviewEntry.id,
+              runAt:    now,
+              summary:  result.structured?.summary ?? bCtx.summary,
+              findings,
+            },
+            updatedAt: now,
+          },
+        });
+        setFeedback(`AI code review (branch diff): ${implStatus}.`);
 
       } else {
         setFeedback('No artifact file and no git repository found. Save a draft or configure the artifact path first.');
@@ -3879,6 +4064,7 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
                   selectedPluginProject={selectedPluginProject}
                   onSelectedPluginChange={handleSelectedPluginChange}
                   onPluginProjectMissing={handlePluginProjectMissing}
+                  onScriptFileSelected={handleScriptFileSelected}
                   pluginRefreshTick={devPanelRefreshTick}
                   reviewerConfigs={plan.requiresAiFileReview ? settings.aiReviewers : undefined}
                   artifactPath={task.workflowSetup?.artifactPath}

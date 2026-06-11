@@ -2293,6 +2293,23 @@ body {
   max-width: 280px;
 }
 
+/* Column wrapper used when a SettingsField has a hint below the control.
+   Prevents the hint <div> from becoming a sibling flex item that shrinks the input. */
+.settings-field-control {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  max-width: 280px;
+  min-width: 0;
+}
+
+.settings-field-control .form-input,
+.settings-field-control .form-select {
+  width: 100%;
+  max-width: none;
+  flex: none;
+}
+
 /* Unified action row for settings buttons */
 .settings-action-row {
   display: flex;
