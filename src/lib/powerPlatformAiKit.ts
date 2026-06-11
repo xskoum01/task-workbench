@@ -8,6 +8,7 @@
  */
 import type { Task } from '../types';
 import { checkPathExists, readFileContent } from './tauriCommands';
+export { isPathInsideDir } from './pathUtils';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -221,22 +222,31 @@ export async function loadAiKitContext(
 // Prompt builders
 // ---------------------------------------------------------------------------
 
-/**
- * Builds the system instructions string for "Implement with AI Kit".
- */
-export function buildImplementInstructions(ctx: PowerPlatformAiKitContext): string {
+export function buildImplementInstructions(
+  ctx: PowerPlatformAiKitContext,
+  options?: { createMode?: boolean },
+): string {
   const parts: string[] = [];
+  const createMode = !!options?.createMode;
 
   parts.push('You are an expert Navertica CRM developer implementing a task according to Power Platform AI Kit rules.');
   parts.push('');
   parts.push('## MANDATORY CONSTRAINTS');
   parts.push('- Make minimal changes — modify only what the task requires.');
   parts.push('- Do NOT do out-of-scope refactoring or cleanup.');
-  parts.push('- Do NOT invent Dataverse schema, entity names, or attribute names.');
+  parts.push('- Do NOT invent Dataverse entity logical names, attribute logical names, or option set values. Use only names explicitly stated in the task or technical plan.');
   parts.push('- Respect existing code style (indentation, naming conventions, patterns).');
   parts.push('- Do NOT commit, push, create PR, or modify Git state.');
   parts.push('- Do NOT write to Dataverse, Azure DevOps, GitHub, or any external system.');
   parts.push('- Only change the single target file provided.');
+  parts.push('- Do NOT use DateTime.UtcNow, Guid.NewGuid(), random number generators, or timestamp values as business identifiers or sequence numbers unless the task explicitly requires it.');
+  parts.push('- Do NOT add placeholder methods, TODO comments ("// TODO", "// Placeholder", "// Implement"), or stub implementations. If a section cannot be implemented without missing metadata, set clarificationNeeded instead.');
+  parts.push('- In PreOperation Create/Update plugins, prefer setting attributes on context.InputParameters["Target"] directly rather than calling service.Update() on the primary entity, unless the plan explicitly specifies Update.');
+  parts.push('- Use the exact field names, entity names, and business logic specified in the task assignment and technical plan — no approximations.');
+  if (createMode) {
+    parts.push('- Create mode: current file content may be empty or missing; generate the complete initial file content for the resolved artifact path.');
+    parts.push('- Do NOT switch to a different file path even if task text mentions alternatives.');
+  }
   parts.push('');
 
   if (ctx.agentInstructions) {
@@ -272,11 +282,12 @@ export function buildImplementInstructions(ctx: PowerPlatformAiKitContext): stri
   parts.push('## OUTPUT FORMAT');
   parts.push('Return ONLY valid JSON with the following schema (no prose, no markdown fences):');
   parts.push(`{
-  "proposedContent": "<complete new file content as a single string>",
-  "summary": "<brief description of what was changed and why>",
+  "proposedContent": "<complete new file content — leave empty string only when clarificationNeeded is set>",
+  "summary": "<brief description of what was changed and why, or 'Clarification needed' if blocked>",
   "changedSections": ["<description of each changed section>"],
   "risks": ["<risk1>", "<risk2>"],
-  "testScenarios": ["<test scenario 1>", "<test scenario 2>"]
+  "testScenarios": ["<test scenario 1>", "<test scenario 2>"],
+  "clarificationNeeded": "<set to a non-empty string listing the exact missing Dataverse metadata or business logic that prevents implementation; omit or leave empty string if not needed>"
 }`);
 
   return parts.join('\n');

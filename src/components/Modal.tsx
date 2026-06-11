@@ -1,4 +1,5 @@
 import { useEffect } from 'react';
+import { createPortal } from 'react-dom';
 
 interface ModalProps {
   title: string;
@@ -19,7 +20,9 @@ export default function Modal({ title, onClose, children, size = 'md', footer }:
     return () => document.removeEventListener('keydown', handleKey);
   }, [onClose]);
 
-  return (
+  // Render at document.body so the overlay is never hidden by a collapsed
+  // <details> element or any display:none ancestor in the component tree.
+  return createPortal(
     <div
       className="modal-overlay"
       onMouseDown={(e) => {
@@ -43,6 +46,7 @@ export default function Modal({ title, onClose, children, size = 'md', footer }:
           </div>
         )}
       </div>
-    </div>
+    </div>,
+    document.body,
   );
 }

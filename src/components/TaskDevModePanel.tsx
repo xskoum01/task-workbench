@@ -1083,23 +1083,45 @@ export default forwardRef<TaskDevModePanelHandle, TaskDevModePanelProps>(functio
             <div className="detail-devmode-hint">{pluginOpenHint}</div>
           )}
 
-          <button
-            className="btn btn-secondary btn-sm btn-full"
-            onClick={handleOpenPlugin}
-            disabled={!selectedPlugin}
-          >
-            <Icon name="terminal" size={13} />{' '}
-            {'Open Plugin in Visual Studio'}
-          </button>
+          <div className="detail-action-grid">
+            <button
+              className="btn btn-secondary btn-sm"
+              onClick={handleOpenPlugin}
+              disabled={!selectedPlugin}
+            >
+              <Icon name="terminal" size={13} />{' '}
+              {'Open Plugin in Visual Studio'}
+            </button>
+            {effectiveRepoRoot && (
+              <button
+                className="btn btn-secondary btn-sm"
+                onClick={async () => { try { await tauriApi.openPath(effectiveRepoRoot); } catch (e) { onError(String(e)); } }}
+                title={effectiveRepoRoot}
+              >
+                <Icon name="folder" size={13} /> Open Repository
+              </button>
+            )}
+          </div>
         </>
       ) : (
-        <button
-          className="btn btn-secondary btn-sm btn-full"
-          onClick={handleOpenScript}
-          disabled={!scriptOpenPath}
-        >
-          <Icon name="terminal" size={13} /> Open Script in VS Code
-        </button>
+        <div className="detail-action-grid">
+          <button
+            className="btn btn-secondary btn-sm"
+            onClick={handleOpenScript}
+            disabled={!scriptOpenPath}
+          >
+            <Icon name="terminal" size={13} /> Open Script in VS Code
+          </button>
+          {effectiveRepoRoot && (
+            <button
+              className="btn btn-secondary btn-sm"
+              onClick={async () => { try { await tauriApi.openPath(effectiveRepoRoot); } catch (e) { onError(String(e)); } }}
+              title={effectiveRepoRoot}
+            >
+              <Icon name="folder" size={13} /> Open Repository
+            </button>
+          )}
+        </div>
       )}
 
       {/* AI Review — hidden when the parent surfaces this inside Assistant Tools */}

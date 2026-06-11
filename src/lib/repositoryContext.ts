@@ -1,0 +1,205 @@
+/**
+ * Deterministic repository context resolver for AI Kit workflow.
+ *
+ * Resolves repoRoot and artifactPath from task / customer / settings using
+ * a fixed priority chain — no AI guessing, no async, no Tauri calls.
+ * All diagnostics (warnings, blockers) are computed here so the UI has a
+ * single source of truth for what the AI Kit can and cannot do.
+ */
+import type { Task, Customer } from '../types';
+import { isPathInsideDir } from './pathUtils';
+import { detectTaskKindFromTask, type AiKitTaskKind } from './powerPlatformAiKit';
+
+// ---------------------------------------------------------------------------
+// Types
+// ---------------------------------------------------------------------------
+
+export interface RepoContextSettings {
+  /** Global base directory where all CRM repositories live (from app settings). */
+  crmBaseDirectory?: string;
+  /** Absolute path to the Power Platform AI Kit repository. */
+  powerPlatformAiKitPath?: string;
+}
+
+export type RepoRootSource =
+  | 'workflow-setup'     // task.workflowSetup.repositoryRoot (user-confirmed)
+  | 'customer-resolved'  // customer.resolvedRepositoryPath (base-dir + folderName, resolved at load)
+  | 'customer-direct'    // customer.repositoryRoot (direct field)
+  | 'base-dir-computed'; // settings.crmBaseDirectory + customer.folderName (runtime derivation)
+
+export type ArtifactPathSource =
+  | 'workflow-artifact'  // task.workflowSetup.artifactPath
+  | 'workflow-script';   // task.workflowSetup.scriptPath (.js/.ts only)
+
+export interface RepositoryContext {
+  // ── Resolved paths ────────────────────────────────────────────────────────
+  repoRoot: string | null;
+  repoRootSource: RepoRootSource | null;
+  artifactPath: string | null;
+  artifactPathSource: ArtifactPathSource | null;
+
+  // ── Task metadata ─────────────────────────────────────────────────────────
+  taskKind: AiKitTaskKind;
+
+  // ── Derived artifact info ─────────────────────────────────────────────────
+  /** Just the file name (no directory). */
+  artifactFileName: string | null;
+  /** File extension including dot, e.g. ".cs", ".js". */
+  artifactExtension: string | null;
+
+  // ── Path boundary checks ──────────────────────────────────────────────────
+  /** null when repo root or artifact path is missing (cannot determine). */
+  insideRepo: boolean | null;
+  /** null when AI Kit path or artifact path is missing. */
+  insideAiKit: boolean | null;
+
+  // ── Convenience flags ─────────────────────────────────────────────────────
+  hasArtifact: boolean;
+  hasRepo: boolean;
+
+  // ── Diagnostics ───────────────────────────────────────────────────────────
+  /** Non-blocking — shown as warnings, do not prevent AI Kit actions. */
+  warnings: string[];
+  /** Blocking — AI Kit file-write actions must not proceed while these exist. */
+  blockers: string[];
+}
+
+// ---------------------------------------------------------------------------
+// Resolver
+// ---------------------------------------------------------------------------
+
+export function buildRepositoryContextForTask(
+  task: Task,
+  customer: Customer | undefined,
+  settings: RepoContextSettings,
+): RepositoryContext {
+  const setup = task.workflowSetup;
+  const warnings: string[] = [];
+  const blockers: string[] = [];
+
+  // ── Resolve repo root (priority order) ───────────────────────────────────
+
+  let repoRoot: string | null = null;
+  let repoRootSource: RepoRootSource | null = null;
+
+  // 1. User-confirmed override in workflow setup
+  if (setup?.repositoryRoot?.trim()) {
+    repoRoot = setup.repositoryRoot.trim();
+    repoRootSource = 'workflow-setup';
+  }
+
+  // 2. Customer resolved path (base-dir + folderName, computed at load time)
+  if (!repoRoot && customer?.resolvedRepositoryPath?.trim()) {
+    repoRoot = customer.resolvedRepositoryPath.trim();
+    repoRootSource = 'customer-resolved';
+  }
+
+  // 3. Customer direct repository root field
+  if (!repoRoot && customer?.repositoryRoot?.trim()) {
+    repoRoot = customer.repositoryRoot.trim();
+    repoRootSource = 'customer-direct';
+  }
+
+  // 4. Runtime derivation from global base directory + customer folder name
+  if (!repoRoot && settings.crmBaseDirectory?.trim() && customer?.folderName?.trim()) {
+    const base   = settings.crmBaseDirectory.trim().replace(/[\\/]+$/, '').replace(/\\/g, '/');
+    const folder = customer.folderName.trim();
+    repoRoot = `${base}/${folder}`;
+    repoRootSource = 'base-dir-computed';
+    warnings.push(
+      `Repository root derived from global base directory (${base}) + customer folder (${folder}).` +
+      ' Verify this path exists on disk.'
+    );
+  }
+
+  if (!repoRoot) {
+    warnings.push('Repository root is not configured. Git diff review requires a repository path.');
+  }
+
+  // ── Resolve artifact path (priority order, no AI guessing) ───────────────
+
+  let artifactPath: string | null = null;
+  let artifactPathSource: ArtifactPathSource | null = null;
+
+  // 1. Explicit artifact path (generated by skeleton / Apply Draft)
+  if (setup?.artifactPath?.trim()) {
+    artifactPath = setup.artifactPath.trim();
+    artifactPathSource = 'workflow-artifact';
+  }
+
+  // 2. Script path when it is a .js or .ts file
+  if (!artifactPath && setup?.scriptPath?.trim()) {
+    const sp = setup.scriptPath.trim();
+    if (/\.[jt]s$/i.test(sp)) {
+      artifactPath = sp;
+      artifactPathSource = 'workflow-script';
+    } else {
+      warnings.push(
+        `scriptPath "${sp.replace(/\\/g, '/').split('/').pop()}" is not a .js/.ts file — not used as artifact.`
+      );
+    }
+  }
+
+  if (!artifactPath) {
+    blockers.push(
+      'No artifact file configured. Complete Confirm Setup or select a target file before running AI Kit actions.'
+    );
+  }
+
+  // ── Derived artifact metadata ─────────────────────────────────────────────
+
+  const artifactFileName = artifactPath
+    ? (artifactPath.replace(/\\/g, '/').split('/').pop() ?? null)
+    : null;
+
+  const artifactExtension = artifactFileName
+    ? ((artifactFileName.match(/\.[^.]+$/) ?? [null])[0])
+    : null;
+
+  // ── Path boundary checks ──────────────────────────────────────────────────
+
+  const aiKitPath = settings.powerPlatformAiKitPath?.trim() ?? null;
+
+  const insideRepo: boolean | null = (artifactPath && repoRoot)
+    ? isPathInsideDir(artifactPath, repoRoot)
+    : null;
+
+  const insideAiKit: boolean | null = (artifactPath && aiKitPath)
+    ? isPathInsideDir(artifactPath, aiKitPath)
+    : null;
+
+  if (insideAiKit === true) {
+    blockers.push(
+      'Artifact is inside the AI Kit repository — all file writes are blocked. ' +
+      'Target file must be inside the customer repository.'
+    );
+  }
+
+  if (insideRepo === false) {
+    blockers.push(
+      `Artifact is outside the repository root.\nFile: ${artifactPath}\nRepo: ${repoRoot}`
+    );
+  }
+
+  // ── Task kind ─────────────────────────────────────────────────────────────
+
+  const taskKind = detectTaskKindFromTask(task);
+
+  // ── Return ────────────────────────────────────────────────────────────────
+
+  return {
+    repoRoot,
+    repoRootSource,
+    artifactPath,
+    artifactPathSource,
+    taskKind,
+    artifactFileName,
+    artifactExtension,
+    insideRepo,
+    insideAiKit,
+    hasArtifact: !!artifactPath,
+    hasRepo: !!repoRoot,
+    warnings,
+    blockers,
+  };
+}

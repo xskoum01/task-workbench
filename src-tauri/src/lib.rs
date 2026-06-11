@@ -8352,6 +8352,33 @@ fn parse_mcp_args(args_raw: &str) -> Vec<String> {
     result
 }
 
+/// Validates the MCP working directory before passing it to Command::current_dir.
+/// Returns Ok(None) when empty (cwd not set), Ok(Some(path)) when path is a valid directory,
+/// or Err with a clear message when the path does not exist or points to a file.
+fn validate_working_directory(wd: &str) -> Result<Option<String>, String> {
+    let trimmed = wd.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    match std::fs::metadata(trimmed) {
+        Ok(meta) if meta.is_dir() => Ok(Some(trimmed.to_string())),
+        Ok(_) => Err(format!(
+            "Working directory points to a file, not a folder. \
+             Use its parent folder instead.\nPath: {trimmed}"
+        )),
+        Err(e) => {
+            if e.raw_os_error() == Some(267) {
+                return Err(format!(
+                    "Working directory is invalid (Windows error 267 — path is not a directory). \
+                     Check that the working directory field contains a folder path, not the MCP script file.\n\
+                     Path: {trimmed}"
+                ));
+            }
+            Err(format!("Working directory does not exist.\nPath: {trimmed}\nError: {e}"))
+        }
+    }
+}
+
 /// Extracts plausible Dataverse logical names from text.
 /// Accepts lowercase identifiers such as account, ownerid, fullname, nvr_company.
 fn extract_logical_names_from_text(text: &str) -> Vec<String> {
@@ -8802,8 +8829,9 @@ fn get_mcp_config(settings: &Value) -> Result<(String, Vec<String>, Option<Strin
         return Err("MCP command is not configured. Go to Settings \u{2192} CRM Metadata and set the server command.".to_string());
     }
     let args = parse_mcp_args(settings["primarchMcpArgs"].as_str().unwrap_or(""));
-    let wd = settings["primarchMcpWorkingDirectory"].as_str().unwrap_or("").to_string();
-    let working_dir = if wd.is_empty() { None } else { Some(wd) };
+    let wd_raw = settings["primarchMcpWorkingDirectory"].as_str().unwrap_or("");
+    let working_dir = validate_working_directory(wd_raw)
+        .map_err(|e| format!("MCP working directory error: {e}"))?;
     Ok((cmd_str, args, working_dir))
 }
 
@@ -8838,7 +8866,14 @@ async fn mcp_list_tools_raw(cmd_str: &str, args: &[String], working_dir: Option<
     #[cfg(target_os = "windows")]
     { cmd.creation_flags(CREATE_NO_WINDOW); }
 
-    let mut child = cmd.spawn().map_err(|e| format!("Failed to start MCP server '{cmd_str}': {e}"))?;
+    let mut child = cmd.spawn().map_err(|e| {
+        let wd_info = working_dir.map(|d| format!("\n  Working directory: {d}")).unwrap_or_default();
+        let hint = if e.raw_os_error() == Some(267) {
+            "\n  Hint: error 267 means the working directory is not a valid folder. \
+             Check that the 'Working directory' setting contains a folder path, not the MCP script file."
+        } else { "" };
+        format!("Failed to start MCP server\n  Command: {cmd_str}\n  Args: {args:?}{wd_info}\n  Error: {e}{hint}")
+    })?;
     let mut stdin  = child.stdin.take().ok_or_else(|| "MCP: no stdin".to_string())?;
     let stdout = child.stdout.take().ok_or_else(|| "MCP: no stdout".to_string())?;
 
@@ -8894,7 +8929,14 @@ async fn mcp_call_tool_raw(
     #[cfg(target_os = "windows")]
     { cmd.creation_flags(CREATE_NO_WINDOW); }
 
-    let mut child = cmd.spawn().map_err(|e| format!("Failed to start MCP server '{cmd_str}': {e}"))?;
+    let mut child = cmd.spawn().map_err(|e| {
+        let wd_info = working_dir.map(|d| format!("\n  Working directory: {d}")).unwrap_or_default();
+        let hint = if e.raw_os_error() == Some(267) {
+            "\n  Hint: error 267 means the working directory is not a valid folder. \
+             Check that the 'Working directory' setting contains a folder path, not the MCP script file."
+        } else { "" };
+        format!("Failed to start MCP server\n  Command: {cmd_str}\n  Args: {args:?}{wd_info}\n  Error: {e}{hint}")
+    })?;
     let mut stdin  = child.stdin.take().ok_or_else(|| "MCP: no stdin".to_string())?;
     let stdout = child.stdout.take().ok_or_else(|| "MCP: no stdout".to_string())?;
 
@@ -11355,6 +11397,51 @@ mod tests {
         // Result: schema_completeness = "unknown" (conservative — we cannot prove it is complete or truncated).
         assert_eq!(entry.schema_completeness, "unknown",
             "list_columns text-wrapper format: count buried in string → unknown, not incomplete");
+    }
+
+    // ── validate_working_directory ────────────────────────────────────────
+
+    #[test]
+    fn validate_wd_empty_string_returns_none() {
+        assert_eq!(validate_working_directory(""), Ok(None));
+    }
+
+    #[test]
+    fn validate_wd_whitespace_only_returns_none() {
+        assert_eq!(validate_working_directory("   "), Ok(None));
+    }
+
+    #[test]
+    fn validate_wd_existing_directory_is_accepted() {
+        let dir = std::env::temp_dir();
+        let result = validate_working_directory(dir.to_str().unwrap());
+        assert!(result.is_ok(), "temp dir should be accepted: {:?}", result);
+        assert!(result.unwrap().is_some());
+    }
+
+    #[test]
+    fn validate_wd_nonexistent_path_is_rejected_with_clear_message() {
+        let result = validate_working_directory("/nonexistent/path/task_workbench_test_xyz_99999");
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_lowercase();
+        assert!(
+            msg.contains("does not exist") || msg.contains("working directory"),
+            "expected 'does not exist' or 'working directory' in: {msg}"
+        );
+    }
+
+    #[test]
+    fn validate_wd_file_path_is_rejected_with_folder_hint() {
+        let tmp_file = std::env::temp_dir().join("task_workbench_wd_file_test.js");
+        std::fs::write(&tmp_file, b"// test").expect("write temp file");
+        let result = validate_working_directory(tmp_file.to_str().unwrap());
+        let _ = std::fs::remove_file(&tmp_file);
+        assert!(result.is_err(), "file path must be rejected");
+        let msg = result.unwrap_err().to_lowercase();
+        assert!(
+            msg.contains("file") || msg.contains("folder"),
+            "message must mention 'file' or 'folder': {msg}"
+        );
     }
 
     #[test]

@@ -284,6 +284,8 @@ export type LocalTestImplStatus = 'not-run' | 'passed' | 'failed' | 'not-needed'
 /** Single optional verification check record — Dataverse check or AI code review. */
 export interface ImplCheckRecord {
   status: ImplCheckStatus;
+  /** References the id of the associated aiFileReviews entry for this result. */
+  reviewId?: string;
   runAt?: string;
   skippedAt?: string;
   skippedReason?: string;

@@ -8,6 +8,23 @@ import TemplatesSection from '../components/TemplatesSection';
 import AiReviewersSettingsPanel from '../components/AiReviewersSettingsPanel';
 
 // ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+/** True when a path string ends with a file extension — likely a file, not a directory. */
+function isLikelyFilePath(path: string | undefined): boolean {
+  const p = path?.trim() ?? '';
+  return p.length > 0 && /\.(js|ts|cjs|mjs|py|exe|bat|ps1|sh|json|yaml|yml|xml|dll)$/i.test(p);
+}
+
+/** Returns the parent directory portion of a file path, or '' if not determinable. */
+function getParentDir(filePath: string): string {
+  const normalized = filePath.trim().replace(/\\/g, '/');
+  const idx = normalized.lastIndexOf('/');
+  return idx > 0 ? filePath.trim().slice(0, idx) : '';
+}
+
+// ---------------------------------------------------------------------------
 // Sub-components
 // ---------------------------------------------------------------------------
 
@@ -1203,11 +1220,31 @@ export default function SettingsPage() {
                 <input
                   className="form-input"
                   type="text"
-                  placeholder="optional absolute path"
+                  placeholder="optional absolute path to a folder"
                   value={draft.primarchMcpWorkingDirectory ?? ''}
                   onChange={(e) => set('primarchMcpWorkingDirectory', e.target.value)}
                   style={{ maxWidth: 520 }}
                 />
+                <div className="settings-field-hint" style={{ marginTop: 3 }}>
+                  Must be a folder, not a file. Usually the folder containing the MCP script.
+                </div>
+                {isLikelyFilePath(draft.primarchMcpWorkingDirectory) && (
+                  <div className="settings-field-hint" style={{ marginTop: 3, color: 'var(--color-warning, #d29922)' }}>
+                    This looks like a file path. Working directory must be a folder — use its parent directory instead.
+                  </div>
+                )}
+                {isLikelyFilePath(draft.primarchMcpArgs) && !draft.primarchMcpWorkingDirectory?.trim() && (
+                  <div style={{ marginTop: 4 }}>
+                    <button
+                      className="btn btn-ghost btn-sm"
+                      type="button"
+                      onClick={() => set('primarchMcpWorkingDirectory', getParentDir(draft.primarchMcpArgs ?? ''))}
+                      title="Set working directory to the folder containing the MCP script"
+                    >
+                      Use parent folder from MCP args
+                    </button>
+                  </div>
+                )}
               </SettingsField>
 
               <div className="settings-inline-list" style={{ marginTop: 2 }}>

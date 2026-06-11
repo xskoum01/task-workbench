@@ -152,6 +152,12 @@ interface Props {
   onProceedToReview: () => Promise<void>;
   onUpdateNextStepAndClose: (nextStep: string) => Promise<void>;
   onOpenAiReview?: () => void;
+  /** Opens the stored Dataverse metadata check result. Present when a result exists. */
+  onOpenDvReview?: () => void;
+  /** Full reset: clears crmVerificationReports, dataverseCheck override, appends activity note. */
+  onResetDvCheck?: () => Promise<void>;
+  /** Full reset: clears aiFileReviews, aiCodeReview override, appends activity note. */
+  onResetAiReview?: () => Promise<void>;
   onClose: () => void;
 }
 
@@ -164,11 +170,13 @@ export default function ImplementationVerificationModal({
   resolvedArtifactPath, artifactInferred,
   buildCheckRunning, dataverseCheckRunning, aiCodeReviewRunning,
   onRunBuildCheck, onRunDataverseCheck, onRunAiCodeReview,
-  onUpdate, onContinueToTesting, onProceedToReview, onUpdateNextStepAndClose, onOpenAiReview, onClose,
+  onUpdate, onContinueToTesting, onProceedToReview, onUpdateNextStepAndClose,
+  onOpenAiReview, onOpenDvReview, onResetDvCheck, onResetAiReview, onClose,
 }: Props) {
   const [busy,               setBusy]               = useState(false);
   const [skipTarget,         setSkipTarget]         = useState<SkipTarget | null>(null);
   const [skipReason,         setSkipReason]         = useState('Skipped by user.');
+  const [confirmResetTarget, setConfirmResetTarget] = useState<'dataverse' | 'aiReview' | null>(null);
   const [testingBusy,        setTestingBusy]        = useState(false);
   const [reviewBusy,         setReviewBusy]         = useState(false);
   const [continueBusy,       setContinueBusy]       = useState(false);
@@ -180,7 +188,14 @@ export default function ImplementationVerificationModal({
   const aiStatus: ImplCheckStatus        = iv?.aiCodeReview?.status ?? 'not-run';
   const localStatus: LocalTestImplStatus = iv?.localTest?.status ?? 'not-run';
   const latestReport = task.crmVerificationReports?.[0];
-  const latestAiReview = task.aiFileReviews?.[0];
+  // Active AI review: look up by reviewId when present; fall back to aiFileReviews[0] for
+  // older records; return undefined when status is not-run so Open review is hidden after reset.
+  const latestAiReview = (() => {
+    if (aiStatus === 'not-run') return undefined;
+    const reviewId = iv?.aiCodeReview?.reviewId;
+    if (reviewId) return task.aiFileReviews?.find((r) => r.id === reviewId);
+    return task.aiFileReviews?.[0];
+  })();
   // Use the resolved path (which includes inferred paths) for display and guard checks.
   const artifactPath = resolvedArtifactPath ?? task.workflowSetup?.artifactPath;
   const entity       = task.workflowSetup?.primaryEntityLogicalName
@@ -243,6 +258,9 @@ export default function ImplementationVerificationModal({
   }
   function cancelSkip() { setSkipTarget(null); setSkipReason('Skipped by user.'); }
 
+  function startReset(target: 'dataverse' | 'aiReview') { setConfirmResetTarget(target); }
+  function cancelReset() { setConfirmResetTarget(null); }
+
   // ---------------------------------------------------------------------------
 
   async function handleBuildRun() {
@@ -289,10 +307,14 @@ export default function ImplementationVerificationModal({
     setBusy(false);
   }
 
-  async function handleDataverseReset() {
+  async function handleDataverseResetConfirm() {
     setBusy(true);
-    await applyUpdate({ dataverseCheck: { status: 'not-run' } });
-    setBusy(false);
+    try {
+      await onResetDvCheck?.();
+    } finally {
+      setConfirmResetTarget(null);
+      setBusy(false);
+    }
   }
 
   // ---------------------------------------------------------------------------
@@ -315,10 +337,14 @@ export default function ImplementationVerificationModal({
     setBusy(false);
   }
 
-  async function handleAiReset() {
+  async function handleAiResetConfirm() {
     setBusy(true);
-    await applyUpdate({ aiCodeReview: { status: 'not-run' } });
-    setBusy(false);
+    try {
+      await onResetAiReview?.();
+    } finally {
+      setConfirmResetTarget(null);
+      setBusy(false);
+    }
   }
 
   // ---------------------------------------------------------------------------
@@ -375,6 +401,22 @@ export default function ImplementationVerificationModal({
             {busy ? <><span className="btn-spinner" /> Skipping</> : 'Confirm Skip'}
           </button>
           <button className="btn btn-ghost btn-sm" onClick={cancelSkip} disabled={busy} type="button">Cancel</button>
+        </div>
+      </div>
+    );
+  }
+
+  function ConfirmReset({ onConfirm }: { onConfirm: () => void }) {
+    return (
+      <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+        <div style={{ fontSize: 11.5, color: 'var(--text-muted)' }}>
+          Reset this verification result? This will clear the current result and allow the check to be run again.
+        </div>
+        <div style={{ display: 'flex', gap: 6 }}>
+          <button className="btn btn-danger btn-sm" onClick={onConfirm} disabled={busy} type="button">
+            {busy ? <><span className="btn-spinner" /> Resetting</> : 'Confirm Reset'}
+          </button>
+          <button className="btn btn-ghost btn-sm" onClick={cancelReset} disabled={busy} type="button">Cancel</button>
         </div>
       </div>
     );
@@ -552,6 +594,8 @@ export default function ImplementationVerificationModal({
 
           {skipTarget === 'dataverse' ? (
             <SkipForm onConfirm={handleDataverseSkipConfirm} />
+          ) : confirmResetTarget === 'dataverse' ? (
+            <ConfirmReset onConfirm={handleDataverseResetConfirm} />
           ) : (
             <div style={btnRow}>
               {dvStatus !== 'manually-verified' && (
@@ -563,6 +607,12 @@ export default function ImplementationVerificationModal({
                     : <><Icon name="search" size={12} /> Run Dataverse Check</>}
                 </button>
               )}
+              {latestReport && onOpenDvReview && (
+                <button className="btn btn-secondary btn-sm" onClick={onOpenDvReview}
+                  disabled={anyBusy} type="button">
+                  <Icon name="search" size={12} /> Open review
+                </button>
+              )}
               {(dvStatus === 'not-run' || dvStatus === 'passed' || dvStatus === 'warnings' || dvStatus === 'failed') && (
                 <button className="btn btn-ghost btn-sm" onClick={handleDataverseManualVerify}
                   disabled={anyBusy} title="Mark as manually verified" type="button">
@@ -572,8 +622,8 @@ export default function ImplementationVerificationModal({
               {(dvStatus === 'not-run' || dvStatus === 'warnings' || dvStatus === 'failed') && (
                 <button className="btn btn-ghost btn-sm" onClick={() => startSkip('dataverse')} disabled={anyBusy} type="button">Skip</button>
               )}
-              {(dvStatus === 'skipped' || dvStatus === 'manually-verified') && (
-                <button className="btn btn-ghost btn-sm" onClick={handleDataverseReset} disabled={anyBusy} type="button">Reset</button>
+              {dvStatus !== 'not-run' && (
+                <button className="btn btn-ghost btn-sm" onClick={() => startReset('dataverse')} disabled={anyBusy} type="button">Reset</button>
               )}
             </div>
           )}
@@ -594,9 +644,16 @@ export default function ImplementationVerificationModal({
           {aiStatus === 'skipped' && iv?.aiCodeReview?.skippedReason && (
             <div style={hintStyle}>Reason: {iv.aiCodeReview.skippedReason}</div>
           )}
+          {aiStatus !== 'not-run' && aiStatus !== 'skipped' && aiStatus !== 'manually-verified' && !latestAiReview && (
+            <div style={{ fontSize: 11.5, color: 'var(--color-warning, #d29922)', marginBottom: 6 }}>
+              Review details are missing. Run AI Code Review again.
+            </div>
+          )}
 
           {skipTarget === 'aiReview' ? (
             <SkipForm onConfirm={handleAiSkipConfirm} />
+          ) : confirmResetTarget === 'aiReview' ? (
+            <ConfirmReset onConfirm={handleAiResetConfirm} />
           ) : (
             <div style={btnRow}>
               {aiStatus !== 'manually-verified' && !!artifactPath && (
@@ -621,8 +678,8 @@ export default function ImplementationVerificationModal({
               {(aiStatus === 'not-run' || aiStatus === 'warnings' || aiStatus === 'failed') && (
                 <button className="btn btn-ghost btn-sm" onClick={() => startSkip('aiReview')} disabled={anyBusy} type="button">Skip</button>
               )}
-              {(aiStatus === 'skipped' || aiStatus === 'manually-verified') && (
-                <button className="btn btn-ghost btn-sm" onClick={handleAiReset} disabled={anyBusy} type="button">Reset</button>
+              {aiStatus !== 'not-run' && (
+                <button className="btn btn-ghost btn-sm" onClick={() => startReset('aiReview')} disabled={anyBusy} type="button">Reset</button>
               )}
             </div>
           )}

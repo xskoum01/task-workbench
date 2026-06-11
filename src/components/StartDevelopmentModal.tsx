@@ -24,6 +24,9 @@ import type { TaskWorkflowPlan } from '../lib/workflowPlan';
 import Modal from './Modal';
 import Icon from './Icon';
 import * as tauriApi from '../lib/tauriCommands';
+import { isPathInsideDir } from '../lib/pathUtils';
+import { resolveScriptActions } from '../lib/startDevelopmentActions';
+import { buildScriptScaffold } from '../lib/scriptScaffold';
 
 interface Props {
   task: Task;
@@ -32,6 +35,8 @@ interface Props {
   pluginsDir: string | undefined;
   selectedPluginProject: string;
   repoRoot: string | undefined;
+  /** Effective repository root selected in developer panel (override-aware) for git/path checks. */
+  effectiveRepoRoot?: string;
   scriptOpenPath: string | undefined;
   /** Path to the configured plugin template folder (settings.pluginTemplateFolder). */
   templateDir?: string;
@@ -65,8 +70,21 @@ interface Props {
   onClose: () => void;
   /** Absolute path to the AI Kit repo from settings — when set, shows AI Kit section. */
   aiKitPath?: string;
-  /** Called when user clicks "Implement with AI Kit" in this modal. */
-  onImplementWithAiKit?: () => void;
+  /** Absolute global CRM base directory from settings. */
+  crmBaseDirectory?: string;
+  /**
+   * Called when the user confirms "Implement with AI Kit" in this modal.
+   * For plugin create tasks, `createdArtifactPath` carries the path of the skeleton
+   * file that was just generated and saved so the caller can persist it and pass it
+   * directly to startImplement without reading stale React state.
+   */
+  onImplementWithAiKit?: (createdArtifactPath?: string) => void;
+  /**
+   * Called after "Create Script File" succeeds (without AI Kit).
+   * The caller should persist the artifact path and record the creation activity.
+   * Development start is left to the explicit "Start Development" button.
+   */
+  onScriptFileCreated?: (path: string) => Promise<void>;
 }
 
 // ---------------------------------------------------------------------------
@@ -117,11 +135,11 @@ function SectionLabel({ children }: { children: React.ReactNode }) {
 export default function StartDevelopmentModal({
   task, customer, plan,
   pluginsDir, selectedPluginProject,
-  repoRoot, scriptOpenPath, templateDir, verificationVerdict,
+  repoRoot, effectiveRepoRoot, templateDir, verificationVerdict,
   onOpenPlugin, onGenerateDraft, onGenerateDraftGuided, onGenerateDraftAndOpen,
   onCreatePlugin, onProjectCreated,
   onStartDevelopment, onClose,
-  aiKitPath, onImplementWithAiKit,
+  aiKitPath, crmBaseDirectory, onImplementWithAiKit, onScriptFileCreated,
 }: Props) {
   const [pluginExists,        setPluginExists]        = useState<boolean | null>(null);
   const [starting,            setStarting]            = useState(false);
@@ -133,6 +151,9 @@ export default function StartDevelopmentModal({
   const [progressMsg,         setProgressMsg]         = useState<string | null>(null);
   const [createMsg,           setCreateMsg]           = useState<{ ok: boolean; text: string } | null>(null);
   const [fsError,             setFsError]             = useState<string | null>(null);
+  const [scriptTargetExists,  setScriptTargetExists]  = useState<boolean>(false);
+  const [creatingScript,      setCreatingScript]      = useState(false);
+  const [creatingScriptAndAi, setCreatingScriptAndAi] = useState(false);
 
   // Check whether the selected plugin project folder exists on disk.
   useEffect(() => {
@@ -158,12 +179,122 @@ export default function StartDevelopmentModal({
   const noPluginSelected  = isPlugin && !selectedPluginProject;
   const canDirectCreate   = isPlugin && !!selectedPluginProject && !!pluginsDir && pluginExists !== true;
   const hasTemplate       = !!templateDir;
+  const resolvedScriptTargetPath = (task.workflowSetup?.artifactPath ?? task.workflowSetup?.scriptPath)?.trim() || '';
+
+  useEffect(() => {
+    if (!isScript || !resolvedScriptTargetPath) {
+      setScriptTargetExists(false);
+      return;
+    }
+    tauriApi.checkPathExists(resolvedScriptTargetPath)
+      .then((exists) => setScriptTargetExists(exists))
+      .catch(() => setScriptTargetExists(false));
+  }, [isScript, resolvedScriptTargetPath]);
+
+  const scriptActions = resolveScriptActions({
+    isScript,
+    workIntent: task.workflowSetup?.workIntent,
+    scriptTargetPath: resolvedScriptTargetPath,
+    scriptTargetExists,
+  });
 
   // Display values
   const workKindLabel    = isPlugin ? 'Plugin' : isScript ? 'Script' : 'General';
   const workActionLabel  = isCreate ? 'Create' : (task.workflowSetup?.workIntent ?? 'Update');
   const targetLabel      = selectedPluginProject
     || (isScript ? task.workflowSetup?.scriptPath?.replace(/\\/g, '/').split('/').pop() ?? '' : '');
+
+  function resolveAbsolute(path: string): string {
+    const trimmed = path.trim();
+    if (/^[a-zA-Z]:[\\/]/.test(trimmed) || trimmed.startsWith('/') || trimmed.startsWith('\\\\')) {
+      return trimmed;
+    }
+    const base = (effectiveRepoRoot ?? repoRoot ?? crmBaseDirectory ?? '').replace(/[\\/]+$/, '');
+    return base ? `${base}/${trimmed}` : trimmed;
+  }
+
+  function getParentDirectory(path: string): string {
+    const normalised = path.replace(/\\/g, '/').replace(/[\\/]+$/, '');
+    const idx = normalised.lastIndexOf('/');
+    return idx > 0 ? normalised.slice(0, idx) : '';
+  }
+
+  /** Validates the script target path without writing any file. Returns the resolved absolute path. */
+  async function validateScriptTargetPath(): Promise<string> {
+    const rawPath = resolvedScriptTargetPath;
+    if (!rawPath) {
+      throw new Error('No script target configured. Use Confirm Setup to select a script file.');
+    }
+
+    const artifactPath = resolveAbsolute(rawPath);
+    const repo = (effectiveRepoRoot ?? repoRoot)?.trim();
+
+    if (!repo) {
+      throw new Error('Repository root is not configured. Configure repository path before creating a script file.');
+    }
+
+    if (!isPathInsideDir(artifactPath, repo)) {
+      throw new Error(`Target file is outside the repository root.\nFile: ${artifactPath}\nRepo: ${repo}`);
+    }
+
+    if (aiKitPath?.trim() && isPathInsideDir(artifactPath, aiKitPath.trim())) {
+      throw new Error(
+        'AI Kit is read-only. Target file must be inside the customer repository, not the AI Kit repo.\n' +
+        `File: ${artifactPath}\nAI Kit: ${aiKitPath}`
+      );
+    }
+
+    const parentDir = getParentDirectory(artifactPath);
+    if (!parentDir || !isPathInsideDir(parentDir, repo)) {
+      throw new Error(`Target parent directory must be inside the repository root.\nDirectory: ${parentDir}\nRepo: ${repo}`);
+    }
+
+    const parentExists = await tauriApi.checkPathExists(parentDir).catch(() => false);
+    if (!parentExists) {
+      throw new Error(`Target directory does not exist: ${parentDir}. Create/select a valid folder first.`);
+    }
+
+    return artifactPath;
+  }
+
+  async function createScriptFileNow(): Promise<string> {
+    const artifactPath = await validateScriptTargetPath();
+    await tauriApi.saveGeneratedFile(artifactPath, buildScriptScaffold());
+    setScriptTargetExists(true);
+    return artifactPath;
+  }
+
+  async function handleCreateScriptFile() {
+    setCreatingScript(true);
+    setCreateMsg(null);
+    try {
+      const createdPath = await createScriptFileNow();
+      setCreateMsg({ ok: true, text: `Script file created: ${createdPath.replace(/\\/g, '/')}` });
+      await onScriptFileCreated?.(createdPath);
+    } catch (e) {
+      setCreateMsg({ ok: false, text: String(e) });
+    } finally {
+      setCreatingScript(false);
+    }
+  }
+
+  async function handleCreateScriptAndImplement() {
+    if (!onImplementWithAiKit) return;
+    setCreatingScriptAndAi(true);
+    setCreateMsg(null);
+    try {
+      // Validate path and ensure parent directory exists — but do NOT pre-write a scaffold.
+      // AI Kit startImplement will receive an empty currentContent (create mode) and generate
+      // the full file content. The file is only written after the user clicks Apply in the preview.
+      const resolvedPath = await validateScriptTargetPath();
+      onImplementWithAiKit(resolvedPath);
+      onClose();
+    } catch (e) {
+      setCreateMsg({ ok: false, text: String(e) });
+    } finally {
+      setCreatingScriptAndAi(false);
+    }
+  }
 
   // ── Direct project creation (no form) ────────────────────────────────────
   async function createProjectNow(): Promise<boolean> {
@@ -245,15 +376,57 @@ export default function StartDevelopmentModal({
   // ── Create + Implement with AI Kit ───────────────────────────────────────
   async function handleCreateAndImplementWithAiKit() {
     if (!onImplementWithAiKit) return;
-    if (isPlugin && pluginExists !== true) {
-      setCreatingAndAiKit(true);
-      setCreateMsg(null);
-      const ok = await createProjectNow();
+
+    setCreatingAndAiKit(true);
+    setCreateMsg(null);
+    setProgressMsg(null);
+
+    try {
+      if (isPlugin) {
+        // 1. Ensure plugin project folder exists.
+        if (pluginExists !== true) {
+          setProgressMsg('Creating project...');
+          const ok = await createProjectNow();
+          if (!ok) return;   // createProjectNow sets createMsg on failure
+        }
+
+        // 2. Generate the skeleton .cs file so AI Kit has a file to read.
+        //    We save it only if it does not exist yet (never overwrite developer work).
+        setProgressMsg('Generating initial plugin file...');
+        const preview = await tauriApi.generateSkeletonPreview(task, customer ?? null);
+        const resolvedPluginBase = `${pluginsDir}/${selectedPluginProject}`;
+        const projectLeaf = resolvedPluginBase.replace(/\\/g, '/').split('/').filter(Boolean).pop() ?? '';
+        const targetPath = `${resolvedPluginBase}/${projectLeaf}/${preview.fileName}`;
+
+        const fileAlreadyExists = await tauriApi.checkPathExists(targetPath).catch(() => false);
+        if (!fileAlreadyExists) {
+          await tauriApi.saveGeneratedFile(targetPath, preview.content);
+        }
+
+        // 3. Validate the file is now on disk.
+        const fileReady = await tauriApi.checkPathExists(targetPath).catch(() => false);
+        if (!fileReady) {
+          throw new Error('Could not create or resolve target artifact before AI Kit implementation.');
+        }
+        if (!targetPath.toLowerCase().endsWith('.cs')) {
+          throw new Error(`Expected a .cs file for plugin implementation, got: ${targetPath}`);
+        }
+
+        // 4. Hand path back to the parent — parent persists workflowSetup.artifactPath
+        //    and calls startImplement(targetPath) without touching stale React state.
+        onImplementWithAiKit(targetPath);
+      } else {
+        // Script: scriptPath / artifactPath already set in workflowSetup.
+        onImplementWithAiKit();
+      }
+
+      onClose();
+    } catch (e) {
+      setCreateMsg({ ok: false, text: String(e) });
+    } finally {
       setCreatingAndAiKit(false);
-      if (!ok) return;
+      setProgressMsg(null);
     }
-    onImplementWithAiKit();
-    onClose();
   }
 
   // ── Existing action handlers ──────────────────────────────────────────────
@@ -285,7 +458,7 @@ export default function StartDevelopmentModal({
   }
 
   // ── Render ────────────────────────────────────────────────────────────────
-  const anyBusy = creating || creatingAndDraft || creatingAndOpen || creatingAndAiKit || starting || opening;
+  const anyBusy = creating || creatingAndDraft || creatingAndOpen || creatingAndAiKit || creatingScript || creatingScriptAndAi || starting || opening;
 
   return (
     <Modal
@@ -428,7 +601,7 @@ export default function StartDevelopmentModal({
                     type="button"
                   >
                     {creatingAndAiKit
-                      ? <><span className="btn-spinner" /> Creating project…</>
+                      ? <><span className="btn-spinner" /> {progressMsg ?? 'Preparing…'}</>
                       : <><Icon name="layers" size={13} /> Create + Implement with AI Kit + Open</>}
                   </button>
                 )}
@@ -467,24 +640,39 @@ export default function StartDevelopmentModal({
             )}
 
             {/* Script work */}
-            {isScript && !!scriptOpenPath && (
+            {isScript && !!resolvedScriptTargetPath && (
               <button
                 className="btn btn-secondary btn-sm"
-                onClick={() => tauriApi.openInVscode(scriptOpenPath).catch((e) => setFsError(String(e)))}
-                disabled={anyBusy}
+                onClick={() => tauriApi.openInVscode(resolvedScriptTargetPath).catch((e) => setFsError(String(e)))}
+                disabled={anyBusy || !scriptActions.openScriptPrimary}
+                title={scriptActions.openScriptDisabledReason ?? undefined}
                 type="button"
               >
                 <Icon name="terminal" size={13} /> Open Script in VS Code
               </button>
             )}
-            {isScript && !scriptOpenPath && (
+            {isScript && !resolvedScriptTargetPath && (
               <p style={{ margin: 0, fontSize: 12, color: 'var(--text-muted)' }}>
                 No script target configured. Use Confirm Setup to select a script file.
               </p>
             )}
 
+            {isScript && scriptActions.showCreateScriptFile && (
+              <button
+                className="btn btn-secondary btn-sm"
+                onClick={handleCreateScriptFile}
+                disabled={anyBusy}
+                type="button"
+                title="Create minimal script file at the configured artifact path"
+              >
+                {creatingScript
+                  ? <><span className="btn-spinner" /> Creating script file…</>
+                  : <><Icon name="file-text" size={13} /> Create Script File</>}
+              </button>
+            )}
+
             {/* Script: Implement with AI Kit + Open */}
-            {isScript && !!aiKitPath && !!onImplementWithAiKit && (
+            {isScript && !!aiKitPath && !!onImplementWithAiKit && !scriptActions.showCreateScriptAndImplement && (
               <button
                 className="btn btn-secondary btn-sm"
                 onClick={() => { onImplementWithAiKit(); onClose(); }}
@@ -493,6 +681,20 @@ export default function StartDevelopmentModal({
                 title="Implement using AI Kit rules — reads artifact, proposes changes, requires confirmation"
               >
                 <Icon name="layers" size={13} /> Implement with AI Kit + Open
+              </button>
+            )}
+
+            {isScript && !!aiKitPath && !!onImplementWithAiKit && scriptActions.showCreateScriptAndImplement && (
+              <button
+                className="btn btn-secondary btn-sm"
+                onClick={handleCreateScriptAndImplement}
+                disabled={anyBusy}
+                type="button"
+                title="Create script file first, then implement with AI Kit using full file generation mode"
+              >
+                {creatingScriptAndAi
+                  ? <><span className="btn-spinner" /> Creating + preparing AI Kit…</>
+                  : <><Icon name="layers" size={13} /> Create Script File + Implement with AI Kit</>}
               </button>
             )}
 

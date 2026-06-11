@@ -94,10 +94,12 @@ import {
   type PowerPlatformAiKitContext,
 } from '../lib/powerPlatformAiKit';
 import TaskModeSwitch from './TaskModeSwitch';
-import { getAiKitWorkflowState, getAiKitActionLabel } from '../lib/aiKitWorkflow';
+import { getAiKitWorkflowState } from '../lib/aiKitWorkflow';
 import { inferTaskMode } from '../lib/taskMode';
 import { BUCKET_META, computePlanning, effectiveBucket } from '../lib/planning';
 import { isOverdue, formatRelativeDate } from '../lib/dates';
+import { buildScriptScaffold } from '../lib/scriptScaffold';
+import { isPathInsideDir } from '../lib/pathUtils';
 import {
   scanJavaScriptCrmReferences,
   scanCSharpCrmReferences,
@@ -759,6 +761,12 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
   const [pluginProjectsForModal, setPluginProjectsForModal] = useState<string[]>([]);
   // Absolute path of the generated script file — set after generateScriptDraft, cleared on apply.
   const [scriptDraftPath, setScriptDraftPath] = useState<string | null>(null);
+  // For script-create tasks: null = unknown/loading, true = exists, false = missing
+  const [scriptArtifactExists, setScriptArtifactExists] = useState<boolean | null>(null);
+  // True while "Create Script File" scaffold write + task update is in progress
+  const [scriptFileCreating, setScriptFileCreating] = useState(false);
+  // True while "Create + Implement with AI Kit" validation is running and the panel is being invoked
+  const [scriptAndImplementLoading, setScriptAndImplementLoading] = useState(false);
   const devModePanelRef  = useRef<TaskDevModePanelHandle>(null);
   // Refresh counter for the Dev panel — increment after creating a new plugin project.
   const [devPanelRefreshTick, setDevPanelRefreshTick] = useState(0);
@@ -781,6 +789,9 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
     setImplVerifyAiRunning(false);
     setModalArtifactPath(task.workflowSetup?.artifactPath ?? null);
     setModalArtifactInferred(false);
+    setScriptArtifactExists(null);
+    setScriptFileCreating(false);
+    setScriptAndImplementLoading(false);
   }, [task.id]);
   // AI Code Review — modal state for viewing a saved review
   const [showSavedReviewModal, setShowSavedReviewModal] = useState(false);
@@ -1516,17 +1527,113 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
     resolvedArtifactForAiKit,
   );
 
-  // When in Development and AI Kit has a recommendation, override the stepper label.
-  const aiKitStepperOverride =
-    (task.status === 'in-progress' && plan.requiresDevTools && aiKitWorkflowState.recommendedAction)
-      ? getAiKitActionLabel(aiKitWorkflowState.recommendedAction)
-      : undefined;
+  // AI Kit actions (implement, review-diff, apply-fixes) are assistant/tool actions only.
+  // They must never replace the plan's primary workflow action in the yellow button.
+  // The main workflow step is always driven by the plan (verify-implementation for script/plugin).
+  const effectiveWorkflowAction = plan.currentAction;
 
-  // Effective workflow action — AI Kit recommendation takes precedence during Development.
-  const effectiveWorkflowAction =
-    (task.status === 'in-progress' && plan.requiresDevTools && aiKitWorkflowState.recommendedAction)
-      ? aiKitWorkflowState.recommendedAction
-      : plan.currentAction;
+  // Check whether the script artifact file exists on disk for script-create tasks in Development.
+  useEffect(() => {
+    const path = resolvedArtifactForAiKit?.trim();
+    if (!plan.requiresScriptCreate || !path) {
+      setScriptArtifactExists(null);
+      return;
+    }
+    let cancelled = false;
+    tauriApi.checkPathExists(path).then((exists) => {
+      if (!cancelled) setScriptArtifactExists(exists);
+    }).catch(() => {
+      if (!cancelled) setScriptArtifactExists(null);
+    });
+    return () => { cancelled = true; };
+  }, [plan.requiresScriptCreate, resolvedArtifactForAiKit]);
+
+  async function handleCreateScriptFileInPanel() {
+    const rawPath = resolvedArtifactForAiKit?.trim();
+    if (!rawPath) {
+      setFsError('No script target configured. Use Confirm Setup to select a script file.');
+      return;
+    }
+    const isAbs = /^[a-zA-Z]:[\\/]|^\/|^\\\\/.test(rawPath);
+    const artifactPath = isAbs ? rawPath : `${repoRootForGit?.replace(/[\\/]+$/, '') ?? ''}/${rawPath}`;
+
+    setScriptFileCreating(true);
+    setFsError(null);
+    try {
+      const repo = repoRootForGit?.trim();
+      if (!repo) throw new Error('Repository root is not configured.');
+      if (!isPathInsideDir(artifactPath, repo)) {
+        throw new Error(`Target file is outside the repository root.\nFile: ${artifactPath}`);
+      }
+      const aiKitPath = settings?.powerPlatformAiKitPath?.trim();
+      if (aiKitPath && isPathInsideDir(artifactPath, aiKitPath)) {
+        throw new Error('Target file must not be inside the AI Kit folder.');
+      }
+      const parentDir = artifactPath.replace(/\\/g, '/').replace(/\/?[^/]+$/, '');
+      if (!parentDir) throw new Error('Cannot determine parent directory.');
+      const parentExists = await tauriApi.checkPathExists(parentDir).catch(() => false);
+      if (!parentExists) {
+        throw new Error(`Target directory does not exist: ${parentDir}`);
+      }
+      await tauriApi.saveGeneratedFile(artifactPath, buildScriptScaffold());
+      const now = new Date().toISOString();
+      const note = `[${now}] UI: script-file-created`;
+      const existing = task.notes?.trim() ?? '';
+      await updateTask(task.id, {
+        workflowSetup: { ...task.workflowSetup, scriptPath: artifactPath, artifactPath },
+        notes: existing ? `${existing}\n${note}` : note,
+      });
+      setScriptArtifactExists(true);
+    } catch (e) {
+      setFsError(String(e));
+    } finally {
+      setScriptFileCreating(false);
+    }
+  }
+
+  async function handleCreateScriptAndImplementInPanel() {
+    if (scriptAndImplementLoading) return;
+    const rawPath = resolvedArtifactForAiKit?.trim();
+    if (!rawPath) {
+      setFsError('No script target configured. Use Confirm Setup to select a script file.');
+      return;
+    }
+    const isAbs = /^[a-zA-Z]:[\\/]|^\/|^\\\\/.test(rawPath);
+    const artifactPath = isAbs ? rawPath : `${repoRootForGit?.replace(/[\\/]+$/, '') ?? ''}/${rawPath}`;
+
+    setScriptAndImplementLoading(true);
+    setFsError(null);
+    try {
+      const repo = repoRootForGit?.trim();
+      if (!repo) throw new Error('Repository root is not configured.');
+      if (!isPathInsideDir(artifactPath, repo)) {
+        throw new Error(`Target file is outside the repository root.`);
+      }
+      const aiKitPath = settings?.powerPlatformAiKitPath?.trim();
+      if (!aiKitPath) throw new Error('AI Kit path is not configured. Go to Settings to configure it.');
+      if (isPathInsideDir(artifactPath, aiKitPath)) {
+        throw new Error('Target file must not be inside the AI Kit folder.');
+      }
+      const parentDir = artifactPath.replace(/\\/g, '/').replace(/\/?[^/]+$/, '');
+      if (!parentDir) throw new Error('Cannot determine parent directory.');
+      const parentExists = await tauriApi.checkPathExists(parentDir).catch(() => false);
+      if (!parentExists) {
+        throw new Error(`Target directory does not exist: ${parentDir}`);
+      }
+      // Explicit null check — ref is null if AiKitActionsPanel is not mounted.
+      const panel = aiKitPanelRef.current;
+      if (!panel) {
+        throw new Error('AI Kit panel is not available. This is a bug — please report it.');
+      }
+      // Start AI Kit implementation. No scaffold is written here.
+      // The file is created only after the user clicks Apply in the preview modal.
+      // Loading state is cleared by onPreviewReady (success) or onError (failure) callbacks.
+      panel.startImplement(artifactPath);
+    } catch (e) {
+      setFsError(String(e));
+      setScriptAndImplementLoading(false);
+    }
+  }
 
   async function handleSetMode(mode: 'developer' | 'general') {
     await updateTask(task.id, { taskMode: mode });
@@ -1935,6 +2042,33 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
   /** Updates task.implementationVerification and persists it. */
   async function handleUpdateImplVerification(iv: ImplementationVerification) {
     await updateTask(task.id, { implementationVerification: iv });
+  }
+
+  /** Full reset of Dataverse Metadata Check: clears reports, override state, and appends activity note. */
+  async function handleResetDvCheck(): Promise<void> {
+    const now = new Date().toISOString();
+    await updateTask(task.id, {
+      crmVerificationReports: [],
+      implementationVerification: {
+        ...task.implementationVerification,
+        dataverseCheck: { status: 'not-run' },
+        updatedAt: now,
+      },
+      notes: appendActivityNote(task.notes, 'UI: dataverse-metadata-check-reset'),
+    });
+  }
+
+  /** Resets AI Internal Code Review to not-run. Keeps aiFileReviews history intact. */
+  async function handleResetAiReview(): Promise<void> {
+    const now = new Date().toISOString();
+    await updateTask(task.id, {
+      implementationVerification: {
+        ...task.implementationVerification,
+        aiCodeReview: { status: 'not-run' },
+        updatedAt: now,
+      },
+      notes: appendActivityNote(task.notes, 'UI: ai-code-review-reset'),
+    });
   }
 
   /** Marks the task as awaiting consultant testing (status stays in-progress). */
@@ -2620,6 +2754,7 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
             ...task.implementationVerification,
             aiCodeReview: {
               status:   implStatus,
+              reviewId: reviewEntry.id,
               runAt:    now,
               summary:  result.structured?.summary ?? gitCtx.summary,
               findings,
@@ -2690,6 +2825,7 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
             ...task.implementationVerification,
             aiCodeReview: {
               status:   implStatus,
+              reviewId: reviewEntry.id,
               runAt:    now,
               summary:  result.structured?.summary ?? '',
               findings,
@@ -2955,7 +3091,7 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
           onRunCurrentAction={runCurrentStageAction}
           isRunning={!!aiLoading}
           onTestingAction={() => setShowTestingActionsModal(true)}
-          actionLabelOverride={aiKitStepperOverride}
+          actionLabelOverride={undefined}
         />
 
         {/* ---- Two-column inner layout ---- */}
@@ -3636,7 +3772,7 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
                     title={
                       plan.isDeveloperAwaitingSetup && effectiveWorkflowAction === 'analyze'
                         ? 'Confirm developer setup before analysis'
-                        : `Run: ${aiKitStepperOverride ?? plan.currentActionLabel}`
+                        : `Run: ${plan.currentActionLabel}`
                     }
                   >
                     {aiLoading === 'analyze'
@@ -3653,7 +3789,7 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
                             : effectiveWorkflowAction === 'mark-waiting-review' ? 'pause'
                             : 'check'
                           } size={13} />
-                          {' '}{aiKitStepperOverride ?? plan.currentActionLabel}
+                          {' '}{plan.currentActionLabel}
                         </>
                     }
                   </button>
@@ -3678,6 +3814,50 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
                 {plan.targetKind === 'plugin' ? 'Plugin file' : plan.targetKind === 'script' ? 'Script file' : 'Branch + Target file'}
               </div>
 
+              {/* Script file create actions — shown for Script Create tasks when artifact doesn't exist */}
+              {plan.requiresScriptCreate && task.status === 'in-progress' && (
+                scriptArtifactExists === false ? (
+                  <div style={{ marginBottom: 8 }}>
+                    <div style={{ color: 'var(--color-warning, #d29922)', fontSize: 11, marginBottom: 6 }}>
+                      Script file does not exist yet. Create it to start working.
+                    </div>
+                    {resolvedArtifactForAiKit && (
+                      <div style={{ fontSize: 10, color: 'var(--color-text-muted, #888)', marginBottom: 6 }}>
+                        {resolvedArtifactForAiKit.replace(/\\/g, '/').split('/').slice(-2).join('/')}
+                      </div>
+                    )}
+                    <div className="detail-action-grid">
+                      <button
+                        className="btn btn-secondary btn-sm"
+                        onClick={handleCreateScriptFileInPanel}
+                        disabled={scriptFileCreating}
+                        title="Create minimal script file at the configured artifact path"
+                      >
+                        {scriptFileCreating
+                          ? 'Creating…'
+                          : <><Icon name="file-text" size={13} /> Create Script File</>}
+                      </button>
+                      {settings?.powerPlatformAiKitPath && (
+                        <button
+                          className="btn btn-secondary btn-sm"
+                          onClick={handleCreateScriptAndImplementInPanel}
+                          disabled={scriptFileCreating || scriptAndImplementLoading}
+                          title="Validate path and open AI Kit implementation preview (no scaffold until Apply)"
+                        >
+                          {scriptAndImplementLoading
+                            ? <><span className="btn-spinner" /> Starting…</>
+                            : <><Icon name="layers" size={13} /> Create + Implement with AI Kit</>}
+                        </button>
+                      )}
+                    </div>
+                  </div>
+                ) : scriptArtifactExists === null ? (
+                  <div style={{ fontSize: 11, color: 'var(--color-text-muted, #888)', marginBottom: 6 }}>
+                    Checking script file…
+                  </div>
+                ) : null
+              )}
+
               {/* Dev setup controls: branch selector + plugin/script target selector + open buttons */}
               {effectiveMode === 'developer' && (hasRepo || hasVscodePath) && plan.requiresDevTools && (
                 <TaskDevModePanel
@@ -3687,7 +3867,11 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
                   pluginsDir={pluginsDir}
                   repoRootForGit={repoRootForGit}
                   defaultMode={devTarget.kind === 'plugin' ? 'plugin' : 'script'}
-                  scriptOpenPath={task.workflowSetup?.scriptPath ?? customer?.scriptFolder ?? effectiveVscodePath}
+                  scriptOpenPath={
+                    (plan.requiresScriptCreate && scriptArtifactExists === false)
+                      ? undefined
+                      : task.workflowSetup?.scriptPath ?? customer?.scriptFolder ?? effectiveVscodePath
+                  }
                   onError={setFsError}
                   autoCollapsed={false}
                   hideModeToggle
@@ -3944,17 +4128,58 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
                       {aiKitWorkflowState.statusText}
                     </div>
                   )}
+
+                  {/* Non-blocking advisory when AI Kit review found issues */}
+                  {aiKitWorkflowState.isConfigured && task.status === 'in-progress'
+                    && (aiKitWorkflowState.latestReviewVerdict === 'needs_changes'
+                        || aiKitWorkflowState.latestReviewVerdict === 'comment') && (
+                    <div style={{
+                      marginBottom: 8,
+                      padding: '7px 9px',
+                      background: 'var(--bg-secondary)',
+                      borderRadius: 4,
+                      border: '1px solid var(--border-subtle)',
+                      fontSize: 11.5,
+                    }}>
+                      <div style={{ color: 'var(--text-secondary)', marginBottom: 6 }}>
+                        AI Kit review found issues. Apply fixes before verification (recommended).
+                      </div>
+                      <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap' }}>
+                        <button
+                          className="btn btn-secondary btn-sm"
+                          onClick={() => aiKitPanelRef.current?.startApplyFixes()}
+                        >
+                          <Icon name="check" size={12} /> Apply AI Review Fixes
+                        </button>
+                        <button
+                          className="btn btn-secondary btn-sm"
+                          onClick={() => aiKitPanelRef.current?.startReviewDiff()}
+                        >
+                          <Icon name="search" size={12} /> Review Diff Again
+                        </button>
+                        <button
+                          className="btn btn-ghost btn-sm"
+                          onClick={handleVerifyImplementation}
+                          title="Skip AI fixes and proceed directly to implementation verification"
+                        >
+                          Verify Anyway
+                        </button>
+                      </div>
+                    </div>
+                  )}
+
                   <AiKitActionsPanel
                     ref={aiKitPanelRef}
                     task={task}
                     customer={customer}
                     aiKitPath={settings?.powerPlatformAiKitPath}
+                    crmBaseDirectory={settings?.crmBaseDirectory}
                     repoRootForGit={repoRootForGit}
-                    artifactPath={task.workflowSetup?.artifactPath ?? task.workflowSetup?.scriptPath}
                     onTaskUpdate={async (updates) => {
                       await updateTask(task.id, updates);
                     }}
-                    onError={(msg) => setFsError(msg)}
+                    onPreviewReady={() => setScriptAndImplementLoading(false)}
+                    onError={(msg) => { setFsError(msg); setScriptAndImplementLoading(false); }}
                   />
                 </div>
 
@@ -4205,6 +4430,7 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
           pluginsDir={pluginsDir}
           selectedPluginProject={selectedPluginProject}
           repoRoot={customer?.resolvedRepositoryPath ?? customer?.repositoryRoot}
+          effectiveRepoRoot={repoRootForGit}
           scriptOpenPath={task.workflowSetup?.scriptPath ?? customer?.scriptFolder ?? effectiveVscodePath}
           templateDir={settings.pluginTemplateFolder ?? ''}
           verificationVerdict={task.crmVerificationReports?.[0]?.verdict ?? 'none'}
@@ -4234,16 +4460,59 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
           onStartDevelopment={handleStartDevelopmentConfirmed}
           onClose={() => setShowStartDevModal(false)}
           aiKitPath={settings?.powerPlatformAiKitPath}
-          onImplementWithAiKit={() => {
+          crmBaseDirectory={settings?.crmBaseDirectory}
+          onImplementWithAiKit={async (createdArtifactPath?: string) => {
             setShowStartDevModal(false);
-            // Start development first if not already in-progress, then trigger implement.
-            if (task.status !== 'in-progress') {
-              handleStartDevelopmentConfirmed().then(() => {
-                aiKitPanelRef.current?.startImplement();
-              }).catch(() => {});
+
+            if (createdArtifactPath) {
+              // Create-flow: the modal already generated and saved the skeleton file.
+              // Persist artifactPath now (before startImplement reads it) and also
+              // add the file to the .csproj when applicable.
+              try {
+                await updateTask(task.id, {
+                  workflowSetup: {
+                    ...task.workflowSetup,
+                    artifactPath: createdArtifactPath,
+                  },
+                });
+                await tauriApi.addCompileIncludeToCsproj(createdArtifactPath).catch(() => {});
+              } catch {
+                // Non-fatal — startImplement receives the path directly so it will
+                // still work even if the task-save partially failed.
+              }
+              // Start development if needed, then implement using the explicit path.
+              if (task.status !== 'in-progress') {
+                handleStartDevelopmentConfirmed().then(() => {
+                  aiKitPanelRef.current?.startImplement(createdArtifactPath);
+                }).catch(() => {});
+              } else {
+                aiKitPanelRef.current?.startImplement(createdArtifactPath);
+              }
             } else {
-              aiKitPanelRef.current?.startImplement();
+              // Existing flow: artifactPath already in task.workflowSetup.
+              if (task.status !== 'in-progress') {
+                handleStartDevelopmentConfirmed().then(() => {
+                  aiKitPanelRef.current?.startImplement();
+                }).catch(() => {});
+              } else {
+                aiKitPanelRef.current?.startImplement();
+              }
             }
+          }}
+          onScriptFileCreated={async (createdPath) => {
+            // Record file creation activity and persist the artifact path.
+            // Development start remains an explicit user action ("Start Development" button).
+            const now = new Date().toISOString();
+            const note = `[${now}] UI: script-file-created`;
+            const existing = task.notes?.trim() ?? '';
+            await updateTask(task.id, {
+              workflowSetup: {
+                ...task.workflowSetup,
+                scriptPath:   createdPath,
+                artifactPath: createdPath,
+              },
+              notes: existing ? `${existing}\n${note}` : note,
+            });
           }}
         />
       )}
@@ -4454,6 +4723,9 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
             setShowImplVerifyModal(false);
           }}
           onOpenAiReview={() => setShowSavedReviewModal(true)}
+          onOpenDvReview={latestCrmVerification ? () => setShowCrmVerificationModal(true) : undefined}
+          onResetDvCheck={handleResetDvCheck}
+          onResetAiReview={handleResetAiReview}
           onClose={() => setShowImplVerifyModal(false)}
         />
       )}

@@ -41,6 +41,9 @@ const TEXT = {
   aiKitDiffReviewedWarn: 'Diff zkontrolov\u00e1n podle AI Kitu: WARN.',
   aiKitDiffReviewedFail: 'Diff zkontrolov\u00e1n podle AI Kitu: FAIL.',
   aiKitReviewFixesApplied: 'P\u0159ipom\u00ednky z AI review byly opraveny pomoc\u00ed AI Kitu.',
+  scriptFileCreated: 'Vytvo\u0159en pr\u00e1zdn\u00fd soubor skriptu.',
+  dataverseMetadataCheckReset: 'Resetov\u00e1na kontrola Dataverse metadat.',
+  aiCodeReviewReset: 'Resetov\u00e1na AI recenze k\u00f3du.',
 };
 
 function formatTimestamp(rawTimestamp: string | undefined): string | undefined {
@@ -172,6 +175,9 @@ export function formatTaskActivityNote(rawNote: string, index = 0): FormattedTas
     return { id: `${index}-${raw}`, timestampLabel, source: 'MCP / Git', message: `${TEXT.gitCommitAndPush} (${mcpGitBothMatch[1]})`, raw };
   }
 
+  if (body === 'UI: script-file-created') {
+    return { id: `${index}-${raw}`, timestampLabel, source: 'Script', message: TEXT.scriptFileCreated, raw };
+  }
   if (body === 'UI: ai-kit-implementation-generated') {
     return { id: `${index}-${raw}`, timestampLabel, source: 'AI Kit', message: TEXT.aiKitImplementationGenerated, raw };
   }
@@ -183,6 +189,12 @@ export function formatTaskActivityNote(rawNote: string, index = 0): FormattedTas
   }
   if (body === 'UI: ai-kit-review-fixes-applied') {
     return { id: `${index}-${raw}`, timestampLabel, source: 'AI Kit', message: TEXT.aiKitReviewFixesApplied, raw };
+  }
+  if (body === 'UI: dataverse-metadata-check-reset') {
+    return { id: `${index}-${raw}`, timestampLabel, source: 'Verification', message: TEXT.dataverseMetadataCheckReset, raw };
+  }
+  if (body === 'UI: ai-code-review-reset') {
+    return { id: `${index}-${raw}`, timestampLabel, source: 'Verification', message: TEXT.aiCodeReviewReset, raw };
   }
 
   return {
@@ -220,9 +232,12 @@ export function isTaskActivityLine(line: string): boolean {
     /^MCP local write: commit_task_changes -> .+$/i.test(body) ||
     /^MCP local write: push_task_branch -> .+$/i.test(body) ||
     /^MCP local write: commit_and_push_task_changes -> .+$/i.test(body) ||
+    body === 'UI: script-file-created' ||
     body === 'UI: ai-kit-implementation-generated' ||
     /^UI: ai-kit-diff-reviewed -> (PASS|WARN|FAIL)$/i.test(body) ||
-    body === 'UI: ai-kit-review-fixes-applied'
+    body === 'UI: ai-kit-review-fixes-applied' ||
+    body === 'UI: dataverse-metadata-check-reset' ||
+    body === 'UI: ai-code-review-reset'
   );
 }
 
