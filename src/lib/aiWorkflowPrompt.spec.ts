@@ -164,12 +164,17 @@ describe('buildAiWorkflowPrompt — common header', () => {
 });
 
 describe('buildAiWorkflowPrompt — setup prompt (not ready)', () => {
-  it('instructs AI not to implement code before understanding context', () => {
-    expect(buildAiWorkflowPrompt(makeTask())).toContain('Do not implement code before understanding');
+  it('instructs AI not to implement code or modify files', () => {
+    expect(buildAiWorkflowPrompt(makeTask())).toContain('Do not implement code or modify files');
   });
 
-  it('instructs AI not to perform external writes', () => {
-    expect(buildAiWorkflowPrompt(makeTask())).toContain('Do not perform external writes');
+  it('instructs AI not to perform external writes during setup/readiness run', () => {
+    const prompt = buildAiWorkflowPrompt(makeTask());
+    expect(prompt).toContain('Do not perform external writes');
+    expect(prompt).toContain('during this setup/readiness run');
+    // Must not imply a permanent ban — approved future workflow actions must still be possible
+    expect(prompt).not.toContain('at any stage');
+    expect(prompt).toContain('External writes are allowed only later through explicit approved workflow actions');
   });
 
   it('references technical plan in setup rules', () => {
@@ -186,8 +191,36 @@ describe('buildAiWorkflowPrompt — setup prompt (not ready)', () => {
     expect(prompt).toContain('Do not continue outside Task Workbench workflow');
   });
 
-  it('instructs AI to re-generate prompt after resolving issues', () => {
-    expect(buildAiWorkflowPrompt(makeTask())).toContain('re-generate this prompt');
+  it('mentions prompt regeneration only as fallback when MCP refresh fails', () => {
+    const prompt = buildAiWorkflowPrompt(makeTask());
+    expect(prompt).toContain('regenerate this prompt');
+    // Must be conditional — only when MCP cannot be reloaded
+    expect(prompt).toContain('Only ask the user to regenerate this prompt if MCP context cannot be reloaded');
+    // Must NOT unconditionally demand regeneration after each update
+    expect(prompt).not.toContain('ask the user to re-generate this prompt');
+  });
+
+  it('includes safe auto-setup loop instructions', () => {
+    const prompt = buildAiWorkflowPrompt(makeTask());
+    expect(prompt).toContain('Safe auto-setup loop:');
+    expect(prompt).toContain('up to 8 safe Task Workbench-only setup updates');
+  });
+
+  it('instructs AI to reload context and continue after safe work classification update', () => {
+    const prompt = buildAiWorkflowPrompt(makeDevTask());
+    expect(prompt).toContain('reload `get_task_full_context`, and continue');
+  });
+
+  it('does not tell AI to stop after work classification save', () => {
+    const prompt = buildAiWorkflowPrompt(makeDevTask());
+    // Rule 3 should say reload+continue, not stop
+    expect(prompt).not.toMatch(/set_task_work_classification[^.]*and stop/);
+  });
+
+  it('lists safe auto-setup examples including mode and classification', () => {
+    const prompt = buildAiWorkflowPrompt(makeTask());
+    expect(prompt).toContain('setting task mode to Developer');
+    expect(prompt).toContain('setting work classification to script/plugin');
   });
 
   it('lists mode blocker for non-developer task', () => {

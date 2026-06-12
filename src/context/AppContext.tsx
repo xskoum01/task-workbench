@@ -81,6 +81,8 @@ interface AppContextValue {
   crmFolders: string[];
   isLoading: boolean;
   error: string | null;
+  /** True when the initial load from persistent storage failed. Saves are disabled until resolved. */
+  taskLoadFailed: boolean;
 
   // Task operations
   createTask: (draft: Omit<Task, 'id' | 'receivedAt' | 'suggestedActions'>) => Promise<void>;
@@ -245,14 +247,19 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
   const [customers, setCustomers] = useState<Customer[]>([]);
   const [settings, setSettings]   = useState<AppSettings>(defaultSettings);
   const [crmFolders, setCrmFolders] = useState<string[]>([]);
-  const [isLoading, setIsLoading] = useState(true);
-  const [error]                   = useState<string | null>(null);
+  const [isLoading, setIsLoading]       = useState(true);
+  const [error, setError]               = useState<string | null>(null);
+  const [taskLoadFailed, setTaskLoadFailed] = useState(false);
 
   // tasksRef always holds the latest tasks array.
   // importMessage reads from this ref so concurrent imports don't capture
   // the same stale closure snapshot and overwrite each other's state.
   const tasksRef = useRef<Task[]>([]);
   useEffect(() => { tasksRef.current = tasks; }, [tasks]);
+
+  // taskLoadFailedRef mirrors taskLoadFailed state for use inside callbacks.
+  // Set both together in the catch block; read the ref inside save closures.
+  const taskLoadFailedRef = useRef(false);
 
   // Load all data once on mount
   useEffect(() => {
@@ -304,9 +311,21 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
         setCustomers(withOther);
         setSettings(loadedSettings);
       } catch (err) {
-        // Tauri runtime not available (e.g. plain Vite dev server in browser).
-        console.warn('Tauri unavailable — starting with empty state:', err);
-        setTasks([]);
+        // Tauri runtime not available (e.g. plain Vite dev server in browser) OR
+        // tasks.json is corrupted/unreadable. Either way we must NOT call setTasks([])
+        // — that would make a failed load indistinguishable from a genuine empty store
+        // and any subsequent save would overwrite the real data with an empty array.
+        const msg = err instanceof Error ? err.message : String(err);
+        console.warn('Task storage failed to load:', err);
+        setError(
+          'Task storage failed to load. ' +
+          `Detail: ${msg}. ` +
+          'Saving is disabled to prevent data loss. ' +
+          'Restart the app and check the data directory if this persists.',
+        );
+        setTaskLoadFailed(true);
+        taskLoadFailedRef.current = true;
+        // tasks state remains [] from initialisation — do not overwrite with setTasks([]).
         setCustomers([]);
         setSettings(defaultSettings);
       } finally {
@@ -333,6 +352,19 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
   // operate on the latest state — safe for rapid sequential calls from async handlers.
   // `captured` is set synchronously inside the updater before the async saveTasks call.
 
+  // Saves tasks to persistent storage only when the initial load succeeded.
+  // If the initial load failed, writing would overwrite the real file with an empty array.
+  // Returns a Promise<void> in both cases so callers can await uniformly.
+  const persistTasksIfSafe = useCallback((tasks: Task[], label: string): Promise<void> => {
+    if (taskLoadFailedRef.current) {
+      console.warn(`[saveTasks] blocked: initial load failed (${label})`);
+      return Promise.resolve();
+    }
+    return api.saveTasks(tasks).catch((e) => {
+      console.warn(`[saveTasks] ${label} failed:`, e);
+    });
+  }, []);
+
   const createTask = useCallback(
     async (draft: Omit<Task, 'id' | 'receivedAt' | 'suggestedActions'>) => {
       const newTask: Task = {
@@ -347,13 +379,9 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
         captured = next;
         return next;
       });
-      try {
-        await api.saveTasks(captured);
-      } catch (err) {
-        console.warn('saveTasks failed:', err);
-      }
+      await persistTasksIfSafe(captured, 'createTask');
     },
-    [],
+    [persistTasksIfSafe],
   );
 
   const updateTask = useCallback(
@@ -374,13 +402,9 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
         captured = next;
         return next;
       });
-      try {
-        await api.saveTasks(captured);
-      } catch (err) {
-        console.warn('saveTasks failed:', err);
-      }
+      await persistTasksIfSafe(captured, 'updateTask');
     },
-    [],
+    [persistTasksIfSafe],
   );
 
   const deleteTask = useCallback(
@@ -391,13 +415,9 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
         captured = next;
         return next;
       });
-      try {
-        await api.saveTasks(captured);
-      } catch (err) {
-        console.warn('saveTasks (deleteTask) failed:', err);
-      }
+      await persistTasksIfSafe(captured, 'deleteTask');
     },
-    [],
+    [persistTasksIfSafe],
   );
 
   // ---------------------------------------------------------------------------
@@ -447,7 +467,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
               );
               tasksRef.current = patched;
               setTasks(patched);
-              api.saveTasks(patched).catch((e) => console.warn('[import] save force-create html backfill failed:', e));
+              persistTasksIfSafe(patched, 'import:force-create-html-backfill');
             }
             return { outcome: 'duplicate', reason: 'Already a task', existingState: 'created', taskId: existing.id };
           }
@@ -465,7 +485,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
             );
             tasksRef.current = upgraded;
             setTasks(upgraded);
-            api.saveTasks(upgraded).catch((e) => console.warn('[import] save force-upgrade failed:', e));
+            persistTasksIfSafe(upgraded, 'import:force-upgrade');
             return { outcome: 'created', taskId: existing.id };
           }
         }
@@ -505,7 +525,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
         const withForced = [...tasksRef.current, forcedTask];
         tasksRef.current = withForced;
         setTasks(withForced);
-        api.saveTasks(withForced).catch((e) => console.warn('[import] save force-create failed:', e));
+        persistTasksIfSafe(withForced, 'import:force-create');
         return { outcome: 'created', taskId: forcedId };
       }
 
@@ -558,7 +578,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
             );
             tasksRef.current = upgraded;
             setTasks(upgraded);
-            api.saveTasks(upgraded).catch((e) => console.warn('[import] dedupe backfill save failed:', e));
+            persistTasksIfSafe(upgraded, 'import:dedupe-backfill');
             console.log(`[import-html] dedupe: saved backfill for taskId=${existing.id}`);
           }
 
@@ -615,7 +635,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
         // Read from ref so a concurrent import's pending task is not lost
         const next = [...tasksRef.current, rejectedTask];
         setTasks(next);
-        api.saveTasks(next).catch((e) => console.warn('[import] save rejected failed:', e));
+        persistTasksIfSafe(next, 'import:prefilter-rejected');
         return { outcome: 'rejected', reason: filterResult.reason, taskId: rejectedId };
       }
 
@@ -679,7 +699,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
       // import see all previously registered pending tasks.
       tasksRef.current = withPending;
       setTasks(withPending);
-      api.saveTasks(withPending).catch((e) => console.warn('[import] save pending failed:', e));
+      persistTasksIfSafe(withPending, 'import:pending');
 
       // 5. AI classification
       // On any failure: update the item to 'analyzed' so it becomes visible in
@@ -728,7 +748,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
             : t,
         );
         setTasks(afterError);
-        api.saveTasks(afterError).catch((e) => console.warn('[import] save after AI error failed:', e));
+        persistTasksIfSafe(afterError, 'import:after-ai-error');
         return {
           outcome: fallbackState === 'created' ? 'created' : fallbackState === 'analyzed' ? 'analyzed' : 'rejected',
           reason: `AI unavailable: ${errMsg}`,
@@ -761,7 +781,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
             : t,
         );
         setTasks(withRejected);
-        api.saveTasks(withRejected).catch((e) => console.warn('[import] save rejected failed:', e));
+        persistTasksIfSafe(withRejected, 'import:ai-rejected');
         return { outcome: 'rejected', reason: skipReason, taskId: pendingId };
       }
       if (input.captureMode === 'explicit' && (!isTask || confidence < IMPORT_CONFIG.MIN_CONFIDENCE_ANALYZE)) {
@@ -852,7 +872,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
             : t,
         );
         setTasks(withCreated);
-        api.saveTasks(withCreated).catch((e) => console.warn('[import] save created failed:', e));
+        persistTasksIfSafe(withCreated, 'import:created');
         // Non-blocking: generate a reply draft for explicit captures.
         if (input.captureMode === 'explicit') {
           api.generateReply(
@@ -861,7 +881,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
           ).then((replyDraft) => {
             const withReply = tasksRef.current.map((t) => t.id === pendingId ? { ...t, generatedReply: replyDraft } : t);
             setTasks(withReply);
-            api.saveTasks(withReply).catch(() => {});
+            persistTasksIfSafe(withReply, 'import:reply-draft');
             console.log('[import] reply draft generated for', pendingId);
           }).catch((e) => console.warn('[import] reply draft failed (non-blocking):', e));
         }
@@ -878,7 +898,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
           : t,
       );
       setTasks(withAnalyzed);
-      api.saveTasks(withAnalyzed).catch((e) => console.warn('[import] save analyzed failed:', e));
+      persistTasksIfSafe(withAnalyzed, 'import:analyzed');
       // Non-blocking: generate a reply draft for explicit captures.
       if (input.captureMode === 'explicit') {
         api.generateReply(
@@ -887,13 +907,13 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
         ).then((replyDraft) => {
           const withReply = tasksRef.current.map((t) => t.id === pendingId ? { ...t, generatedReply: replyDraft } : t);
           setTasks(withReply);
-          api.saveTasks(withReply).catch(() => {});
+          persistTasksIfSafe(withReply, 'import:reply-draft-analyzed');
           console.log('[import] reply draft generated for', pendingId);
         }).catch((e) => console.warn('[import] reply draft failed (non-blocking):', e));
       }
       return { outcome: 'analyzed', taskId: pendingId };
     },
-    [customers], // reads tasks via tasksRef — no stale capture on concurrent imports
+    [customers, persistTasksIfSafe], // reads tasks via tasksRef — no stale capture on concurrent imports
   );
 
   // --- Customer operations ---
@@ -1102,12 +1122,19 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
         crmFolders,
         isLoading,
         error,
+        taskLoadFailed,
         createTask,
         updateTask,
         deleteTask,
         reloadTasks: async () => {
           const updated = await api.loadTasks();
           setTasks(updated);
+          // A successful reload resolves the load-failed state.
+          if (taskLoadFailedRef.current) {
+            taskLoadFailedRef.current = false;
+            setTaskLoadFailed(false);
+            setError(null);
+          }
         },
         importMessage,
         createCustomer,

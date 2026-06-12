@@ -78,11 +78,11 @@ export function buildAiWorkflowPrompt(task: Task): string {
   if (!readiness.isReady) {
     lines.push(
       '',
-      'IMPORTANT: This task is NOT implementation-ready. Do not implement code before understanding and resolving all issues listed below.',
+      'IMPORTANT: This task is NOT implementation-ready. Do not implement code or modify files until all blockers below are resolved.',
       '',
-      'Do not perform external writes (Dataverse writes, plugin registration, web resource upload, GitHub/ADO actions) at this stage.',
+      'Do not perform external writes (Dataverse writes, plugin registration, web resource upload, GitHub/ADO actions) during this setup/readiness run. External writes are allowed only later through explicit approved workflow actions.',
       '',
-      'The following issues must be resolved through Task Workbench before implementation can begin:',
+      'The following blockers must be resolved before implementation can begin:',
     );
     for (const issue of readiness.blockers) {
       lines.push(`* ${issue}`);
@@ -95,16 +95,26 @@ export function buildAiWorkflowPrompt(task: Task): string {
       '',
       `Recommended next step: ${readiness.recommendedNextStep}`,
       '',
+      'Safe auto-setup loop:',
+      'When a readiness issue can be resolved by updating Task Workbench metadata only, and the correct value is explicit from the task title, original message, or current setup — resolve it immediately using the appropriate Task Workbench MCP write tool. After each update, reload the task with `get_task_full_context` and continue evaluating readiness. You may perform up to 8 safe Task Workbench-only setup updates in this run. Stop if the same blocker repeats twice.',
+      '',
+      'Safe Task Workbench-only updates (no user input needed when the value is explicit):',
+      '* setting task mode to Developer when the task is clearly a development task',
+      '* setting work classification to script/plugin when explicit from the task text',
+      '* updating next step',
+      '* saving analysis or summary when it does not require guessing',
+      '* saving a technical plan draft when enough context exists — do not begin implementation before plan approval',
+      '',
       'Setup rules:',
       '',
       `1. Load the full task context using \`get_task_full_context\` with id "${task.id}".`,
-      '2. Do not create or modify any files until all readiness issues above are resolved.',
-      '3. If work kind is missing, "unknown", or inconsistent with the task assignment — save work classification via `set_task_work_classification` and stop.',
-      '4. If target artifact path is missing — do not guess a file name or directory. Save/update next step via `set_task_next_step` and stop.',
-      '5. If technical plan is missing — create it via `save_technical_plan`. Do not begin coding.',
+      '2. Do not create or modify any files until the task is implementation-ready and the workflow phase allows it.',
+      '3. If work kind is missing, "unknown", or inconsistent with the task assignment — save it via `set_task_work_classification`, reload `get_task_full_context`, and continue.',
+      '4. If target artifact path is missing — do not guess a file name or directory. Update next step via `set_task_next_step` and stop until the user provides the correct path.',
+      '5. If technical plan is missing — create a draft via `save_technical_plan` when enough context exists. Do not begin implementation until the plan is approved.',
       '6. If Dataverse metadata verification is required but not completed — run `run_dataverse_check_for_task` (Primarch integration). Record all findings back into Task Workbench.',
       '7. If Task Workbench MCP becomes unavailable or any required MCP read/write fails — stop immediately. Do not continue outside Task Workbench workflow.',
-      '8. After resolving all issues, update the next step in Task Workbench and ask the user to re-generate this prompt.',
+      '8. Only ask the user to regenerate this prompt if MCP context cannot be reloaded or the workflow cannot be refreshed through Task Workbench MCP after exhausting safe auto-setup updates.',
     );
     return lines.join('\n');
   }

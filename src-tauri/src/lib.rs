@@ -102,8 +102,41 @@ fn load_tasks(app: tauri::AppHandle) -> Result<Value, String> {
 
 #[tauri::command]
 fn save_tasks(app: tauri::AppHandle, tasks: Value) -> Result<(), String> {
-    let path = app_data_dir(&app)?.join("tasks.json");
+    let dir  = app_data_dir(&app)?;
+    let path = dir.join("tasks.json");
+
+    // Create a timestamped backup before overwriting so data can be recovered if
+    // the write succeeds but the content was wrong (e.g. accidental empty array).
+    if path.exists() {
+        let ts    = now_unix();
+        let bname = format!("tasks.backup-{}.json", ts);
+        fs::copy(&path, dir.join(&bname)).map_err(|e| format!("backup tasks.json: {}", e))?;
+        prune_task_backups(&dir, 5);
+    }
+
     write_json(&path, &tasks)
+}
+
+/// Keeps only the most-recent `keep` task backup files; silently removes older ones.
+fn prune_task_backups(dir: &PathBuf, keep: usize) {
+    let entries = match fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+    let mut backups: Vec<PathBuf> = entries
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .map(|n| n.starts_with("tasks.backup-") && n.ends_with(".json"))
+                .unwrap_or(false)
+        })
+        .collect();
+    backups.sort();
+    while backups.len() > keep {
+        let _ = fs::remove_file(&backups[0]);
+        backups.remove(0);
+    }
 }
 
 // --- Customers -------------------------------------------------------------

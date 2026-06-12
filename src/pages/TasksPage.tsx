@@ -43,7 +43,7 @@ const STATUS_FILTERS: { value: TaskStatus | 'all'; label: string }[] = [
 // ---------------------------------------------------------------------------
 
 export default function TasksPage() {
-  const { tasks, getCustomerById, updateTask, deleteTask, reloadTasks } = useApp();
+  const { tasks, getCustomerById, updateTask, deleteTask, reloadTasks, taskLoadFailed, error } = useApp();
 
   const [viewMode, setViewMode]           = useState<ViewMode>('planning');
   const [filter, setFilter]               = useState<TaskStatus | 'all'>('all');
@@ -111,6 +111,20 @@ export default function TasksPage() {
 
   return (
     <>
+      {taskLoadFailed && (
+        <div style={{
+          background: '#5c1a1a',
+          borderBottom: '1px solid #8b2020',
+          color: '#f8b4b4',
+          padding: '8px 16px',
+          fontSize: 13,
+          lineHeight: 1.5,
+        }}>
+          <strong style={{ color: '#ff6b6b' }}>Storage error:</strong>{' '}
+          {error ?? 'Task data failed to load from disk.'}
+          {' '}Saving is temporarily disabled to protect your data. Use the reload button to retry.
+        </div>
+      )}
       <div className="page-content">
         <div className="page-header">
           <div>
