@@ -9,6 +9,7 @@ import TaskForm from '../components/TaskForm';
 import PlanningView, { type PlanningFilter } from '../components/PlanningView';
 import { isOverdue, formatRelativeDate } from '../lib/dates';
 import { effectiveBucket } from '../lib/planning';
+import CopyAiWorkflowPromptButton from '../components/CopyAiWorkflowPromptButton';
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -237,7 +238,10 @@ export default function TasksPage() {
                     onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') handleSelect(task.id); }}
                   >
                     <div className="task-list-item-main">
-                      <div className="task-list-item-title">{task.title}</div>
+                      <div className="task-list-item-title-row">
+                        <div className="task-list-item-title">{task.title}</div>
+                        <CopyAiWorkflowPromptButton task={task} />
+                      </div>
                       <div className="task-list-item-meta">
                         <SourceBadge source={task.source} />
                         <TypeBadge type={task.taskType} />

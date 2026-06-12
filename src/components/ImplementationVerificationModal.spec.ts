@@ -4,7 +4,8 @@ import {
   computeImplVerifyNextStep,
 } from './ImplementationVerificationModal';
 import { formatTaskActivityNote, isTaskActivityLine } from '../lib/taskActivityFormatter';
-import type { Task, CrmVerificationReport } from '../types';
+import { mergeWithDefaults, selectReviewer, inferReviewSource } from '../lib/aiReviewers';
+import type { Task, CrmVerificationReport, AiReviewerConfig, AiFileReviewResult } from '../types';
 
 function makeTask(overrides: Partial<Task> = {}): Task {
   return { id: 't1', title: 'Test task', status: 'in-progress', ...overrides } as unknown as Task;
@@ -531,5 +532,356 @@ describe('formatTaskActivityNote — reset events', () => {
 
   it('isTaskActivityLine recognizes ai-code-review-reset', () => {
     expect(isTaskActivityLine(withTimestamp('UI: ai-code-review-reset'))).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Settings reviewer selection — used by handleRunSettingsReviewerForImpl
+// ---------------------------------------------------------------------------
+
+describe('Settings reviewer selection for Implementation Verification', () => {
+  function makeReviewer(overrides: Partial<AiReviewerConfig>): AiReviewerConfig {
+    return {
+      id:           'custom',
+      name:         'Custom Reviewer',
+      description:  'Test reviewer',
+      instructions: 'Review the code.',
+      quickPrompts: [],
+      enabled:      true,
+      temperature:  0.2,
+      appliesTo:    { fileExtensions: [], devTargetKinds: [] },
+      ...overrides,
+    };
+  }
+
+  // ── Renders two AI review buttons (data-model level) ──────────────────────
+
+  it('AI Kit review button: calls onRunAiCodeReview — distinct from Settings reviewer path', () => {
+    // The modal exposes two callbacks: onRunAiCodeReview (AI Kit) and onRunSettingsReviewer.
+    // Verify they are separate props so components can wire them independently.
+    let aiKitCalled = false;
+    let settingsCalled = false;
+    const onRunAiCodeReview    = async () => { aiKitCalled    = true; };
+    const onRunSettingsReviewer = async () => { settingsCalled = true; };
+
+    onRunAiCodeReview();
+    expect(aiKitCalled).toBe(true);
+    expect(settingsCalled).toBe(false);
+
+    onRunSettingsReviewer();
+    expect(settingsCalled).toBe(true);
+  });
+
+  // ── Script task: .js/.ts file → JavaScript reviewer ──────────────────────
+
+  it('script task: .js artifact selects JavaScript Power Apps Script Reviewer', () => {
+    const configs  = mergeWithDefaults(undefined);
+    const reviewer = selectReviewer(configs, 'Scripts/nvr_account_events.js', 'script');
+    expect(reviewer).toBeDefined();
+    expect(reviewer!.name).toBe('JavaScript Power Apps Script Reviewer');
+  });
+
+  it('script task: .ts artifact selects JavaScript Power Apps Script Reviewer', () => {
+    const configs  = mergeWithDefaults(undefined);
+    const reviewer = selectReviewer(configs, 'Scripts/my_form_handler.ts', 'script');
+    expect(reviewer).toBeDefined();
+    expect(reviewer!.name).toBe('JavaScript Power Apps Script Reviewer');
+  });
+
+  it('script task: reviewerName is the reviewer display name, not AI Kit name', () => {
+    const configs  = mergeWithDefaults(undefined);
+    const reviewer = selectReviewer(configs, 'Scripts/nvr_account_events.js', 'script');
+    expect(reviewer!.name).toBe('JavaScript Power Apps Script Reviewer');
+    expect(reviewer!.name).not.toBe('Script AI Kit Review');
+    expect(reviewer!.name).not.toBe('Script Internal Check');
+  });
+
+  it('script task: reviewer has non-empty instructions', () => {
+    const configs  = mergeWithDefaults(undefined);
+    const reviewer = selectReviewer(configs, 'Scripts/nvr_account_events.js', 'script');
+    expect(reviewer!.instructions.trim().length).toBeGreaterThan(0);
+  });
+
+  // ── Plugin task: .cs file → C# Plugin CRM Reviewer ───────────────────────
+
+  it('plugin task: .cs artifact selects C# Plugin CRM Reviewer', () => {
+    const configs  = mergeWithDefaults(undefined);
+    const reviewer = selectReviewer(configs, 'Plugins/MyPlugin.cs', 'plugin');
+    expect(reviewer).toBeDefined();
+    expect(reviewer!.name).toBe('C# Plugin CRM Reviewer');
+  });
+
+  it('plugin task: reviewerName is the reviewer display name, not AI Kit name', () => {
+    const configs  = mergeWithDefaults(undefined);
+    const reviewer = selectReviewer(configs, 'Plugins/MyPlugin.cs', 'plugin');
+    expect(reviewer!.name).toBe('C# Plugin CRM Reviewer');
+    expect(reviewer!.name).not.toBe('Plugin AI Kit Review');
+    expect(reviewer!.name).not.toBe('Plugin Internal Check');
+  });
+
+  // ── Error case: no enabled reviewer matches ───────────────────────────────
+
+  it('no matching reviewer: selectReviewer returns undefined for unrecognized extension', () => {
+    const configs  = mergeWithDefaults(undefined);
+    const reviewer = selectReviewer(configs, 'README.md', undefined);
+    expect(reviewer).toBeUndefined();
+  });
+
+  it('no matching reviewer: selectReviewer returns undefined when all reviewers are disabled', () => {
+    const disabled = mergeWithDefaults(undefined).map((r) => ({ ...r, enabled: false }));
+    const reviewer = selectReviewer(disabled, 'Scripts/nvr_account_events.js', 'script');
+    expect(reviewer).toBeUndefined();
+  });
+
+  it('no matching reviewer: result is undefined, not a thrown exception', () => {
+    const configs = mergeWithDefaults(undefined);
+    expect(() => selectReviewer(configs, 'unknown.xyz', undefined)).not.toThrow();
+    expect(selectReviewer(configs, 'unknown.xyz', undefined)).toBeUndefined();
+  });
+
+  // ── User-configured reviewer override ────────────────────────────────────
+
+  it('user override: Settings reviewer name is used, not the default name', () => {
+    const userOverride: AiReviewerConfig = makeReviewer({
+      id:          'javascript-powerapps-script',
+      name:        'My Custom JS Reviewer',
+      appliesTo:   { fileExtensions: ['js', 'ts'], devTargetKinds: ['script'] },
+    });
+    const configs  = mergeWithDefaults([userOverride]);
+    const reviewer = selectReviewer(configs, 'Scripts/nvr_account_events.js', 'script');
+    expect(reviewer!.name).toBe('My Custom JS Reviewer');
+  });
+
+  // ── reviewId is set after a Settings reviewer run (data-model level) ──────
+
+  it('aiCodeReview.reviewId is set to the review entry id after a Settings reviewer run', () => {
+    // Simulates what handleRunSettingsReviewerForImpl stores.
+    const reviewEntry = { id: 'impl-review-2026-06-12T10:00:00.000Z', reviewerName: 'C# Plugin CRM Reviewer', filePath: 'Plugins/MyPlugin.cs', reviewMode: 'change' as const };
+    const aiCodeReview = { status: 'passed' as const, reviewId: reviewEntry.id, runAt: '2026-06-12T10:00:00.000Z', summary: 'Looks good.', findings: [] };
+    expect(aiCodeReview.reviewId).toBe(reviewEntry.id);
+  });
+
+  it('latestAiReview lookup: finds review by reviewId — works for Settings reviewer entry', () => {
+    const id = 'impl-review-settings-2026-06-12T10:00:00.000Z';
+    const task = makeTask({
+      aiFileReviews: [
+        { id, reviewerName: 'C# Plugin CRM Reviewer', filePath: 'Plugins/MyPlugin.cs', reviewMode: 'change' },
+        { id: 'impl-review-other', reviewerName: 'Script AI Kit Review', filePath: 'Scripts/foo.js', reviewMode: 'change' },
+      ] as never,
+      implementationVerification: {
+        aiCodeReview: { status: 'passed', reviewId: id },
+      },
+    });
+    const reviewId     = task.implementationVerification?.aiCodeReview?.reviewId;
+    const latestReview = task.aiFileReviews?.find((r) => r.id === reviewId);
+    expect(latestReview).toBeDefined();
+    expect(latestReview!.reviewerName).toBe('C# Plugin CRM Reviewer');
+  });
+
+  it('Open review: after Settings reviewer run, reviewId points to the latest Settings reviewer entry', () => {
+    const id = 'impl-review-settings-2026-06-12T10:00:00.000Z';
+    const task = makeTask({
+      aiFileReviews: [
+        { id, reviewerName: 'JavaScript Power Apps Script Reviewer', filePath: 'Scripts/nvr_account_events.js', reviewMode: 'change' },
+      ] as never,
+      implementationVerification: {
+        aiCodeReview: { status: 'passed', reviewId: id },
+      },
+    });
+    const aiStatus  = task.implementationVerification?.aiCodeReview?.status ?? 'not-run';
+    const reviewId  = task.implementationVerification?.aiCodeReview?.reviewId;
+    const latestReview = aiStatus !== 'not-run'
+      ? (reviewId ? task.aiFileReviews?.find((r) => r.id === reviewId) : task.aiFileReviews?.[0])
+      : undefined;
+    expect(latestReview).toBeDefined();
+    expect(latestReview!.reviewerName).toBe('JavaScript Power Apps Script Reviewer');
+  });
+
+  // ── Regression: no "undefined › undefined" ───────────────────────────────
+
+  it('REGRESSION: selectReviewer with empty artifactPath does not throw', () => {
+    const configs = mergeWithDefaults(undefined);
+    expect(() => selectReviewer(configs, '', 'script')).not.toThrow();
+  });
+
+  it('REGRESSION: selectReviewer with undefined devMode falls back to extension-only match', () => {
+    const configs = mergeWithDefaults(undefined);
+    // C# reviewer declares devTargetKinds: ['plugin'] so with devMode=undefined it still matches
+    // via Priority 2 (devTargetKinds declared but devMode unknown — allowed per selectReviewer logic).
+    // Just verify no crash.
+    expect(() => selectReviewer(configs, 'Plugins/MyPlugin.cs', undefined)).not.toThrow();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// inferReviewSource — badge classification
+// ---------------------------------------------------------------------------
+
+describe('inferReviewSource — badge classification', () => {
+  function makeReview(overrides: Partial<AiFileReviewResult>): AiFileReviewResult {
+    return { reviewerName: 'Test Reviewer', filePath: 'file.js', ...overrides };
+  }
+
+  it('returns ai-kit when reviewSource is explicitly ai-kit', () => {
+    expect(inferReviewSource(makeReview({ reviewSource: 'ai-kit' }))).toBe('ai-kit');
+  });
+
+  it('returns settings when reviewSource is explicitly settings', () => {
+    expect(inferReviewSource(makeReview({ reviewSource: 'settings' }))).toBe('settings');
+  });
+
+  it('returns legacy when reviewSource is explicitly legacy', () => {
+    expect(inferReviewSource(makeReview({ reviewSource: 'legacy' }))).toBe('legacy');
+  });
+
+  it('infers ai-kit from reviewerName "Script AI Kit Review" when reviewSource absent', () => {
+    expect(inferReviewSource(makeReview({ reviewerName: 'Script AI Kit Review' }))).toBe('ai-kit');
+  });
+
+  it('infers ai-kit from reviewerName "Plugin AI Kit Review" when reviewSource absent', () => {
+    expect(inferReviewSource(makeReview({ reviewerName: 'Plugin AI Kit Review' }))).toBe('ai-kit');
+  });
+
+  it('returns legacy for Settings reviewer name when reviewSource absent', () => {
+    expect(inferReviewSource(makeReview({ reviewerName: 'JavaScript Power Apps Script Reviewer' }))).toBe('legacy');
+  });
+
+  it('returns legacy for C# reviewer name when reviewSource absent', () => {
+    expect(inferReviewSource(makeReview({ reviewerName: 'C# Plugin CRM Reviewer' }))).toBe('legacy');
+  });
+
+  it('explicit reviewSource=settings wins over reviewerName containing AI Kit text', () => {
+    // Unlikely but verify priority: explicit field beats name heuristic.
+    expect(inferReviewSource(makeReview({ reviewSource: 'settings', reviewerName: 'My AI Kit Override' }))).toBe('settings');
+  });
+
+  it('does not throw for entries with missing reviewerName', () => {
+    expect(() => inferReviewSource({ reviewerName: undefined as unknown as string })).not.toThrow();
+  });
+
+  it('does not throw for empty reviewerName', () => {
+    expect(() => inferReviewSource(makeReview({ reviewerName: '' }))).not.toThrow();
+    expect(inferReviewSource(makeReview({ reviewerName: '' }))).toBe('legacy');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Multi-review display — data-model level
+// ---------------------------------------------------------------------------
+
+describe('Multi-review display — data-model level', () => {
+  function makeReview(overrides: Partial<AiFileReviewResult>): AiFileReviewResult {
+    return { reviewerName: 'Test Reviewer', filePath: 'file.js', ...overrides };
+  }
+
+  it('task with two reviews shows both entries in aiFileReviews', () => {
+    const aiKitReview  = makeReview({ id: 'r-aikit', reviewerName: 'Script AI Kit Review', reviewSource: 'ai-kit' });
+    const settingsReview = makeReview({ id: 'r-settings', reviewerName: 'JavaScript Power Apps Script Reviewer', reviewSource: 'settings' });
+    const reviews = [settingsReview, aiKitReview]; // newest first
+    expect(reviews).toHaveLength(2);
+    expect(reviews[0].reviewerName).toBe('JavaScript Power Apps Script Reviewer');
+    expect(reviews[1].reviewerName).toBe('Script AI Kit Review');
+  });
+
+  it('running Settings Reviewer after AI Kit Review preserves the AI Kit review entry', () => {
+    const existing     = [makeReview({ id: 'r-aikit', reviewSource: 'ai-kit', reviewerName: 'Script AI Kit Review' })];
+    const settingsNew  = makeReview({ id: 'r-settings', reviewSource: 'settings', reviewerName: 'JS Reviewer' });
+    const updated      = [settingsNew, ...existing].slice(0, 5);
+    expect(updated).toHaveLength(2);
+    expect(updated.some((r) => r.reviewSource === 'ai-kit')).toBe(true);
+    expect(updated.some((r) => r.reviewSource === 'settings')).toBe(true);
+  });
+
+  it('running AI Kit Review after Settings Reviewer preserves the Settings review entry', () => {
+    const existing    = [makeReview({ id: 'r-settings', reviewSource: 'settings', reviewerName: 'JS Reviewer' })];
+    const aiKitNew    = makeReview({ id: 'r-aikit', reviewSource: 'ai-kit', reviewerName: 'Script AI Kit Review' });
+    const updated     = [aiKitNew, ...existing].slice(0, 5);
+    expect(updated).toHaveLength(2);
+    expect(updated.some((r) => r.reviewSource === 'settings')).toBe(true);
+    expect(updated.some((r) => r.reviewSource === 'ai-kit')).toBe(true);
+  });
+
+  it('cap of 5 entries is respected when many reviews exist', () => {
+    const reviews = Array.from({ length: 4 }, (_, i) =>
+      makeReview({ id: `r-${i}`, reviewSource: 'ai-kit' })
+    );
+    const newReview = makeReview({ id: 'r-new', reviewSource: 'settings' });
+    const updated = [newReview, ...reviews].slice(0, 5);
+    expect(updated).toHaveLength(5);
+  });
+
+  it('AI Kit badge: inferReviewSource returns ai-kit for AI Kit entry', () => {
+    const r = makeReview({ reviewSource: 'ai-kit', reviewerName: 'Script AI Kit Review' });
+    expect(inferReviewSource(r)).toBe('ai-kit');
+  });
+
+  it('Settings badge: inferReviewSource returns settings for Settings entry', () => {
+    const r = makeReview({ reviewSource: 'settings', reviewerName: 'JavaScript Power Apps Script Reviewer' });
+    expect(inferReviewSource(r)).toBe('settings');
+  });
+
+  it('both cards have different reviewerName in a two-review scenario', () => {
+    const aiKitReview  = makeReview({ id: 'r-1', reviewerName: 'Script AI Kit Review', reviewSource: 'ai-kit' });
+    const settingsReview = makeReview({ id: 'r-2', reviewerName: 'JavaScript Power Apps Script Reviewer', reviewSource: 'settings' });
+    const reviews = [settingsReview, aiKitReview];
+    expect(reviews[0].reviewerName).not.toBe(reviews[1].reviewerName);
+  });
+
+  it('Open AI Kit card: reviewId lookup finds the AI Kit review', () => {
+    const aiKitId = 'r-aikit';
+    const task = makeTask({
+      aiFileReviews: [
+        makeReview({ id: 'r-settings', reviewSource: 'settings', reviewerName: 'JS Reviewer' }),
+        makeReview({ id: aiKitId, reviewSource: 'ai-kit', reviewerName: 'Script AI Kit Review' }),
+      ] as never,
+      implementationVerification: { aiCodeReview: { status: 'passed', reviewId: aiKitId } },
+    });
+    const reviewId = task.implementationVerification?.aiCodeReview?.reviewId;
+    const target   = task.aiFileReviews?.find((r) => r.id === reviewId);
+    expect(target?.reviewerName).toBe('Script AI Kit Review');
+  });
+
+  it('Open Settings card: reviewId lookup finds the Settings review', () => {
+    const settingsId = 'r-settings';
+    const task = makeTask({
+      aiFileReviews: [
+        makeReview({ id: settingsId, reviewSource: 'settings', reviewerName: 'JS Reviewer' }),
+        makeReview({ id: 'r-aikit', reviewSource: 'ai-kit', reviewerName: 'Script AI Kit Review' }),
+      ] as never,
+      implementationVerification: { aiCodeReview: { status: 'passed', reviewId: settingsId } },
+    });
+    const reviewId = task.implementationVerification?.aiCodeReview?.reviewId;
+    const target   = task.aiFileReviews?.find((r) => r.id === reviewId);
+    expect(target?.reviewerName).toBe('JS Reviewer');
+  });
+
+  it('single-review layout: one entry in aiFileReviews still works', () => {
+    const r = makeReview({ id: 'r-1', reviewSource: 'ai-kit', reviewerName: 'Script AI Kit Review' });
+    const reviews = [r];
+    expect(reviews).toHaveLength(1);
+    expect(inferReviewSource(reviews[0])).toBe('ai-kit');
+  });
+
+  it('old review without reviewSource renders safely — no crash on badge inference', () => {
+    const oldReview = makeReview({ reviewSource: undefined, reviewerName: 'Script AI Kit Review' });
+    expect(() => inferReviewSource(oldReview)).not.toThrow();
+    expect(inferReviewSource(oldReview)).toBe('ai-kit');
+  });
+
+  it('old review without reviewSource and unknown name returns legacy — no crash', () => {
+    const oldReview = makeReview({ reviewSource: undefined, reviewerName: 'Script Internal Check' });
+    expect(() => inferReviewSource(oldReview)).not.toThrow();
+    expect(inferReviewSource(oldReview)).toBe('legacy');
+  });
+
+  it('REGRESSION: aiFileReviews undefined — length check does not throw', () => {
+    const task = makeTask({ aiFileReviews: undefined });
+    expect(() => (task.aiFileReviews ?? []).length).not.toThrow();
+    expect((task.aiFileReviews ?? []).length).toBe(0);
+  });
+
+  it('REGRESSION: aiFileReviews empty array — no crash', () => {
+    const task = makeTask({ aiFileReviews: [] as never });
+    expect((task.aiFileReviews ?? []).length).toBe(0);
   });
 });

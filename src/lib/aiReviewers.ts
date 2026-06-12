@@ -4,7 +4,7 @@
  * Reviewers are matched by file extension and optional dev target kind.
  * The first enabled matching reviewer is selected automatically.
  */
-import type { AiReviewerConfig } from '../types';
+import type { AiReviewerConfig, AiReviewSource } from '../types';
 
 // ---------------------------------------------------------------------------
 // Defaults
@@ -189,4 +189,21 @@ export function selectReviewer(
         r.appliesTo.devTargetKinds.includes(devMode)
       ),
   );
+}
+
+/**
+ * Infers the review source for display/badge purposes.
+ *
+ * Priority:
+ *   1. Explicit `reviewSource` field on the entry.
+ *   2. Reviewer name contains "AI Kit" → 'ai-kit'.
+ *   3. Otherwise → 'legacy' (old entry or unknown origin).
+ */
+export function inferReviewSource(
+  review: { reviewSource?: string; reviewerName?: string },
+): AiReviewSource {
+  if (review.reviewSource === 'ai-kit')   return 'ai-kit';
+  if (review.reviewSource === 'settings') return 'settings';
+  if (review.reviewerName?.includes('AI Kit')) return 'ai-kit';
+  return 'legacy';
 }

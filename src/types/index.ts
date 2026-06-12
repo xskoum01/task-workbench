@@ -90,12 +90,26 @@ export interface CrmTechnicalImplementationPlan {
   workKind: CrmDeveloperWorkKind;
   summary: string;
   target?: {
+    // Shared
     entityLogicalName?: string;
+    // Plugin-specific
     message?: string;
     stage?: string;
     mode?: string;
-    scriptPath?: string;
     pluginProject?: string;
+    filteringAttributes?: string[];
+    preImageName?: string;
+    preImageAttributes?: string[];
+    postImageName?: string;
+    postImageAttributes?: string[];
+    // Script-specific
+    scriptPath?: string;
+    webResourceName?: string;
+    formName?: string;
+    eventName?: string;
+    /** Field logical name that triggers an onChange event (e.g., 'new_fieldname'). */
+    eventFieldName?: string;
+    functionName?: string;
   };
   implementationSteps: string[];
   dataverseFindings: string[];
@@ -526,6 +540,22 @@ export interface WorkflowSetup {
    * confirmed name instead of re-inferring it from the task text.
    */
   desiredScriptFile?: string;
+  /**
+   * Explicit marker that form/event registration will be done manually later.
+   * When set to 'manual-later', the implementation readiness check treats form/event
+   * info as satisfied even if no formName/eventName/functionName is present in the plan.
+   */
+  scriptFormRegistration?: 'manual-later';
+  /**
+   * Explicit action type for script workflows.
+   * 'create-new-script': creating a new JS file — requires target directory and desired file name.
+   * 'update-existing-script': modifying an existing file — requires a specific file path.
+   */
+  actionType?: 'create-new-script' | 'update-existing-script';
+  /** Path to an existing script used as conventions reference for AI context. */
+  conventionsSource?: string;
+  /** Paths of similar existing script files included for AI conventions context. */
+  relatedExistingFiles?: string[];
 }
 
 /**
@@ -910,6 +940,9 @@ export interface AiStructuredReview {
   generalSuggestions: string[];
 }
 
+/** Identifies which review path produced an AI code review entry. */
+export type AiReviewSource = 'ai-kit' | 'settings' | 'legacy';
+
 /**
  * Result returned by the run_ai_file_review Tauri command.
  * `structured` is present when the model returned valid JSON.
@@ -929,6 +962,8 @@ export interface AiFileReviewResult {
    * 'change' — git-diff review (Update / Fix workflow).
    */
   reviewMode?: 'file' | 'change';
+  /** Which review button produced this entry — used for source badge display. */
+  reviewSource?: AiReviewSource;
   /** Parsed structured review. Present when JSON parsing succeeded. */
   structured?: AiStructuredReview;
   /** Raw markdown fallback. Present when JSON parsing failed. */

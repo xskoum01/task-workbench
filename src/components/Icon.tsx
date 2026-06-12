@@ -60,7 +60,8 @@ export type IconName =
   | 'log-in'         // reconnect / sign in
   | 'pause'          // waiting bucket
   | 'eye'            // preview / view
-  | 'alert-triangle'; // warning banner
+  | 'alert-triangle' // warning banner
+  | 'copy';           // copy to clipboard
 
 // ---------------------------------------------------------------------------
 // SVG path definitions (24×24 viewBox, Lucide-style)
@@ -302,6 +303,12 @@ const ICON_PATHS: Record<IconName, string[]> = {
   'alert-triangle': [
     'M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z',
     'M12 9v4M12 17h.01',
+  ],
+
+  // Copy — two overlapping rectangles (clipboard copy)
+  'copy': [
+    'M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2',
+    'M8 8h10a2 2 0 0 1 2 2v10a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2V10a2 2 0 0 1 2-2z',
   ],
 };
 

@@ -6,7 +6,7 @@ import path from 'node:path';
 import process from 'node:process';
 
 const SERVER_NAME = 'task-workbench-mcp-bridge';
-const SERVER_VERSION = '0.4.0';
+const SERVER_VERSION = '0.6.0';
 const APP_IDENTIFIER = 'com.vskoumal.task-workbench';
 const PRODUCT_NAME = 'Task Workbench';
 const MAX_SUMMARY_LENGTH = 700;
@@ -30,6 +30,14 @@ const READ_ONLY_TOOL_NAMES = new Set([
   'get_next_recommended_step',
   'prepare_commit_for_task',
   'get_power_platform_ai_kit_status',
+  // run_dataverse_check_for_task performs no Dataverse/Git/external writes.
+  // Its local report persistence is expected behavior, not a write side effect.
+  'run_dataverse_check_for_task',
+  // New read-only tools
+  'get_dataverse_verification_report',
+  'get_external_action_proposal',
+  'get_implementation_verification_state',
+  'get_implementation_readiness',
 ]);
 
 const TOOL_DEFINITIONS = [
@@ -317,12 +325,12 @@ const TOOL_DEFINITIONS = [
   },
   {
     name: 'set_task_work_classification',
-    description: 'Set work kind (plugin/script/general/unknown) and work action (create/update/unknown). Strict enum validation.',
+    description: 'Set work kind and work action. workKind must be one of: plugin, script, ribbon, repo-only, bugfix, review, general, unknown. Strict enum validation.',
     inputSchema: {
       type: 'object',
       properties: {
         taskId:     { type: 'string' },
-        workKind:   { type: 'string', enum: ['plugin', 'script', 'general', 'unknown'] },
+        workKind:   { type: 'string', enum: ['plugin', 'script', 'ribbon', 'repo-only', 'bugfix', 'review', 'general', 'unknown'] },
         workAction: { type: 'string', enum: ['create', 'update', 'unknown'] },
       },
       required: ['taskId', 'workKind', 'workAction'],
@@ -412,7 +420,7 @@ const TOOL_DEFINITIONS = [
   },
   {
     name: 'save_technical_plan',
-    description: 'Save local technical plan: summary, steps, entities, test plan, risks. Does not write code or register anything.',
+    description: 'Save local technical plan: summary, steps, entities, test plan, risks, and optional plugin or script target details. Does not write code or register anything.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -423,6 +431,36 @@ const TOOL_DEFINITIONS = [
         crmEntities:        { type: 'array', items: { type: 'string' } },
         testPlan:           { type: 'array', items: { type: 'string' } },
         risks:              { type: 'array', items: { type: 'string' } },
+        pluginTarget: {
+          type: 'object',
+          description: 'Optional plugin-specific target details. Only relevant for plugin (C#) tasks.',
+          properties: {
+            entityLogicalName:  { type: 'string' },
+            message:            { type: 'string', enum: ['Create','Update','Delete','Retrieve','RetrieveMultiple','Associate','Disassociate','Assign','SetState'] },
+            stage:              { type: 'string', enum: ['PreValidation','PreOperation','PostOperation'] },
+            mode:               { type: 'string', enum: ['Sync','Async'] },
+            pluginProject:      { type: 'string' },
+            filteringAttributes:{ type: 'array', items: { type: 'string' } },
+            preImageName:       { type: 'string' },
+            preImageAttributes: { type: 'array', items: { type: 'string' } },
+            postImageName:      { type: 'string' },
+            postImageAttributes:{ type: 'array', items: { type: 'string' } },
+          },
+          additionalProperties: false,
+        },
+        scriptTarget: {
+          type: 'object',
+          description: 'Optional script-specific target details. Only relevant for script (JS/TS) tasks.',
+          properties: {
+            entityLogicalName: { type: 'string' },
+            scriptPath:        { type: 'string' },
+            webResourceName:   { type: 'string' },
+            formName:          { type: 'string' },
+            eventName:         { type: 'string' },
+            functionName:      { type: 'string' },
+          },
+          additionalProperties: false,
+        },
       },
       required: ['taskId', 'planSummary'],
       additionalProperties: false,
@@ -665,6 +703,93 @@ const TOOL_DEFINITIONS = [
         note: { type: 'string', description: 'Optional note about the testing result.' },
       },
       required: ['taskId'],
+      additionalProperties: false,
+    },
+  },
+  // ── New read-only tools added in v0.5.0 ───────────────────────────────────
+  {
+    name: 'get_dataverse_verification_report',
+    description:
+      'Read-only. Returns the stored Dataverse verification report for a task (saved by run_dataverse_check_for_task). ' +
+      'Returns a null/empty result with a helpful message if no report has been saved yet. ' +
+      'Does NOT run a new check. Does NOT write anything.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        id: { type: 'string', description: 'Task ID.' },
+      },
+      required: ['id'],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: 'get_external_action_proposal',
+    description:
+      'Read-only. Returns the current external action proposal state for a task: ' +
+      'externalActionPreview from the technical plan, external action approval gate status, ' +
+      'and any recorded external execution tracking. ' +
+      'Returns a null/empty result with a message if nothing is present. ' +
+      'Does NOT write anything.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        id: { type: 'string', description: 'Task ID.' },
+      },
+      required: ['id'],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: 'record_external_action_completed',
+    description:
+      'WRITE (local task state only) — records that the developer manually completed the required external action ' +
+      '(plugin registration, web resource upload, publish customizations, etc.). ' +
+      'Does NOT call Dataverse, GitHub, Azure DevOps, PAC CLI, XrmToolBox, or any external system. ' +
+      'If completedAt is omitted the current timestamp is used. ' +
+      'Appends an audit note. Safe to call multiple times.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        taskId: { type: 'string' },
+        actionType: {
+          type: 'string',
+          enum: ['plugin-registration', 'web-resource-upload', 'publish-customizations', 'pull-request', 'manual-check'],
+          description: 'The type of external action that was completed.',
+        },
+        completedAt: { type: 'string', description: 'ISO timestamp of completion. Defaults to current time if omitted.' },
+        note: { type: 'string', description: 'Optional note describing what was done.' },
+      },
+      required: ['taskId', 'actionType'],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: 'get_implementation_verification_state',
+    description:
+      'Read-only. Returns the implementation verification state for a task: ' +
+      'build check, Dataverse check override, AI code review, local test record, and consultant testing record. ' +
+      'Fields are null when not yet recorded. Does NOT write anything.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        id: { type: 'string', description: 'Task ID.' },
+      },
+      required: ['id'],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: 'get_implementation_readiness',
+    description:
+      'Read-only. Returns whether the task is ready for code generation, with a list of blockers ' +
+      'and warnings that must be resolved first, and a recommended next step. ' +
+      'Applies only to developer mode plugin/script tasks. Does NOT write anything.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        id: { type: 'string', description: 'Task ID.' },
+      },
+      required: ['id'],
       additionalProperties: false,
     },
   },
@@ -1247,6 +1372,144 @@ function nextRecommendedStep(task) {
   };
 }
 
+const READINESS_VERIFIED_VERDICTS = new Set(['pass', 'warnings', 'fail']);
+
+function computeImplementationReadiness(task) {
+  const blockers = [];
+  const warnings = [];
+
+  if (task.taskMode !== 'developer') {
+    return {
+      isImplementationReady: false,
+      blockers: ['Task mode is not set to Developer.'],
+      warnings: [],
+      recommendedNextStep: 'Set task mode to Developer.',
+    };
+  }
+
+  const setup = asObject(task.workflowSetup);
+  const workflow = asObject(task.crmDeveloperWorkflow);
+  const detectedWorkKind = workflow.detectedWorkKind ?? '';
+  const devTargetKind = setup.devTargetKind ?? '';
+
+  const isPlugin = devTargetKind === 'plugin' || detectedWorkKind === 'plugin';
+  const isScript = devTargetKind === 'script' || detectedWorkKind === 'script' || detectedWorkKind === 'ribbon';
+
+  if (!isPlugin && !isScript) {
+    const corpus = `${task.title ?? ''} ${task.originalMessage ?? ''} ${task.classificationLabel ?? ''}`.toLowerCase();
+    const looksScript = /\b(javascript|form\s*script|web\s*resource|jscript|on.?load|on.?save|field.*change|column.*change|onchange|onload|onsave)\b/.test(corpus);
+    return {
+      isImplementationReady: false,
+      blockers: ['Work kind must be plugin or script.'],
+      warnings: looksScript
+        ? ['Task text mentions JavaScript/form scripts. Consider classifying this task as script work kind.']
+        : [],
+      recommendedNextStep: looksScript
+        ? 'Set work classification to script (JavaScript form script indicators found in task text).'
+        : 'Set work classification to plugin or script via Set Work Classification.',
+    };
+  }
+
+  const customer = setup.customerId || task.customerId || '';
+  if (!customer) blockers.push('Customer/environment is not set.');
+  if (!setup.repositoryRoot) blockers.push('Repository root is not set.');
+  if (!setup.confirmedAt) blockers.push('Developer setup has not been confirmed.');
+
+  const plan = asObject(workflow.technicalPlan && typeof workflow.technicalPlan === 'object' ? workflow.technicalPlan : null);
+  const hasPlan = !!(workflow.technicalPlan && typeof workflow.technicalPlan === 'object');
+  if (!hasPlan) blockers.push('Technical implementation plan is missing.');
+
+  const reports = Array.isArray(task.crmVerificationReports) ? task.crmVerificationReports : [];
+  const latestVerdict = reports[0]?.verdict ?? '';
+  const dvCheck = asObject(asObject(task.implementationVerification).dataverseCheck);
+  const dvSatisfied = READINESS_VERIFIED_VERDICTS.has(latestVerdict)
+    || !!dvCheck.skippedAt || !!dvCheck.manuallyVerifiedAt
+    || dvCheck.status === 'skipped' || dvCheck.status === 'manually-verified';
+
+  if (!dvSatisfied) {
+    blockers.push('Dataverse metadata verification has not been completed or explicitly skipped.');
+  } else {
+    if (latestVerdict === 'warnings') warnings.push('Dataverse verification completed with warnings. Review before implementing.');
+    if (latestVerdict === 'fail')     warnings.push('Dataverse verification found issues. Ensure they are accounted for in the technical plan.');
+  }
+
+  const planTarget = hasPlan ? asObject(plan.target) : {};
+
+  if (isPlugin) {
+    const pluginProject = setup.pluginProject || task.selectedPluginProject || planTarget.pluginProject || '';
+    if (!pluginProject) blockers.push('Plugin project is not selected.');
+
+    const entity = setup.primaryEntityLogicalName || planTarget.entityLogicalName || '';
+    if (!entity) blockers.push('Target entity logical name is not set.');
+
+    if (hasPlan) {
+      const missing = [
+        !planTarget.message ? 'message' : null,
+        !planTarget.stage   ? 'stage'   : null,
+        !planTarget.mode    ? 'mode'    : null,
+      ].filter(Boolean);
+      if (missing.length > 0) blockers.push(`Plugin registration details are incomplete: ${missing.join(', ')} not specified in technical plan.`);
+    }
+  }
+
+  if (isScript) {
+    const targetPath = setup.artifactPath || setup.scriptPath || planTarget.scriptPath || '';
+    if (!targetPath) {
+      blockers.push('Target script/artifact path is not set.');
+    } else {
+      const actionType = setup.actionType ?? '';
+      const isSpecificFile = (p) => p && /\.[jt]sx?$/.test(p);
+
+      if (actionType === 'create-new-script') {
+        const hasDir      = !!(setup.scriptPath || planTarget.scriptPath);
+        const hasFileName = !!(setup.artifactPath) || isSpecificFile(setup.scriptPath) || isSpecificFile(planTarget.scriptPath) || !!(setup.desiredScriptFile);
+        if (!hasDir || !hasFileName) {
+          blockers.push('Script creation requires a known target directory and file name. Set script path and desired file name.');
+        }
+      } else if (actionType === 'update-existing-script') {
+        const hasSpecific = !!(setup.artifactPath) || isSpecificFile(setup.scriptPath) || isSpecificFile(planTarget.scriptPath);
+        if (!hasSpecific) {
+          blockers.push('Script update requires a specific existing file path. Set script path to an existing .js file.');
+        }
+      }
+    }
+
+    const entity = setup.primaryEntityLogicalName || planTarget.entityLogicalName || '';
+    if (!entity) blockers.push('Target entity logical name (table) is not set.');
+
+    if (hasPlan) {
+      const hasFormEvent = !!(planTarget.formName || planTarget.eventName || planTarget.eventFieldName || planTarget.functionName);
+      const manualLater = setup.scriptFormRegistration === 'manual-later';
+      if (!hasFormEvent && !manualLater) {
+        blockers.push('Form/event registration details are not set. Add form name, event name, or mark as manual registration later.');
+      }
+    }
+  }
+
+  const isReady = blockers.length === 0;
+  let recommendedNextStep;
+  if (isReady) {
+    recommendedNextStep = warnings.length > 0 ? 'Review warnings, then proceed with code generation.' : 'Ready for code generation.';
+  } else {
+    const first = blockers[0] ?? '';
+    if (first.includes('Customer'))                     recommendedNextStep = 'Set customer/environment for this task.';
+    else if (first.includes('Repository root'))         recommendedNextStep = 'Set repository root via Developer Target Setup.';
+    else if (first.includes('setup has not been'))      recommendedNextStep = 'Complete and confirm the developer setup.';
+    else if (first.includes('Technical implementation'))recommendedNextStep = 'Generate a technical implementation plan.';
+    else if (first.includes('Dataverse metadata'))      recommendedNextStep = 'Run Dataverse metadata verification or mark it as not required.';
+    else if (first.includes('Plugin project'))          recommendedNextStep = 'Select the plugin project.';
+    else if (first.includes('Target entity'))           recommendedNextStep = 'Specify the target entity logical name in the technical plan.';
+    else if (first.includes('Plugin registration'))     recommendedNextStep = 'Specify message, stage, and execution mode in the technical plan.';
+    else if (first.includes('Script creation requires')) recommendedNextStep = 'Set target directory and file name for script creation in Developer Target Setup.';
+    else if (first.includes('Script update requires'))  recommendedNextStep = 'Set the existing script file path in Developer Target Setup.';
+    else if (first.includes('Target script'))           recommendedNextStep = 'Set the target script path via Developer Target Setup.';
+    else if (first.includes('Form/event'))              recommendedNextStep = 'Add form/event details to the technical plan, or mark form registration as manual-later.';
+    else                                                recommendedNextStep = 'Resolve all blockers before proceeding with implementation.';
+  }
+
+  return { isImplementationReady: isReady, blockers, warnings, recommendedNextStep };
+}
+
 async function callToolFallback(name, args = {}) {
   const { tasks, found, warning } = await loadTasks();
   const common = {
@@ -1267,6 +1530,13 @@ async function callToolFallback(name, args = {}) {
         count: filtered.length,
         tasks: filtered.slice(0, limit).map(safeTaskSummary),
       };
+    }
+    case 'get_task_full_context': {
+      const task = getTaskById(tasks, args.id);
+      if (!task) return { ...common, error: `Task not found: ${args.id}` };
+      const detail = safeTaskDetail(task);
+      detail.implementationReadiness = computeImplementationReadiness(task);
+      return { ...common, task: detail };
     }
     case 'get_task': {
       const task = getTaskById(tasks, args.id);
@@ -1310,6 +1580,91 @@ async function callToolFallback(name, args = {}) {
     case 'get_next_recommended_step': {
       const task = getTaskById(tasks, args.id);
       return task ? { ...common, taskId: task.id, recommendation: nextRecommendedStep(task) } : { ...common, error: `Task not found: ${args.id}` };
+    }
+    case 'get_dataverse_verification_report': {
+      const task = getTaskById(tasks, args.id);
+      if (!task) return { ...common, error: `Task not found: ${args.id}` };
+      const reports = Array.isArray(task.crmVerificationReports) ? task.crmVerificationReports : [];
+      const report = reports[0];
+      if (!report) {
+        return {
+          ...common,
+          taskId: task.id,
+          hasReport: false,
+          report: null,
+          message: 'No Dataverse verification report is stored for this task. Run run_dataverse_check_for_task first.',
+        };
+      }
+      return {
+        ...common,
+        taskId: task.id,
+        hasReport: true,
+        report: {
+          id: report.id,
+          createdAt: report.createdAt ?? report.generatedAt,
+          filePath: report.filePath,
+          verdict: report.verdict ?? report.status ?? 'unknown',
+          metadataVerdict: report.metadataVerdict,
+          summary: summarize(report.summary ?? report.message ?? ''),
+          issueCount: Array.isArray(report.issues) ? report.issues.length : (report.issueCount ?? 0),
+          inspectedEntities: Array.isArray(report.inspectedEntities) ? report.inspectedEntities : [],
+          confirmedCount: Array.isArray(report.confirmedReferences) ? report.confirmedReferences.length : 0,
+          missingCount: Array.isArray(report.missingReferences) ? report.missingReferences.length : 0,
+          ambiguousCount: Array.isArray(report.ambiguousReferences) ? report.ambiguousReferences.length : 0,
+          runtimeReadiness: report.runtimeReadiness,
+          compileReadiness: report.compileReadiness ? {
+            canCompile: report.compileReadiness.canCompile,
+            missingUsings: Array.isArray(report.compileReadiness.missingUsings) ? report.compileReadiness.missingUsings : [],
+          } : undefined,
+        },
+      };
+    }
+    case 'get_external_action_proposal': {
+      const task = getTaskById(tasks, args.id);
+      if (!task) return { ...common, error: `Task not found: ${args.id}` };
+      const workflow = asObject(task.crmDeveloperWorkflow);
+      const plan = asObject(workflow.technicalPlan);
+      const preview = Array.isArray(plan.externalActionPreview) ? plan.externalActionPreview : [];
+      const approval = approvalSummary(workflow.externalActionApproval);
+      const execution = sanitizeExternalExecution(workflow.externalExecution);
+      const hasProposal = preview.length > 0 || Object.keys(asObject(workflow.externalActionApproval)).length > 0;
+      if (!hasProposal && !execution) {
+        return {
+          ...common,
+          taskId: task.id,
+          hasProposal: false,
+          message: 'No external action proposal is present for this task. A technical plan with externalActionPreview is needed first.',
+        };
+      }
+      return {
+        ...common,
+        taskId: task.id,
+        hasProposal: true,
+        externalActionPreview: preview,
+        approval,
+        execution: execution ?? null,
+      };
+    }
+    case 'get_implementation_verification_state': {
+      const task = getTaskById(tasks, args.id);
+      if (!task) return { ...common, error: `Task not found: ${args.id}` };
+      const impl = asObject(task.implementationVerification);
+      return {
+        ...common,
+        taskId: task.id,
+        buildCheck: impl.buildCheck ?? null,
+        dataverseCheck: impl.dataverseCheck ?? null,
+        aiCodeReview: impl.aiCodeReview ?? null,
+        localTest: impl.localTest ?? null,
+        localTestRecord: task.localTestRecord ?? null,
+        consultantTestRecord: task.consultantTestRecord ?? null,
+        updatedAt: impl.updatedAt ?? null,
+      };
+    }
+    case 'get_implementation_readiness': {
+      const task = getTaskById(tasks, args.id);
+      if (!task) return { ...common, error: `Task not found: ${args.id}` };
+      return { ...common, taskId: task.id, ...computeImplementationReadiness(task) };
     }
     case 'get_power_platform_ai_kit_status': {
       const settings = await loadSettings();
@@ -1539,5 +1894,8 @@ process.stdin.on('data', (chunk) => {
 });
 
 process.stdin.on('end', () => {
-  pendingRequests.finally(() => process.exit(0));
+  if (!process.env.VITEST) pendingRequests.finally(() => process.exit(0));
 });
+
+// Named exports for unit tests. Does not affect runtime behaviour when executed as a script.
+export { READ_ONLY_TOOL_NAMES, TOOL_DEFINITIONS, callToolFallback };

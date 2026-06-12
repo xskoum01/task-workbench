@@ -6530,4 +6530,64 @@ body {
   margin-bottom: 4px;
 }
 
+/* ============================================================
+   Copy AI workflow prompt button
+   ============================================================ */
+
+/* Title row wrappers — flex containers that hold the title text + copy button */
+.detail-panel-title-row {
+  display: flex;
+  align-items: flex-start;
+  gap: 6px;
+}
+
+.planning-task-title-row,
+.task-list-item-title-row {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  min-width: 0; /* required so the ellipsis title shrinks instead of overflowing */
+}
+
+/* The button itself — hidden in list/planning rows until row hover */
+.copy-ai-prompt-btn {
+  background: var(--bg-overlay);
+  border: 1px solid var(--border);
+  color: var(--text-secondary);
+  cursor: pointer;
+  padding: 2px 5px;
+  border-radius: var(--radius-sm);
+  display: inline-flex;
+  align-items: center;
+  flex-shrink: 0;
+  opacity: 0;
+  transition: opacity 0.12s, background 0.12s, color 0.12s, border-color 0.12s;
+}
+
+/* Reveal fully when the parent row is hovered */
+.planning-task-row:hover .copy-ai-prompt-btn,
+.task-list-item:hover .copy-ai-prompt-btn {
+  opacity: 1;
+}
+
+/* Button-level hover: stronger border + primary text */
+.copy-ai-prompt-btn:hover {
+  background: var(--bg-hover);
+  border-color: var(--text-secondary);
+  color: var(--text-primary);
+  opacity: 1;
+}
+
+/* Detail variant — always visible in the task detail header */
+.copy-ai-prompt-btn--detail {
+  opacity: 1;
+  margin-top: 3px; /* align with the large title baseline */
+}
+
+.copy-ai-prompt-btn--detail:hover {
+  background: var(--bg-hover);
+  border-color: var(--accent);
+  color: var(--accent-hover);
+}
+
 .td-advanced-btn:hover { color: var(--text-secondary); }

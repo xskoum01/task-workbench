@@ -1,4 +1,4 @@
-﻿import { useState, useEffect, useRef } from 'react';
+﻿import { useState, useEffect, useRef, useMemo } from 'react';
 import type {
   Task,
   TaskStatus,
@@ -37,6 +37,8 @@ import * as tauriApi from '../lib/tauriCommands';
 import { openReviewTarget } from '../lib/openReviewTarget';
 import { formatTaskActivityNotes, splitTaskNotes } from '../lib/taskActivityFormatter';
 import { WorkflowStepper } from './WorkflowStepper';
+import CopyAiWorkflowPromptButton from './CopyAiWorkflowPromptButton';
+import { getDeveloperReadiness } from '../lib/developerReadiness';
 import GitCommitModal from './GitCommitModal';
 import { buildTaskWorkflowPlan } from '../lib/workflowPlan';
 import type { TaskWorkflowPlan } from '../lib/workflowPlan';
@@ -96,6 +98,7 @@ import {
 import TaskModeSwitch from './TaskModeSwitch';
 import { getAiKitWorkflowState } from '../lib/aiKitWorkflow';
 import { selectImplReviewSource } from '../lib/implReviewSource';
+import { mergeWithDefaults, selectReviewer, inferReviewSource } from '../lib/aiReviewers';
 import { inferTaskMode } from '../lib/taskMode';
 import { BUCKET_META, computePlanning, effectiveBucket } from '../lib/planning';
 import { isOverdue, formatRelativeDate } from '../lib/dates';
@@ -794,8 +797,8 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
     setScriptFileCreating(false);
     setScriptAndImplementLoading(false);
   }, [task.id]);
-  // AI Code Review — modal state for viewing a saved review
-  const [showSavedReviewModal, setShowSavedReviewModal] = useState(false);
+  // AI Code Review — which saved review is open in the detail modal (null = closed)
+  const [savedReviewModal, setSavedReviewModal] = useState<AiFileReviewResult | null>(null);
   const [showCrmSkeletonModal, setShowCrmSkeletonModal] = useState(false);
   const [showCrmVerificationModal, setShowCrmVerificationModal] = useState(false);
   const [showPrimarchVerifyModal, setShowPrimarchVerifyModal] = useState(false);
@@ -809,7 +812,6 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
       ?? task.scriptAnalysis?.entityLogicalName
       ?? '',
   );
-  const latestReview = task.aiFileReviews?.[0];
   const latestCrmSkeleton = task.crmSkeletons?.[0];
   const latestCrmVerification = task.crmVerificationReports?.[0];
   const isCreateIntent = task.workflowSetup?.workIntent === 'create';
@@ -1519,6 +1521,11 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
   // Pass the heuristic devTarget kind so tasks without confirmed setup still work.
   const plan = buildTaskWorkflowPlan(task, heuristicDevTarget.kind);
   const { mode: effectiveMode } = inferTaskMode(task);
+
+  // Developer implementation readiness — used to show blockers and drive prompt content.
+  const devReadiness = useMemo(() => getDeveloperReadiness(task), [task]);
+  const showDevReadiness = effectiveMode === 'developer'
+    && (devTarget.kind === 'plugin' || devTarget.kind === 'script');
 
   // AI Kit guided workflow state — derived from task notes, reviews, and settings.
   const resolvedArtifactForAiKit = task.workflowSetup?.artifactPath ?? task.workflowSetup?.scriptPath;
@@ -2529,6 +2536,79 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
     }
   }
 
+  /** Shared: resolves git/file review contexts for both AI review buttons. */
+  async function resolveImplReviewContexts(artifactPath: string | null) {
+    const repoCandidates = [
+      task.workflowSetup?.repositoryRoot,
+      customer?.resolvedRepositoryPath,
+      customer?.repositoryRoot,
+      pluginsDir,
+    ].filter((p): p is string => !!p);
+
+    let repoRootForArtifact: string | undefined;
+    if (artifactPath) {
+      for (const candidate of repoCandidates) {
+        const hasGit = await tauriApi.checkPathExists(
+          `${candidate.replace(/[\\/]+$/, '')}/.git`
+        ).catch(() => false);
+        if (hasGit) { repoRootForArtifact = candidate; break; }
+      }
+      if (!repoRootForArtifact) {
+        const norm  = artifactPath.replace(/\\/g, '/');
+        const parts = norm.split('/');
+        for (let i = parts.length - 1; i > 0; i--) {
+          const candidate = parts.slice(0, i).join('/');
+          if (!candidate) break;
+          const hasGit = await tauriApi.checkPathExists(`${candidate}/.git`).catch(() => false);
+          if (hasGit) { repoRootForArtifact = candidate; break; }
+        }
+      }
+    }
+
+    let fileGitCtx: tauriApi.GitFileReviewContext | null = null;
+    if (artifactPath && repoRootForArtifact) {
+      try {
+        fileGitCtx = await tauriApi.collectGitFileReviewContext(repoRootForArtifact, artifactPath);
+      } catch { /* not a git repo or command failed */ }
+    }
+
+    let fileContent: string | null = null;
+    if (artifactPath && !fileGitCtx?.diff.trim()) {
+      try { fileContent = await tauriApi.readFileContent(artifactPath); } catch { /* ignore */ }
+    }
+
+    let branchGitCtx: tauriApi.GitReviewContext | null = null;
+    if (!artifactPath) {
+      for (const candidate of repoCandidates) {
+        try {
+          const ctx = await tauriApi.collectGitReviewContext(candidate);
+          if (ctx.diff.trim() || (ctx.changedFiles ?? []).length > 0) {
+            branchGitCtx = ctx;
+            break;
+          }
+        } catch { /* not a git repo — try next */ }
+      }
+    }
+
+    return selectImplReviewSource(artifactPath, fileGitCtx, fileContent, branchGitCtx);
+  }
+
+  /** Shared: flattens structured AI review result into a string array for findings storage. */
+  function flattenImplReviewFindings(result: AiFileReviewResult): string[] {
+    if (!result.structured) {
+      return result.markdown ? [result.markdown.slice(0, 400)] : [];
+    }
+    return [
+      ...(result.structured.comments ?? []).map((c) => {
+        const loc       = c.lineStart ? ` (ř.${c.lineStart})` : '';
+        const firstLine = (c.problem ?? '').split('\n')
+          .find((l) => l.trim().startsWith('-'))?.replace(/^-\s*/, '') ?? c.problem ?? '';
+        return `[${c.severity}] ${c.title}${loc}: ${firstLine}`.slice(0, 200);
+      }),
+      ...(result.structured.generalSuggestions ?? []).map((s) => String(s).slice(0, 200)),
+    ];
+  }
+
   /**
    * Runs AI internal code review using ONLY local read-only sources.
    *
@@ -2560,14 +2640,6 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
           aiKitCtx = await loadAiKitContext(aiKitPath, taskKind, true, true);
         } catch { /* AI Kit not configured or invalid */ }
       }
-
-      // Repo root candidates
-      const repoCandidates = [
-        setup?.repositoryRoot,
-        customer?.resolvedRepositoryPath,
-        customer?.repositoryRoot,
-        pluginsDir,
-      ].filter((p): p is string => !!p);
 
       // Shared context builder (used in all review modes)
       function buildInstructions(reviewMode: string, gitInfo?: string): string {
@@ -2662,73 +2734,8 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
         return ctx.join('\n');
       }
 
-      function flattenFindings(result: AiFileReviewResult): string[] {
-        if (!result.structured) {
-          return result.markdown ? [result.markdown.slice(0, 400)] : [];
-        }
-        return [
-          ...(result.structured.comments ?? []).map((c) => {
-            const loc = c.lineStart ? ` (ř.${c.lineStart})` : '';
-            const firstLine = (c.problem ?? '').split('\n')
-              .find((l) => l.trim().startsWith('-'))?.replace(/^-\s*/, '') ?? c.problem ?? '';
-            return `[${c.severity}] ${c.title}${loc}: ${firstLine}`.slice(0, 200);
-          }),
-          ...(result.structured.generalSuggestions ?? []).map((s) => String(s).slice(0, 200)),
-        ];
-      }
-
-      // ── Find repo root for the artifact file ──────────────────────────────
-      let repoRootForArtifact: string | undefined;
-      if (artifactPath) {
-        for (const candidate of repoCandidates) {
-          const hasGit = await tauriApi.checkPathExists(
-            `${candidate.replace(/[\\/]+$/, '')}/.git`
-          ).catch(() => false);
-          if (hasGit) { repoRootForArtifact = candidate; break; }
-        }
-        if (!repoRootForArtifact) {
-          const norm = artifactPath.replace(/\\/g, '/');
-          const parts = norm.split('/');
-          for (let i = parts.length - 1; i > 0; i--) {
-            const candidate = parts.slice(0, i).join('/');
-            if (!candidate) break;
-            const hasGit = await tauriApi.checkPathExists(`${candidate}/.git`).catch(() => false);
-            if (hasGit) { repoRootForArtifact = candidate; break; }
-          }
-        }
-      }
-
-      // ── File-specific git diff for the artifact ───────────────────────────
-      let fileGitCtx: tauriApi.GitFileReviewContext | null = null;
-      if (artifactPath && repoRootForArtifact) {
-        try {
-          fileGitCtx = await tauriApi.collectGitFileReviewContext(repoRootForArtifact, artifactPath);
-        } catch { /* not a git repo or command failed */ }
-      }
-
-      // ── File content for new/untracked/unchanged files ────────────────────
-      let fileContent: string | null = null;
-      if (artifactPath && !fileGitCtx?.diff.trim()) {
-        try { fileContent = await tauriApi.readFileContent(artifactPath); } catch { /* ignore */ }
-      }
-
-      // ── Branch diff — ONLY when no artifact is selected ──────────────────
-      // When an artifact is selected, we never send unrelated branch changes to AI.
-      let branchGitCtx: tauriApi.GitReviewContext | null = null;
-      if (!artifactPath) {
-        for (const candidate of repoCandidates) {
-          try {
-            const ctx = await tauriApi.collectGitReviewContext(candidate);
-            if (ctx.diff.trim() || (ctx.changedFiles ?? []).length > 0) {
-              branchGitCtx = ctx;
-              break;
-            }
-          } catch { /* not a git repo — try next */ }
-        }
-      }
-
-      // ── Select review source ──────────────────────────────────────────────
-      const source = selectImplReviewSource(artifactPath, fileGitCtx, fileContent, branchGitCtx);
+      // ── Resolve git/file contexts and select review source ───────────────
+      const source = await resolveImplReviewContexts(artifactPath);
 
       // ── Rules strings (reused across file-diff and file-content modes) ────
       const scriptDiffRules = [
@@ -2852,7 +2859,7 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
           ...(source.hasStaged    ? ['[info] Staged changes included'] : []),
           ...(source.hasUnstaged  ? ['[info] Unstaged changes included'] : []),
         ];
-        const findings = [...metaFindings, ...flattenFindings(result)];
+        const findings = [...metaFindings, ...flattenImplReviewFindings(result)];
 
         const now = new Date().toISOString();
         const existing = task.aiFileReviews ?? [];
@@ -2862,6 +2869,7 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
           reviewerName,
           filePath:     source.fileRelPath ?? fileLabel,
           reviewMode:   'change',
+          reviewSource: 'ai-kit',
         };
         await updateTask(task.id, {
           aiFileReviews: [reviewEntry, ...existing].slice(0, 5),
@@ -2911,7 +2919,7 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
           ? `Selected file content (new/untracked): ${fileLabel}`
           : `Selected file content: ${fileLabel}`;
         const metaFindings = [`Review source: ${sourceLabel}`];
-        const findings = [...metaFindings, ...flattenFindings(result)];
+        const findings = [...metaFindings, ...flattenImplReviewFindings(result)];
 
         const now = new Date().toISOString();
         const existing = task.aiFileReviews ?? [];
@@ -2921,6 +2929,7 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
           reviewerName,
           filePath:     source.fileRelPath ?? fileLabel,
           reviewMode:   'file',
+          reviewSource: 'ai-kit',
         };
         await updateTask(task.id, {
           aiFileReviews: [reviewEntry, ...existing].slice(0, 5),
@@ -2993,7 +3002,7 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
           ...(_noiseFiles.length   > 0  ? [`[warning] Noise files in diff: ${_noiseFiles.slice(0, 3).join(', ')}`] : []),
           ...(_flaggedPaths.length > 0  ? [`[warning] Flagged paths added: ${_flaggedPaths.join(', ')}`] : []),
         ];
-        const findings = [...metaFindings, ...flattenFindings(result)];
+        const findings = [...metaFindings, ...flattenImplReviewFindings(result)];
 
         const now = new Date().toISOString();
         const existing = task.aiFileReviews ?? [];
@@ -3003,6 +3012,7 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
           reviewerName,
           filePath:     fileName,
           reviewMode:   'change',
+          reviewSource: 'ai-kit',
         };
         await updateTask(task.id, {
           aiFileReviews: [reviewEntry, ...existing].slice(0, 5),
@@ -3025,6 +3035,221 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
       }
     } catch (e) {
       setFeedback(`AI code review failed: ${String(e)}`);
+      const now = new Date().toISOString();
+      await updateTask(task.id, {
+        implementationVerification: {
+          ...task.implementationVerification,
+          aiCodeReview: { status: 'failed', runAt: now, summary: `Review failed: ${String(e)}` },
+          updatedAt: now,
+        },
+      }).catch(() => {});
+    } finally {
+      setImplVerifyAiRunning(false);
+    }
+  }
+
+  /**
+   * Runs Implementation Verification AI review using the configured Settings reviewer profile.
+   * Does NOT load AI Kit context. Uses reviewer.instructions, model, temperature from Settings.
+   */
+  async function handleRunSettingsReviewerForImpl(): Promise<void> {
+    setImplVerifyAiRunning(true);
+    try {
+      const artifactPath = await resolveArtifactPath();
+      const isScript     = !!artifactPath && /\.[jt]s$/i.test(artifactPath);
+      const devMode: 'plugin' | 'script' = isScript ? 'script' : 'plugin';
+
+      const allReviewers = mergeWithDefaults(settings?.aiReviewers);
+      const reviewer     = selectReviewer(allReviewers, artifactPath ?? '', devMode);
+
+      if (!reviewer) {
+        const ext = artifactPath && artifactPath.lastIndexOf('.') >= 0
+          ? artifactPath.slice(artifactPath.lastIndexOf('.'))
+          : '';
+        setFeedback(
+          `No enabled Settings reviewer matches this file type${ext ? ` (${ext})` : ''}. Configure Settings → AI Reviewers.`
+        );
+        return;
+      }
+
+      const source      = await resolveImplReviewContexts(artifactPath);
+      const reviewerName = reviewer.name;
+      const instructions = reviewer.instructions;
+      const model        = reviewer.model ?? '';
+      const temperature  = reviewer.temperature ?? 0.2;
+
+      // ── Mode: file-diff ──────────────────────────────────────────────────
+      if (source.mode === 'file-diff') {
+        const fileLabel = source.fileRelPath
+          ?? artifactPath!.replace(/\\/g, '/').split('/').pop()
+          ?? 'file';
+
+        const result = await tauriApi.runAiChangeReview(
+          source.diff!,
+          task.title,
+          fileLabel,
+          reviewerName,
+          instructions,
+          model,
+          temperature,
+        );
+
+        const verdict    = result.structured?.verdict;
+        const implStatus = verdict === 'pass' ? 'passed' : verdict === 'needs_changes' ? 'failed' : 'warnings';
+
+        const branchLabel = source.currentBranch && source.baseBranch
+          ? ` (${source.currentBranch} › ${source.baseBranch})` : '';
+        const metaFindings: string[] = [
+          `Review source: Selected file diff (${fileLabel})`,
+          ...(branchLabel ? [`[info] Branch:${branchLabel}`] : []),
+          ...(source.hasCommitted ? ['[info] Committed branch changes included'] : []),
+          ...(source.hasStaged    ? ['[info] Staged changes included'] : []),
+          ...(source.hasUnstaged  ? ['[info] Unstaged changes included'] : []),
+        ];
+        const findings = [...metaFindings, ...flattenImplReviewFindings(result)];
+
+        const now = new Date().toISOString();
+        const existing = task.aiFileReviews ?? [];
+        const reviewEntry: AiFileReviewResult = {
+          ...result,
+          id:         `impl-review-${now}`,
+          reviewerName,
+          filePath:   source.fileRelPath ?? fileLabel,
+          reviewMode: 'change',
+          reviewSource: 'settings',
+        };
+        await updateTask(task.id, {
+          aiFileReviews: [reviewEntry, ...existing].slice(0, 5),
+          implementationVerification: {
+            ...task.implementationVerification,
+            aiCodeReview: {
+              status:   implStatus,
+              reviewId: reviewEntry.id,
+              runAt:    now,
+              summary:  result.structured?.summary ?? fileLabel,
+              findings,
+            },
+            updatedAt: now,
+          },
+        });
+        setFeedback(`Settings reviewer (file diff): ${implStatus}.`);
+
+      // ── Mode: file-content ───────────────────────────────────────────────
+      } else if (source.mode === 'file-content') {
+        const fileLabel  = source.fileRelPath
+          ?? artifactPath!.replace(/\\/g, '/').split('/').pop()
+          ?? 'file';
+
+        const result = await tauriApi.runAiFileReview(
+          artifactPath!,
+          reviewerName,
+          instructions,
+          model,
+          temperature,
+        );
+
+        const verdict    = result.structured?.verdict;
+        const implStatus = verdict === 'pass' ? 'passed' : verdict === 'needs_changes' ? 'failed' : 'warnings';
+
+        const sourceLabel = source.isUntracked
+          ? `Selected file content (new/untracked): ${fileLabel}`
+          : `Selected file content: ${fileLabel}`;
+        const findings = [`Review source: ${sourceLabel}`, ...flattenImplReviewFindings(result)];
+
+        const now = new Date().toISOString();
+        const existing = task.aiFileReviews ?? [];
+        const reviewEntry: AiFileReviewResult = {
+          ...result,
+          id:         `impl-review-${now}`,
+          reviewerName,
+          filePath:   source.fileRelPath ?? fileLabel,
+          reviewMode: 'file',
+          reviewSource: 'settings',
+        };
+        await updateTask(task.id, {
+          aiFileReviews: [reviewEntry, ...existing].slice(0, 5),
+          implementationVerification: {
+            ...task.implementationVerification,
+            aiCodeReview: {
+              status:   implStatus,
+              reviewId: reviewEntry.id,
+              runAt:    now,
+              summary:  result.structured?.summary ?? '',
+              findings,
+            },
+            updatedAt: now,
+          },
+        });
+        setFeedback(`Settings reviewer (file): ${implStatus}.`);
+
+      // ── Mode: branch-diff ────────────────────────────────────────────────
+      } else if (source.mode === 'branch-diff') {
+        const bCtx       = source.branchContext!;
+        const branchFrom = bCtx.currentBranch || 'unknown';
+        const branchTo   = bCtx.baseBranch    || 'unknown';
+        const fileName   = `local changes (${branchFrom} › ${branchTo})`;
+
+        const result = await tauriApi.runAiChangeReview(
+          bCtx.diff,
+          `${task.title}. ${bCtx.summary}`,
+          fileName,
+          reviewerName,
+          instructions,
+          model,
+          temperature,
+        );
+
+        const verdict    = result.structured?.verdict;
+        const implStatus = verdict === 'pass' ? 'passed' : verdict === 'needs_changes' ? 'failed' : 'warnings';
+
+        const _changedFiles  = bCtx.changedFiles    ?? [];
+        const _noiseFiles    = bCtx.noiseFiles      ?? [];
+        const _flaggedPaths  = bCtx.flaggedPaths    ?? [];
+        const _untrackedIncl = bCtx.untrackedIncluded ?? [];
+        const _untrackedSkip = bCtx.untrackedSkipped  ?? [];
+        const metaFindings: string[] = [
+          `Review source: Branch diff (${branchFrom} › ${branchTo})`,
+          `[info] Changed files (${_changedFiles.length}): ${_changedFiles.slice(0, 6).join(', ')}${_changedFiles.length > 6 ? '…' : ''}`,
+          ...(bCtx.hasStaged    ? ['[info] Staged changes included'] : []),
+          ...(bCtx.hasUnstaged  ? ['[info] Unstaged changes included'] : []),
+          ...(_untrackedIncl.length > 0 ? [`[info] Untracked files included (${_untrackedIncl.length}): ${_untrackedIncl.join(', ')}`] : []),
+          ...(_untrackedSkip.length > 0 ? [`[info] Untracked files skipped: ${_untrackedSkip.slice(0, 3).join(', ')}`] : []),
+          ...(_noiseFiles.length   > 0  ? [`[warning] Noise files in diff: ${_noiseFiles.slice(0, 3).join(', ')}`] : []),
+          ...(_flaggedPaths.length > 0  ? [`[warning] Flagged paths added: ${_flaggedPaths.join(', ')}`] : []),
+        ];
+        const findings = [...metaFindings, ...flattenImplReviewFindings(result)];
+
+        const now = new Date().toISOString();
+        const existing = task.aiFileReviews ?? [];
+        const reviewEntry: AiFileReviewResult = {
+          ...result,
+          id:         `impl-review-${now}`,
+          reviewerName,
+          filePath:   fileName,
+          reviewMode: 'change',
+          reviewSource: 'settings',
+        };
+        await updateTask(task.id, {
+          aiFileReviews: [reviewEntry, ...existing].slice(0, 5),
+          implementationVerification: {
+            ...task.implementationVerification,
+            aiCodeReview: {
+              status:   implStatus,
+              reviewId: reviewEntry.id,
+              runAt:    now,
+              summary:  result.structured?.summary ?? bCtx.summary,
+              findings,
+            },
+            updatedAt: now,
+          },
+        });
+        setFeedback(`Settings reviewer (branch diff): ${implStatus}.`);
+
+      } else {
+        setFeedback('No artifact file and no git repository found. Save a draft or configure the artifact path first.');
+      }
+    } catch (e) {
+      setFeedback(`Settings reviewer failed: ${String(e)}`);
       const now = new Date().toISOString();
       await updateTask(task.id, {
         implementationVerification: {
@@ -3224,7 +3449,10 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
           </button>
 
           <div className="detail-panel-header-content">
-            <div className="detail-panel-title">{task.title}</div>
+            <div className="detail-panel-title-row">
+              <div className="detail-panel-title">{task.title}</div>
+              <CopyAiWorkflowPromptButton task={task} variant="detail" onSuccess={setFeedback} />
+            </div>
             <div style={{ marginTop: 4, display: 'flex', gap: 6, alignItems: 'center' }}>
               <TypeBadge type={task.taskType} />
               <TaskStateBadges task={task} />
@@ -3609,6 +3837,42 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
             </div>
           )}
 
+          {/* IMPLEMENTATION READINESS */}
+          {showDevReadiness && (
+            <div className="detail-section">
+              <span className="detail-section-label">Implementation readiness</span>
+              {devReadiness.isReady ? (
+                <div style={{ fontSize: 12, color: '#3fb950', paddingTop: 2 }}>
+                  Ready for code generation
+                  {devReadiness.warnings.length > 0 && (
+                    <span style={{ color: '#d29922' }}> — review warnings</span>
+                  )}
+                </div>
+              ) : (
+                <div>
+                  <div style={{ fontSize: 11, color: '#8b949e', marginBottom: 4 }}>
+                    {devReadiness.blockers.length} issue{devReadiness.blockers.length !== 1 ? 's' : ''} blocking implementation
+                  </div>
+                  <ul style={{ margin: 0, padding: '0 0 0 14px' }}>
+                    {devReadiness.blockers.map((b: string, i: number) => (
+                      <li key={i} style={{ fontSize: 11, color: '#f85149', marginBottom: 2 }}>{b}</li>
+                    ))}
+                  </ul>
+                  <div style={{ fontSize: 11, color: '#8b949e', marginTop: 6 }}>
+                    Next: {devReadiness.recommendedNextStep}
+                  </div>
+                </div>
+              )}
+              {devReadiness.warnings.length > 0 && (
+                <ul style={{ margin: '6px 0 0 0', padding: '0 0 0 14px' }}>
+                  {devReadiness.warnings.map((w: string, i: number) => (
+                    <li key={i} style={{ fontSize: 11, color: '#d29922', marginBottom: 2 }}>{w}</li>
+                  ))}
+                </ul>
+              )}
+            </div>
+          )}
+
           {/* CRM DEVELOPER WORKFLOW — collapsed by default to reduce clutter */}
           {effectiveMode === 'developer' && (
             <div className="detail-section">
@@ -3733,94 +3997,113 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
             </div>
           )}
 
-          {/* AI Code Review — compact card showing the latest saved review */}
-          {latestReview && (
+          {/* AI Code Review — one compact card per saved review entry */}
+          {(task.aiFileReviews ?? []).length > 0 && (
             <div className="detail-section">
-              <span className="detail-section-label detail-ai-label">AI recenze kódu</span>
-              <div style={{
-                border: '1px solid var(--border-subtle)',
-                borderRadius: 4,
-                background: 'var(--bg-overlay)',
-                padding: '8px 10px',
-                display: 'flex',
-                flexDirection: 'column',
-                gap: 5,
-              }}>
-                {/* Top row: file name + verdict */}
-                <div style={{ display: 'flex', alignItems: 'center', gap: 6, flexWrap: 'wrap' }}>
-                  <span style={{ fontSize: 12, fontWeight: 600, color: 'var(--text-primary)', flex: 1, minWidth: 0,
-                    overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-                    {latestReview.structured?.fileName ??
-                      latestReview.filePath.replace(/\\/g, '/').split('/').pop() ?? latestReview.filePath}
-                  </span>
-                  {latestReview.structured?.verdict && (() => {
-                    const VERDICT_COLOR: Record<string, string> = {
-                      pass: '#3fb950', comment: '#388bfd', needs_changes: '#d29922',
-                    };
-                    const VERDICT_LABEL: Record<string, string> = {
-                      pass: 'Bez zásadních připomínek',
-                      comment: 'Komentář',
-                      needs_changes: 'Vyžaduje úpravy',
-                    };
-                    const v = latestReview.structured!.verdict;
-                    return (
-                      <span style={{
-                        fontSize: 10, fontWeight: 600, padding: '1px 6px',
-                        borderRadius: 3, letterSpacing: '0.04em',
-                        color: VERDICT_COLOR[v],
-                        border: `1px solid ${VERDICT_COLOR[v]}`,
-                        background: `color-mix(in srgb, ${VERDICT_COLOR[v]} 12%, var(--bg-surface))`,
-                      }}>{VERDICT_LABEL[v]}</span>
-                    );
-                  })()}
-                </div>
-                {/* Meta row */}
-                <div style={{ fontSize: 11, color: 'var(--text-muted)', display: 'flex', gap: 8, flexWrap: 'wrap', alignItems: 'center' }}>
-                  {latestReview.reviewMode && (
-                    <span style={{
-                      fontSize: 10, fontWeight: 600, padding: '1px 5px', borderRadius: 3,
-                      letterSpacing: '0.04em', border: '1px solid var(--border-subtle)',
-                      color: 'var(--text-muted)', background: 'var(--bg-surface)',
-                    }}>
-                      {latestReview.reviewMode === 'file' ? 'File review' : 'Change review'}
-                    </span>
-                  )}
-                  <span>Recenzent: {latestReview.reviewerName}</span>
-                  {latestReview.structured?.comments?.length != null && (
-                    <span>{latestReview.structured.comments.length} komentářů</span>
-                  )}
-                  {latestReview.reviewedAt && (
-                    <span>{formatRelativeDate(latestReview.reviewedAt)}</span>
-                  )}
-                </div>
-                {/* Summary preview */}
-                {latestReview.structured?.summary && (
-                  <p style={{ margin: 0, fontSize: 11, color: 'var(--text-secondary)',
-                    display: '-webkit-box', WebkitLineClamp: 2, WebkitBoxOrient: 'vertical',
-                    overflow: 'hidden' }}>
-                    {latestReview.structured.summary}
-                  </p>
-                )}
-                {/* Actions */}
-                <div style={{ display: 'flex', gap: 6, marginTop: 2 }}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 4 }}>
+                <span className="detail-section-label detail-ai-label" style={{ marginBottom: 0 }}>
+                  AI recenze kódu
+                </span>
+                {effectiveMode === 'developer' && plan.requiresDevTools && (
                   <button
-                    className="btn btn-secondary btn-sm"
-                    onClick={() => setShowSavedReviewModal(true)}
+                    className="btn btn-ghost btn-sm"
+                    onClick={() => devModePanelRef.current?.openReviewModal()}
                     type="button"
+                    title="Open the review panel to run a fresh review"
                   >
-                    <Icon name="search" size={11} /> Otevřít recenzi
+                    <Icon name="refresh-cw" size={11} /> Spustit znovu
                   </button>
-                  {effectiveMode === 'developer' && plan.requiresDevTools && (
-                    <button
-                      className="btn btn-ghost btn-sm"
-                      onClick={() => devModePanelRef.current?.openReviewModal()}
-                      type="button"
-                      title="Open the review panel to run a fresh review"
-                    >
-                      <Icon name="refresh-cw" size={11} /> Spustit znovu
-                    </button>
-                  )}
-                </div>
+                )}
+              </div>
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+                {(task.aiFileReviews ?? []).map((review, idx) => {
+                  const src = inferReviewSource(review);
+                  const VERDICT_COLOR: Record<string, string> = {
+                    pass: '#3fb950', comment: '#388bfd', needs_changes: '#d29922',
+                  };
+                  const VERDICT_LABEL: Record<string, string> = {
+                    pass: 'Bez zásadních připomínek',
+                    comment: 'Komentář',
+                    needs_changes: 'Vyžaduje úpravy',
+                  };
+                  const v = review.structured?.verdict;
+                  return (
+                    <div key={review.id ?? idx} style={{
+                      border: '1px solid var(--border-subtle)',
+                      borderRadius: 4,
+                      background: 'var(--bg-overlay)',
+                      padding: '8px 10px',
+                      display: 'flex',
+                      flexDirection: 'column',
+                      gap: 5,
+                    }}>
+                      {/* Top row: file name + source badge + verdict */}
+                      <div style={{ display: 'flex', alignItems: 'center', gap: 6, flexWrap: 'wrap' }}>
+                        <span style={{ fontSize: 12, fontWeight: 600, color: 'var(--text-primary)', flex: 1, minWidth: 0,
+                          overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                          {review.structured?.fileName ??
+                            review.filePath.replace(/\\/g, '/').split('/').pop() ?? review.filePath}
+                        </span>
+                        {src !== 'legacy' && (
+                          <span style={{
+                            fontSize: 10, fontWeight: 600, padding: '1px 5px', borderRadius: 3,
+                            letterSpacing: '0.04em', border: '1px solid var(--border-subtle)',
+                            color: src === 'ai-kit' ? 'var(--accent-fg, #388bfd)' : 'var(--text-muted)',
+                            background: 'var(--bg-surface)',
+                          }}>
+                            {src === 'ai-kit' ? 'AI Kit' : 'Settings'}
+                          </span>
+                        )}
+                        {v && (
+                          <span style={{
+                            fontSize: 10, fontWeight: 600, padding: '1px 6px',
+                            borderRadius: 3, letterSpacing: '0.04em',
+                            color: VERDICT_COLOR[v],
+                            border: `1px solid ${VERDICT_COLOR[v]}`,
+                            background: `color-mix(in srgb, ${VERDICT_COLOR[v]} 12%, var(--bg-surface))`,
+                          }}>{VERDICT_LABEL[v]}</span>
+                        )}
+                      </div>
+                      {/* Meta row */}
+                      <div style={{ fontSize: 11, color: 'var(--text-muted)', display: 'flex', gap: 8, flexWrap: 'wrap', alignItems: 'center' }}>
+                        {review.reviewMode && (
+                          <span style={{
+                            fontSize: 10, fontWeight: 600, padding: '1px 5px', borderRadius: 3,
+                            letterSpacing: '0.04em', border: '1px solid var(--border-subtle)',
+                            color: 'var(--text-muted)', background: 'var(--bg-surface)',
+                          }}>
+                            {review.reviewMode === 'file' ? 'File review' : 'Change review'}
+                          </span>
+                        )}
+                        <span>Recenzent: {review.reviewerName}</span>
+                        {review.structured?.comments?.length != null && (
+                          <span>{review.structured.comments.length} komentářů</span>
+                        )}
+                        {review.reviewedAt && (
+                          <span>{formatRelativeDate(review.reviewedAt)}</span>
+                        )}
+                      </div>
+                      {/* Summary preview */}
+                      {review.structured?.summary && (
+                        <p style={{ margin: 0, fontSize: 11, color: 'var(--text-secondary)',
+                          display: '-webkit-box', WebkitLineClamp: 2, WebkitBoxOrient: 'vertical',
+                          overflow: 'hidden' }}>
+                          {review.structured.summary}
+                        </p>
+                      )}
+                      {/* Actions */}
+                      <div style={{ display: 'flex', gap: 6, marginTop: 2 }}>
+                        <button
+                          className="btn btn-secondary btn-sm"
+                          onClick={() => setSavedReviewModal(review)}
+                          type="button"
+                        >
+                          <Icon name="search" size={11} /> Otevřít recenzi
+                        </button>
+                      </div>
+                    </div>
+                  );
+                })}
               </div>
             </div>
           )}
@@ -4891,6 +5174,7 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
           onRunBuildCheck={handleRunBuildCheckForImpl}
           onRunDataverseCheck={handleRunDataverseCheckForImpl}
           onRunAiCodeReview={handleRunAiCodeReviewForImpl}
+          onRunSettingsReviewer={handleRunSettingsReviewerForImpl}
           onUpdate={handleUpdateImplVerification}
           onContinueToTesting={handleContinueToTestingWithGate}
           onProceedToReview={async () => {
@@ -4908,7 +5192,13 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
             setFeedback(`Next step set: "${nextStep}"`);
             setShowImplVerifyModal(false);
           }}
-          onOpenAiReview={() => setShowSavedReviewModal(true)}
+          onOpenAiReview={() => {
+            const reviewId = task.implementationVerification?.aiCodeReview?.reviewId;
+            const target = reviewId
+              ? task.aiFileReviews?.find((r) => r.id === reviewId)
+              : task.aiFileReviews?.[0];
+            if (target) setSavedReviewModal(target);
+          }}
           onOpenDvReview={latestCrmVerification ? () => setShowCrmVerificationModal(true) : undefined}
           onResetDvCheck={handleResetDvCheck}
           onResetAiReview={handleResetAiReview}
@@ -4954,13 +5244,13 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
         />
       )}
 
-      {/* AI Code Review — full PR-style view of the latest saved review */}
-      {showSavedReviewModal && latestReview && (() => {
+      {/* AI Code Review — full PR-style view of the selected saved review */}
+      {savedReviewModal && (() => {
         // Determine whether this is a plugin review.
         // The reviewed file extension is the primary signal — it is stored on the
         // review result itself and cannot lie. devTargetKind is used only as a
         // tiebreaker when the extension is ambiguous (e.g. .ts could be either).
-        const reviewFilePath = latestReview.filePath ?? latestReview.structured?.filePath ?? '';
+        const reviewFilePath = savedReviewModal.filePath ?? savedReviewModal.structured?.filePath ?? '';
         const lowerReviewPath = reviewFilePath.toLowerCase();
         const reviewKind: 'plugin' | 'script' = (() => {
           // Extension wins for unambiguous types.
@@ -4983,11 +5273,11 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
           <Modal
             title="AI recenze kódu"
             size="xl"
-            onClose={() => setShowSavedReviewModal(false)}
+            onClose={() => setSavedReviewModal(null)}
             footer={
               <button
                 className="btn btn-secondary btn-sm"
-                onClick={() => setShowSavedReviewModal(false)}
+                onClick={() => setSavedReviewModal(null)}
                 type="button"
               >
                 Zavřít
@@ -4997,8 +5287,8 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
             <div className="ai-review-modal-body">
               <div className="ai-review-modal-result">
                 <AiReviewResultView
-                  structured={latestReview.structured}
-                  markdown={latestReview.markdown}
+                  structured={savedReviewModal.structured}
+                  markdown={savedReviewModal.markdown}
                   onOpenFile={handleReviewOpen}
                   openLabel={isPlugin ? 'Otevřít projekt' : 'Otevřít soubor'}
                   openTitle={isPlugin ? 'Otevře .sln ve Visual Studiu, pokud existuje.' : 'Otevře soubor ve VS Code.'}

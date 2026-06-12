@@ -18,6 +18,7 @@ import {
   groupByBucket,
 } from '../lib/planning';
 import { isOverdue, formatRelativeDate } from '../lib/dates';
+import CopyAiWorkflowPromptButton from './CopyAiWorkflowPromptButton';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -224,7 +225,10 @@ function PlanningTaskRow({ task, selected, onSelect }: PlanningTaskRowProps) {
     <button className={rowClass} onClick={() => onSelect(task.id)}>
       {/* Main content — same structure as task-list-item-main */}
       <div className="planning-task-main">
-        <div className="planning-task-title">{task.title}</div>
+        <div className="planning-task-title-row">
+          <div className="planning-task-title">{task.title}</div>
+          <CopyAiWorkflowPromptButton task={task} />
+        </div>
 
         <div className="planning-task-meta">
           <SourceBadge source={task.source} />

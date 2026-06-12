@@ -149,6 +149,7 @@ interface Props {
   /** Runs Dataverse check inline  no second modal. Returns when check is complete. */
   onRunDataverseCheck: () => Promise<void>;
   onRunAiCodeReview: () => Promise<void>;
+  onRunSettingsReviewer: () => Promise<void>;
   onUpdate: (iv: ImplementationVerification) => Promise<void>;
   onContinueToTesting: () => Promise<void>;
   onProceedToReview: () => Promise<void>;
@@ -171,7 +172,7 @@ export default function ImplementationVerificationModal({
   task, customer, selectedPluginProject, targetKind = 'plugin',
   resolvedArtifactPath, artifactInferred,
   buildCheckRunning, dataverseCheckRunning, aiCodeReviewRunning,
-  onRunBuildCheck, onRunDataverseCheck, onRunAiCodeReview,
+  onRunBuildCheck, onRunDataverseCheck, onRunAiCodeReview, onRunSettingsReviewer,
   onUpdate, onContinueToTesting, onProceedToReview, onUpdateNextStepAndClose,
   onOpenAiReview, onOpenDvReview, onResetDvCheck, onResetAiReview, onClose,
 }: Props) {
@@ -183,6 +184,7 @@ export default function ImplementationVerificationModal({
   const [reviewBusy,         setReviewBusy]         = useState(false);
   const [continueBusy,       setContinueBusy]       = useState(false);
   const [reviewConfirmPending, setReviewConfirmPending] = useState(false);
+  const [reviewRunKind, setReviewRunKind] = useState<'ai-kit' | 'settings' | null>(null);
 
   const iv           = task.implementationVerification;
   const bldStatus    = deriveBuildCheckStatus(task);
@@ -321,9 +323,16 @@ export default function ImplementationVerificationModal({
 
   // ---------------------------------------------------------------------------
 
-  async function handleAiReviewRun() {
+  async function handleAiKitReviewRun() {
+    setReviewRunKind('ai-kit');
     setBusy(true);
-    try { await onRunAiCodeReview(); } finally { setBusy(false); }
+    try { await onRunAiCodeReview(); } finally { setBusy(false); setReviewRunKind(null); }
+  }
+
+  async function handleSettingsReviewerRun() {
+    setReviewRunKind('settings');
+    setBusy(true);
+    try { await onRunSettingsReviewer(); } finally { setBusy(false); setReviewRunKind(null); }
   }
 
   async function handleAiManualVerify() {
@@ -659,11 +668,18 @@ export default function ImplementationVerificationModal({
           ) : (
             <div style={btnRow}>
               {aiStatus !== 'manually-verified' && !!artifactPath && (
-                <button className="btn btn-secondary btn-sm" onClick={handleAiReviewRun}
-                  disabled={anyBusy || aiCodeReviewRunning} type="button"
-                  title="Run AI internal code review against plugin conventions">
-                  {aiCodeReviewRunning ? <><span className="btn-spinner" /> Reviewing</> : <><Icon name="eye" size={12} /> Run AI Code Review</>}
-                </button>
+                <>
+                  <button className="btn btn-secondary btn-sm" onClick={handleAiKitReviewRun}
+                    disabled={anyBusy || aiCodeReviewRunning} type="button"
+                    title="Run AI Kit review using AI Kit rules and prompts">
+                    {(aiCodeReviewRunning && reviewRunKind === 'ai-kit') ? <><span className="btn-spinner" /> Reviewing</> : <><Icon name="eye" size={12} /> AI Kit Review</>}
+                  </button>
+                  <button className="btn btn-secondary btn-sm" onClick={handleSettingsReviewerRun}
+                    disabled={anyBusy || aiCodeReviewRunning} type="button"
+                    title="Run review using configured Settings reviewer profile">
+                    {(aiCodeReviewRunning && reviewRunKind === 'settings') ? <><span className="btn-spinner" /> Reviewing</> : <><Icon name="eye" size={12} /> Settings Reviewer</>}
+                  </button>
+                </>
               )}
               {latestAiReview && onOpenAiReview && (
                 <button className="btn btn-secondary btn-sm" onClick={onOpenAiReview}
