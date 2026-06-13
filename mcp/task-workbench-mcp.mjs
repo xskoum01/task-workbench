@@ -38,7 +38,57 @@ const READ_ONLY_TOOL_NAMES = new Set([
   'get_external_action_proposal',
   'get_implementation_verification_state',
   'get_implementation_readiness',
+  'get_task_templates',
 ]);
+
+/**
+ * Built-in task templates. Matched by title prefix or exact title match.
+ * The AI can use these to resolve missing setup fields automatically.
+ */
+const TASK_TEMPLATES = [
+  {
+    id: 'nvr-training-sh-script-prefill',
+    name: 'NVR Training Service Hub — Script: Předvyplnění servisního požadavku',
+    titlePattern: 'Script: Předvyplnění servisního požadavku',
+    mode: 'developer',
+    workKind: 'script',
+    actionType: 'create-new-script',
+    targetEntity: 'nvr_servicecase',
+    scriptTarget: {
+      entityLogicalName: 'nvr_servicecase',
+      eventName: 'onChange',
+      eventFieldName: 'nvr_assetid',
+    },
+    notes: 'onChange on nvr_assetid. Source entity: nvr_customerasset. Copy nvr_customerid, nvr_contactid, nvr_isunderwarranty, nvr_statuscustom → nvr_servicecase fields nvr_customerid, nvr_contactid, nvr_iswarrantycase. Solution: NVRTrainingServiceHubCore. App: nvr_trainingservicehub.',
+  },
+  {
+    id: 'nvr-training-sh-plugin-workorderline',
+    name: 'NVR Training Service Hub — Plugin: Výpočet částek na položce servisní zakázky',
+    titlePattern: 'Plugin: Výpočet částek na položce servisní zakázky',
+    mode: 'developer',
+    workKind: 'plugin',
+    actionType: 'create-new-plugin',
+    targetEntity: 'nvr_workorderline',
+    pluginTarget: {
+      entityLogicalName: 'nvr_workorderline',
+      messages: ['Create', 'Update'],
+      stage: 'PreOperation',
+      mode: 'Sync',
+      filteringAttributes: ['nvr_quantity', 'nvr_unitprice', 'nvr_discountpercent', 'nvr_vatpercent'],
+    },
+    notes: 'Compute nvr_netamount, nvr_vatamount, nvr_totalamount from input fields nvr_quantity, nvr_unitprice, nvr_discountpercent, nvr_vatpercent.',
+  },
+];
+
+/**
+ * Match a task title against template patterns. Returns the first matching template or null.
+ * Matching is substring-based and case-insensitive for robustness.
+ */
+function matchTaskTemplate(title) {
+  if (!title) return null;
+  const lower = String(title).toLowerCase();
+  return TASK_TEMPLATES.find((t) => lower.includes(t.titlePattern.toLowerCase())) ?? null;
+}
 
 const TOOL_DEFINITIONS = [
   {
@@ -339,15 +389,36 @@ const TOOL_DEFINITIONS = [
   },
   {
     name: 'set_task_developer_target',
-    description: 'Set developer target fields: repository root, plugin project, script path, customer. Does not scan or write any files.',
+    description: 'Set developer target fields: repository root, plugin project, script path, primary entity logical name, action type, event context, customer. Does not scan or write any files.',
     inputSchema: {
       type: 'object',
       properties: {
-        taskId:                { type: 'string' },
-        repositoryRoot:        { type: 'string' },
-        selectedPluginProject: { type: 'string' },
-        selectedScriptTarget:  { type: 'string' },
-        customerId:            { type: 'string' },
+        taskId:                     { type: 'string' },
+        repositoryRoot:             { type: 'string' },
+        selectedPluginProject:      { type: 'string' },
+        selectedScriptTarget:       { type: 'string' },
+        primaryEntityLogicalName:   {
+          type: 'string',
+          description: 'Primary Dataverse entity logical name (e.g. "account", "nvr_servicecase"). Saved to workflowSetup.primaryEntityLogicalName.',
+        },
+        actionType: {
+          type: 'string',
+          enum: ['create-new-script', 'update-existing-script', 'create-new-plugin', 'update-existing-plugin'],
+          description: 'What kind of artifact action this task performs.',
+        },
+        eventName: {
+          type: 'string',
+          description: 'Form event name (e.g. "onChange", "onLoad", "onSave"). Mirrors plan.target.eventName.',
+        },
+        eventFieldName: {
+          type: 'string',
+          description: 'Field/column logical name that triggers the event (for onChange events). Mirrors plan.target.eventFieldName.',
+        },
+        desiredScriptFile: {
+          type: 'string',
+          description: 'Desired output file name for a new script (e.g. "prefillServiceCase.js"). Used when action is create-new-script.',
+        },
+        customerId:                 { type: 'string' },
       },
       required: ['taskId'],
       additionalProperties: false,
@@ -793,6 +864,24 @@ const TOOL_DEFINITIONS = [
       additionalProperties: false,
     },
   },
+  {
+    name: 'get_task_templates',
+    description:
+      'Read-only. Returns built-in task templates that can be used to auto-resolve missing setup fields. ' +
+      'When a taskId is provided, also returns the matched template for that task based on title pattern. ' +
+      'Use this to discover default workKind, actionType, targetEntity, and other setup values for known task types. ' +
+      'Does NOT write anything.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        taskId: {
+          type: 'string',
+          description: 'Optional task ID. When provided, the response includes matchedTemplate for this task.',
+        },
+      },
+      additionalProperties: false,
+    },
+  },
 ];
 
 function getCliDataDir() {
@@ -899,6 +988,51 @@ async function loadSettings() {
   } catch {
     return null;
   }
+}
+
+async function resolveCustomersFile() {
+  for (const dir of defaultDataDirCandidates()) {
+    const filePath = path.join(dir, 'customers.json');
+    if (await fileExists(filePath)) return filePath;
+  }
+  return undefined;
+}
+
+async function loadCustomers() {
+  const customersFile = await resolveCustomersFile();
+  if (!customersFile) return [];
+  try {
+    const raw = await fs.readFile(customersFile, 'utf8');
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    return [];
+  }
+}
+
+function computeCustomerDevDefaults(customer, crmBaseDir) {
+  if (!customer) return null;
+  const repoRoot =
+    (customer.repositoryRootOverride && customer.repositoryRootOverride.trim()) ||
+    (customer.repositoryRoot && customer.repositoryRoot.trim()) ||
+    (customer.folderName && customer.folderName.trim() && crmBaseDir && crmBaseDir.trim()
+      ? `${crmBaseDir.replace(/[/\\]+$/, '')}/${customer.folderName.trim()}`
+      : null);
+  const scriptDirectory    = customer.scriptFolder        || null;
+  const pluginProjectPath  = customer.pluginFolder        || null;
+  const jsConventionsSource    = customer.jsConventionsSource    || null;
+  const pluginConventionsSource = customer.pluginConventionsSource || null;
+
+  if (!repoRoot && !scriptDirectory && !pluginProjectPath && !jsConventionsSource && !pluginConventionsSource) {
+    return null;
+  }
+  const result = {};
+  if (repoRoot)               result.repositoryRoot         = repoRoot;
+  if (scriptDirectory)        result.scriptDirectory        = scriptDirectory;
+  if (pluginProjectPath)      result.pluginProjectPath      = pluginProjectPath;
+  if (jsConventionsSource)    result.jsConventionsSource    = jsConventionsSource;
+  if (pluginConventionsSource) result.pluginConventionsSource = pluginConventionsSource;
+  return result;
 }
 
 async function loadTasks() {
@@ -1043,6 +1177,11 @@ function sanitizeWorkflowSetup(setup) {
     scriptPath: setup.scriptPath,
     artifactPath: setup.artifactPath,
     repositoryRoot: setup.repositoryRoot,
+    primaryEntityLogicalName: setup.primaryEntityLogicalName,
+    actionType: setup.actionType,
+    eventName: setup.eventName,
+    eventFieldName: setup.eventFieldName,
+    desiredScriptFile: setup.desiredScriptFile,
   };
 }
 
@@ -1536,6 +1675,14 @@ async function callToolFallback(name, args = {}) {
       if (!task) return { ...common, error: `Task not found: ${args.id}` };
       const detail = safeTaskDetail(task);
       detail.implementationReadiness = computeImplementationReadiness(task);
+      const customerId = task.customerId || task.workflowSetup?.customerId;
+      if (customerId) {
+        const [customers, settings] = await Promise.all([loadCustomers(), loadSettings()]);
+        const customer = customers.find((c) => c.id === customerId);
+        const crmBaseDir = settings?.crmBaseDirectory ?? '';
+        const devDefaults = computeCustomerDevDefaults(customer, crmBaseDir);
+        if (devDefaults) detail.customerDevDefaults = devDefaults;
+      }
       return { ...common, task: detail };
     }
     case 'get_task': {
@@ -1700,6 +1847,18 @@ async function callToolFallback(name, args = {}) {
         missingFiles,
         availableFiles: fileStatus.filter((f) => f.present).map((f) => f.file),
         statusMessage: valid ? 'Valid kit — all required files found.' : `Invalid kit: missing ${missingFiles.join(', ')}`,
+      };
+    }
+    case 'get_task_templates': {
+      let matchedTemplate = null;
+      if (args.taskId) {
+        const task = getTaskById(tasks, args.taskId);
+        if (task) matchedTemplate = matchTaskTemplate(task.title);
+      }
+      return {
+        ...common,
+        templates: TASK_TEMPLATES,
+        matchedTemplate: matchedTemplate ?? undefined,
       };
     }
     default:
@@ -1898,4 +2057,4 @@ process.stdin.on('end', () => {
 });
 
 // Named exports for unit tests. Does not affect runtime behaviour when executed as a script.
-export { READ_ONLY_TOOL_NAMES, TOOL_DEFINITIONS, callToolFallback };
+export { READ_ONLY_TOOL_NAMES, TOOL_DEFINITIONS, TASK_TEMPLATES, matchTaskTemplate, callToolFallback };

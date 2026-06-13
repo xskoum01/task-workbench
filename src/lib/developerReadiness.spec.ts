@@ -96,6 +96,13 @@ describe('getDeveloperReadiness — mode gate', () => {
     expect(r.isReady).toBe(false);
     expect(r.blockers[0]).toContain('Task mode is not set to Developer.');
   });
+
+  it('mode blocker is auto-resolvable', () => {
+    const r = getDeveloperReadiness(makeTask());
+    const blocker = r.categorizedBlockers.find(b => b.message.includes('Task mode'));
+    expect(blocker?.category).toBe('auto-resolvable');
+    expect(blocker?.mcpTool).toBe('set_task_mode');
+  });
 });
 
 describe('getDeveloperReadiness — work kind gate', () => {
@@ -144,6 +151,35 @@ describe('getDeveloperReadiness — work kind gate', () => {
     }));
     expect(r.blockers[0]).not.toContain('Work kind');
   });
+
+  it('work kind blocker is auto-resolvable when title mentions Script', () => {
+    const r = getDeveloperReadiness(makeTask({
+      taskMode: 'developer',
+      title: '[TEST] Script: Prefill service case',
+    }));
+    const blocker = r.categorizedBlockers.find(b => b.message.includes('Work kind'));
+    expect(blocker?.category).toBe('auto-resolvable');
+    expect(blocker?.mcpTool).toBe('set_task_work_classification');
+  });
+
+  it('work kind blocker is auto-resolvable when title mentions Plugin', () => {
+    const r = getDeveloperReadiness(makeTask({
+      taskMode: 'developer',
+      title: '[TEST] Plugin: Calculate amounts on work order line',
+    }));
+    const blocker = r.categorizedBlockers.find(b => b.message.includes('Work kind'));
+    expect(blocker?.category).toBe('auto-resolvable');
+    expect(blocker?.mcpTool).toBe('set_task_work_classification');
+  });
+
+  it('work kind blocker is hard when no dev keywords present', () => {
+    const r = getDeveloperReadiness(makeTask({
+      taskMode: 'developer',
+      title: '[TEST] Some unclear task',
+    }));
+    const blocker = r.categorizedBlockers.find(b => b.message.includes('Work kind'));
+    expect(blocker?.category).toBe('hard');
+  });
 });
 
 describe('getDeveloperReadiness — common checks', () => {
@@ -172,11 +208,64 @@ describe('getDeveloperReadiness — common checks', () => {
     expect(r.blockers).toContain('Repository root is not set.');
   });
 
+  it('repository root blocker is hard when no customer default exists', () => {
+    const r = getDeveloperReadiness(makeReadyPluginTask({
+      workflowSetup: { ...makeReadyPluginTask().workflowSetup, repositoryRoot: undefined },
+    }));
+    const blocker = r.categorizedBlockers.find(b => b.message.includes('Repository root'));
+    expect(blocker?.category).toBe('hard');
+  });
+
+  it('repository root blocker is auto-resolvable when customer has repositoryRoot', () => {
+    const customer = { id: 'c1', name: 'Acme', shortCode: 'ACM', repositoryRoot: 'C:/repos/Acme' } as const;
+    const r = getDeveloperReadiness(
+      makeReadyPluginTask({ workflowSetup: { ...makeReadyPluginTask().workflowSetup, repositoryRoot: undefined } }),
+      customer,
+    );
+    const blocker = r.categorizedBlockers.find(b => b.message.includes('Repository root'));
+    expect(blocker?.category).toBe('auto-resolvable');
+    expect(blocker?.mcpTool).toBe('set_task_developer_target');
+  });
+
+  it('repository root blocker is auto-resolvable when customer has resolvedRepositoryPath', () => {
+    const customer = { id: 'c1', name: 'Acme', shortCode: 'ACM', resolvedRepositoryPath: 'C:/resolved/Acme' } as const;
+    const r = getDeveloperReadiness(
+      makeReadyPluginTask({ workflowSetup: { ...makeReadyPluginTask().workflowSetup, repositoryRoot: undefined } }),
+      customer,
+    );
+    const blocker = r.categorizedBlockers.find(b => b.message.includes('Repository root'));
+    expect(blocker?.category).toBe('auto-resolvable');
+  });
+
+  it('repository root blocker stays hard when customer exists but has no repo path', () => {
+    const customer = { id: 'c1', name: 'Acme', shortCode: 'ACM' } as const;
+    const r = getDeveloperReadiness(
+      makeReadyPluginTask({ workflowSetup: { ...makeReadyPluginTask().workflowSetup, repositoryRoot: undefined } }),
+      customer,
+    );
+    const blocker = r.categorizedBlockers.find(b => b.message.includes('Repository root'));
+    expect(blocker?.category).toBe('hard');
+  });
+
+  it('no repository root blocker when workflowSetup.repositoryRoot is set regardless of customer', () => {
+    const customer = { id: 'c1', name: 'Acme', shortCode: 'ACM', repositoryRoot: 'C:/repos/Acme' } as const;
+    const r = getDeveloperReadiness(makeReadyPluginTask(), customer);
+    expect(r.blockers).not.toContain('Repository root is not set.');
+  });
+
   it('blocks when setup has not been confirmed', () => {
     const r = getDeveloperReadiness(makeReadyPluginTask({
       workflowSetup: { ...makeReadyPluginTask().workflowSetup, confirmedAt: undefined },
     }));
     expect(r.blockers).toContain('Developer setup has not been confirmed.');
+  });
+
+  it('setup confirmation blocker is approval-gate', () => {
+    const r = getDeveloperReadiness(makeReadyPluginTask({
+      workflowSetup: { ...makeReadyPluginTask().workflowSetup, confirmedAt: undefined },
+    }));
+    const blocker = r.categorizedBlockers.find(b => b.message.includes('confirmed'));
+    expect(blocker?.category).toBe('approval-gate');
   });
 
   it('blocks when technical plan is missing', () => {
@@ -186,11 +275,29 @@ describe('getDeveloperReadiness — common checks', () => {
     expect(r.blockers).toContain('Technical implementation plan is missing.');
   });
 
+  it('technical plan blocker is proposal (not hard)', () => {
+    const r = getDeveloperReadiness(makeReadyPluginTask({
+      crmDeveloperWorkflow: { detectedWorkKind: 'plugin', technicalPlan: undefined },
+    }));
+    const blocker = r.categorizedBlockers.find(b => b.message.includes('Technical implementation plan'));
+    expect(blocker?.category).toBe('proposal');
+    expect(blocker?.mcpTool).toBe('save_technical_plan');
+  });
+
   it('blocks when Dataverse verification has not run', () => {
     const r = getDeveloperReadiness(makeReadyPluginTask({
       crmVerificationReports: undefined,
     }));
     expect(r.blockers).toContain('Dataverse metadata verification has not been completed or explicitly skipped.');
+  });
+
+  it('Dataverse verification blocker is workflow-action (not hard)', () => {
+    const r = getDeveloperReadiness(makeReadyPluginTask({
+      crmVerificationReports: undefined,
+    }));
+    const blocker = r.categorizedBlockers.find(b => b.message.includes('Dataverse metadata'));
+    expect(blocker?.category).toBe('workflow-action');
+    expect(blocker?.mcpTool).toBe('run_dataverse_check_for_task');
   });
 
   it('accepts verdict=warnings as completed verification', () => {
@@ -273,6 +380,21 @@ describe('getDeveloperReadiness — plugin-specific checks', () => {
     expect(r.blockers).toContain('Target entity logical name is not set.');
   });
 
+  it('target entity blocker for plugin is proposal', () => {
+    const r = getDeveloperReadiness(makeReadyPluginTask({
+      workflowSetup: { ...makeReadyPluginTask().workflowSetup, primaryEntityLogicalName: undefined },
+      crmDeveloperWorkflow: {
+        ...makeReadyPluginTask().crmDeveloperWorkflow,
+        technicalPlan: {
+          ...makeReadyPluginTask().crmDeveloperWorkflow!.technicalPlan!,
+          target: { ...makeReadyPluginTask().crmDeveloperWorkflow!.technicalPlan!.target, entityLogicalName: undefined },
+        },
+      },
+    }));
+    const blocker = r.categorizedBlockers.find(b => b.message.includes('Target entity logical name is not set'));
+    expect(blocker?.category).toBe('proposal');
+  });
+
   it('blocks when message is missing from technical plan', () => {
     const base = makeReadyPluginTask();
     const r = getDeveloperReadiness(makeReadyPluginTask({
@@ -299,6 +421,21 @@ describe('getDeveloperReadiness — plugin-specific checks', () => {
       },
     }));
     expect(r.blockers.some(b => b.includes('Plugin registration') && b.includes('stage') && b.includes('mode'))).toBe(true);
+  });
+
+  it('plugin registration details blocker is proposal', () => {
+    const base = makeReadyPluginTask();
+    const r = getDeveloperReadiness(makeReadyPluginTask({
+      crmDeveloperWorkflow: {
+        ...base.crmDeveloperWorkflow,
+        technicalPlan: {
+          ...base.crmDeveloperWorkflow!.technicalPlan!,
+          target: { ...base.crmDeveloperWorkflow!.technicalPlan!.target, message: undefined },
+        },
+      },
+    }));
+    const blocker = r.categorizedBlockers.find(b => b.message.includes('Plugin registration'));
+    expect(blocker?.category).toBe('proposal');
   });
 });
 
@@ -348,6 +485,21 @@ describe('getDeveloperReadiness — script-specific checks', () => {
     expect(r.blockers).toContain('Target entity logical name (table) is not set.');
   });
 
+  it('target entity blocker for script is proposal', () => {
+    const r = getDeveloperReadiness(makeReadyScriptTask({
+      workflowSetup: { ...makeReadyScriptTask().workflowSetup, primaryEntityLogicalName: undefined },
+      crmDeveloperWorkflow: {
+        ...makeReadyScriptTask().crmDeveloperWorkflow,
+        technicalPlan: {
+          ...makeReadyScriptTask().crmDeveloperWorkflow!.technicalPlan!,
+          target: { ...makeReadyScriptTask().crmDeveloperWorkflow!.technicalPlan!.target, entityLogicalName: undefined },
+        },
+      },
+    }));
+    const blocker = r.categorizedBlockers.find(b => b.message.includes('Target entity logical name (table)'));
+    expect(blocker?.category).toBe('proposal');
+  });
+
   it('blocks when form/event info is missing and not marked manual-later', () => {
     const base = makeReadyScriptTask();
     const r = getDeveloperReadiness(makeReadyScriptTask({
@@ -365,6 +517,26 @@ describe('getDeveloperReadiness — script-specific checks', () => {
       },
     }));
     expect(r.blockers).toContain('Form/event registration details are not set. Add form name, event name, or mark as manual registration later.');
+  });
+
+  it('form/event blocker is proposal', () => {
+    const base = makeReadyScriptTask();
+    const r = getDeveloperReadiness(makeReadyScriptTask({
+      crmDeveloperWorkflow: {
+        ...base.crmDeveloperWorkflow,
+        technicalPlan: {
+          ...base.crmDeveloperWorkflow!.technicalPlan!,
+          target: {
+            ...base.crmDeveloperWorkflow!.technicalPlan!.target,
+            formName: undefined,
+            eventName: undefined,
+            functionName: undefined,
+          },
+        },
+      },
+    }));
+    const blocker = r.categorizedBlockers.find(b => b.message.includes('Form/event'));
+    expect(blocker?.category).toBe('proposal');
   });
 
   it('passes form/event check when eventName is set', () => {
@@ -434,7 +606,7 @@ describe('getDeveloperReadiness — JS script detection warning', () => {
   it('does not add JS warning when task text has no script indicators', () => {
     const r = getDeveloperReadiness(makeTask({
       taskMode: 'developer',
-      title: 'Update plugin for account',
+      title: 'Update something unclear',
     }));
     expect(r.warnings).toHaveLength(0);
     expect(r.recommendedNextStep).toContain('Set work classification to plugin or script');
@@ -507,6 +679,27 @@ describe('getDeveloperReadiness — actionType: create-new-script', () => {
     expect(r.blockers).toContain('Script creation requires a known target directory and file name. Set script path and desired file name.');
   });
 
+  it('create-new-script missing file blocker is proposal when repo root is known', () => {
+    const r = getDeveloperReadiness(makeReadyScriptTask({
+      workflowSetup: {
+        ...makeReadyScriptTask().workflowSetup,
+        scriptPath: 'src/scripts',
+        artifactPath: undefined,
+        actionType: 'create-new-script',
+        desiredScriptFile: undefined,
+      },
+      crmDeveloperWorkflow: {
+        ...makeReadyScriptTask().crmDeveloperWorkflow,
+        technicalPlan: {
+          ...makeReadyScriptTask().crmDeveloperWorkflow!.technicalPlan!,
+          target: { ...makeReadyScriptTask().crmDeveloperWorkflow!.technicalPlan!.target, scriptPath: undefined },
+        },
+      },
+    }));
+    const blocker = r.categorizedBlockers.find(b => b.message.includes('Script creation'));
+    expect(blocker?.category).toBe('proposal');
+  });
+
   it('recommendedNextStep points to setup for create blocker', () => {
     const r = getDeveloperReadiness(makeReadyScriptTask({
       workflowSetup: {
@@ -570,6 +763,26 @@ describe('getDeveloperReadiness — actionType: update-existing-script', () => {
       },
     }));
     expect(r.blockers).toContain('Script update requires a specific existing file path. Set script path to an existing .js file.');
+  });
+
+  it('update-existing-script missing specific file blocker is hard', () => {
+    const r = getDeveloperReadiness(makeReadyScriptTask({
+      workflowSetup: {
+        ...makeReadyScriptTask().workflowSetup,
+        scriptPath: 'src/scripts',
+        artifactPath: undefined,
+        actionType: 'update-existing-script',
+      },
+      crmDeveloperWorkflow: {
+        ...makeReadyScriptTask().crmDeveloperWorkflow,
+        technicalPlan: {
+          ...makeReadyScriptTask().crmDeveloperWorkflow!.technicalPlan!,
+          target: { ...makeReadyScriptTask().crmDeveloperWorkflow!.technicalPlan!.target, scriptPath: undefined },
+        },
+      },
+    }));
+    const blocker = r.categorizedBlockers.find(b => b.message.includes('Script update'));
+    expect(blocker?.category).toBe('hard');
   });
 
   it('recommendedNextStep points to setup for update blocker', () => {
@@ -643,5 +856,28 @@ describe('getDeveloperReadiness — recommendedNextStep', () => {
     }));
     expect(r.isReady).toBe(true);
     expect(r.recommendedNextStep).toContain('warnings');
+  });
+});
+
+describe('getDeveloperReadiness — categorizedBlockers structure', () => {
+  it('has categorizedBlockers array', () => {
+    const r = getDeveloperReadiness(makeTask());
+    expect(Array.isArray(r.categorizedBlockers)).toBe(true);
+  });
+
+  it('categorizedBlockers messages match blockers strings', () => {
+    const r = getDeveloperReadiness(makeReadyPluginTask({
+      crmDeveloperWorkflow: { detectedWorkKind: 'plugin', technicalPlan: undefined },
+      crmVerificationReports: undefined,
+    }));
+    const categorizedMessages = r.categorizedBlockers.map(b => b.message);
+    for (const blocker of r.blockers) {
+      expect(categorizedMessages).toContain(blocker);
+    }
+  });
+
+  it('fully ready task has empty categorizedBlockers', () => {
+    const r = getDeveloperReadiness(makeReadyPluginTask());
+    expect(r.categorizedBlockers).toHaveLength(0);
   });
 });

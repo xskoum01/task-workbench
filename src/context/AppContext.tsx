@@ -1,6 +1,6 @@
 import { createContext, useContext, useEffect, useState, useRef, useCallback } from 'react';
 import { listen } from '@tauri-apps/api/event';
-import type { Task, Customer, AppSettings, CreateRepoResult, CreateRepoOptions, TaskType, ClassificationState, PlanningBucket, AdoEmailContext } from '../types';
+import type { Task, Customer, AppSettings, CreateRepoResult, CreateRepoOptions, TaskType, ClassificationState, PlanningBucket, AdoEmailContext, TaskStorageStatus } from '../types';
 import * as api from '../lib/tauriCommands';
 import { defaultSettings } from '../data/mockData';
 import { OTHER_CUSTOMER, OTHER_CUSTOMER_ID } from '../data/mockData';
@@ -83,6 +83,11 @@ interface AppContextValue {
   error: string | null;
   /** True when the initial load from persistent storage failed. Saves are disabled until resolved. */
   taskLoadFailed: boolean;
+  /**
+   * Storage diagnostics loaded at startup. Non-null once the check completes.
+   * When `empty_with_nonempty_backups` is true, the UI should offer a restore action.
+   */
+  taskStorageStatus: TaskStorageStatus | null;
 
   // Task operations
   createTask: (draft: Omit<Task, 'id' | 'receivedAt' | 'suggestedActions'>) => Promise<void>;
@@ -90,6 +95,8 @@ interface AppContextValue {
   deleteTask: (id: string) => Promise<void>;
   /** Re-fetches tasks from storage. Useful after external writes (e.g. MCP tools). */
   reloadTasks: () => Promise<void>;
+  /** Restores the most-recent non-empty backup to tasks.json then reloads tasks. */
+  restoreTasksFromLatestBackup: () => Promise<void>;
 
   // Import pipeline — normalises, deduplicates, prefilters, and classifies
   importMessage: (input: ImportMessageInput) => Promise<ImportResult>;
@@ -247,9 +254,10 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
   const [customers, setCustomers] = useState<Customer[]>([]);
   const [settings, setSettings]   = useState<AppSettings>(defaultSettings);
   const [crmFolders, setCrmFolders] = useState<string[]>([]);
-  const [isLoading, setIsLoading]       = useState(true);
-  const [error, setError]               = useState<string | null>(null);
+  const [isLoading, setIsLoading]           = useState(true);
+  const [error, setError]                   = useState<string | null>(null);
   const [taskLoadFailed, setTaskLoadFailed] = useState(false);
+  const [taskStorageStatus, setTaskStorageStatus] = useState<TaskStorageStatus | null>(null);
 
   // tasksRef always holds the latest tasks array.
   // importMessage reads from this ref so concurrent imports don't capture
@@ -270,6 +278,9 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
           api.loadCustomers(),
           api.loadSettings(),
         ]);
+
+        // Storage diagnostics — non-critical, failure is silently ignored.
+        api.checkTaskStorage().then(setTaskStorageStatus).catch(() => undefined);
 
         // Reconcile stored M365 connection status with the actual token cache.
         if (loadedSettings.microsoftConnectionStatus === 'connected') {
@@ -1123,6 +1134,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
         isLoading,
         error,
         taskLoadFailed,
+        taskStorageStatus,
         createTask,
         updateTask,
         deleteTask,
@@ -1135,6 +1147,14 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
             setTaskLoadFailed(false);
             setError(null);
           }
+          // Refresh storage diagnostics after any reload.
+          api.checkTaskStorage().then(setTaskStorageStatus).catch(() => undefined);
+        },
+        restoreTasksFromLatestBackup: async () => {
+          await api.restoreTasksFromLatestBackup();
+          const updated = await api.loadTasks();
+          setTasks(updated);
+          api.checkTaskStorage().then(setTaskStorageStatus).catch(() => undefined);
         },
         importMessage,
         createCustomer,

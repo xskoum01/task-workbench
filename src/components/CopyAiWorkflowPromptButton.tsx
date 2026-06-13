@@ -1,10 +1,11 @@
 import { useState, useCallback } from 'react';
-import type { Task } from '../types';
+import type { Task, Customer } from '../types';
 import Icon from './Icon';
 import { buildAiWorkflowPrompt } from '../lib/aiWorkflowPrompt';
 
 interface Props {
   task: Task;
+  customer?: Customer;
   /** 'detail' shows the button with slightly higher baseline opacity; 'list' hides until row hover. */
   variant?: 'detail' | 'list';
   /** Called with the success message on copy, then with null after 2 s to allow auto-clear. */
@@ -15,6 +16,7 @@ interface Props {
 
 export default function CopyAiWorkflowPromptButton({
   task,
+  customer,
   variant = 'list',
   onSuccess,
   onError,
@@ -24,7 +26,7 @@ export default function CopyAiWorkflowPromptButton({
   const handleClick = useCallback(async (e: React.MouseEvent) => {
     e.stopPropagation();
     e.preventDefault();
-    const prompt = buildAiWorkflowPrompt(task);
+    const prompt = buildAiWorkflowPrompt(task, customer);
     try {
       await navigator.clipboard.writeText(prompt);
       setCopied(true);

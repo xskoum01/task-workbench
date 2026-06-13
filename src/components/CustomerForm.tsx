@@ -11,45 +11,51 @@ interface CustomerFormProps {
 }
 
 type FormState = {
-  name:               string;
-  shortCode:          string;
-  folderName:         string;
-  repositoryName:     string;
-  azureDevOpsRepoUrl: string;
-  repositoryRoot:     string;
-  pluginFolder:       string;
-  scriptFolder:       string;
-  namespace:          string;
-  notes:              string;
+  name:                    string;
+  shortCode:               string;
+  folderName:              string;
+  repositoryName:          string;
+  azureDevOpsRepoUrl:      string;
+  repositoryRoot:          string;
+  pluginFolder:            string;
+  scriptFolder:            string;
+  namespace:               string;
+  notes:                   string;
+  jsConventionsSource:     string;
+  pluginConventionsSource: string;
 };
 
 function blankForm(): FormState {
   return {
-    name:               '',
-    shortCode:          '',
-    folderName:         '',
-    repositoryName:     '',
-    azureDevOpsRepoUrl: '',
-    repositoryRoot:     '',
-    pluginFolder:       '',
-    scriptFolder:       '',
-    namespace:          '',
-    notes:              '',
+    name:                    '',
+    shortCode:               '',
+    folderName:              '',
+    repositoryName:          '',
+    azureDevOpsRepoUrl:      '',
+    repositoryRoot:          '',
+    pluginFolder:            '',
+    scriptFolder:            '',
+    namespace:               '',
+    notes:                   '',
+    jsConventionsSource:     '',
+    pluginConventionsSource: '',
   };
 }
 
 function customerToForm(c: Customer): FormState {
   return {
-    name:               c.name,
-    shortCode:          c.shortCode,
-    folderName:         c.folderName          ?? '',
-    repositoryName:     c.repositoryName      ?? '',
-    azureDevOpsRepoUrl: c.azureDevOpsRepoUrl  ?? '',
-    repositoryRoot:     c.repositoryRoot      ?? '',
-    pluginFolder:       c.pluginFolder        ?? '',
-    scriptFolder:       c.scriptFolder        ?? '',
-    namespace:          c.namespace           ?? '',
-    notes:              c.notes               ?? '',
+    name:                    c.name,
+    shortCode:               c.shortCode,
+    folderName:              c.folderName              ?? '',
+    repositoryName:          c.repositoryName          ?? '',
+    azureDevOpsRepoUrl:      c.azureDevOpsRepoUrl      ?? '',
+    repositoryRoot:          c.repositoryRoot          ?? '',
+    pluginFolder:            c.pluginFolder            ?? '',
+    scriptFolder:            c.scriptFolder            ?? '',
+    namespace:               c.namespace               ?? '',
+    notes:                   c.notes                   ?? '',
+    jsConventionsSource:     c.jsConventionsSource     ?? '',
+    pluginConventionsSource: c.pluginConventionsSource ?? '',
   };
 }
 
@@ -57,16 +63,18 @@ function customerToForm(c: Customer): FormState {
 function formToCustomer(form: FormState): Omit<Customer, 'id'> {
   const opt = (v: string) => v.trim() || undefined;
   return {
-    name:               form.name.trim(),
-    shortCode:          form.shortCode.trim().toUpperCase(),
-    folderName:         opt(form.folderName),
-    repositoryName:     opt(form.repositoryName),
-    azureDevOpsRepoUrl: opt(form.azureDevOpsRepoUrl),
-    repositoryRoot:     opt(form.repositoryRoot),
-    pluginFolder:       opt(form.pluginFolder),
-    scriptFolder:       opt(form.scriptFolder),
-    namespace:          opt(form.namespace),
-    notes:              opt(form.notes),
+    name:                    form.name.trim(),
+    shortCode:               form.shortCode.trim().toUpperCase(),
+    folderName:              opt(form.folderName),
+    repositoryName:          opt(form.repositoryName),
+    azureDevOpsRepoUrl:      opt(form.azureDevOpsRepoUrl),
+    repositoryRoot:          opt(form.repositoryRoot),
+    pluginFolder:            opt(form.pluginFolder),
+    scriptFolder:            opt(form.scriptFolder),
+    namespace:               opt(form.namespace),
+    notes:                   opt(form.notes),
+    jsConventionsSource:     opt(form.jsConventionsSource),
+    pluginConventionsSource: opt(form.pluginConventionsSource),
   };
 }
 
@@ -329,6 +337,26 @@ export default function CustomerForm({ initialData, onClose }: CustomerFormProps
                 placeholder={'…/Scripts  (leave blank to use <repo>/Scripts)'}
                 value={form.scriptFolder ?? ''}
                 onChange={(e) => set('scriptFolder', e.target.value)}
+              />
+            </div>
+            <div className="form-group">
+              <label className="form-label">JS Conventions Source</label>
+              <input
+                className="form-input"
+                type="text"
+                placeholder={'Path to a reference .js file for AI script conventions'}
+                value={form.jsConventionsSource ?? ''}
+                onChange={(e) => set('jsConventionsSource', e.target.value)}
+              />
+            </div>
+            <div className="form-group">
+              <label className="form-label">Plugin Conventions Source</label>
+              <input
+                className="form-input"
+                type="text"
+                placeholder={'Path to a reference .cs plugin file for AI plugin conventions'}
+                value={form.pluginConventionsSource ?? ''}
+                onChange={(e) => set('pluginConventionsSource', e.target.value)}
               />
             </div>
           </div>

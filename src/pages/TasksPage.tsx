@@ -43,7 +43,10 @@ const STATUS_FILTERS: { value: TaskStatus | 'all'; label: string }[] = [
 // ---------------------------------------------------------------------------
 
 export default function TasksPage() {
-  const { tasks, getCustomerById, updateTask, deleteTask, reloadTasks, taskLoadFailed, error } = useApp();
+  const {
+    tasks, getCustomerById, updateTask, deleteTask, reloadTasks,
+    taskLoadFailed, error, taskStorageStatus, restoreTasksFromLatestBackup,
+  } = useApp();
 
   const [viewMode, setViewMode]           = useState<ViewMode>('planning');
   const [filter, setFilter]               = useState<TaskStatus | 'all'>('all');
@@ -53,11 +56,25 @@ export default function TasksPage() {
   const [detailOpenId, setDetailOpenId]   = useState<string | null>(null);
   const [showTaskForm, setShowTaskForm]   = useState(false);
   const [confirmDeleteId, setConfirmDeleteId] = useState<string | null>(null);
-  const [reloading, setReloading] = useState(false);
+  const [reloading, setReloading]   = useState(false);
+  const [restoring, setRestoring]   = useState(false);
+  const [restoreError, setRestoreError] = useState<string | null>(null);
 
   async function handleReload() {
     setReloading(true);
     try { await reloadTasks(); } finally { setReloading(false); }
+  }
+
+  async function handleRestore() {
+    setRestoring(true);
+    setRestoreError(null);
+    try {
+      await restoreTasksFromLatestBackup();
+    } catch (err) {
+      setRestoreError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setRestoring(false);
+    }
   }
 
   function handleSelect(id: string) {
@@ -123,6 +140,45 @@ export default function TasksPage() {
           <strong style={{ color: '#ff6b6b' }}>Storage error:</strong>{' '}
           {error ?? 'Task data failed to load from disk.'}
           {' '}Saving is temporarily disabled to protect your data. Use the reload button to retry.
+        </div>
+      )}
+      {!taskLoadFailed && taskStorageStatus?.empty_with_nonempty_backups && (
+        <div style={{
+          background: '#3a2a00',
+          borderBottom: '1px solid #664a00',
+          color: '#f0c060',
+          padding: '8px 16px',
+          fontSize: 13,
+          lineHeight: 1.5,
+          display: 'flex',
+          alignItems: 'center',
+          gap: 12,
+        }}>
+          <span>
+            <strong style={{ color: '#ffcc44' }}>Tasks appear empty</strong>
+            {' '}but a backup with {taskStorageStatus.newest_backup_task_count} task
+            {taskStorageStatus.newest_backup_task_count !== 1 ? 's' : ''} was found.
+            {' '}This may indicate accidental data loss.
+            {restoreError && (
+              <span style={{ color: '#ff8888', marginLeft: 8 }}>Restore failed: {restoreError}</span>
+            )}
+          </span>
+          <button
+            onClick={handleRestore}
+            disabled={restoring}
+            style={{
+              background: '#664a00',
+              border: '1px solid #997000',
+              color: '#ffcc44',
+              padding: '3px 10px',
+              fontSize: 12,
+              cursor: restoring ? 'default' : 'pointer',
+              borderRadius: 3,
+              flexShrink: 0,
+            }}
+          >
+            {restoring ? 'Restoring...' : 'Restore from backup'}
+          </button>
         </div>
       )}
       <div className="page-content">

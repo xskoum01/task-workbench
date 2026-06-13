@@ -7,6 +7,7 @@ import type {
   Task,
   Customer,
   AppSettings,
+  TaskStorageStatus,
   TaskAnalysis,
   SkeletonPreview,
   GitInitStatus,
@@ -36,6 +37,21 @@ export function loadTasks(): Promise<Task[]> {
 
 export function saveTasks(tasks: Task[]): Promise<void> {
   return invoke('save_tasks', { tasks });
+}
+
+/** Explicitly clears all tasks. Bypasses the empty-overwrite guard. */
+export function clearAllTasks(): Promise<void> {
+  return invoke('clear_all_tasks');
+}
+
+/** Returns storage diagnostics: task count, backup count, restore-needed signal. */
+export function checkTaskStorage(): Promise<TaskStorageStatus> {
+  return invoke<TaskStorageStatus>('check_task_storage');
+}
+
+/** Restores the most-recent non-empty backup to tasks.json. Returns restored count. */
+export function restoreTasksFromLatestBackup(): Promise<number> {
+  return invoke<number>('restore_tasks_from_latest_backup');
 }
 
 export function loadCustomers(): Promise<Customer[]> {

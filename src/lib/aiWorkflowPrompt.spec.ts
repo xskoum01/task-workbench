@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import { buildAiWorkflowPrompt } from './aiWorkflowPrompt';
-import type { Task, CrmVerificationReport } from '../types';
+import type { Task, Customer, CrmVerificationReport } from '../types';
 
 // Minimal task — no developer mode set → produces setup prompt
 function makeTask(overrides: Partial<Task> = {}): Task {
@@ -161,6 +161,45 @@ describe('buildAiWorkflowPrompt — common header', () => {
     }));
     expect(prompt).toContain('Customer/environment: setup-customer');
   });
+
+  it('includes customer developer defaults section when customer has repositoryRoot', () => {
+    const customer = { id: 'c1', name: 'VSK-Test', shortCode: 'VSK', repositoryRoot: 'C:/repos/VSK' } as Customer;
+    const prompt = buildAiWorkflowPrompt(makeTask(), customer);
+    expect(prompt).toContain('Customer developer defaults (VSK-Test):');
+    expect(prompt).toContain('Default repository root: C:/repos/VSK');
+  });
+
+  it('prefers resolvedRepositoryPath over repositoryRoot in customer defaults', () => {
+    const customer = { id: 'c1', name: 'VSK-Test', shortCode: 'VSK', repositoryRoot: 'C:/repos/raw', resolvedRepositoryPath: 'C:/repos/resolved' } as Customer;
+    const prompt = buildAiWorkflowPrompt(makeTask(), customer);
+    expect(prompt).toContain('Default repository root: C:/repos/resolved');
+    expect(prompt).not.toContain('C:/repos/raw');
+  });
+
+  it('includes scriptFolder and pluginFolder in customer defaults when set', () => {
+    const customer = { id: 'c1', name: 'Acme', shortCode: 'ACM', repositoryRoot: 'C:/repos/Acme', scriptFolder: 'C:/repos/Acme/scripts', pluginFolder: 'C:/repos/Acme/plugins' } as Customer;
+    const prompt = buildAiWorkflowPrompt(makeTask(), customer);
+    expect(prompt).toContain('Default script directory: C:/repos/Acme/scripts');
+    expect(prompt).toContain('Default plugin project path: C:/repos/Acme/plugins');
+  });
+
+  it('includes jsConventionsSource and pluginConventionsSource in customer defaults when set', () => {
+    const customer = { id: 'c1', name: 'Acme', shortCode: 'ACM', repositoryRoot: 'C:/repos/Acme', jsConventionsSource: 'C:/repos/Acme/scripts/contact.js', pluginConventionsSource: 'C:/repos/Acme/plugins/ContactPlugin.cs' } as Customer;
+    const prompt = buildAiWorkflowPrompt(makeTask(), customer);
+    expect(prompt).toContain('JS conventions reference: C:/repos/Acme/scripts/contact.js');
+    expect(prompt).toContain('Plugin conventions reference: C:/repos/Acme/plugins/ContactPlugin.cs');
+  });
+
+  it('omits customer defaults section when customer has no relevant fields', () => {
+    const customer = { id: 'c1', name: 'Acme', shortCode: 'ACM' } as Customer;
+    const prompt = buildAiWorkflowPrompt(makeTask(), customer);
+    expect(prompt).not.toContain('Customer developer defaults');
+  });
+
+  it('omits customer defaults section when no customer is provided', () => {
+    const prompt = buildAiWorkflowPrompt(makeTask());
+    expect(prompt).not.toContain('Customer developer defaults');
+  });
 });
 
 describe('buildAiWorkflowPrompt — setup prompt (not ready)', () => {
@@ -206,6 +245,12 @@ describe('buildAiWorkflowPrompt — setup prompt (not ready)', () => {
     expect(prompt).toContain('up to 8 safe Task Workbench-only setup updates');
   });
 
+  it('includes auto-setup orchestration loop description', () => {
+    const prompt = buildAiWorkflowPrompt(makeTask());
+    expect(prompt).toContain('Auto-setup orchestration loop:');
+    expect(prompt).toContain('up to 8 safe Task Workbench-only setup actions');
+  });
+
   it('instructs AI to reload context and continue after safe work classification update', () => {
     const prompt = buildAiWorkflowPrompt(makeDevTask());
     expect(prompt).toContain('reload `get_task_full_context`, and continue');
@@ -246,6 +291,34 @@ describe('buildAiWorkflowPrompt — setup prompt (not ready)', () => {
     expect(prompt).not.toContain('Implementation rules');
     expect(prompt).not.toContain('Record local test results');
   });
+
+  it('separates blockers by category in setup prompt', () => {
+    const prompt = buildAiWorkflowPrompt(makeTask());
+    // Mode missing = auto-resolvable → appears under auto-resolvable section
+    expect(prompt).toContain('Auto-resolvable');
+  });
+
+  it('shows Dataverse check as read-only workflow action (not hard blocker)', () => {
+    const prompt = buildAiWorkflowPrompt(makeDevTask());
+    expect(prompt).toContain('Read-only workflow actions');
+    expect(prompt).toContain('run_dataverse_check_for_task');
+  });
+
+  it('shows technical plan as proposal action (not hard blocker)', () => {
+    const prompt = buildAiWorkflowPrompt(makeDevTask());
+    expect(prompt).toContain('Proposal/draft actions');
+    expect(prompt).toContain('save_technical_plan');
+  });
+
+  it('includes retry behavior instructions', () => {
+    const prompt = buildAiWorkflowPrompt(makeTask());
+    expect(prompt).toContain('Retry required MCP read calls up to 3 times');
+  });
+
+  it('mode blocker section mentions set_task_mode', () => {
+    const prompt = buildAiWorkflowPrompt(makeTask());
+    expect(prompt).toContain('set_task_mode');
+  });
 });
 
 describe('buildAiWorkflowPrompt — script context block', () => {
@@ -284,6 +357,98 @@ describe('buildAiWorkflowPrompt — script context block', () => {
 
   it('includes function name in script context', () => {
     expect(buildAiWorkflowPrompt(makeReadyScriptTask())).toContain('Function name: onAccountLoad');
+  });
+
+  it('falls back to workflowSetup.eventName when target.eventName is absent', () => {
+    const task = makeReadyScriptTask({
+      workflowSetup: {
+        devTargetKind: 'script',
+        repositoryRoot: 'C:/repos/CrmScripts',
+        scriptPath: 'C:/repos/CrmScripts/src/scripts/account_form.js',
+        primaryEntityLogicalName: 'account',
+        confirmedAt: '2026-06-01T10:00:00.000Z',
+        actionType: 'update-existing-script',
+        eventName: 'OnSave',
+      },
+      crmDeveloperWorkflow: {
+        detectedWorkKind: 'script',
+        technicalPlan: {
+          generatedAt: '2026-06-01T10:00:00.000Z',
+          workKind: 'script',
+          summary: 'Extend account form script.',
+          target: {
+            entityLogicalName: 'account',
+            scriptPath: 'C:/repos/CrmScripts/src/scripts/account_form.js',
+          },
+          implementationSteps: [],
+          dataverseFindings: [],
+          risks: [],
+          testChecklist: [],
+        },
+      },
+    });
+    expect(buildAiWorkflowPrompt(task)).toContain('Event: OnSave');
+  });
+
+  it('falls back to workflowSetup.eventFieldName when target.eventFieldName is absent', () => {
+    const task = makeReadyScriptTask({
+      workflowSetup: {
+        devTargetKind: 'script',
+        repositoryRoot: 'C:/repos/CrmScripts',
+        scriptPath: 'C:/repos/CrmScripts/src/scripts/account_form.js',
+        primaryEntityLogicalName: 'account',
+        confirmedAt: '2026-06-01T10:00:00.000Z',
+        actionType: 'update-existing-script',
+        eventFieldName: 'nvr_assetid',
+      },
+      crmDeveloperWorkflow: {
+        detectedWorkKind: 'script',
+        technicalPlan: {
+          generatedAt: '2026-06-01T10:00:00.000Z',
+          workKind: 'script',
+          summary: 'Extend account form script.',
+          target: {
+            entityLogicalName: 'account',
+            scriptPath: 'C:/repos/CrmScripts/src/scripts/account_form.js',
+          },
+          implementationSteps: [],
+          dataverseFindings: [],
+          risks: [],
+          testChecklist: [],
+        },
+      },
+    });
+    expect(buildAiWorkflowPrompt(task)).toContain('Event field (onChange): nvr_assetid');
+  });
+
+  it('prefers target.eventName over workflowSetup.eventName', () => {
+    const task = makeReadyScriptTask({
+      workflowSetup: {
+        devTargetKind: 'script',
+        repositoryRoot: 'C:/repos/CrmScripts',
+        scriptPath: 'C:/repos/CrmScripts/src/scripts/account_form.js',
+        primaryEntityLogicalName: 'account',
+        confirmedAt: '2026-06-01T10:00:00.000Z',
+        actionType: 'update-existing-script',
+        eventName: 'OnSave',
+      },
+      crmDeveloperWorkflow: {
+        detectedWorkKind: 'script',
+        technicalPlan: {
+          generatedAt: '2026-06-01T10:00:00.000Z',
+          workKind: 'script',
+          summary: 'Extend.',
+          target: { entityLogicalName: 'account', scriptPath: 'C:/repos/CrmScripts/src/scripts/account_form.js', eventName: 'OnLoad' },
+          implementationSteps: [],
+          dataverseFindings: [],
+          risks: [],
+          testChecklist: [],
+        },
+      },
+    });
+    const prompt = buildAiWorkflowPrompt(task);
+    expect(prompt).toContain('Event: OnLoad');
+    expect(prompt).not.toContain('Event: OnSave');
   });
 
   it('includes conventions reference in script context', () => {
@@ -382,5 +547,83 @@ describe('buildAiWorkflowPrompt — implementation prompt (ready task)', () => {
     expect(prompt).toContain('Implementation rules');
     expect(prompt).toContain('Warnings:');
     expect(prompt).toContain('Dataverse verification completed with warnings');
+  });
+});
+
+describe('buildAiWorkflowPrompt — template lookup instruction', () => {
+  it('instructs AI to call get_task_templates with the task ID in the opening sequence', () => {
+    const prompt = buildAiWorkflowPrompt(makeTask({ id: 'task-nvr-001' }));
+    expect(prompt).toContain('get_task_templates');
+    expect(prompt).toContain('"task-nvr-001"');
+  });
+
+  it('instructs AI to apply template values before evaluating missing metadata as blockers', () => {
+    const prompt = buildAiWorkflowPrompt(makeTask());
+    expect(prompt).toContain('apply its values');
+    expect(prompt).toContain('BEFORE evaluating which metadata fields are missing');
+  });
+
+  it('includes get_task_templates as setup rule 2 with apply-before-evaluate instruction', () => {
+    const prompt = buildAiWorkflowPrompt(makeTask());
+    expect(prompt).toContain('apply its workKind, actionType, targetEntity');
+    expect(prompt).toContain('BEFORE treating those fields as missing blockers');
+  });
+
+  it('setup rule 2 instructs reload after applying template values', () => {
+    const prompt = buildAiWorkflowPrompt(makeTask());
+    expect(prompt).toContain('Reload `get_task_full_context` after applying template values');
+  });
+
+  it('get_task_templates call appears in both the opening sequence and the setup rules', () => {
+    const prompt = buildAiWorkflowPrompt(makeTask({ id: 'task-abc' }));
+    const occurrences = (prompt.match(/get_task_templates/g) ?? []).length;
+    expect(occurrences).toBeGreaterThanOrEqual(2);
+  });
+});
+
+describe('buildAiWorkflowPrompt — setup prompt categorized sections', () => {
+  it('non-developer task auto-resolvable section includes set_task_mode call', () => {
+    const prompt = buildAiWorkflowPrompt(makeTask());
+    expect(prompt).toContain('Auto-resolvable');
+    expect(prompt).toContain('set_task_mode');
+  });
+
+  it('setup prompt contains hard blocker section for missing repo root', () => {
+    const prompt = buildAiWorkflowPrompt(makeDevTask());
+    expect(prompt).toContain('Hard blockers');
+    expect(prompt).toContain('Repository root is not set.');
+  });
+
+  it('setup prompt shows approval gate for missing confirmedAt when no other hard blockers', () => {
+    // Task with only confirmedAt missing (all other setup present)
+    const prompt = buildAiWorkflowPrompt(makeReadyTask({
+      workflowSetup: {
+        devTargetKind: 'plugin',
+        repositoryRoot: 'C:/repos/CrmPlugins',
+        pluginProject: 'Acme.Plugins',
+        primaryEntityLogicalName: 'account',
+        confirmedAt: undefined,
+      },
+    }));
+    expect(prompt).toContain('Approval gates');
+    expect(prompt).toContain('Developer setup has not been confirmed.');
+  });
+
+  it('NVR script task title triggers auto-resolvable work kind blocker', () => {
+    const prompt = buildAiWorkflowPrompt(makeTask({
+      taskMode: 'developer',
+      title: '[TEST] Script: Předvyplnění servisního požadavku podle zařízení',
+    }));
+    expect(prompt).toContain('Auto-resolvable');
+    expect(prompt).toContain('set_task_work_classification');
+  });
+
+  it('NVR plugin task title triggers auto-resolvable work kind blocker', () => {
+    const prompt = buildAiWorkflowPrompt(makeTask({
+      taskMode: 'developer',
+      title: '[TEST] Plugin: Výpočet částek na položce servisní zakázky',
+    }));
+    expect(prompt).toContain('Auto-resolvable');
+    expect(prompt).toContain('set_task_work_classification');
   });
 });

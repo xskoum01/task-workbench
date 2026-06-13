@@ -1523,7 +1523,7 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
   const { mode: effectiveMode } = inferTaskMode(task);
 
   // Developer implementation readiness — used to show blockers and drive prompt content.
-  const devReadiness = useMemo(() => getDeveloperReadiness(task), [task]);
+  const devReadiness = useMemo(() => getDeveloperReadiness(task, customer), [task, customer]);
   const showDevReadiness = effectiveMode === 'developer'
     && (devTarget.kind === 'plugin' || devTarget.kind === 'script');
 
@@ -3451,7 +3451,7 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
           <div className="detail-panel-header-content">
             <div className="detail-panel-title-row">
               <div className="detail-panel-title">{task.title}</div>
-              <CopyAiWorkflowPromptButton task={task} variant="detail" onSuccess={setFeedback} />
+              <CopyAiWorkflowPromptButton task={task} customer={customer} variant="detail" onSuccess={setFeedback} />
             </div>
             <div style={{ marginTop: 4, display: 'flex', gap: 6, alignItems: 'center' }}>
               <TypeBadge type={task.taskType} />

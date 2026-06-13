@@ -150,7 +150,7 @@ export interface InferWorkflowSetupInput {
 }
 
 export interface InferWorkflowSetupResult {
-  defaults: Required<Omit<WorkflowSetup, 'confirmedAt' | 'repositoryRoot' | 'artifactPath' | 'desiredPluginProject' | 'desiredScriptFile' | 'scriptFormRegistration' | 'actionType' | 'conventionsSource' | 'relatedExistingFiles'>> & {
+  defaults: Required<Omit<WorkflowSetup, 'confirmedAt' | 'repositoryRoot' | 'artifactPath' | 'desiredPluginProject' | 'desiredScriptFile' | 'scriptFormRegistration' | 'actionType' | 'conventionsSource' | 'relatedExistingFiles' | 'eventName' | 'eventFieldName'>> & {
     customerId: string;
     /** Inferred target JS file name for Create + Script (base name only). */
     desiredScriptFile?: string;

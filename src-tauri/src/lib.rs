@@ -91,7 +91,15 @@ fn hide_console_window(_cmd: &mut std::process::Command) {}
 
 #[tauri::command]
 fn load_tasks(app: tauri::AppHandle) -> Result<Value, String> {
-    let path = app_data_dir(&app)?.join("tasks.json");
+    let dir  = app_data_dir(&app)?;
+    let path = dir.join("tasks.json");
+
+    // Clean up any stale temp file left by an interrupted atomic write.
+    let tmp_path = path.with_extension("tmp");
+    if tmp_path.exists() {
+        let _ = fs::remove_file(&tmp_path);
+    }
+
     let value = read_json(&path)?;
     if value.is_null() {
         Ok(Value::Array(vec![]))
@@ -100,28 +108,85 @@ fn load_tasks(app: tauri::AppHandle) -> Result<Value, String> {
     }
 }
 
+/// Normal save — refuses to overwrite a non-empty tasks.json with an empty array.
+/// Use `clear_all_tasks` for an intentional reset.
 #[tauri::command]
 fn save_tasks(app: tauri::AppHandle, tasks: Value) -> Result<(), String> {
-    let dir  = app_data_dir(&app)?;
+    let dir = app_data_dir(&app)?;
+    save_tasks_impl(&dir, &tasks, false)
+}
+
+/// Explicitly clears all tasks.  Bypasses the empty-overwrite guard.
+/// Only called from an intentional "reset all data" UI action.
+#[tauri::command]
+fn clear_all_tasks(app: tauri::AppHandle) -> Result<(), String> {
+    let dir = app_data_dir(&app)?;
+    save_tasks_impl(&dir, &Value::Array(vec![]), true)
+}
+
+/// Core task-save logic.  `allow_empty_overwrite` must be true to replace a
+/// non-empty tasks.json with []; normal saves always pass false.
+fn save_tasks_impl(dir: &PathBuf, tasks: &Value, allow_empty_overwrite: bool) -> Result<(), String> {
     let path = dir.join("tasks.json");
 
-    // Create a timestamped backup before overwriting so data can be recovered if
-    // the write succeeds but the content was wrong (e.g. accidental empty array).
+    let existing_count = count_tasks_on_disk(&path)?;
+    let incoming_count = json_array_len(tasks);
+
+    // Guard: refuse to silently replace a non-empty store with an empty array.
+    // This is the second line of defence after the React-side load-failure guard.
+    if existing_count > 0 && incoming_count == 0 && !allow_empty_overwrite {
+        return Err(format!(
+            "ERR_EMPTY_OVERWRITE: refused to replace {} existing tasks with an empty array. \
+             Use the explicit clear_all_tasks action for an intentional reset.",
+            existing_count,
+        ));
+    }
+
+    // Backup the current file before overwriting.
     if path.exists() {
         let ts    = now_unix();
         let bname = format!("tasks.backup-{}.json", ts);
         fs::copy(&path, dir.join(&bname)).map_err(|e| format!("backup tasks.json: {}", e))?;
-        prune_task_backups(&dir, 5);
+        prune_task_backups(dir, 5);
     }
 
-    write_json(&path, &tasks)
+    // Atomic write: write to a temp file then rename so a crash mid-write
+    // leaves the previous tasks.json intact.
+    atomic_write_json(&path, tasks)
 }
 
-/// Keeps only the most-recent `keep` task backup files; silently removes older ones.
-fn prune_task_backups(dir: &PathBuf, keep: usize) {
+/// Writes JSON atomically: writes to a .tmp sibling then renames over the target.
+fn atomic_write_json(path: &PathBuf, value: &Value) -> Result<(), String> {
+    let tmp = path.with_extension("tmp");
+    let raw = serde_json::to_string_pretty(value).map_err(|e| e.to_string())?;
+    fs::write(&tmp, &raw).map_err(|e| format!("write temp: {}", e))?;
+    fs::rename(&tmp, path).map_err(|e| {
+        let _ = fs::remove_file(&tmp);
+        format!("atomic rename: {}", e)
+    })
+}
+
+/// Returns the number of items in a JSON array value; 0 for non-arrays.
+fn json_array_len(v: &Value) -> usize {
+    match v {
+        Value::Array(arr) => arr.len(),
+        _ => 0,
+    }
+}
+
+/// Reads tasks.json and counts items.  Returns 0 if the file does not exist.
+fn count_tasks_on_disk(path: &PathBuf) -> Result<usize, String> {
+    if !path.exists() {
+        return Ok(0);
+    }
+    Ok(json_array_len(&read_json(path)?))
+}
+
+/// Returns all tasks.backup-*.json paths in `dir`, sorted ascending by name.
+fn list_task_backups(dir: &PathBuf) -> Vec<PathBuf> {
     let entries = match fs::read_dir(dir) {
         Ok(e) => e,
-        Err(_) => return,
+        Err(_) => return vec![],
     };
     let mut backups: Vec<PathBuf> = entries
         .filter_map(|e| e.ok().map(|e| e.path()))
@@ -133,10 +198,89 @@ fn prune_task_backups(dir: &PathBuf, keep: usize) {
         })
         .collect();
     backups.sort();
+    backups
+}
+
+/// Keeps only the most-recent `keep` backup files; silently removes older ones.
+fn prune_task_backups(dir: &PathBuf, keep: usize) {
+    let mut backups = list_task_backups(dir);
     while backups.len() > keep {
         let _ = fs::remove_file(&backups[0]);
         backups.remove(0);
     }
+}
+
+/// Diagnostic info returned by `check_task_storage`.
+#[derive(Serialize)]
+struct TaskStorageStatus {
+    /// Tasks currently in tasks.json (0 if file is absent or empty).
+    task_count: usize,
+    /// Number of tasks.backup-*.json files present.
+    backup_count: usize,
+    /// True when tasks.json has 0 tasks but at least one backup has tasks.
+    /// Likely indicates accidental data loss that can be auto-restored.
+    empty_with_nonempty_backups: bool,
+    /// Task count in the most-recent non-empty backup, if any.
+    newest_backup_task_count: usize,
+}
+
+fn check_task_storage_impl(dir: &PathBuf) -> Result<TaskStorageStatus, String> {
+    let path = dir.join("tasks.json");
+
+    let task_count = if path.exists() { count_tasks_on_disk(&path)? } else { 0 };
+
+    let backups = list_task_backups(dir);
+    let backup_count = backups.len();
+
+    let mut newest_backup_task_count = 0usize;
+    let empty_with_nonempty_backups = if task_count == 0 && backup_count > 0 {
+        backups.iter().rev().any(|bp| {
+            if let Ok(v) = read_json(bp) {
+                let n = json_array_len(&v);
+                if n > 0 {
+                    newest_backup_task_count = n;
+                    return true;
+                }
+            }
+            false
+        })
+    } else {
+        false
+    };
+
+    Ok(TaskStorageStatus {
+        task_count,
+        backup_count,
+        empty_with_nonempty_backups,
+        newest_backup_task_count,
+    })
+}
+
+/// Returns storage diagnostics so the UI can warn the user when tasks.json is
+/// empty but non-empty backups exist (possible accidental data loss).
+#[tauri::command]
+fn check_task_storage(app: tauri::AppHandle) -> Result<TaskStorageStatus, String> {
+    let dir = app_data_dir(&app)?;
+    check_task_storage_impl(&dir)
+}
+
+/// Copies the most-recent non-empty tasks.backup-*.json back to tasks.json.
+/// Returns the number of tasks restored.
+#[tauri::command]
+fn restore_tasks_from_latest_backup(app: tauri::AppHandle) -> Result<usize, String> {
+    let dir  = app_data_dir(&app)?;
+    let path = dir.join("tasks.json");
+
+    let backups = list_task_backups(&dir);
+    let source = backups.iter().rev()
+        .find(|bp| read_json(bp).map(|v| json_array_len(&v) > 0).unwrap_or(false))
+        .ok_or_else(|| "No non-empty backup found to restore from".to_string())?
+        .clone();
+
+    let restored = read_json(&source)?;
+    let count    = json_array_len(&restored);
+    atomic_write_json(&path, &restored)?;
+    Ok(count)
 }
 
 // --- Customers -------------------------------------------------------------
@@ -7141,6 +7285,9 @@ fn task_mcp_implementation_readiness(task: &Value) -> Value {
 
 fn task_mcp_execute_tool(app: &tauri::AppHandle, tool_name: &str, args: &Value) -> Result<Value, String> {
     let mut tasks = task_mcp_load_tasks(app)?;
+    let customers = task_mcp_load_customers(app).unwrap_or_default();
+    let settings = load_settings(app.clone()).unwrap_or_else(|_| serde_json::json!({}));
+    let crm_base_dir = settings["crmBaseDirectory"].as_str().unwrap_or("").trim_end_matches('/').to_string();
     let mut updated = false;
 
     let result = match tool_name {
@@ -7532,6 +7679,17 @@ fn task_mcp_execute_tool(app: &tauri::AppHandle, tool_name: &str, args: &Value) 
             detail["pullRequestState"]         = task_mcp_pull_request_state(task.get("crmDeveloperWorkflow").unwrap_or(&Value::Null));
             detail["nextRecommendedStep"]      = task_mcp_next_recommended_step(task);
             detail["implementationReadiness"]  = task_mcp_implementation_readiness(task);
+
+            // Embed customer developer defaults so the AI can apply them without a separate tool call
+            let customer_id = task["customerId"].as_str()
+                .or_else(|| task["workflowSetup"]["customerId"].as_str())
+                .unwrap_or("");
+            if let Some(dev_defaults) = task_mcp_find_customer(&customers, customer_id)
+                .and_then(|c| task_mcp_customer_dev_defaults(c, &crm_base_dir))
+            {
+                detail["customerDevDefaults"] = dev_defaults;
+            }
+
             serde_json::json!({"task": detail})
         }
 
@@ -7721,13 +7879,36 @@ fn task_mcp_execute_tool(app: &tauri::AppHandle, tool_name: &str, args: &Value) 
             let task_id = args["taskId"].as_str().unwrap_or("").trim();
             if task_id.is_empty() { return Err("Missing required argument: taskId".to_string()); }
 
-            // Collect optional string fields and validate them for safety
-            let repo_root   = args["repositoryRoot"].as_str().map(str::trim).filter(|s| !s.is_empty());
-            let plugin_proj = args["selectedPluginProject"].as_str().map(str::trim).filter(|s| !s.is_empty());
-            let script_tgt  = args["selectedScriptTarget"].as_str().map(str::trim).filter(|s| !s.is_empty());
-            let customer_id = args["customerId"].as_str().map(str::trim).filter(|s| !s.is_empty());
+            // Collect optional string fields
+            let repo_root           = args["repositoryRoot"].as_str().map(str::trim).filter(|s| !s.is_empty());
+            let plugin_proj         = args["selectedPluginProject"].as_str().map(str::trim).filter(|s| !s.is_empty());
+            let script_tgt          = args["selectedScriptTarget"].as_str().map(str::trim).filter(|s| !s.is_empty());
+            let customer_id         = args["customerId"].as_str().map(str::trim).filter(|s| !s.is_empty());
+            let primary_entity      = args["primaryEntityLogicalName"].as_str().map(str::trim).filter(|s| !s.is_empty());
+            let action_type         = args["actionType"].as_str().map(str::trim).filter(|s| !s.is_empty());
+            let event_name          = args["eventName"].as_str().map(str::trim).filter(|s| !s.is_empty());
+            let event_field_name    = args["eventFieldName"].as_str().map(str::trim).filter(|s| !s.is_empty());
+            let desired_script_file = args["desiredScriptFile"].as_str().map(str::trim).filter(|s| !s.is_empty());
 
-            for (name, opt_val) in &[("repositoryRoot", repo_root), ("selectedPluginProject", plugin_proj), ("selectedScriptTarget", script_tgt)] {
+            const VALID_ACTION_TYPES: &[&str] = &[
+                "create-new-script", "update-existing-script",
+                "create-new-plugin", "update-existing-plugin",
+            ];
+            if let Some(at) = action_type {
+                if !VALID_ACTION_TYPES.contains(&at) {
+                    return Err(format!("actionType must be one of: {}", VALID_ACTION_TYPES.join(", ")));
+                }
+            }
+
+            for (name, opt_val) in &[
+                ("repositoryRoot", repo_root),
+                ("selectedPluginProject", plugin_proj),
+                ("selectedScriptTarget", script_tgt),
+                ("primaryEntityLogicalName", primary_entity),
+                ("eventName", event_name),
+                ("eventFieldName", event_field_name),
+                ("desiredScriptFile", desired_script_file),
+            ] {
                 if let Some(v) = opt_val {
                     if v.len() > 500 { return Err(format!("{name} exceeds 500 characters")); }
                     if v.contains(|c: char| matches!(c, '|' | '&' | ';' | '`' | '$' | '>' | '<' | '\n' | '\r')) {
@@ -7740,10 +7921,15 @@ fn task_mcp_execute_tool(app: &tauri::AppHandle, tool_name: &str, args: &Value) 
                 .ok_or_else(|| format!("Task not found: {task_id}"))?;
             let task = &mut tasks[index];
             if task["workflowSetup"].is_null() { task["workflowSetup"] = serde_json::json!({}); }
-            if let Some(v) = repo_root   { task["workflowSetup"]["repositoryRoot"] = serde_json::json!(v); }
-            if let Some(v) = plugin_proj { task["workflowSetup"]["pluginProject"]  = serde_json::json!(v); }
-            if let Some(v) = script_tgt  { task["workflowSetup"]["scriptPath"]     = serde_json::json!(v); }
-            if let Some(v) = customer_id { task["workflowSetup"]["customerId"]     = serde_json::json!(v); }
+            if let Some(v) = repo_root           { task["workflowSetup"]["repositoryRoot"]           = serde_json::json!(v); }
+            if let Some(v) = plugin_proj         { task["workflowSetup"]["pluginProject"]            = serde_json::json!(v); }
+            if let Some(v) = script_tgt          { task["workflowSetup"]["scriptPath"]               = serde_json::json!(v); }
+            if let Some(v) = customer_id         { task["workflowSetup"]["customerId"]               = serde_json::json!(v); }
+            if let Some(v) = primary_entity      { task["workflowSetup"]["primaryEntityLogicalName"] = serde_json::json!(v); }
+            if let Some(v) = action_type         { task["workflowSetup"]["actionType"]               = serde_json::json!(v); }
+            if let Some(v) = event_name          { task["workflowSetup"]["eventName"]                = serde_json::json!(v); }
+            if let Some(v) = event_field_name    { task["workflowSetup"]["eventFieldName"]           = serde_json::json!(v); }
+            if let Some(v) = desired_script_file { task["workflowSetup"]["desiredScriptFile"]        = serde_json::json!(v); }
             task_mcp_append_audit_note(task, "set_task_developer_target");
             updated = true;
             serde_json::json!({"task": task_mcp_safe_task_summary(task)})
@@ -11775,6 +11961,47 @@ fn task_mcp_load_customers(app: &tauri::AppHandle) -> Result<Vec<Value>, String>
     }
 }
 
+/// Finds the customer whose `id` matches the given customer_id.
+fn task_mcp_find_customer<'a>(customers: &'a [Value], customer_id: &str) -> Option<&'a Value> {
+    if customer_id.is_empty() { return None; }
+    customers.iter().find(|c| c["id"].as_str().unwrap_or("") == customer_id)
+}
+
+/// Builds a sanitized developer-defaults object from a customer.
+/// Returns None when no relevant defaults are configured.
+/// crm_base_dir is the global CRM base directory from settings (may be empty).
+fn task_mcp_customer_dev_defaults(customer: &Value, crm_base_dir: &str) -> Option<Value> {
+    // Priority: repositoryRootOverride → repositoryRoot → folderName + crm_base_dir.
+    // resolvedRepositoryPath is computed client-side and not persisted.
+    let repo_root: Option<String> = customer["repositoryRootOverride"].as_str()
+        .or_else(|| customer["repositoryRoot"].as_str())
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .or_else(|| {
+            let folder = customer["folderName"].as_str()?.trim();
+            if folder.is_empty() || crm_base_dir.is_empty() { return None; }
+            Some(format!("{}/{}", crm_base_dir.trim_end_matches('/'), folder))
+        });
+    let repo_root = repo_root.as_deref();
+    let script_dir   = customer["scriptFolder"].as_str().filter(|s| !s.is_empty());
+    let plugin_dir   = customer["pluginFolder"].as_str().filter(|s| !s.is_empty());
+    let js_conv      = customer["jsConventionsSource"].as_str().filter(|s| !s.is_empty());
+    let plugin_conv  = customer["pluginConventionsSource"].as_str().filter(|s| !s.is_empty());
+
+    if repo_root.is_none() && script_dir.is_none() && plugin_dir.is_none()
+        && js_conv.is_none() && plugin_conv.is_none() {
+        return None;
+    }
+
+    let mut obj = serde_json::json!({});
+    if let Some(v) = repo_root   { obj["repositoryRoot"]          = serde_json::json!(v); }
+    if let Some(v) = script_dir  { obj["scriptDirectory"]         = serde_json::json!(v); }
+    if let Some(v) = plugin_dir  { obj["pluginProjectPath"]       = serde_json::json!(v); }
+    if let Some(v) = js_conv     { obj["jsConventionsSource"]     = serde_json::json!(v); }
+    if let Some(v) = plugin_conv { obj["pluginConventionsSource"] = serde_json::json!(v); }
+    Some(obj)
+}
+
 /// Resolves the artifact (.cs) path for a task.
 ///
 /// Priority:
@@ -11876,6 +12103,181 @@ fn mcp_resolve_artifact_path(
         "Could not find a plugin project folder for '{}'. Set workflowSetup.artifactPath or workflowSetup.repositoryRoot.",
         project_name
     ))
+}
+
+#[cfg(test)]
+mod task_storage_tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    fn make_tasks(n: usize) -> Value {
+        let items: Vec<Value> = (0..n).map(|i| serde_json::json!({ "id": i })).collect();
+        Value::Array(items)
+    }
+
+    // ── guard: non-empty file cannot be overwritten with [] ─────────────────
+
+    #[test]
+    fn blocks_empty_overwrite_of_nonempty_file() {
+        let dir = TempDir::new().unwrap();
+        let d   = dir.path().to_path_buf();
+
+        save_tasks_impl(&d, &make_tasks(3), false).unwrap();
+
+        let result = save_tasks_impl(&d, &Value::Array(vec![]), false);
+        assert!(result.is_err(), "expected error when overwriting with []");
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("ERR_EMPTY_OVERWRITE"),
+            "expected ERR_EMPTY_OVERWRITE prefix in: {err}"
+        );
+        assert!(err.contains('3'), "expected existing count in error: {err}");
+
+        // tasks.json must still contain 3 tasks
+        assert_eq!(count_tasks_on_disk(&d.join("tasks.json")).unwrap(), 3);
+    }
+
+    // ── first-run: missing tasks.json can be created as [] ──────────────────
+
+    #[test]
+    fn first_run_missing_file_allows_empty_write() {
+        let dir = TempDir::new().unwrap();
+        let d   = dir.path().to_path_buf();
+
+        // No tasks.json exists yet → existing_count == 0 → guard not triggered
+        save_tasks_impl(&d, &Value::Array(vec![]), false).unwrap();
+
+        assert_eq!(count_tasks_on_disk(&d.join("tasks.json")).unwrap(), 0);
+    }
+
+    // ── normal save with tasks succeeds ─────────────────────────────────────
+
+    #[test]
+    fn normal_nonempty_save_works() {
+        let dir = TempDir::new().unwrap();
+        let d   = dir.path().to_path_buf();
+
+        save_tasks_impl(&d, &make_tasks(5), false).unwrap();
+
+        assert_eq!(count_tasks_on_disk(&d.join("tasks.json")).unwrap(), 5);
+    }
+
+    // ── explicit reset is the only path that can overwrite with [] ──────────
+
+    #[test]
+    fn explicit_reset_allows_empty_overwrite() {
+        let dir = TempDir::new().unwrap();
+        let d   = dir.path().to_path_buf();
+
+        save_tasks_impl(&d, &make_tasks(4), false).unwrap();
+
+        // allow_empty_overwrite = true → should succeed
+        save_tasks_impl(&d, &Value::Array(vec![]), true).unwrap();
+        assert_eq!(count_tasks_on_disk(&d.join("tasks.json")).unwrap(), 0);
+    }
+
+    // ── backup pruning keeps only the configured maximum ────────────────────
+
+    #[test]
+    fn prune_keeps_at_most_five_backups() {
+        let dir = TempDir::new().unwrap();
+        let d   = dir.path().to_path_buf();
+
+        // Manually create 8 backup files with distinct sortable timestamps
+        for i in 1u64..=8 {
+            let name    = format!("tasks.backup-{:010}.json", i * 1_000);
+            let content = serde_json::to_string_pretty(&make_tasks(1)).unwrap();
+            fs::write(d.join(&name), &content).unwrap();
+        }
+
+        prune_task_backups(&d, 5);
+
+        let kept = list_task_backups(&d);
+        assert_eq!(kept.len(), 5, "expected exactly 5 backups after prune");
+
+        // The 5 with highest timestamps (4000–8000) must be kept
+        for bp in &kept {
+            let fname = bp.file_name().unwrap().to_str().unwrap();
+            let ts: u64 = fname
+                .strip_prefix("tasks.backup-").unwrap()
+                .strip_suffix(".json").unwrap()
+                .parse().unwrap();
+            assert!(ts >= 4_000, "expected only recent backups kept, got ts={ts}");
+        }
+    }
+
+    // ── a backup is created before every overwrite ──────────────────────────
+
+    #[test]
+    fn backup_is_created_before_overwrite() {
+        let dir = TempDir::new().unwrap();
+        let d   = dir.path().to_path_buf();
+
+        // Seed 3 tasks
+        save_tasks_impl(&d, &make_tasks(3), false).unwrap();
+        let backups_before = list_task_backups(&d).len();
+
+        // Overwrite with 5 tasks → a backup of the 3-task version should appear
+        save_tasks_impl(&d, &make_tasks(5), false).unwrap();
+        let backups_after = list_task_backups(&d);
+
+        assert!(
+            !backups_after.is_empty() && backups_after.len() >= backups_before,
+            "expected at least one backup after second save"
+        );
+
+        // The backup should hold the pre-second-save content (3 tasks)
+        let backup_val = read_json(backups_after.last().unwrap()).unwrap();
+        assert_eq!(json_array_len(&backup_val), 3);
+    }
+
+    // ── check_task_storage: normal non-empty case ───────────────────────────
+
+    #[test]
+    fn check_storage_normal_nonempty() {
+        let dir = TempDir::new().unwrap();
+        let d   = dir.path().to_path_buf();
+
+        save_tasks_impl(&d, &make_tasks(7), false).unwrap();
+        let status = check_task_storage_impl(&d).unwrap();
+
+        assert_eq!(status.task_count, 7);
+        assert!(!status.empty_with_nonempty_backups);
+        assert_eq!(status.newest_backup_task_count, 0);
+    }
+
+    // ── check_task_storage: empty file with non-empty backups ───────────────
+
+    #[test]
+    fn check_storage_detects_empty_file_with_nonempty_backup() {
+        let dir = TempDir::new().unwrap();
+        let d   = dir.path().to_path_buf();
+
+        // Write tasks, then explicitly clear to empty (which creates a backup)
+        save_tasks_impl(&d, &make_tasks(4), false).unwrap();
+        save_tasks_impl(&d, &Value::Array(vec![]), true).unwrap();
+
+        let status = check_task_storage_impl(&d).unwrap();
+
+        assert_eq!(status.task_count, 0);
+        assert!(status.backup_count > 0);
+        assert!(status.empty_with_nonempty_backups);
+        assert_eq!(status.newest_backup_task_count, 4);
+    }
+
+    // ── check_task_storage: first-run (no file, no backups) ─────────────────
+
+    #[test]
+    fn check_storage_first_run_all_zero() {
+        let dir = TempDir::new().unwrap();
+        let d   = dir.path().to_path_buf();
+
+        let status = check_task_storage_impl(&d).unwrap();
+
+        assert_eq!(status.task_count, 0);
+        assert_eq!(status.backup_count, 0);
+        assert!(!status.empty_with_nonempty_backups);
+    }
 }
 
 #[cfg(test)]
@@ -12056,6 +12458,51 @@ mod tests {
         );
     }
 
+    // ── task_mcp_customer_dev_defaults ────────────────────────────────────────
+
+    #[test]
+    fn customer_dev_defaults_folder_name_plus_crm_base_dir() {
+        let customer = serde_json::json!({"id": "vsk", "folderName": "VSK-Test"});
+        let result = task_mcp_customer_dev_defaults(&customer, "C:/Dev/repos").unwrap();
+        assert_eq!(result["repositoryRoot"].as_str(), Some("C:/Dev/repos/VSK-Test"));
+    }
+
+    #[test]
+    fn customer_dev_defaults_explicit_repository_root_takes_priority() {
+        let customer = serde_json::json!({"id": "vsk", "folderName": "VSK-Test", "repositoryRoot": "D:/custom/path"});
+        let result = task_mcp_customer_dev_defaults(&customer, "C:/Dev/repos").unwrap();
+        assert_eq!(result["repositoryRoot"].as_str(), Some("D:/custom/path"));
+    }
+
+    #[test]
+    fn customer_dev_defaults_override_beats_repository_root() {
+        let customer = serde_json::json!({"id": "vsk", "repositoryRoot": "D:/base", "repositoryRootOverride": "E:/override"});
+        let result = task_mcp_customer_dev_defaults(&customer, "").unwrap();
+        assert_eq!(result["repositoryRoot"].as_str(), Some("E:/override"));
+    }
+
+    #[test]
+    fn customer_dev_defaults_folder_name_without_crm_base_dir_no_repo_root() {
+        let customer = serde_json::json!({"id": "vsk", "folderName": "VSK-Test", "scriptFolder": "/Scripts"});
+        let result = task_mcp_customer_dev_defaults(&customer, "").unwrap();
+        assert!(result.get("repositoryRoot").is_none() || result["repositoryRoot"].is_null(),
+            "repositoryRoot must be absent when crmBaseDir is empty");
+        assert_eq!(result["scriptDirectory"].as_str(), Some("/Scripts"));
+    }
+
+    #[test]
+    fn customer_dev_defaults_empty_customer_returns_none() {
+        let customer = serde_json::json!({"id": "vsk"});
+        assert!(task_mcp_customer_dev_defaults(&customer, "").is_none());
+    }
+
+    #[test]
+    fn customer_dev_defaults_trailing_slash_stripped_from_base_dir() {
+        let customer = serde_json::json!({"id": "vsk", "folderName": "VSK-Test"});
+        let result = task_mcp_customer_dev_defaults(&customer, "C:/Dev/repos/").unwrap();
+        assert_eq!(result["repositoryRoot"].as_str(), Some("C:/Dev/repos/VSK-Test"));
+    }
+
     #[test]
     fn list_columns_full_186_column_response_is_schema_unknown() {
         // With 186 columns returned: column_count > 5, no paging params, no detectable totalCount
@@ -12096,6 +12543,9 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             load_tasks,
             save_tasks,
+            clear_all_tasks,
+            check_task_storage,
+            restore_tasks_from_latest_backup,
             load_customers,
             save_customers,
             load_settings,

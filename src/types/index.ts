@@ -552,6 +552,17 @@ export interface WorkflowSetup {
    * 'update-existing-script': modifying an existing file — requires a specific file path.
    */
   actionType?: 'create-new-script' | 'update-existing-script';
+  /**
+   * Event type for script onChange/onLoad/onSave registration.
+   * Mirrors CrmTechnicalImplementationPlan.target.eventName; set here during template application
+   * so the value is available before a full technical plan exists.
+   */
+  eventName?: string;
+  /**
+   * Field logical name that triggers an onChange event (e.g. 'nvr_assetid').
+   * Mirrors CrmTechnicalImplementationPlan.target.eventFieldName; set during template application.
+   */
+  eventFieldName?: string;
   /** Path to an existing script used as conventions reference for AI context. */
   conventionsSource?: string;
   /** Paths of similar existing script files included for AI conventions context. */
@@ -642,6 +653,10 @@ export interface Customer {
   /** .NET namespace prefix used for generated code (e.g. "Contoso.CRM"). */
   namespace?: string;
   notes?: string;
+  /** Path to a reference JS script used as the coding conventions source for AI-generated scripts. */
+  jsConventionsSource?: string;
+  /** Path to a reference C# plugin file used as the coding conventions source for AI-generated plugins. */
+  pluginConventionsSource?: string;
 }
 
 /**
@@ -1433,4 +1448,20 @@ export interface TeamsFlatMessage {
   linkedMessageUrl?: string;
   linkedMessageType?: 'chat' | 'channel' | 'unknown';
   linkedMessageResolved?: boolean;
+}
+
+// ── Task storage diagnostics (returned by check_task_storage Rust command) ───
+
+export interface TaskStorageStatus {
+  /** Tasks currently in tasks.json (0 if absent or empty). */
+  task_count: number;
+  /** Number of tasks.backup-*.json files in the data directory. */
+  backup_count: number;
+  /**
+   * True when tasks.json has 0 tasks but at least one backup has tasks.
+   * Likely indicates accidental data loss that can be auto-restored.
+   */
+  empty_with_nonempty_backups: boolean;
+  /** Task count from the most-recent non-empty backup. */
+  newest_backup_task_count: number;
 }
