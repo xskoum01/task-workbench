@@ -72,7 +72,7 @@ fn write_json(path: &PathBuf, value: &Value) -> Result<(), String> {
 }
 
 /// Prevents a console window from flashing when spawning console programs on Windows.
-/// On Windows GUI apps, any child process that is a console application (git, cmd, …)
+/// On Windows GUI apps, any child process that is a console application (git, cmd, â€¦)
 /// will briefly show a console window unless CREATE_NO_WINDOW is set.
 /// This is a no-op on other platforms.
 #[cfg(target_os = "windows")]
@@ -108,7 +108,7 @@ fn load_tasks(app: tauri::AppHandle) -> Result<Value, String> {
     }
 }
 
-/// Normal save — refuses to overwrite a non-empty tasks.json with an empty array.
+/// Normal save â€” refuses to overwrite a non-empty tasks.json with an empty array.
 /// Use `clear_all_tasks` for an intentional reset.
 #[tauri::command]
 fn save_tasks(app: tauri::AppHandle, tasks: Value) -> Result<(), String> {
@@ -342,7 +342,7 @@ fn default_settings() -> Value {
         "appName": "Task Workbench",
         "theme": "dark",
         "defaultTaskConfidence": 80,
-        // Legacy fields — kept for backward compatibility
+        // Legacy fields â€” kept for backward compatibility
         "aiModel": "",
         "aiApiKey": "",
         // Multi-provider AI config
@@ -462,7 +462,7 @@ fn open_path(path: String) -> Result<(), String> {
 /// On Windows, VS Code ships as `code.cmd` (a batch script), not a native
 /// executable. `Command::new("code")` cannot find `.cmd` files without going
 /// through a shell, so we always delegate to `cmd /c code <path>` on Windows.
-/// On macOS/Linux, `code` is a normal shell wrapper — direct exec is fine.
+/// On macOS/Linux, `code` is a normal shell wrapper â€” direct exec is fine.
 #[tauri::command]
 fn open_in_vscode(path: String) -> Result<(), String> {
     let p = std::path::Path::new(&path);
@@ -642,7 +642,7 @@ fn git_run(repo_path: &str, args: &[&str]) -> Result<String, String> {
 
 /// Returns `true` when the repository has at least one commit (HEAD resolves to a commit).
 /// Returns `false` for a valid but empty (no-commits / unborn-branch) repository.
-/// Never throws — callers may safely treat any error as `false`.
+/// Never throws â€” callers may safely treat any error as `false`.
 #[tauri::command]
 fn git_has_head(repo_path: String) -> bool {
     if !std::path::Path::new(&repo_path).exists() { return false; }
@@ -667,7 +667,7 @@ async fn get_git_branch(repo_path: String) -> Result<String, String> {
 }
 
 /// Returns the name of the currently checked-out branch by reading `.git/HEAD`
-/// directly — no git process is spawned, so this is instantaneous even on
+/// directly â€” no git process is spawned, so this is instantaneous even on
 /// large repositories. Falls back to a short SHA prefix when HEAD is detached.
 #[tauri::command]
 fn get_git_branch_quick(repo_path: String) -> Result<String, String> {
@@ -681,7 +681,7 @@ fn get_git_branch_quick(repo_path: String) -> Result<String, String> {
     if let Some(branch) = content.strip_prefix("ref: refs/heads/") {
         Ok(branch.to_string())
     } else {
-        // Detached HEAD — show abbreviated SHA so the UI shows something useful.
+        // Detached HEAD â€” show abbreviated SHA so the UI shows something useful.
         let sha = content.get(..8).unwrap_or(content);
         Ok(format!("(detached {})", sha))
     }
@@ -779,14 +779,14 @@ fn get_git_diff(repo_path: String, file_path: Option<String>) -> Result<String, 
                     eprintln!("[get_git_diff] relative={rel}");
                     Some(rel)
                 } else if fp_norm == repo_norm {
-                    // Path IS the repo root — diff the whole repo.
+                    // Path IS the repo root â€” diff the whole repo.
                     eprintln!("[get_git_diff] relative=(whole repo)");
                     None
                 } else {
                     return Err("Selected file is outside the Git repository.".to_string());
                 }
             } else {
-                // Already relative — normalize slashes only.
+                // Already relative â€” normalize slashes only.
                 eprintln!("[get_git_diff] relative={fp_norm} (already relative)");
                 Some(fp_norm)
             }
@@ -863,7 +863,7 @@ fn run_git_ro(working_dir: &str, args: &[&str]) -> Option<String> {
 fn cap_utf8(s: String, max_bytes: usize) -> String {
     if s.len() <= max_bytes { return s; }
     let boundary = (0..=max_bytes).rev().find(|&i| s.is_char_boundary(i)).unwrap_or(0);
-    format!("{}\n\n… [truncated at {} KB]", &s[..boundary], max_bytes / 1024)
+    format!("{}\n\nâ€¦ [truncated at {} KB]", &s[..boundary], max_bytes / 1024)
 }
 
 /// Probes common base-branch names and returns the first that exists in the repo.
@@ -904,7 +904,7 @@ fn is_untracked_relevant(path: &str) -> bool {
         || p.ends_with("packages.config")
         || p.ends_with("app.config")
         || p.ends_with(".config")
-        // Small JSON not inside noise folders — handled by the noise check above
+        // Small JSON not inside noise folders â€” handled by the noise check above
         || p.ends_with(".json")
 }
 
@@ -1023,7 +1023,7 @@ fn collect_git_review_context(
     let noise_files:   Vec<String> = all_files.iter().filter(|f| is_repo_noise(f)).cloned().collect();
     let flagged_paths: Vec<String> = all_files.iter().filter(|f| is_flagged_repo_path(f)).cloned().collect();
 
-    // ── Read relevant untracked file content ──────────────────────────────
+    // â”€â”€ Read relevant untracked file content â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     const MAX_PER_FILE:  usize = 20_000;
     const MAX_UNTRACKED: usize = 60_000;
 
@@ -1079,12 +1079,12 @@ fn collect_git_review_context(
 
     // Combined diff
     let mut diff_parts: Vec<String> = Vec::new();
-    if has_committed  { diff_parts.push(format!("=== BRANCH DIFF ({base} → HEAD) ===\n{branch_diff}")); }
+    if has_committed  { diff_parts.push(format!("=== BRANCH DIFF ({base} â†’ HEAD) ===\n{branch_diff}")); }
     if has_staged     { diff_parts.push(format!("=== STAGED CHANGES ===\n{staged}")); }
     if has_unstaged   { diff_parts.push(format!("=== UNSTAGED CHANGES ===\n{unstaged}")); }
     if has_untracked  {
         diff_parts.push(format!(
-            "=== UNTRACKED NEW FILES ({} file(s) — not yet staged) ===\n{}",
+            "=== UNTRACKED NEW FILES ({} file(s) â€” not yet staged) ===\n{}",
             untracked_parts.len(),
             untracked_parts.join("\n\n")
         ));
@@ -1099,7 +1099,7 @@ fn collect_git_review_context(
     let sources = if src.is_empty() { "no local changes found".to_string() } else { src.join(", ") };
 
     let summary = format!(
-        "Branch: {current_branch} → base: {base}. \
+        "Branch: {current_branch} â†’ base: {base}. \
          Changed files: {}. Sources: {sources}.",
         all_files.len()
     );
@@ -1178,7 +1178,7 @@ fn collect_git_file_review_context(
     let file_rel = if fp_norm.starts_with(&repo_prefix) {
         fp_norm[repo_prefix.len()..].to_string()
     } else if !fp_norm.contains('/') && !fp_norm.contains('\\') {
-        // Bare filename — use as-is.
+        // Bare filename â€” use as-is.
         fp_norm.clone()
     } else {
         return Err(format!(
@@ -1219,13 +1219,13 @@ fn collect_git_file_review_context(
     // 9. Combine all diffs with section headers.
     let mut diff_parts: Vec<String> = Vec::new();
     if has_committed {
-        diff_parts.push(format!("=== BRANCH DIFF ({base} → HEAD) — {file_rel} ===\n{committed_diff}"));
+        diff_parts.push(format!("=== BRANCH DIFF ({base} â†’ HEAD) â€” {file_rel} ===\n{committed_diff}"));
     }
     if has_staged {
-        diff_parts.push(format!("=== STAGED CHANGES — {file_rel} ===\n{staged_diff}"));
+        diff_parts.push(format!("=== STAGED CHANGES â€” {file_rel} ===\n{staged_diff}"));
     }
     if has_unstaged {
-        diff_parts.push(format!("=== UNSTAGED CHANGES — {file_rel} ===\n{unstaged_diff}"));
+        diff_parts.push(format!("=== UNSTAGED CHANGES â€” {file_rel} ===\n{unstaged_diff}"));
     }
     let diff = diff_parts.join("\n\n");
 
@@ -1253,7 +1253,7 @@ fn parse_git_status_output(output: &str) -> (Vec<Value>, Vec<Value>) {
         let x = line.chars().next().unwrap_or(' ');
         let y = line.chars().nth(1).unwrap_or(' ');
         let path_part = line[3..].trim();
-        // Renamed files: "old -> new" — take new path
+        // Renamed files: "old -> new" â€” take new path
         let path = if let Some(arrow) = path_part.find(" -> ") {
             path_part[arrow + 4..].trim().trim_matches('"')
         } else {
@@ -1303,7 +1303,7 @@ fn generate_commit_message(task_json: &Value) -> String {
             after[..end].to_string()
         } else { String::new() }
     };
-    // Strip leading bracketed prefix like [TEST], [FEATURE] …
+    // Strip leading bracketed prefix like [TEST], [FEATURE] â€¦
     let clean = {
         let s = title;
         let s = if s.starts_with('[') {
@@ -1319,9 +1319,9 @@ fn generate_commit_message(task_json: &Value) -> String {
     if task_id.is_empty() { base } else { format!("{task_id}: {base}") }
 }
 
-/// Core logic for getting commit preview — shared by Tauri command and MCP handler.
+/// Core logic for getting commit preview â€” shared by Tauri command and MCP handler.
 fn git_commit_preview_impl(repo_root: &str, task_json: Option<&Value>) -> Result<Value, String> {
-    // Resolve canonical git root — explicit error when path is not a git repo.
+    // Resolve canonical git root â€” explicit error when path is not a git repo.
     let canonical_root = run_git_ro(repo_root, &["rev-parse", "--show-toplevel"])
         .map(|s| s.trim().replace('\\', "/").trim_end_matches('/').to_string())
         .ok_or_else(|| format!("Configured repository root is not a Git repository: {repo_root}"))?;
@@ -1344,7 +1344,7 @@ fn git_commit_preview_impl(repo_root: &str, task_json: Option<&Value>) -> Result
     let remote_raw = run_git_ro(repo, &["remote", "-v"]).unwrap_or_default();
     let (remote_name, remote_url) = parse_git_fetch_url(&remote_raw);
 
-    // Use `git status --short` — works correctly even when HEAD does not exist.
+    // Use `git status --short` â€” works correctly even when HEAD does not exist.
     let status_raw = run_git_ro(repo, &["status", "--short"]).unwrap_or_default();
     let (changed, noise) = parse_git_status_output(&status_raw);
 
@@ -1353,13 +1353,13 @@ fn git_commit_preview_impl(repo_root: &str, task_json: Option<&Value>) -> Result
         warnings.push("Repository has no commits yet; preview is based on git status only.".into());
     }
     if branch == "main" || branch == "master" {
-        warnings.push(format!("Branch '{}' is the default branch — push will be blocked.", branch));
+        warnings.push(format!("Branch '{}' is the default branch â€” push will be blocked.", branch));
     }
     if branch.is_empty() { warnings.push("Could not determine branch.".into()); }
     if changed.is_empty() && noise.is_empty() { warnings.push("No changes detected.".into()); }
     else if changed.is_empty() { warnings.push("All changed files are in the exclusion list.".into()); }
-    if !noise.is_empty() { warnings.push(format!("{} file(s) excluded (bin/, obj/, .vs/, …).", noise.len())); }
-    if remote_url.is_none() { warnings.push("No remote configured — push will not be available.".into()); }
+    if !noise.is_empty() { warnings.push(format!("{} file(s) excluded (bin/, obj/, .vs/, â€¦).", noise.len())); }
+    if remote_url.is_none() { warnings.push("No remote configured â€” push will not be available.".into()); }
 
     let suggested_message = task_json
         .map(|t| generate_commit_message(t))
@@ -1378,7 +1378,7 @@ fn git_commit_preview_impl(repo_root: &str, task_json: Option<&Value>) -> Result
     if base_branch.is_some() && is_feature && !has_merge_base {
         warnings.push(format!(
             "Branch has no common history with {}. \
-             A normal PR cannot be created — GitHub compare will show unrelated histories.",
+             A normal PR cannot be created â€” GitHub compare will show unrelated histories.",
             base_branch.as_deref().unwrap_or("remote base")
         ));
     }
@@ -1395,7 +1395,7 @@ fn git_commit_preview_impl(repo_root: &str, task_json: Option<&Value>) -> Result
         .map(|u| u == expected_upstream)
         .unwrap_or(false);
 
-    // Warn about upstream mismatch (does not block — push will auto-fix with --set-upstream).
+    // Warn about upstream mismatch (does not block â€” push will auto-fix with --set-upstream).
     if is_feature && has_upstream && !upstream_matches {
         warnings.push(format!(
             "Current branch tracks {} as upstream, but it should publish to {}. \
@@ -1414,7 +1414,7 @@ fn git_commit_preview_impl(repo_root: &str, task_json: Option<&Value>) -> Result
                 .and_then(|s| s.trim().parse().ok())
                 .unwrap_or(0)
         } else if let Some(ref base) = base_branch {
-            // No upstream yet — count commits ahead of the remote base branch.
+            // No upstream yet â€” count commits ahead of the remote base branch.
             run_git_ro(repo, &["rev-list", "--count", &format!("{base}..HEAD")])
                 .and_then(|s| s.trim().parse().ok())
                 .unwrap_or(0)
@@ -1454,7 +1454,7 @@ fn git_commit_preview_impl(repo_root: &str, task_json: Option<&Value>) -> Result
     }))
 }
 
-/// Core logic for committing selected files — shared by Tauri command and MCP handler.
+/// Core logic for committing selected files â€” shared by Tauri command and MCP handler.
 fn git_commit_impl(repo_root: &str, files: &[String], message: &str) -> Result<Value, String> {
     if message.trim().is_empty() { return Err("Commit message cannot be empty.".into()); }
     if files.is_empty() { return Err("No files specified for commit.".into()); }
@@ -1487,13 +1487,13 @@ fn git_commit_impl(repo_root: &str, files: &[String], message: &str) -> Result<V
     Ok(serde_json::json!({ "ok": true, "commitHash": hash, "summary": format!("Commit {hash} created.") }))
 }
 
-/// Core logic for pushing the current branch — shared by Tauri command and MCP handler.
+/// Core logic for pushing the current branch â€” shared by Tauri command and MCP handler.
 ///
 /// Push strategy (never force-pushes, never pushes to main/master):
-/// A. No upstream configured → `git push --set-upstream origin <branch>` (first publish)
-/// B. Upstream exists but is NOT `origin/<branch>` (e.g. tracks origin/main) →
+/// A. No upstream configured â†’ `git push --set-upstream origin <branch>` (first publish)
+/// B. Upstream exists but is NOT `origin/<branch>` (e.g. tracks origin/main) â†’
 ///    `git push --set-upstream origin <branch>` (fixes the tracking and publishes)
-/// C. Upstream already matches `origin/<branch>` → `git push`
+/// C. Upstream already matches `origin/<branch>` â†’ `git push`
 fn git_push_impl(repo_root: &str) -> Result<Value, String> {
     let branch = git_run(repo_root, &["branch", "--show-current"])
         .map_err(|e| format!("Cannot determine branch: {e}"))?
@@ -1509,7 +1509,7 @@ fn git_push_impl(repo_root: &str) -> Result<Value, String> {
     let expected_upstream = format!("origin/{branch}");
     let needs_set_upstream = upstream.as_deref().map(str::trim)
         .map(|u| u != expected_upstream)
-        .unwrap_or(true); // None → no upstream → also needs set-upstream
+        .unwrap_or(true); // None â†’ no upstream â†’ also needs set-upstream
 
     if needs_set_upstream {
         // Publish the branch (creates remote branch and sets correct tracking).
@@ -1524,7 +1524,7 @@ fn git_push_impl(repo_root: &str) -> Result<Value, String> {
 }
 
 /// Detects the remote default/base branch.
-/// Priority: origin/main → origin/master → symbolic-ref refs/remotes/origin/HEAD.
+/// Priority: origin/main â†’ origin/master â†’ symbolic-ref refs/remotes/origin/HEAD.
 /// Returns "origin/main", "origin/master", or None. Read-only.
 fn detect_remote_base_branch(repo_root: &str) -> Option<String> {
     if run_git_ro(repo_root, &["rev-parse", "--verify", "origin/main"]).is_some() {
@@ -1533,7 +1533,7 @@ fn detect_remote_base_branch(repo_root: &str) -> Option<String> {
     if run_git_ro(repo_root, &["rev-parse", "--verify", "origin/master"]).is_some() {
         return Some("origin/master".into());
     }
-    // Symbolic ref: refs/remotes/origin/HEAD → refs/remotes/origin/main
+    // Symbolic ref: refs/remotes/origin/HEAD â†’ refs/remotes/origin/main
     if let Some(sym) = run_git_ro(repo_root, &["symbolic-ref", "refs/remotes/origin/HEAD"]) {
         let sym = sym.trim();
         if let Some(suffix) = sym.strip_prefix("refs/remotes/") {
@@ -1568,7 +1568,7 @@ fn validate_git_branch_name(name: &str) -> Result<(), String> {
         }
     }
     if t == "main" || t == "master" {
-        return Err(format!("\"{}\" is a default branch — use a feature branch name.", t));
+        return Err(format!("\"{}\" is a default branch â€” use a feature branch name.", t));
     }
     if t.starts_with("refs/") {
         return Err("Branch name must not start with \"refs/\".".into());
@@ -1656,7 +1656,7 @@ fn create_git_branch_impl(repo_root: &str, branch_name: &str) -> Result<Value, S
 }
 
 /// Creates a new local Git branch and switches to it.
-/// Rejects push/merge/force operations — local branch creation only.
+/// Rejects push/merge/force operations â€” local branch creation only.
 #[tauri::command]
 fn create_git_branch(repo_root: String, branch_name: String) -> Result<Value, String> {
     create_git_branch_impl(&repo_root, &branch_name)
@@ -1681,7 +1681,7 @@ fn mcp_resolve_repo_root_for_task(app: &tauri::AppHandle, task: &Value) -> Resul
 }
 
 /// Returns a preview of pending git changes and a suggested commit message.
-/// Read-only — never stages or commits anything.
+/// Read-only â€” never stages or commits anything.
 #[tauri::command]
 fn get_git_commit_preview(repo_root: String, task_json: Option<Value>) -> Result<Value, String> {
     git_commit_preview_impl(&repo_root, task_json.as_ref())
@@ -1701,7 +1701,7 @@ fn push_task_branch(repo_root: String) -> Result<Value, String> {
     git_push_impl(&repo_root)
 }
 
-/// Stages files, commits, then pushes the current branch — a single-step wrapper.
+/// Stages files, commits, then pushes the current branch â€” a single-step wrapper.
 #[tauri::command]
 fn commit_and_push_task_changes(
     repo_root: String,
@@ -1749,7 +1749,7 @@ fn get_ai_config(app: &tauri::AppHandle) -> Result<AiConfig, String> {
         };
         (key, mdl)
     } else {
-        // OpenAI — with legacy fallback
+        // OpenAI â€” with legacy fallback
         let key = {
             let k = settings["openaiApiKey"].as_str().unwrap_or("");
             if k.is_empty() {
@@ -1773,14 +1773,14 @@ fn get_ai_config(app: &tauri::AppHandle) -> Result<AiConfig, String> {
     if api_key.is_empty() {
         let label = if provider == "anthropic" { "Anthropic" } else { "OpenAI" };
         return Err(format!(
-            "AI API key not configured. Add your {label} API key in Settings → AI."
+            "AI API key not configured. Add your {label} API key in Settings â†’ AI."
         ));
     }
 
     Ok(AiConfig { provider, api_key, model })
 }
 
-/// Legacy helper — kept to avoid touching unchanged call sites individually.
+/// Legacy helper â€” kept to avoid touching unchanged call sites individually.
 /// New code should use get_ai_config.
 #[allow(dead_code)]
 fn get_ai_settings(app: &tauri::AppHandle) -> Result<(String, String), String> {
@@ -1814,7 +1814,7 @@ async fn call_openai_with_temperature(
             if let Some(clamped) = ai_model_capabilities::clamp_temperature("openai", model, t) {
                 body["temperature"] = serde_json::Value::from(clamped);
             }
-            // If clamp_temperature returns None, the model does not support temperature —
+            // If clamp_temperature returns None, the model does not support temperature â€”
             // the parameter is intentionally omitted from the request body.
         }
     }
@@ -1844,7 +1844,7 @@ async fn call_openai_with_temperature(
             msg.push_str(
                 "\n\nNote: an unsupported parameter was rejected by the model. \
                  Task Workbench omits unsupported parameters automatically for recognized \
-                 models. If this error persists, the model name may not be recognized — \
+                 models. If this error persists, the model name may not be recognized â€” \
                  try using a known model such as gpt-4.1-mini."
             );
         }
@@ -1968,7 +1968,7 @@ fn normalize_task_analysis(mut v: Value) -> Value {
     if !v["suggestedActions"].is_array() {
         v["suggestedActions"] = serde_json::json!([]);
     }
-    // Fix null bilingual array fields — only touch keys that already exist in the response
+    // Fix null bilingual array fields â€” only touch keys that already exist in the response
     let array_fields = [
         "problemPoints",
         "problemPointsCz", "problemPointsEn",
@@ -1979,7 +1979,7 @@ fn normalize_task_analysis(mut v: Value) -> Value {
             v[key] = serde_json::json!([]);
         }
     }
-    // Do NOT synthesise missing bilingual fields from legacy English values —
+    // Do NOT synthesise missing bilingual fields from legacy English values â€”
     // the frontend uses absence to detect "legacy-only" mode.
     v
 }
@@ -1998,13 +1998,13 @@ async fn analyze_task(app: tauri::AppHandle, task: Value, customer: Value) -> Re
     let repo_name     = customer["repositoryName"].as_str().unwrap_or("");
 
     let instructions = "You are a Dynamics 365 / Dataverse developer assistant. \
-Return ONLY valid JSON — no markdown, no prose, no code fences. \
+Return ONLY valid JSON â€” no markdown, no prose, no code fences. \
 All bilingual fields (summaryCz, summaryEn, problemPointsCz, problemPointsEn, \
 actionPointsCz, actionPointsEn, nextStepCz, nextStepEn) are MANDATORY. \
 Czech fields must be real Czech. English fields must be real English.";
 
     let prompt = format!(
-        "Analyse this work request. Return ALL fields — bilingual fields are required.\n\n\
+        "Analyse this work request. Return ALL fields â€” bilingual fields are required.\n\n\
 Task:\n- Title: {title}\n- Type: {task_type}\n- Source: {source}\n- Message: {message}\n\n\
 Customer:\n- Name: {customer_name}\n- Namespace: {namespace}\n- Repository: {repo_name}\n\n\
 Return ONLY this exact JSON shape (fill every field with real content):\n\
@@ -2014,21 +2014,21 @@ Return ONLY this exact JSON shape (fill every field with real content):\n\
 \"suggestedActions\":[{{\"id\":\"ai1\",\"label\":\"Concrete English action step\"}}],\
 \"confidence\":85,\
 \"nextStep\":\"Most important next action in English\",\
-\"summaryCz\":\"1-2 věty česky popisující problém\",\
+\"summaryCz\":\"1-2 vÄ›ty ÄŤesky popisujĂ­cĂ­ problĂ©m\",\
 \"summaryEn\":\"1-2 sentences in English describing the problem\",\
-\"problemPointsCz\":[\"Krátký český bod o problému.\",\"Kde se projevuje nebo kdo je ovlivněn.\"],\
+\"problemPointsCz\":[\"KrĂˇtkĂ˝ ÄŤeskĂ˝ bod o problĂ©mu.\",\"Kde se projevuje nebo kdo je ovlivnÄ›n.\"],\
 \"problemPointsEn\":[\"Short English bullet about the problem.\",\"Where it occurs or who is affected.\"],\
-\"actionPointsCz\":[\"Konkrétní akční krok česky.\",\"Druhý krok česky.\"],\
+\"actionPointsCz\":[\"KonkrĂ©tnĂ­ akÄŤnĂ­ krok ÄŤesky.\",\"DruhĂ˝ krok ÄŤesky.\"],\
 \"actionPointsEn\":[\"Concrete action step in English.\",\"Second step in English.\"],\
-\"nextStepCz\":\"Jeden jasný bezprostřední krok česky.\",\
+\"nextStepCz\":\"Jeden jasnĂ˝ bezprostĹ™ednĂ­ krok ÄŤesky.\",\
 \"nextStepEn\":\"One clear immediate next step in English.\"\
 }}\n\n\
-Rules — follow strictly:\n\
+Rules â€” follow strictly:\n\
 - ALL 13 fields above are mandatory. Do not omit any.\n\
-- summaryCz and all *Cz fields: must be natural Czech — not translated literally, not English.\n\
-- summaryEn and all *En fields: must be natural English — not Czech.\n\
-- problemPointsCz / problemPointsEn: 2-4 bullets — what is wrong, where, who is affected.\n\
-- actionPointsCz / actionPointsEn: 2-4 bullets — concrete steps to fix the issue.\n\
+- summaryCz and all *Cz fields: must be natural Czech â€” not translated literally, not English.\n\
+- summaryEn and all *En fields: must be natural English â€” not Czech.\n\
+- problemPointsCz / problemPointsEn: 2-4 bullets â€” what is wrong, where, who is affected.\n\
+- actionPointsCz / actionPointsEn: 2-4 bullets â€” concrete steps to fix the issue.\n\
 - nextStepCz / nextStepEn: the single most important immediate action.\n\
 - suggestedActions: 3-5 English steps (legacy field, keep it).\n\
 - confidence: integer 0-100 reflecting how clear and actionable the request is.\n\
@@ -2057,7 +2057,7 @@ async fn generate_reply(app: tauri::AppHandle, task: Value, customer: Value) -> 
     let message       = task["originalMessage"].as_str().unwrap_or("");
     let customer_name = customer["name"].as_str().unwrap_or("there");
 
-    let instructions = "Write brief professional client replies. Plain text only — no markdown.";
+    let instructions = "Write brief professional client replies. Plain text only â€” no markdown.";
 
     let prompt = format!(
         "Write a brief professional reply to a client request.\n\n\
@@ -2096,7 +2096,7 @@ async fn generate_skeleton_preview(app: tauri::AppHandle, task: Value, customer:
     };
 
     let instructions = "Generate C# plugin skeletons for Dynamics 365 / Dataverse. \
-Respond with ONLY valid JSON — no markdown, no code fences.";
+Respond with ONLY valid JSON â€” no markdown, no code fences.";
 
     let base_stub = "\
 public void Execute(IServiceProvider serviceProvider)\n\
@@ -2119,7 +2119,7 @@ public void Execute(IServiceProvider serviceProvider)\n\
         "Generate a C# plugin class skeleton.\n\n\
 Task:\n- Title: {title}\n- Type: {task_type}\n- Message: {message}\n\n\
 Customer namespace: {namespace}\n\n\
-Base Execute stub — you MUST preserve this structure and extend it with task-specific logic:\n\
+Base Execute stub â€” you MUST preserve this structure and extend it with task-specific logic:\n\
 ```csharp\n{base_stub}\n```\n\n\
 Respond with ONLY this JSON (no markdown, no fences):\n\
 {{\"fileName\":\"PluginClassName.cs\",\"content\":\"// full C# file\",\"targetPath\":\"\"}}\n\n\
@@ -2139,7 +2139,7 @@ Execute method built on the base stub above with task-specific logic replacing t
 }
 
 /// Reads a source file from disk and runs a configurable AI review against it.
-/// The API key is read from settings.json — never exposed to the frontend.
+/// The API key is read from settings.json â€” never exposed to the frontend.
 /// `model_override` is used when non-empty; otherwise falls back to the global AI model.
 /// `temperature` is clamped to [0.0, 2.0]; defaults to 0.2 when 0.0 is passed and
 /// the caller did not explicitly intend zero temperature (we treat 0.0 as "use default").
@@ -2171,7 +2171,7 @@ async fn run_ai_file_review(
         .map_err(|e| format!("Cannot read file '{file_path}': {e}"))?;
     let content = if raw.len() > MAX_BYTES {
         let boundary = (0..=MAX_BYTES).rev().find(|&i| raw.is_char_boundary(i)).unwrap_or(0);
-        format!("{}\n\n… [file truncated at 200 KB]", &raw[..boundary])
+        format!("{}\n\nâ€¦ [file truncated at 200 KB]", &raw[..boundary])
     } else {
         raw
     };
@@ -2188,40 +2188,40 @@ async fn run_ai_file_review(
     // Append structured-JSON format requirement to whatever reviewer instructions were provided.
     let json_format_requirement = r#"
 
-Vráť POUZE platné JSON bez prose, bez markdown kódových blőků, bez jiného textu.
-Veškerý textový obsah (summary, title, problem, recommendation, generalSuggestions) píši český.
-Kódové úseky (codeSnippet, suggestedCode) ponechávej v originálním programovacím jazyce, nepřekládej je.
+VrĂˇĹĄ POUZE platnĂ© JSON bez prose, bez markdown kĂłdovĂ˝ch blĹ‘kĹŻ, bez jinĂ©ho textu.
+VeĹˇkerĂ˝ textovĂ˝ obsah (summary, title, problem, recommendation, generalSuggestions) pĂ­Ĺˇi ÄŤeskĂ˝.
+KĂłdovĂ© Ăşseky (codeSnippet, suggestedCode) ponechĂˇvej v originĂˇlnĂ­m programovacĂ­m jazyce, nepĹ™eklĂˇdej je.
 
-Požadované schéma:
+PoĹľadovanĂ© schĂ©ma:
 {
   "verdict": "pass" | "needs_changes" | "comment",
-  "summary": "český souhrnny odstavec.",
+  "summary": "ÄŤeskĂ˝ souhrnny odstavec.",
   "comments": [
     {
       "severity": "critical" | "major" | "minor" | "suggestion",
       "lineStart": 42,
       "lineEnd": 58,
-      "title": "Krátký český název problému",
-      "problem": "- První problém\n- Druhý problém\n- Třetí problém",
-      "recommendation": "- První krok\n- Druhý krok\n- Třetí krok",
-      "codeSnippet": "1–5 řádků z původního souboru ilustrující problém",
-      "suggestedCode": "Volitelný opravový kód"
+      "title": "KrĂˇtkĂ˝ ÄŤeskĂ˝ nĂˇzev problĂ©mu",
+      "problem": "- PrvnĂ­ problĂ©m\n- DruhĂ˝ problĂ©m\n- TĹ™etĂ­ problĂ©m",
+      "recommendation": "- PrvnĂ­ krok\n- DruhĂ˝ krok\n- TĹ™etĂ­ krok",
+      "codeSnippet": "1â€“5 Ĺ™ĂˇdkĹŻ z pĹŻvodnĂ­ho souboru ilustrujĂ­cĂ­ problĂ©m",
+      "suggestedCode": "VolitelnĂ˝ opravovĂ˝ kĂłd"
     }
   ],
-  "generalSuggestions": ["české obecné doporučení neodpovídající konkrétnímu řádku"]
+  "generalSuggestions": ["ÄŤeskĂ© obecnĂ© doporuÄŤenĂ­ neodpovĂ­dajĂ­cĂ­ konkrĂ©tnĂ­mu Ĺ™Ăˇdku"]
 }
 
 Pravidla:
-- Odpovídej česky.
-- Nejvýše 8 komentářů.
-- Nápis title: krátký, max 6 slov.
-- problem a recommendation: krátké odrůkové body, každý na novém řádku začínající "-".
-- Nepíši dlouhé odstavce — preferuj 2–4 krátké odrůky.
-- lineStart/lineEnd: uvedeň jen když si jsi jistý přesným místem; jinak vynechat.
-- codeSnippet: 1–5 řádků z původního souboru ilustrující problém.
-- suggestedCode: volitelný, pouze když máš konkrétní oprávněný návrh.
-- verdict: "pass" = žádné zásadní problémy; "comment" = jen mala doporučení; "needs_changes" = důležité problémy.
-- Zaměř se na konkrétní problémy udržovatelného kódu, správnosti, Dataverse/Power Apps specifika."#;
+- OdpovĂ­dej ÄŤesky.
+- NejvĂ˝Ĺˇe 8 komentĂˇĹ™ĹŻ.
+- NĂˇpis title: krĂˇtkĂ˝, max 6 slov.
+- problem a recommendation: krĂˇtkĂ© odrĹŻkovĂ© body, kaĹľdĂ˝ na novĂ©m Ĺ™Ăˇdku zaÄŤĂ­najĂ­cĂ­ "-".
+- NepĂ­Ĺˇi dlouhĂ© odstavce â€” preferuj 2â€“4 krĂˇtkĂ© odrĹŻky.
+- lineStart/lineEnd: uvedeĹ jen kdyĹľ si jsi jistĂ˝ pĹ™esnĂ˝m mĂ­stem; jinak vynechat.
+- codeSnippet: 1â€“5 Ĺ™ĂˇdkĹŻ z pĹŻvodnĂ­ho souboru ilustrujĂ­cĂ­ problĂ©m.
+- suggestedCode: volitelnĂ˝, pouze kdyĹľ mĂˇĹˇ konkrĂ©tnĂ­ oprĂˇvnÄ›nĂ˝ nĂˇvrh.
+- verdict: "pass" = ĹľĂˇdnĂ© zĂˇsadnĂ­ problĂ©my; "comment" = jen mala doporuÄŤenĂ­; "needs_changes" = dĹŻleĹľitĂ© problĂ©my.
+- ZamÄ›Ĺ™ se na konkrĂ©tnĂ­ problĂ©my udrĹľovatelnĂ©ho kĂłdu, sprĂˇvnosti, Dataverse/Power Apps specifika."#;
 
     let full_instructions = if instructions.is_empty() {
         json_format_requirement.trim_start().to_string()
@@ -2244,7 +2244,7 @@ Pravidla:
             Ok(serde_json::json!({ "structured": parsed, "markdown": null }))
         }
         Err(_) => {
-            // JSON parsing failed — return as markdown so the frontend can still show the result.
+            // JSON parsing failed â€” return as markdown so the frontend can still show the result.
             let header = format!("**Reviewer:** {reviewer_name}  \n**File:** {file_name}\n\n---\n\n");
             Ok(serde_json::json!({ "structured": null, "markdown": format!("{header}{text}") }))
         }
@@ -2290,7 +2290,7 @@ async fn run_ai_change_review(
     const MAX_BYTES: usize = 200 * 1024;
     let diff_content = if diff.len() > MAX_BYTES {
         let boundary = (0..=MAX_BYTES).rev().find(|&i| diff.is_char_boundary(i)).unwrap_or(0);
-        format!("{}\n\n… [diff truncated at 200 KB]", &diff[..boundary])
+        format!("{}\n\nâ€¦ [diff truncated at 200 KB]", &diff[..boundary])
     } else {
         diff.clone()
     };
@@ -2307,42 +2307,42 @@ async fn run_ai_change_review(
 
     let json_format_requirement = r#"
 
-Recenzuješ POUZE změny zobrazené v diff — nekomentuješ kód, který diff nezahrnuje.
-Pokud diff neobsahuje dostatek kontextu pro posouzení určitého aspektu, uveď to stručně,
-ale nevymýšlej problémy v kódu, který v diffu není vidět.
+RecenzujeĹˇ POUZE zmÄ›ny zobrazenĂ© v diff â€” nekomentujeĹˇ kĂłd, kterĂ˝ diff nezahrnuje.
+Pokud diff neobsahuje dostatek kontextu pro posouzenĂ­ urÄŤitĂ©ho aspektu, uveÄŹ to struÄŤnÄ›,
+ale nevymĂ˝Ĺˇlej problĂ©my v kĂłdu, kterĂ˝ v diffu nenĂ­ vidÄ›t.
 
-Vráť POUZE platné JSON bez prose, bez markdown kódových bloků, bez jiného textu.
-Veškerý textový obsah (summary, title, problem, recommendation, generalSuggestions) piš česky.
-Kódové úseky (codeSnippet, suggestedCode) ponechávej v originálním programovacím jazyce.
+VrĂˇĹĄ POUZE platnĂ© JSON bez prose, bez markdown kĂłdovĂ˝ch blokĹŻ, bez jinĂ©ho textu.
+VeĹˇkerĂ˝ textovĂ˝ obsah (summary, title, problem, recommendation, generalSuggestions) piĹˇ ÄŤesky.
+KĂłdovĂ© Ăşseky (codeSnippet, suggestedCode) ponechĂˇvej v originĂˇlnĂ­m programovacĂ­m jazyce.
 
-Požadované schéma:
+PoĹľadovanĂ© schĂ©ma:
 {
   "verdict": "pass" | "needs_changes" | "comment",
-  "summary": "český souhrnný odstavec o změnách v diffu.",
+  "summary": "ÄŤeskĂ˝ souhrnnĂ˝ odstavec o zmÄ›nĂˇch v diffu.",
   "comments": [
     {
       "severity": "critical" | "major" | "minor" | "suggestion",
       "lineStart": 42,
       "lineEnd": 58,
-      "title": "Krátký český název problému",
-      "problem": "- První problém\n- Druhý problém",
-      "recommendation": "- První krok\n- Druhý krok",
-      "codeSnippet": "1–5 řádků z diffu ilustrující problém",
-      "suggestedCode": "Volitelný opravový kód"
+      "title": "KrĂˇtkĂ˝ ÄŤeskĂ˝ nĂˇzev problĂ©mu",
+      "problem": "- PrvnĂ­ problĂ©m\n- DruhĂ˝ problĂ©m",
+      "recommendation": "- PrvnĂ­ krok\n- DruhĂ˝ krok",
+      "codeSnippet": "1â€“5 Ĺ™ĂˇdkĹŻ z diffu ilustrujĂ­cĂ­ problĂ©m",
+      "suggestedCode": "VolitelnĂ˝ opravovĂ˝ kĂłd"
     }
   ],
-  "generalSuggestions": ["české obecné doporučení k diffu"]
+  "generalSuggestions": ["ÄŤeskĂ© obecnĂ© doporuÄŤenĂ­ k diffu"]
 }
 
 Pravidla:
-- Odpovídej česky.
-- Komentuj POUZE řádky označené '+' nebo '-' v diffu — ignoruj kontext ('  ').
-- Nejvýše 8 komentářů.
-- title: krátký, max 6 slov.
-- problem a recommendation: krátké odrážkové body, každý začínající '-'.
-- lineStart/lineEnd: čísla řádků z diffu ('+' strany), pokud je lze spolehlivě určit.
-- verdict: "pass" = vše v pořádku; "comment" = drobná doporučení; "needs_changes" = důležité problémy.
-- Zaměř se na konkrétní problémy v nových/změněných řádcích — správnost, udržovatelnost, Dataverse/Power Apps specifika."#;
+- OdpovĂ­dej ÄŤesky.
+- Komentuj POUZE Ĺ™Ăˇdky oznaÄŤenĂ© '+' nebo '-' v diffu â€” ignoruj kontext ('  ').
+- NejvĂ˝Ĺˇe 8 komentĂˇĹ™ĹŻ.
+- title: krĂˇtkĂ˝, max 6 slov.
+- problem a recommendation: krĂˇtkĂ© odrĂˇĹľkovĂ© body, kaĹľdĂ˝ zaÄŤĂ­najĂ­cĂ­ '-'.
+- lineStart/lineEnd: ÄŤĂ­sla Ĺ™ĂˇdkĹŻ z diffu ('+' strany), pokud je lze spolehlivÄ› urÄŤit.
+- verdict: "pass" = vĹˇe v poĹ™Ăˇdku; "comment" = drobnĂˇ doporuÄŤenĂ­; "needs_changes" = dĹŻleĹľitĂ© problĂ©my.
+- ZamÄ›Ĺ™ se na konkrĂ©tnĂ­ problĂ©my v novĂ˝ch/zmÄ›nÄ›nĂ˝ch Ĺ™ĂˇdcĂ­ch â€” sprĂˇvnost, udrĹľovatelnost, Dataverse/Power Apps specifika."#;
 
     let full_instructions = if instructions.is_empty() {
         json_format_requirement.trim_start().to_string()
@@ -2357,7 +2357,7 @@ Pravidla:
     match serde_json::from_str::<Value>(stripped) {
         Ok(mut parsed) => {
             parsed["reviewerName"] = serde_json::Value::String(reviewer_name);
-            // filePath is not a single file for a diff review — use file_name as a hint.
+            // filePath is not a single file for a diff review â€” use file_name as a hint.
             parsed["filePath"]     = serde_json::Value::String(file_name.clone());
             parsed["fileName"]     = serde_json::Value::String(file_name);
             Ok(serde_json::json!({ "structured": parsed, "markdown": null }))
@@ -2375,7 +2375,7 @@ Pravidla:
 /// instructions (already loaded and assembled by the frontend), calls the AI, and
 /// returns the proposed new file content plus a structured summary.
 ///
-/// The artifact file is NOT read or written by this command — the frontend is
+/// The artifact file is NOT read or written by this command â€” the frontend is
 /// responsible for reading it before the call and writing the result after user
 /// confirmation.
 ///
@@ -2402,13 +2402,13 @@ async fn run_ai_kit_implementation(
     const MAX_BYTES: usize = 150 * 1024;
     let content_trimmed = if artifact_content.len() > MAX_BYTES {
         let boundary = (0..=MAX_BYTES).rev().find(|&i| artifact_content.is_char_boundary(i)).unwrap_or(0);
-        format!("{}\n\n… [file truncated at 150 KB]", &artifact_content[..boundary])
+        format!("{}\n\nâ€¦ [file truncated at 150 KB]", &artifact_content[..boundary])
     } else {
         artifact_content.clone()
     };
 
     let prompt = format!(
-        "{task_context}\n\n## CURRENT FILE CONTENT\n\n```\n{content_trimmed}\n```\n\nImplement the required changes according to the task and rules above. Return ONLY the JSON response — no prose, no fences."
+        "{task_context}\n\n## CURRENT FILE CONTENT\n\n```\n{content_trimmed}\n```\n\nImplement the required changes according to the task and rules above. Return ONLY the JSON response â€” no prose, no fences."
     );
 
     let temp_opt = if temperature > 0.0 { Some(temperature) } else { None };
@@ -2500,11 +2500,11 @@ fn create_plugin_project_from_template(
 
     if template_dir.is_empty() {
         // -----------------------------------------------------------------
-        // Built-in default scaffold — no custom template configured.
+        // Built-in default scaffold â€” no custom template configured.
         // Standard Visual Studio layout:
-        //   <plugins_dir>/<project_name>/                ← solution root
+        //   <plugins_dir>/<project_name>/                â† solution root
         //     <project_name>.sln
-        //     <project_name>/                            ← project folder
+        //     <project_name>/                            â† project folder
         //       <project_name>.csproj
         //       (legacy: packages.config, app.config, key.snk, Properties/AssemblyInfo.cs)
         //       <ClassName>.cs  (when create_initial_class is true)
@@ -2605,7 +2605,7 @@ using System.Runtime.InteropServices;\r\n\
             fs::write(proj_dir.join("app.config"), app_config.as_bytes())
                 .map_err(|e| format!("Failed to write app.config: {e}"))?;
 
-            // --- key.snk — generate using PowerShell RSA crypto API ---
+            // --- key.snk â€” generate using PowerShell RSA crypto API ---
             let snk_path = proj_dir.join("key.snk");
             let snk_generated = generate_snk_key(&snk_path);
             if !snk_generated {
@@ -2753,7 +2753,7 @@ using System.Runtime.InteropServices;\r\n\
     // Derive substitution values.
     let plugin_class       = format!("{}Plugin", project_name.split('.').last().unwrap_or(&project_name));
     let assembly_guid      = task_mcp_generate_id();
-    // Literal template folder base name (e.g. "Template.Plugin") — replaced with project_name
+    // Literal template folder base name (e.g. "Template.Plugin") â€” replaced with project_name
     // in all names and content so a real VS project works as a template without manual renaming.
     let template_base_name = src.file_name()
         .map(|n| n.to_string_lossy().into_owned())
@@ -2764,7 +2764,7 @@ using System.Runtime.InteropServices;\r\n\
         .map_err(|e| format!("Template copy failed: {e}"))?;
 
     // Generate a fresh key.snk after the copy.
-    // Never reuse a key from the template — each project must have its own signing key.
+    // Never reuse a key from the template â€” each project must have its own signing key.
     // The key is placed in the project subfolder if it exists (standard VS layout), or at
     // the solution root otherwise.
     {
@@ -2811,10 +2811,10 @@ using System.Runtime.InteropServices;\r\n\
 ///   key.snk  copilot-instructions.md
 ///
 /// **Supported placeholders** (file names, folder names, and text content):
-///   __PROJECT_NAME__  — project/assembly name  (e.g. "Navertica.Account")
-///   __NAMESPACE__     — .NET root namespace      (may equal project name)
-///   __PLUGIN_CLASS__  — plugin class stub name   (e.g. "AccountPlugin")
-///   __ASSEMBLY_GUID__ — fresh GUID per project   (e.g. "12345678-...")
+///   __PROJECT_NAME__  â€” project/assembly name  (e.g. "Navertica.Account")
+///   __NAMESPACE__     â€” .NET root namespace      (may equal project name)
+///   __PLUGIN_CLASS__  â€” plugin class stub name   (e.g. "AccountPlugin")
+///   __ASSEMBLY_GUID__ â€” fresh GUID per project   (e.g. "12345678-...")
 // template_base_name: literal folder name of the template (e.g. "Template.Plugin").
 // Substituted with project_name in names and content alongside the __PLACEHOLDER__ tokens.
 fn copy_template_tree(
@@ -2896,7 +2896,7 @@ async fn classify_inbox_item(app: tauri::AppHandle, item: Value) -> Result<Value
 
     // Truncate content to avoid unnecessarily large payloads.
     let content_trimmed = if content.len() > 3000 {
-        format!("{}…[truncated]", &content[..3000])
+        format!("{}â€¦[truncated]", &content[..3000])
     } else {
         content.clone()
     };
@@ -2907,14 +2907,14 @@ async fn classify_inbox_item(app: tauri::AppHandle, item: Value) -> Result<Value
         Ok(config) => {
             // --- AI path ---
             let source_context = match source.as_str() {
-                "teams" => "Teams chat message (very noisy channel — be strict, require explicit request verbs or clear issues)",
+                "teams" => "Teams chat message (very noisy channel â€” be strict, require explicit request verbs or clear issues)",
                 _       => "Outlook email (apply reasonable developer workflow classification)",
             };
 
             let instructions = "You are a classification assistant for a Dynamics 365 / Dataverse developer productivity app. \
 Your job is to classify incoming messages and decide whether they represent real engineering work tasks. \
 Be CONSERVATIVE: when in doubt, return isTask=false or low confidence. \
-Respond with ONLY valid JSON — no markdown, no code fences, no explanation outside the JSON.";
+Respond with ONLY valid JSON â€” no markdown, no code fences, no explanation outside the JSON.";
 
             let prompt = format!(
 "Classify this message for a CRM/Dynamics/Dataverse developer.\n\
@@ -2922,7 +2922,7 @@ Source type: {source_context}\n\
 From: {sender_name} <{sender_email}>\n\
 Subject/Title: {title}\n\
 Content:\n{content_trimmed}\n\n\
-DECISION RULES — apply strictly in this order:\n\n\
+DECISION RULES â€” apply strictly in this order:\n\n\
 ALWAYS isTask=false (skip unconditionally):\n\
 - Build/CI/pipeline result notifications (succeeded, failed, completed)\n\
 - Change task or work item marked as FINISHED, COMPLETED, DONE, CLOSED\n\
@@ -2940,27 +2940,27 @@ Confidence calibration:\n\
 - 90-100: unambiguous direct request with customer + specific issue/file/ticket\n\
 - 85-89: clear request, minor ambiguity about scope or urgency\n\
 - 70-84: plausible work item but missing specifics or could be informational\n\
-- 50-69: uncertain — might need action or might be informational\n\
+- 50-69: uncertain â€” might need action or might be informational\n\
 - <50: almost certainly not a task\n\n\
 Threshold note: items with confidence < 85 go to user review; >= 85 auto-create. \
 Prefer lower confidence for borderline items rather than guessing high.\n\n\
 Examples:\n\
-- 'Bug na Ptáčkovi v nvr_activity_events.js' → isTask=true conf=90 (customer + file + bug)\n\
-- 'Change task: ... (pending); Ticket: #76688; Neopharma' → isTask=true conf=87 (pending helpdesk task)\n\
-- 'Change task: ... (finished); Ticket: #76423' → isTask=false (completed, no action)\n\
-- 'Informace o vytvoření objednávky z portálu' → isTask=false (informational, no action required)\n\
-- 'Build succeeded: main → production' → isTask=false (CI notification)\n\
-- 'PR - VSM 113862 needs your review' → isTask=true conf=88 (explicit review request)\n\n\
+- 'Bug na PtĂˇÄŤkovi v nvr_activity_events.js' â†’ isTask=true conf=90 (customer + file + bug)\n\
+- 'Change task: ... (pending); Ticket: #76688; Neopharma' â†’ isTask=true conf=87 (pending helpdesk task)\n\
+- 'Change task: ... (finished); Ticket: #76423' â†’ isTask=false (completed, no action)\n\
+- 'Informace o vytvoĹ™enĂ­ objednĂˇvky z portĂˇlu' â†’ isTask=false (informational, no action required)\n\
+- 'Build succeeded: main â†’ production' â†’ isTask=false (CI notification)\n\
+- 'PR - VSM 113862 needs your review' â†’ isTask=true conf=88 (explicit review request)\n\n\
 Respond with ONLY this JSON:\n\
 {{\"isTask\":true,\"confidence\":85,\"title\":\"Short imperative action title (max 80 chars)\",\
 \"summary\":\"1-2 sentences in English: what needs to be done and why\",\
-\"summaryCz\":\"1-2 věty česky: co je třeba udělat a proč\",\
+\"summaryCz\":\"1-2 vÄ›ty ÄŤesky: co je tĹ™eba udÄ›lat a proÄŤ\",\
 \"summaryEn\":\"1-2 sentences in English describing the problem\",\
-\"problemPointsCz\":[\"Krátký český bod o problému.\"],\
+\"problemPointsCz\":[\"KrĂˇtkĂ˝ ÄŤeskĂ˝ bod o problĂ©mu.\"],\
 \"problemPointsEn\":[\"Short English bullet about the problem.\"],\
-\"actionPointsCz\":[\"Konkrétní akční krok česky.\"],\
+\"actionPointsCz\":[\"KonkrĂ©tnĂ­ akÄŤnĂ­ krok ÄŤesky.\"],\
 \"actionPointsEn\":[\"Concrete action step in English.\"],\
-\"nextStepCz\":\"Jeden jasný bezprostřední krok česky.\",\
+\"nextStepCz\":\"Jeden jasnĂ˝ bezprostĹ™ednĂ­ krok ÄŤesky.\",\
 \"nextStepEn\":\"One clear immediate next step in English.\",\
 \"customerName\":null,\"taskType\":\"other\",\"estimatedEffort\":null,\"dueAt\":null,\
 \"suggestedReply\":null,\"skipReason\":null}}\n\n\
@@ -2973,7 +2973,7 @@ Field rules:\n\
 - suggestedReply: 1-2 sentence acknowledgement if a reply is appropriate, else null\n\
 - ALL bilingual fields (summaryCz, summaryEn, *Cz, *En) are MANDATORY when isTask=true\n\
 - *Cz fields: natural Czech. *En fields: natural English.\n\
-- title: must be in Czech for Teams messages. Use an action-oriented noun phrase (e.g. 'Upravit možnost změny data dokončení úkolu')."
+- title: must be in Czech for Teams messages. Use an action-oriented noun phrase (e.g. 'Upravit moĹľnost zmÄ›ny data dokonÄŤenĂ­ Ăşkolu')."
             );
 
             let text_result = call_ai_text(&config, instructions, &prompt).await;
@@ -3000,7 +3000,7 @@ Field rules:\n\
         }
         Err(_) => {
             // --- Heuristic path (no OpenAI API key configured) ---
-            eprintln!("[classify] No AI key — using heuristic classification for: {title}");
+            eprintln!("[classify] No AI key â€” using heuristic classification for: {title}");
             Ok(heuristic_classify_item(&title, &content, &sender_name, &source))
         }
     }
@@ -3022,14 +3022,14 @@ fn heuristic_classify_item(
         "please", "fix", "check", "review", "deploy", "verify", "look into",
         "could you", "can you", "would you", "we need", "i need",
         // Czech
-        "potřeboval", "kouknout", "podívat", "zkontrolovat", "opravit",
-        "prověřit", "zobrazuje", "prosím",
+        "potĹ™eboval", "kouknout", "podĂ­vat", "zkontrolovat", "opravit",
+        "provÄ›Ĺ™it", "zobrazuje", "prosĂ­m",
     ];
     let issue_words = [
         "not working", "broken", "bug", "error", "fails", "crash", "wrong",
         "doesn't work", "cant work", "can't work",
         // Czech
-        "nefunguje", "chyba", "problém", "nefunkcni", "nefunkční",
+        "nefunguje", "chyba", "problĂ©m", "nefunkcni", "nefunkÄŤnĂ­",
     ];
     // Environment words indicate developer-relevant context
     let env_words = ["prod", "production", "uat", "staging", "dev ", "development"];
@@ -3039,8 +3039,8 @@ fn heuristic_classify_item(
     let env_score    = env_words.iter().filter(|&&w| combined.contains(w)).count();
 
     // Teams base is 20 (matches frontend heuristicClassify.ts SOURCE_BASE).
-    // Zero signals → score stays below MIN_CONFIDENCE_ANALYZE (50) → silently skipped.
-    // Email base is 35 — emails generally have more context.
+    // Zero signals â†’ score stays below MIN_CONFIDENCE_ANALYZE (50) â†’ silently skipped.
+    // Email base is 35 â€” emails generally have more context.
     let base = if source == "teams" { 20u32 } else { 35u32 };
     let score = (base + action_score as u32 * 8 + issue_score as u32 * 12 + env_score as u32 * 5).min(92);
     let is_task = score >= 50;
@@ -3100,7 +3100,7 @@ fn heuristic_title_from_content(sender_name: &str, content: &str) -> String {
         .unwrap_or(&body[..body.len().min(80)]);
 
     let capped = if first.len() > 95 {
-        format!("{}…", &first[..92])
+        format!("{}â€¦", &first[..92])
     } else {
         first.to_string()
     };
@@ -3296,7 +3296,7 @@ fn create_repository_from_template(
         };
 
         if rel.is_empty() {
-            continue; // top-level directory entry itself — skip it
+            continue; // top-level directory entry itself â€” skip it
         }
 
         let out_path = target.join(rel);
@@ -3353,7 +3353,7 @@ fn initialize_git_repository(
     if target.join(".git").exists() {
         return GitInitResult {
             status:  "already_exists".to_string(),
-            message: ".git directory already present — skipped".to_string(),
+            message: ".git directory already present â€” skipped".to_string(),
             initial_commit_created: false,
         };
     }
@@ -3409,7 +3409,7 @@ fn initialize_git_repository(
         };
 
         if add_ok {
-            // Create commit — tolerate failure silently (e.g. nothing to commit)
+            // Create commit â€” tolerate failure silently (e.g. nothing to commit)
             let commit_ok = {
                 let mut cmd = std::process::Command::new("git");
                 cmd.args(["-C", &path, "commit", "-m", "Initial commit"]);
@@ -3574,7 +3574,7 @@ fn infer_review_file_path(base_path: String, mode: String, project_name: String,
 }
 
 /// Lists files in `dir` that match `extension` (e.g. "js"), non-recursively.
-/// Returns file names only (not full paths). Never fails — returns empty vec on any error.
+/// Returns file names only (not full paths). Never fails â€” returns empty vec on any error.
 #[tauri::command]
 fn list_directory_files(dir: String, extension: String) -> Vec<String> {
     let path = std::path::Path::new(&dir);
@@ -3602,7 +3602,7 @@ fn list_directory_files(dir: String, extension: String) -> Vec<String> {
 /// When `recursive = false`, only the immediate directory is scanned (shallow).
 /// When `recursive = true`, the tree is walked and any entry whose name (lowercase)
 /// matches an entry in `excluded_dirs` is skipped entirely (e.g. "bin", "obj").
-/// Never fails — returns an empty array on any filesystem error.
+/// Never fails â€” returns an empty array on any filesystem error.
 #[tauri::command]
 fn list_files_with_paths(
     dir: String,
@@ -3907,7 +3907,7 @@ fn ensure_xrm_sdk_reference(
 /// Restores NuGet packages for a legacy packages.config plugin project.
 ///
 /// Strategy:
-///   1. Try `nuget.exe restore <sln>` (fast path — uses user's NuGet cache).
+///   1. Try `nuget.exe restore <sln>` (fast path â€” uses user's NuGet cache).
 ///   2. If nuget.exe is not available, download Microsoft.CrmSdk.CoreAssemblies directly
 ///      from api.nuget.org and extract lib/net462/ DLLs into the packages folder.
 ///   3. Validate (and optionally auto-fix) the .csproj Xrm.Sdk reference for custom templates.
@@ -4091,7 +4091,7 @@ async fn check_plugin_build_readiness(
         any_fail = true;
     }
 
-    // 4. key.snk — warning only (assembly might still build without it if signing is disabled)
+    // 4. key.snk â€” warning only (assembly might still build without it if signing is disabled)
     let snk_ok = csproj.as_deref()
         .and_then(|p| p.parent())
         .map(|d| d.join("key.snk").exists())
@@ -4100,7 +4100,7 @@ async fn check_plugin_build_readiness(
         checks.push(bcheck("key_snk", "key.snk (signing)", "pass", "Found."));
     } else {
         checks.push(bcheck("key_snk", "key.snk (signing)", "warning",
-            "key.snk not found — assembly signing may fail if enabled in .csproj."));
+            "key.snk not found â€” assembly signing may fail if enabled in .csproj."));
         any_warn = true;
     }
 
@@ -4115,7 +4115,7 @@ async fn check_plugin_build_readiness(
             any_fail = true;
         }
     } else {
-        checks.push(bcheck("xrm_ref", "Microsoft.Xrm.Sdk reference", "skip", "Skipped — no .csproj."));
+        checks.push(bcheck("xrm_ref", "Microsoft.Xrm.Sdk reference", "skip", "Skipped â€” no .csproj."));
     }
 
     // 6. Microsoft.Xrm.Sdk.dll in packages folder
@@ -4123,7 +4123,7 @@ async fn check_plugin_build_readiness(
         checks.push(bcheck("xrm_dll", "Microsoft.Xrm.Sdk.dll in packages", "pass", "Found."));
     } else {
         checks.push(bcheck("xrm_dll", "Microsoft.Xrm.Sdk.dll in packages", "fail",
-            "Not found — run NuGet restore."));
+            "Not found â€” run NuGet restore."));
         any_fail = true;
     }
 
@@ -4181,7 +4181,7 @@ async fn check_plugin_build_readiness(
 
             match msbuild_exe {
                 None => {
-                    // msbuild not found: visible warning — build was not verified.
+                    // msbuild not found: visible warning â€” build was not verified.
                     checks.push(bcheck("build", "MSBuild", "warning",
                         "MSBuild was not found in PATH or common Visual Studio installation paths. \
                          Project structure checks passed, but the solution was not compiled."));
@@ -4219,7 +4219,7 @@ async fn check_plugin_build_readiness(
                             if success {
                                 checks.push(bcheck("build", "MSBuild", "pass", "Build succeeded."));
                             } else {
-                                checks.push(bcheck("build", "MSBuild", "fail", "Build failed — see output."));
+                                checks.push(bcheck("build", "MSBuild", "fail", "Build failed â€” see output."));
                                 any_fail = true;
                             }
                         }
@@ -4245,14 +4245,14 @@ async fn check_plugin_build_readiness(
         }
     } else {
         checks.push(bcheck("build", "MSBuild", "skip",
-            "Skipped — resolve failing checks before building."));
+            "Skipped â€” resolve failing checks before building."));
     }
 
     let fail_count = checks.iter().filter(|c| c.result == "fail").count();
     let warn_count = checks.iter().filter(|c| c.result == "warning").count();
     let status = if any_fail { "failed" } else if any_warn { "warnings" } else { "passed" };
     let summary = match status {
-        "failed"   => format!("{fail_count} check(s) failed — resolve before building."),
+        "failed"   => format!("{fail_count} check(s) failed â€” resolve before building."),
         "warnings" => format!("Passed with {warn_count} warning(s)."),
         _          => "All build readiness checks passed.".to_string(),
     };
@@ -4319,7 +4319,7 @@ fn compile_include_exists(content: &str, rel_path: &str) -> bool {
 /// Inserts `<Compile Include="rel_path" />` into the .csproj content string.
 ///
 /// Strategy (in order):
-///   1. After the last existing `<Compile Include=…>` line (keeps items grouped).
+///   1. After the last existing `<Compile Include=â€¦>` line (keeps items grouped).
 ///   2. Before the `Microsoft.CSharp.targets` Import line (in a new ItemGroup).
 ///   3. Before the closing `</Project>` tag.
 fn insert_compile_include(content: &str, rel_path: &str) -> Result<String, String> {
@@ -4374,14 +4374,14 @@ fn insert_compile_include(content: &str, rel_path: &str) -> Result<String, Strin
     Err("Could not find a suitable location to insert Compile Include in the .csproj.".to_string())
 }
 
-/// Adds `<Compile Include="…" />` for a newly saved .cs file to the legacy .csproj
+/// Adds `<Compile Include="â€¦" />` for a newly saved .cs file to the legacy .csproj
 /// that lives in the same directory.
 ///
 /// Returns a tagged result so the frontend can show appropriate feedback:
-///   "added"          – entry was inserted
-///   "already_present"– entry already existed; no change
-///   "sdk_style"      – SDK-style project (auto-includes); no change needed
-///   "no_csproj_found"– no .csproj in the directory; action not possible
+///   "added"          â€“ entry was inserted
+///   "already_present"â€“ entry already existed; no change
+///   "sdk_style"      â€“ SDK-style project (auto-includes); no change needed
+///   "no_csproj_found"â€“ no .csproj in the directory; action not possible
 #[tauri::command]
 fn add_compile_include_to_csproj(cs_file_path: String) -> Result<CsprojUpdateResult, String> {
     let cs_path = std::path::Path::new(&cs_file_path);
@@ -4416,7 +4416,7 @@ fn add_compile_include_to_csproj(cs_file_path: String) -> Result<CsprojUpdateRes
     }
 
     // Compute relative path from the project folder to the .cs file.
-    // Use Windows backslashes — that is the MSBuild convention in .csproj files.
+    // Use Windows backslashes â€” that is the MSBuild convention in .csproj files.
     let rel_path = cs_path
         .strip_prefix(proj_dir)
         .map_err(|_| {
@@ -4464,7 +4464,7 @@ fn ms_authority(tenant_id: &str) -> String {
     format!("https://login.microsoftonline.com/{tenant_id}")
 }
 
-// ── PKCE helpers ────────────────────────────────────────────────────────────
+// â”€â”€ PKCE helpers â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 fn generate_code_verifier() -> String {
     let bytes: Vec<u8> = (0..32).map(|_| rand::thread_rng().gen::<u8>()).collect();
@@ -4481,7 +4481,7 @@ fn generate_state() -> String {
     URL_SAFE_NO_PAD.encode(&bytes)
 }
 
-// ── Token cache ─────────────────────────────────────────────────────────────
+// â”€â”€ Token cache â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
 struct TokenCache {
@@ -4490,7 +4490,7 @@ struct TokenCache {
     /// Unix timestamp (seconds) when the access token expires.
     expires_at: u64,
     id_token: Option<String>,
-    /// Tenant ID used during sign-in — required to build the correct authority URL on refresh.
+    /// Tenant ID used during sign-in â€” required to build the correct authority URL on refresh.
     /// Old caches without this field deserialise to an empty string; the refresh will fail
     /// gracefully and prompt the user to reconnect.
     #[serde(default)]
@@ -4529,7 +4529,7 @@ fn now_unix() -> u64 {
         .as_secs()
 }
 
-// ── Redirect server ──────────────────────────────────────────────────────────
+// â”€â”€ Redirect server â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 /// Opens a local TCP listener and waits for the browser redirect.
 /// Returns the query-string parameters as a map.
@@ -4602,7 +4602,7 @@ fn percent_decode(s: &str) -> String {
     out
 }
 
-// ── Token exchange ───────────────────────────────────────────────────────────
+// â”€â”€ Token exchange â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 #[derive(Deserialize, Debug)]
 struct TokenResponse {
@@ -4619,12 +4619,12 @@ fn msal_error_from_body(body: &str, status: u16, operation: &str) -> String {
     if let Ok(json) = serde_json::from_str::<Value>(body) {
         let code = json["error"].as_str().unwrap_or("unknown");
         let desc = json["error_description"].as_str().unwrap_or("no detail");
-        // Truncate the description — MSAL descriptions can be very long.
+        // Truncate the description â€” MSAL descriptions can be very long.
         let preview: String = desc.chars().take(200).collect();
         let friendly = match code {
             "invalid_grant" | "interaction_required" =>
                 format!(
-                    "InvalidAuthenticationToken — Microsoft connection expired ({code}). \
+                    "InvalidAuthenticationToken â€” Microsoft connection expired ({code}). \
                      Please reconnect in Settings. Detail: {preview}"
                 ),
             "invalid_client" | "unauthorized_client" =>
@@ -4733,7 +4733,7 @@ async fn refresh_access_token(
     })
 }
 
-// ── Graph helpers ────────────────────────────────────────────────────────────
+// â”€â”€ Graph helpers â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 async fn graph_get(url: &str, access_token: &str) -> Result<Value, String> {
     // Strip query string from the logged URL so the log line is concise and
@@ -4761,9 +4761,9 @@ async fn graph_get(url: &str, access_token: &str) -> Result<Value, String> {
         .unwrap_or("")
         .to_owned();
 
-    // ── Non-2xx: read the body as TEXT first ─────────────────────────────────
+    // â”€â”€ Non-2xx: read the body as TEXT first â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     // IMPORTANT: calling `.json()` before checking the status is the root cause
-    // of "error decoding response body" — Graph sometimes returns HTML or an
+    // of "error decoding response body" â€” Graph sometimes returns HTML or an
     // empty body on 401/403/503, which cannot be decoded as JSON.
     // Reading as text lets us surface the real HTTP status and a body preview.
     if !status.is_success() {
@@ -4783,7 +4783,7 @@ async fn graph_get(url: &str, access_token: &str) -> Result<Value, String> {
                     "Authorization_RequestDenied" | "Unauthorized" | "AccessDenied" =>
                         format!("Missing Microsoft permissions ({code}): {msg}. Make sure Mail.Read is granted in Azure."),
                     "InvalidAuthenticationToken" | "AuthenticationError" =>
-                        format!("InvalidAuthenticationToken — Microsoft connection expired. Please reconnect in Settings."),
+                        format!("InvalidAuthenticationToken â€” Microsoft connection expired. Please reconnect in Settings."),
                     _ =>
                         format!("Microsoft Graph API error [{status}] {code}: {msg}"),
                 };
@@ -4792,14 +4792,14 @@ async fn graph_get(url: &str, access_token: &str) -> Result<Value, String> {
             }
         }
 
-        // No structured JSON error — produce a clear plain-text error.
+        // No structured JSON error â€” produce a clear plain-text error.
         let friendly = match status.as_u16() {
             401 => format!(
                 "Outlook authorization failed (HTTP 401). Please reconnect Microsoft in Settings. \
                  Endpoint: {url_base}"
             ),
             403 => format!(
-                "Access denied (HTTP 403) — Mail.Read permission may be missing from your Azure app registration. \
+                "Access denied (HTTP 403) â€” Mail.Read permission may be missing from your Azure app registration. \
                  Endpoint: {url_base}"
             ),
             _ => format!(
@@ -4810,7 +4810,7 @@ async fn graph_get(url: &str, access_token: &str) -> Result<Value, String> {
         return Err(friendly);
     }
 
-    // ── 2xx: parse JSON ───────────────────────────────────────────────────────
+    // â”€â”€ 2xx: parse JSON â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     let body: Value = resp
         .json()
         .await
@@ -4824,7 +4824,7 @@ async fn graph_get(url: &str, access_token: &str) -> Result<Value, String> {
             "Authorization_RequestDenied" | "Unauthorized" | "AccessDenied" =>
                 format!("Missing Microsoft permissions ({code}): {msg}"),
             "InvalidAuthenticationToken" | "AuthenticationError" =>
-                format!("InvalidAuthenticationToken — Microsoft connection expired. Please reconnect in Settings."),
+                format!("InvalidAuthenticationToken â€” Microsoft connection expired. Please reconnect in Settings."),
             _ =>
                 format!("Microsoft Graph API error [{status}] {code}: {msg}"),
         };
@@ -4854,9 +4854,9 @@ async fn ensure_valid_token(app: &tauri::AppHandle, client_id: &str) -> Result<S
             Ok(new_cache.access_token)
         }
         Err(refresh_err) => {
-            // Refresh failed — the refresh token is invalid/expired.
+            // Refresh failed â€” the refresh token is invalid/expired.
             // Clear the cache so we don't attempt to use a dead token on the next call.
-            eprintln!("[token] ensure_valid_token: refresh failed — clearing token cache");
+            eprintln!("[token] ensure_valid_token: refresh failed â€” clearing token cache");
             let _ = clear_token_cache(app);
             // Prefix with a recognizable code so the frontend can route to a reconnect flow.
             Err(format!("MICROSOFT_RECONNECT_REQUIRED: {refresh_err}"))
@@ -4864,7 +4864,7 @@ async fn ensure_valid_token(app: &tauri::AppHandle, client_id: &str) -> Result<S
     }
 }
 
-// ── Microsoft account info types ─────────────────────────────────────────────
+// â”€â”€ Microsoft account info types â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 #[serde(rename_all = "camelCase")]
@@ -4875,7 +4875,7 @@ struct MicrosoftAccountInfo {
     last_sync_at: String,
 }
 
-// ── Tauri commands ────────────────────────────────────────────────────────────
+// â”€â”€ Tauri commands â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 /// Begin OAuth2 PKCE sign-in: open browser at the tenant-specific authority,
 /// wait for redirect, exchange code, fetch /me from Graph, return account info.
@@ -4889,10 +4889,10 @@ async fn connect_microsoft_account(
     let tenant_id = tenant_id.trim().to_owned();
 
     if client_id.is_empty() {
-        return Err("Application (client) ID is required. Enter it in Settings → Microsoft 365 Integration.".into());
+        return Err("Application (client) ID is required. Enter it in Settings â†’ Microsoft 365 Integration.".into());
     }
     if tenant_id.is_empty() {
-        return Err("Directory (tenant) ID is required. Enter it in Settings → Microsoft 365 Integration.".into());
+        return Err("Directory (tenant) ID is required. Enter it in Settings â†’ Microsoft 365 Integration.".into());
     }
 
     let authority = ms_authority(&tenant_id);
@@ -4948,7 +4948,7 @@ async fn connect_microsoft_account(
 }
 
 /// Refresh the Microsoft connection using the stored refresh token.
-/// The tenant ID is read from the token cache — no need to re-enter it.
+/// The tenant ID is read from the token cache â€” no need to re-enter it.
 #[tauri::command]
 async fn refresh_microsoft_connection(
     app: tauri::AppHandle,
@@ -5005,7 +5005,7 @@ async fn get_outlook_messages(
 ) -> Result<Value, String> {
     let token = ensure_valid_token(&app, &client_id).await?;
     // Server-side filter: only flagged emails.
-    // NOTE: $orderby is intentionally omitted — Graph rejects the combination of
+    // NOTE: $orderby is intentionally omitted â€” Graph rejects the combination of
     // $filter on flag/flagStatus with $orderby on a different field (InefficientFilter).
     // Messages are sorted locally after fetch.
     let url = format!(
@@ -5022,7 +5022,7 @@ async fn get_outlook_messages(
         .into_iter()
         .map(|m| {
             // Strip HTML from the full body for deterministic parsing in the frontend.
-            // IMPORTANT: extract Azure DevOps href URLs *before* stripping tags —
+            // IMPORTANT: extract Azure DevOps href URLs *before* stripping tags â€”
             // ADO "View comment" / "View pull request" links only exist in <a href>
             // attributes and are completely lost by strip_html otherwise.
             //
@@ -5066,7 +5066,7 @@ async fn get_outlook_messages(
             })
         })
         .collect();
-    // Sort by receivedAt descending ($orderby omitted from request — see above).
+    // Sort by receivedAt descending ($orderby omitted from request â€” see above).
     let mut messages = messages;
     messages.sort_by(|a, b| {
         let ta = a["receivedAt"].as_str().unwrap_or("");
@@ -5091,11 +5091,11 @@ async fn get_outlook_flagged_list(
     const MAX_FETCH: usize = 300;
     const SHOW_LIMIT: usize = 50;
 
-    eprintln!("[outlook-import] get_outlook_flagged_list v2 — days_back={days_back}");
+    eprintln!("[outlook-import] get_outlook_flagged_list v2 â€” days_back={days_back}");
     let token = ensure_valid_token(&app, &client_id).await?;
 
     // Build the OData $filter expression.
-    // Combining flag/flagStatus with receivedDateTime ge <date> is safe — InefficientFilter
+    // Combining flag/flagStatus with receivedDateTime ge <date> is safe â€” InefficientFilter
     // only fires when $orderby is mixed with the flag filter, not for AND-filter clauses.
     let filter = if days_back > 0 {
         use std::time::{SystemTime, UNIX_EPOCH};
@@ -5214,7 +5214,7 @@ async fn resolve_cid_attachments(html: &str, message_id: &str, token: &str) -> S
 }
 
 /// Fetch one Outlook message by id with full body, HTML stripping, and ADO link extraction.
-/// Called lazily when the user clicks Import for a specific email — not during panel load.
+/// Called lazily when the user clicks Import for a specific email â€” not during panel load.
 #[tauri::command]
 async fn get_outlook_message_full(
     app: tauri::AppHandle,
@@ -5232,7 +5232,7 @@ async fn get_outlook_message_full(
     let preview_str = m["bodyPreview"].as_str().unwrap_or("");
     let body_html   = m["body"]["content"].as_str().unwrap_or("").to_string();
     // strip_html_email preserves block-level line breaks for quoted-reply detection.
-    // body_full is the plain-text path — AI, prefilter, ADO parsing all use this.
+    // body_full is the plain-text path â€” AI, prefilter, ADO parsing all use this.
     let mut body_full = strip_html_email(&body_html);
     if is_potential_ado_email(&from_email, subject_str, preview_str) {
         let ado_pairs = extract_ado_link_pairs(&body_html);
@@ -5243,7 +5243,7 @@ async fn get_outlook_message_full(
             eprintln!("[ado-link] {} ADO link(s) for messageId={}", ado_pairs.len(), &message_id[..message_id.len().min(12)]);
         }
     }
-    // Resolve CID inline images → data: URIs for the HTML display path.
+    // Resolve CID inline images â†’ data: URIs for the HTML display path.
     // This is separate from body_full and does not affect any text analysis.
     let had_cid = body_html.contains("cid:");
     let body_html_resolved = resolve_cid_attachments(&body_html, &message_id, &token).await;
@@ -5272,7 +5272,7 @@ async fn get_outlook_message_full(
 }
 
 /// Fetch recent Teams chats (top 20, personal/group chats only).
-/// Note: $orderby is NOT supported on /me/chats — it causes a 400 when combined
+/// Note: $orderby is NOT supported on /me/chats â€” it causes a 400 when combined
 /// with $expand. Results are sorted in Rust after fetching.
 #[tauri::command]
 async fn get_teams_chats(
@@ -5393,7 +5393,7 @@ async fn get_teams_intake_messages(
     chat_id: String,
 ) -> Result<Value, String> {
     if chat_id.trim().is_empty() {
-        return Err("Teams intake chat ID is not configured. Set it in Settings → Teams Intake.".to_string());
+        return Err("Teams intake chat ID is not configured. Set it in Settings â†’ Teams Intake.".to_string());
     }
     let token = ensure_valid_token(&app, &client_id).await?;
 
@@ -5433,7 +5433,7 @@ async fn get_teams_intake_messages(
             continue;
         }
 
-        // ── Targeted diagnostic logging for forwarded-message diagnosis ────────
+        // â”€â”€ Targeted diagnostic logging for forwarded-message diagnosis â”€â”€â”€â”€â”€â”€â”€â”€
         // Log attachment metadata and a body snippet for messages that look like
         // forwards (contains "from" keyword or has attachments). Safe and bounded.
         let atts = m["attachments"].as_array();
@@ -5466,7 +5466,7 @@ async fn get_teams_intake_messages(
                 m["id"].as_str().unwrap_or("?"));
         }
 
-        // ── Teams message link resolution ────────────────────────────────────
+        // â”€â”€ Teams message link resolution â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         // If the intake message body contains a "Copy link to message" URL,
         // resolve and prefer the original linked message over forwarded heuristics.
         let link = parse_teams_message_link(&content);
@@ -5478,7 +5478,7 @@ async fn get_teams_intake_messages(
         if let Some(ref lnk) = link {
             linked_url = lnk.raw_url.clone();
             if lnk.is_channel {
-                linked_type = "channel";       // not supported — surface in UI
+                linked_type = "channel";       // not supported â€” surface in UI
                 eprintln!("[Teams-link] channel link detected (unsupported): {}", &lnk.raw_url[..lnk.raw_url.len().min(80)]);
                 // Still try to parse the preview card text for the original sender/body.
                 if let Some(pc) = parse_teams_preview_card(&content) {
@@ -5526,13 +5526,13 @@ async fn get_teams_intake_messages(
             "chatTopic":          "Teams intake",
             "chatType":           "oneOnOne",
             "chatMembersSummary": "Intake chat",
-            // Forwarded-message metadata — empty when not a forward.
+            // Forwarded-message metadata â€” empty when not a forward.
             "isForwarded":         effective.is_some(),
             "originalSenderName":  effective.as_ref().map(|f| f.sender_name.as_str()).unwrap_or(""),
             "originalSenderEmail": effective.as_ref().and_then(|f| f.sender_email.as_deref()).unwrap_or(""),
             "originalSentAt":      effective.as_ref().and_then(|f| f.sent_at.as_deref()).unwrap_or(""),
             "originalContent":     effective.as_ref().map(|f| f.content.as_str()).unwrap_or(""),
-            // Teams link metadata — non-empty when a "Copy link to message" URL was found.
+            // Teams link metadata â€” non-empty when a "Copy link to message" URL was found.
             "hasLinkedTeamsMessage": link.is_some(),
             "linkedMessageUrl":      linked_url,
             "linkedMessageType":     linked_type,
@@ -5559,7 +5559,7 @@ async fn get_teams_recent_messages(
 ) -> Result<Value, String> {
     let token = ensure_valid_token(&app, &client_id).await?;
 
-    // Step 1: recent chats (no $orderby — not supported with $expand)
+    // Step 1: recent chats (no $orderby â€” not supported with $expand)
     let chats_url = format!(
         "{MS_GRAPH_BASE}/me/chats\
          ?$top=25\
@@ -5654,7 +5654,7 @@ async fn get_teams_recent_messages(
 }
 
 /// Convert a Unix timestamp (seconds since epoch) to a UTC date string "YYYY-MM-DD".
-/// Uses Howard Hinnant's civil-from-days algorithm — no external crate required.
+/// Uses Howard Hinnant's civil-from-days algorithm â€” no external crate required.
 fn unix_secs_to_date_str(secs: u64) -> String {
     let z   = (secs / 86400) as i64 + 719468;
     let era = if z >= 0 { z } else { z - 146096 } / 146097;
@@ -5702,7 +5702,7 @@ async fn get_teams_self_chat_messages(
     let raw_chats = chats_data["value"].as_array().cloned().unwrap_or_default();
     eprintln!("[Teams-selfchat] {} chats fetched", raw_chats.len());
 
-    // Step 3: find the self-chat — a oneOnOne chat where ALL members share my userId.
+    // Step 3: find the self-chat â€” a oneOnOne chat where ALL members share my userId.
     let self_chat_id = raw_chats.iter().find_map(|c| {
         if c["chatType"].as_str() != Some("oneOnOne") {
             return None;
@@ -5780,7 +5780,7 @@ async fn get_teams_self_chat_messages(
 /// Cheap pre-check: returns true if the email is likely from Azure DevOps.
 ///
 /// Examines the sender address, subject line, and body preview using simple
-/// string matching — no HTML parsing involved. This gates the more expensive
+/// string matching â€” no HTML parsing involved. This gates the more expensive
 /// `extract_ado_link_pairs` so we don't scan every Outlook email for ADO links.
 ///
 /// Broad-enough to catch all real ADO notification types:
@@ -5866,7 +5866,7 @@ fn extract_ado_link_pairs(html: &str) -> Vec<(String, String)> {
 
         let tag_slice = &html[a_start..tag_end - 1]; // content inside <a ... >
 
-        // Extract href value — look for href="..."
+        // Extract href value â€” look for href="..."
         let href_opt = 'href: {
             let tag_lower = tag_slice.to_ascii_lowercase();
             let Some(href_pos) = tag_lower.find("href=\"") else { break 'href None };
@@ -5881,7 +5881,7 @@ fn extract_ado_link_pairs(html: &str) -> Vec<(String, String)> {
             if !is_ado_url {
                 break 'href None;
             }
-            // Decode &amp; → & so the URL is valid when opened
+            // Decode &amp; â†’ & so the URL is valid when opened
             Some(raw_href.replace("&amp;", "&").replace("&#38;", "&"))
         };
 
@@ -5919,7 +5919,7 @@ fn is_block_tag(tag: &str) -> bool {
 }
 
 /// Email-aware HTML stripper: preserves paragraph / line-break structure.
-/// Block-level tags (p, div, br, tr, …) become newlines so that email thread
+/// Block-level tags (p, div, br, tr, â€¦) become newlines so that email thread
 /// boundaries remain detectable for the frontend thread splitter.
 /// Use this for Outlook full-body content; use `strip_html` for short previews.
 fn strip_html_email(html: &str) -> String {
@@ -5943,7 +5943,7 @@ fn strip_html_email(html: &str) -> String {
                     }
                     tag_buf.clear();
                 } else {
-                    // Stray > in content — pass through
+                    // Stray > in content â€” pass through
                     out.push(ch);
                 }
                 in_tag = false;
@@ -6203,7 +6203,7 @@ fn strip_teams_chrome(s: &str) -> &str {
 /// When a user pastes a Teams message link into a chat, Teams renders it as a
 /// "rich preview" card.  After HTML stripping the body looks like:
 ///
-///   `Jan Kvicala: V těch 16:00 spustíme ten release na PROD | Chat | Microsoft Teams`
+///   `Jan Kvicala: V tÄ›ch 16:00 spustĂ­me ten release na PROD | Chat | Microsoft Teams`
 ///   `https://teams.microsoft.com/l/message/...`
 ///
 /// This function detects that pattern and extracts the original sender name
@@ -6265,13 +6265,13 @@ struct ForwardedMeta {
 ///
 /// Two strategies (tried in order):
 ///
-/// 1. **messageReference attachment** — when a user explicitly shares/references
+/// 1. **messageReference attachment** â€” when a user explicitly shares/references
 ///    another message via the Teams UI, the Graph API populates
 ///    `attachments[].contentType == "messageReference"` with a JSON `content`
 ///    string that contains `messageSender.user.{displayName,userPrincipalName}`
 ///    and `messagePreview`. This is the most reliable signal.
 ///
-/// 2. **HTML `<b>From:</b>` pattern** — when a message is forwarded by copying
+/// 2. **HTML `<b>From:</b>` pattern** â€” when a message is forwarded by copying
 ///    and pasting, the body HTML often contains an email-style header block
 ///    (`<b>From:</b> Name ...`) that is destroyed when `strip_html` is called.
 ///    We parse this *before* stripping.
@@ -6279,7 +6279,7 @@ struct ForwardedMeta {
 /// Returns `None` for normal (non-forwarded) messages so the caller falls back
 /// cleanly to the existing behaviour.
 fn parse_teams_forwarded_card(msg: &Value, body_html: &str) -> Option<ForwardedMeta> {
-    // ── Strategy 1 & 3: attachment-based detection ───────────────────────────
+    // â”€â”€ Strategy 1 & 3: attachment-based detection â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     // Strategy 1: contentType == "messageReference"  (explicit Teams forward button)
     // Strategy 3: contentType == "reference"         (some group-chat / channel variants)
     if let Some(atts) = msg["attachments"].as_array() {
@@ -6318,7 +6318,7 @@ fn parse_teams_forwarded_card(msg: &Value, body_html: &str) -> Option<ForwardedM
         }
     }
 
-    // ── Strategy 4: blockquote / Teams indent-forward ────────────────────────
+    // â”€â”€ Strategy 4: blockquote / Teams indent-forward â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     // When a user pastes a forwarded block, Teams sometimes wraps it in a
     // <blockquote> or a <div> with the forwarded content inside.  We look for
     // a <blockquote> that contains recognisable attribution text.
@@ -6372,7 +6372,7 @@ fn parse_teams_forwarded_card(msg: &Value, body_html: &str) -> Option<ForwardedM
         }
     }
 
-    // ── Strategy 2: HTML <b>From:</b> / <strong>From:</strong> pattern ────────
+    // â”€â”€ Strategy 2: HTML <b>From:</b> / <strong>From:</strong> pattern â”€â”€â”€â”€â”€â”€â”€â”€
     // Parse this in the raw HTML *before* strip_html destroys the structure.
     if lower_html.contains("<b>from:</b>") || lower_html.contains("<strong>from:</strong>") {
         let plain = strip_html(body_html);
@@ -6562,17 +6562,17 @@ fn task_mcp_local_write_tool_definitions() -> Vec<Value> {
         serde_json::json!({"name":"set_task_estimate",                   "description":"Set task effort estimate in hours with optional budget note. Validates positive numeric input.","readOnly":false}),
         serde_json::json!({"name":"save_technical_plan",                 "description":"Save local technical plan draft: summary, steps, entities, test plan, risks. Does not write code or register anything.","readOnly":false}),
         serde_json::json!({"name":"mark_technical_plan_ready_for_approval","description":"Mark saved technical plan as ready for user review. Requires save_technical_plan to have been called first.","readOnly":false}),
-        serde_json::json!({"name":"record_manual_pr",                    "description":"Record a pull request created manually outside task-workbench. Local tracking only — does not call GitHub or Azure DevOps.","readOnly":false}),
+        serde_json::json!({"name":"record_manual_pr",                    "description":"Record a pull request created manually outside task-workbench. Local tracking only â€” does not call GitHub or Azure DevOps.","readOnly":false}),
         serde_json::json!({"name":"save_pr_review_analysis",             "description":"Save local PR review analysis: summary, action items, warnings. Does not reply to or resolve PR comments.","readOnly":false}),
         serde_json::json!({"name":"save_pr_fix_proposal",                "description":"Save local PR fix proposal: summary and proposed changes. Does not edit files, commit, or push.","readOnly":false}),
         serde_json::json!({"name":"update_task_checklist_item",          "description":"Set status of a local workflow checklist item. Strict key and status enum validation.","readOnly":false}),
         serde_json::json!({"name":"set_task_next_step",                  "description":"Set the AI-recommended next action and reason. Does not overwrite analysis or plan.","readOnly":false}),
-        serde_json::json!({"name":"create_branch_for_task",              "description":"This modifies the local Git repository by creating and switching to a new branch. Creates a local branch only — no commit, no push, no PR, no GitHub/Azure DevOps API calls.","readOnly":false}),
-        serde_json::json!({"name":"commit_task_changes",                 "description":"WRITE — stages the specified files and creates a Git commit in the task repository. Does NOT push. Use push_task_branch or commit_and_push_task_changes to push afterwards.","readOnly":false}),
-        serde_json::json!({"name":"push_task_branch",                    "description":"WRITE — pushes the current branch of the task repository to origin. Push to main/master is blocked. No force push.","readOnly":false}),
-        serde_json::json!({"name":"commit_and_push_task_changes",        "description":"WRITE — stages files, creates a Git commit, and pushes the current branch in one step. No PR creation. Set moveToReviewAfterPush=true to also move the task to Code Review / Waiting for code review.","readOnly":false}),
-        serde_json::json!({"name":"mark_testing_confirmed_prepare_commit","description":"WRITE (local task state only) — marks consultant testing as confirmed and sets the next step to Prepare commit and push. Does NOT commit, push, or move the task to Code Review.","readOnly":false}),
-        serde_json::json!({"name":"record_external_action_completed",     "description":"WRITE (local task state only) — records that the developer manually completed an external action (plugin registration, web resource upload, etc.). Does not call any external system.","readOnly":false}),
+        serde_json::json!({"name":"create_branch_for_task",              "description":"This modifies the local Git repository by creating and switching to a new branch. Creates a local branch only â€” no commit, no push, no PR, no GitHub/Azure DevOps API calls.","readOnly":false}),
+        serde_json::json!({"name":"commit_task_changes",                 "description":"WRITE â€” stages the specified files and creates a Git commit in the task repository. Does NOT push. Use push_task_branch or commit_and_push_task_changes to push afterwards.","readOnly":false}),
+        serde_json::json!({"name":"push_task_branch",                    "description":"WRITE â€” pushes the current branch of the task repository to origin. Push to main/master is blocked. No force push.","readOnly":false}),
+        serde_json::json!({"name":"commit_and_push_task_changes",        "description":"WRITE â€” stages files, creates a Git commit, and pushes the current branch in one step. No PR creation. Set moveToReviewAfterPush=true to also move the task to Code Review / Waiting for code review.","readOnly":false}),
+        serde_json::json!({"name":"mark_testing_confirmed_prepare_commit","description":"WRITE (local task state only) â€” marks consultant testing as confirmed and sets the next step to Prepare commit and push. Does NOT commit, push, or move the task to Code Review.","readOnly":false}),
+        serde_json::json!({"name":"record_external_action_completed",     "description":"WRITE (local task state only) â€” records that the developer manually completed an external action (plugin registration, web resource upload, etc.). Does not call any external system.","readOnly":false}),
     ]
 }
 
@@ -7172,7 +7172,11 @@ fn task_mcp_implementation_readiness(task: &Value) -> Value {
         || dv_check["status"].as_str().map(|s| s == "skipped" || s == "manually-verified").unwrap_or(false);
 
     if !dv_satisfied {
-        blockers.push("Dataverse metadata verification has not been completed or explicitly skipped.".into());
+        if is_script {
+            warnings.push("Dataverse metadata verification for JS/TS is not available through MCP. Use the in-app Verify Implementation modal after implementation/upload.".into());
+        } else {
+            blockers.push("Dataverse metadata verification has not been completed or explicitly skipped.".into());
+        }
     } else {
         if latest_verdict == "warnings" { warnings.push("Dataverse verification completed with warnings. Review before implementing.".into()); }
         if latest_verdict == "fail"     { warnings.push("Dataverse verification found issues. Ensure they are accounted for in the technical plan.".into()); }
@@ -7289,8 +7293,8 @@ fn task_mcp_builtin_templates() -> Vec<Value> {
     vec![
         serde_json::json!({
             "id": "nvr-training-sh-script-prefill",
-            "name": "NVR Training Service Hub — Script: Předvyplnění servisního požadavku",
-            "titlePattern": "Script: Předvyplnění servisního požadavku",
+            "name": "NVR Training Service Hub â€” Script: PĹ™edvyplnÄ›nĂ­ servisnĂ­ho poĹľadavku",
+            "titlePattern": "Script: PĹ™edvyplnÄ›nĂ­ servisnĂ­ho poĹľadavku",
             "mode": "developer",
             "workKind": "script",
             "actionType": "create-new-script",
@@ -7309,14 +7313,15 @@ fn task_mcp_builtin_templates() -> Vec<Value> {
                 "mainHelperSuggestion": "prefillServiceCaseFromAsset"
             },
             "sourceEntity": "nvr_customerasset",
-            "sourceFields": ["nvr_customerid", "nvr_contactid", "nvr_isunderwarranty", "nvr_statuscustom"],
+            "sourceFields": ["nvr_customerid", "nvr_contactid", "nvr_isunderwarranty"],
             "targetFields": ["nvr_customerid", "nvr_contactid", "nvr_iswarrantycase"],
-            "notes": "onChange on nvr_assetid. Source entity: nvr_customerasset. Copy nvr_customerid, nvr_contactid, nvr_isunderwarranty, nvr_statuscustom → nvr_servicecase fields nvr_customerid, nvr_contactid, nvr_iswarrantycase. Solution: NVRTrainingServiceHubCore. App: nvr_trainingservicehub."
+            "additionalSourceFields": ["nvr_statuscustom"],
+            "notes": "onChange on nvr_assetid. Source entity: nvr_customerasset. Copy nvr_customerid, nvr_contactid, nvr_isunderwarranty to nvr_servicecase fields nvr_customerid, nvr_contactid, nvr_iswarrantycase. Additional source field available: nvr_statuscustom. Solution: NVRTrainingServiceHubCore. App: nvr_trainingservicehub."
         }),
         serde_json::json!({
             "id": "nvr-training-sh-plugin-workorderline",
-            "name": "NVR Training Service Hub — Plugin: Výpočet částek na položce servisní zakázky",
-            "titlePattern": "Plugin: Výpočet částek na položce servisní zakázky",
+            "name": "NVR Training Service Hub â€” Plugin: VĂ˝poÄŤet ÄŤĂˇstek na poloĹľce servisnĂ­ zakĂˇzky",
+            "titlePattern": "Plugin: VĂ˝poÄŤet ÄŤĂˇstek na poloĹľce servisnĂ­ zakĂˇzky",
             "mode": "developer",
             "workKind": "plugin",
             "actionType": "create-new-plugin",
@@ -7419,17 +7424,52 @@ fn task_mcp_prepare_plan_draft(task: &Value, template: Option<&Value>) -> Option
         .or_else(|| template.and_then(|t| t["scriptTarget"]["entityLogicalName"].as_str()))
         .or_else(|| template.and_then(|t| t["pluginTarget"]["entityLogicalName"].as_str()))
         .filter(|s| !s.is_empty())?;
-    let mapping = template.and_then(|t| {
-        let sources = t["sourceFields"].as_array().map(|a| a.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>().join(", ")).unwrap_or_default();
-        let targets = t["targetFields"].as_array().map(|a| a.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>().join(", ")).unwrap_or_default();
-        if sources.is_empty() && targets.is_empty() { None } else { Some(format!("Map template fields from {} ({}) to {} ({}).", t["sourceEntity"].as_str().unwrap_or("source"), sources, entity, targets)) }
-    });
+    let source_entity = template.and_then(|t| t["sourceEntity"].as_str()).unwrap_or("source");
+    let source_fields: Vec<String> = template
+        .and_then(|t| t["sourceFields"].as_array())
+        .map(|a| a.iter().filter_map(|v| v.as_str()).map(str::to_string).collect())
+        .unwrap_or_default();
+    let target_fields: Vec<String> = template
+        .and_then(|t| t["targetFields"].as_array())
+        .map(|a| a.iter().filter_map(|v| v.as_str()).map(str::to_string).collect())
+        .unwrap_or_default();
+    let pair_count = source_fields.len().min(target_fields.len());
+    let field_mappings: Vec<Value> = (0..pair_count)
+        .map(|i| serde_json::json!({
+            "source": format!("{}.{}", source_entity, source_fields[i]),
+            "target": format!("{}.{}", entity, target_fields[i]),
+        }))
+        .collect();
+    let mut unmapped_source_fields: Vec<String> = source_fields.iter().skip(pair_count).cloned().collect();
+    if let Some(additional) = template.and_then(|t| t["additionalSourceFields"].as_array()) {
+        unmapped_source_fields.extend(additional.iter().filter_map(|v| v.as_str()).map(str::to_string));
+    }
+    let mapping = if field_mappings.is_empty() {
+        None
+    } else {
+        Some(format!(
+            "Map template fields: {}.",
+            field_mappings.iter().filter_map(|pair| {
+                Some(format!("{} -> {}", pair["source"].as_str()?, pair["target"].as_str()?))
+            }).collect::<Vec<_>>().join("; ")
+        ))
+    };
+    let additional_mapping = if unmapped_source_fields.is_empty() {
+        None
+    } else {
+        Some(format!(
+            "Additional source field{} available from template: {}. No target mapping is defined.",
+            if unmapped_source_fields.len() == 1 { "" } else { "s" },
+            unmapped_source_fields.join(", ")
+        ))
+    };
     let is_script = work_kind == "script" || work_kind == "ribbon";
     let mut steps = vec![
         if is_script { format!("Use the selected script target {}.", setup["artifactPath"].as_str().or(setup["scriptPath"].as_str()).unwrap_or("the configured script path")) } else { format!("Use the selected plugin project {}.", setup["pluginProject"].as_str().unwrap_or("the configured plugin project")) },
         format!("Implement {} for {}.", setup["actionType"].as_str().or_else(|| template.and_then(|t| t["actionType"].as_str())).unwrap_or("the requested change"), entity),
         "Keep external Dataverse registration/upload as a manual approved action outside this setup step.".to_string(),
     ];
+    if let Some(m) = additional_mapping.clone() { steps.insert(2, m); }
     if let Some(m) = mapping.clone() { steps.insert(2, m); }
     let target = if is_script {
         serde_json::json!({
@@ -7453,11 +7493,16 @@ fn task_mcp_prepare_plan_draft(task: &Value, template: Option<&Value>) -> Option
     if let Some(m) = mapping {
         findings.push(Value::String(m));
     }
+    if let Some(m) = additional_mapping {
+        findings.push(Value::String(m));
+    }
     Some(serde_json::json!({
         "workKind": work_kind,
         "summary": if is_script { format!("Create/update a Dataverse form script for {}.", entity) } else { format!("Create/update a Dataverse plugin for {}.", entity) },
         "implementationSteps": steps,
         "dataverseFindings": findings,
+        "fieldMappings": field_mappings,
+        "unmappedSourceFields": unmapped_source_fields,
         "risks": ["Dataverse metadata and runtime registration still require separate verification before implementation."],
         "testChecklist": if is_script { serde_json::json!(["Validate the form event wiring manually in the model-driven app.", "Test the happy path and empty/null source values."]) } else { serde_json::json!(["Run/build the plugin project locally.", "Verify message/stage/filtering attributes before manual registration."]) },
         "target": target,
@@ -7466,19 +7511,25 @@ fn task_mcp_prepare_plan_draft(task: &Value, template: Option<&Value>) -> Option
 
 fn task_mcp_plan_has_template_mapping(plan: &Value, template: Option<&Value>) -> bool {
     let Some(tpl) = template else { return true; };
-    let has_template_mapping = tpl["sourceFields"].as_array().map(|a| !a.is_empty()).unwrap_or(false)
-        || tpl["targetFields"].as_array().map(|a| !a.is_empty()).unwrap_or(false);
-    if !has_template_mapping { return true; }
-    let haystack = serde_json::to_string(plan).unwrap_or_default();
-    let mut required: Vec<String> = Vec::new();
-    if let Some(v) = tpl["sourceEntity"].as_str() { required.push(v.to_string()); }
-    if let Some(arr) = tpl["sourceFields"].as_array() {
-        required.extend(arr.iter().filter_map(|v| v.as_str()).map(str::to_string));
-    }
-    if let Some(arr) = tpl["targetFields"].as_array() {
-        required.extend(arr.iter().filter_map(|v| v.as_str()).map(str::to_string));
-    }
-    required.iter().all(|value| haystack.contains(value))
+    let source_entity = tpl["sourceEntity"].as_str().unwrap_or("source");
+    let target_entity = plan["target"]["entityLogicalName"].as_str()
+        .or_else(|| tpl["targetEntity"].as_str())
+        .or_else(|| tpl["scriptTarget"]["entityLogicalName"].as_str())
+        .unwrap_or("");
+    let source_fields: Vec<String> = tpl["sourceFields"].as_array()
+        .map(|a| a.iter().filter_map(|v| v.as_str()).map(str::to_string).collect())
+        .unwrap_or_default();
+    let target_fields: Vec<String> = tpl["targetFields"].as_array()
+        .map(|a| a.iter().filter_map(|v| v.as_str()).map(str::to_string).collect())
+        .unwrap_or_default();
+    let pair_count = source_fields.len().min(target_fields.len());
+    if pair_count == 0 { return true; }
+    let actual = plan["fieldMappings"].as_array().cloned().unwrap_or_default();
+    (0..pair_count).all(|i| {
+        let source = format!("{}.{}", source_entity, source_fields[i]);
+        let target = format!("{}.{}", target_entity, target_fields[i]);
+        actual.iter().any(|item| item["source"].as_str() == Some(source.as_str()) && item["target"].as_str() == Some(target.as_str()))
+    })
 }
 
 fn task_mcp_execute_tool(app: &tauri::AppHandle, tool_name: &str, args: &Value) -> Result<Value, String> {
@@ -7592,7 +7643,7 @@ fn task_mcp_execute_tool(app: &tauri::AppHandle, tool_name: &str, args: &Value) 
             let index = task_mcp_find_task_index(&tasks, task_id).ok_or_else(|| format!("Task not found: {task_id}"))?;
             let task = &mut tasks[index];
             let existing = task["notes"].as_str().unwrap_or("").trim();
-            // The timestamped note itself is the audit record — no separate audit line needed.
+            // The timestamped note itself is the audit record â€” no separate audit line needed.
             let line = format!("[{}] {}", chrono_now_iso(), note);
             let combined = if existing.is_empty() {
                 line
@@ -7673,10 +7724,10 @@ fn task_mcp_execute_tool(app: &tauri::AppHandle, tool_name: &str, args: &Value) 
             updated = true;
             serde_json::json!({"task": task_mcp_safe_task_summary(task)})
         }
-        // ── Task creation tools ───────────────────────────────────────────────
+        // â”€â”€ Task creation tools â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
         "create_task" => {
-            // Required: title — sanitize HTML, then reject if too long (never truncate silently)
+            // Required: title â€” sanitize HTML, then reject if too long (never truncate silently)
             let title = task_mcp_strip_html(args["title"].as_str().unwrap_or(""))
                 .trim()
                 .to_string();
@@ -7687,7 +7738,7 @@ fn task_mcp_execute_tool(app: &tauri::AppHandle, tool_name: &str, args: &Value) 
                 return Err("title must be 300 characters or fewer.".to_string());
             }
 
-            // source — map mcp/devops to stored values
+            // source â€” map mcp/devops to stored values
             let source_input = args["source"].as_str().unwrap_or("manual").trim();
             if !source_input.is_empty() && !task_mcp_allowed_create_sources().contains(&source_input) {
                 return Err(format!("Invalid source '{source_input}'. Allowed: {}", task_mcp_allowed_create_sources().join(", ")));
@@ -7698,7 +7749,7 @@ fn task_mcp_execute_tool(app: &tauri::AppHandle, tool_name: &str, args: &Value) 
                 other    => if other.is_empty() { "manual" } else { other },
             };
 
-            // taskType — allow 'bug' as alias for 'bug-fix'
+            // taskType â€” allow 'bug' as alias for 'bug-fix'
             let type_input = args["taskType"].as_str().unwrap_or("other").trim();
             if !type_input.is_empty() && !task_mcp_allowed_create_task_types().contains(&type_input) {
                 return Err(format!("Invalid taskType '{type_input}'. Allowed: {}", task_mcp_allowed_create_task_types().join(", ")));
@@ -7857,7 +7908,7 @@ fn task_mcp_execute_tool(app: &tauri::AppHandle, tool_name: &str, args: &Value) 
             serde_json::json!({"deleted": true, "taskId": task_id})
         }
 
-        // ── New read tools ────────────────────────────────────────────────────
+        // â”€â”€ New read tools â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
         "get_task_full_context" => {
             let task_id = args["id"].as_str().unwrap_or("").trim();
@@ -7934,7 +7985,7 @@ fn task_mcp_execute_tool(app: &tauri::AppHandle, tool_name: &str, args: &Value) 
             let mut applied: Vec<&str> = Vec::new();
             let skipped = vec![serde_json::json!({
                 "action": "run_dataverse_check_for_task",
-                "reason": "JS/TS metadata check is not supported by MCP orchestration; run or skip verification separately before implementation."
+                "reason": "Dataverse metadata verification for JS/TS is not available through MCP. Use the in-app Verify Implementation modal after implementation/upload."
             })];
             let mut hard_blockers: Vec<String> = Vec::new();
             let mut warnings: Vec<String> = Vec::new();
@@ -8037,6 +8088,9 @@ fn task_mcp_execute_tool(app: &tauri::AppHandle, tool_name: &str, args: &Value) 
                     .unwrap_or(dev_target_kind.as_str())
                     .to_string();
                 let confirmed_missing = task["workflowSetup"]["confirmedAt"].as_str().unwrap_or("").is_empty();
+                if dev_target_kind == "script" || work_kind == "script" || work_kind == "ribbon" {
+                    warnings.push("Dataverse metadata verification for JS/TS is not available through MCP. Use the in-app Verify Implementation modal after implementation/upload.".into());
+                }
                 if task["workflowSetup"]["repositoryRoot"].as_str().unwrap_or("").is_empty() { missing.push("repositoryRoot".into()); }
                 if work_kind.is_empty() || work_kind == "unknown" { missing.push("workKind".into()); }
                 if action_type.is_empty() { missing.push("actionType".into()); }
@@ -8066,6 +8120,8 @@ fn task_mcp_execute_tool(app: &tauri::AppHandle, tool_name: &str, args: &Value) 
                             "summary": plan_base["summary"].clone(),
                             "implementationSteps": plan_base["implementationSteps"].clone(),
                             "dataverseFindings": plan_base["dataverseFindings"].clone(),
+                            "fieldMappings": plan_base["fieldMappings"].clone(),
+                            "unmappedSourceFields": plan_base["unmappedSourceFields"].clone(),
                             "risks": plan_base["risks"].clone(),
                             "testChecklist": plan_base["testChecklist"].clone(),
                             "externalActionPreview": [],
@@ -8178,7 +8234,7 @@ fn task_mcp_execute_tool(app: &tauri::AppHandle, tool_name: &str, args: &Value) 
             })
         }
 
-        // ── New write tools ───────────────────────────────────────────────────
+        // â”€â”€ New write tools â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
         "save_task_analysis" => {
             let task_id = args["taskId"].as_str().unwrap_or("").trim();
@@ -8278,7 +8334,7 @@ fn task_mcp_execute_tool(app: &tauri::AppHandle, tool_name: &str, args: &Value) 
             if !task_mcp_allowed_work_actions().contains(&work_action) {
                 return Err(format!("Invalid workAction '{work_action}'. Allowed: {}", task_mcp_allowed_work_actions().join(", ")));
             }
-            // plugin → plugin target, ribbon/script → script target, all others → repo
+            // plugin â†’ plugin target, ribbon/script â†’ script target, all others â†’ repo
             let dev_target_kind = match work_kind {
                 "plugin"   => "plugin",
                 "script"   => "script",
@@ -8817,7 +8873,7 @@ fn task_mcp_execute_tool(app: &tauri::AppHandle, tool_name: &str, args: &Value) 
             serde_json::json!({"task": task_mcp_safe_task_summary(task)})
         }
 
-        // ── run_dataverse_check_for_task ─────────────────────────────────────
+        // â”€â”€ run_dataverse_check_for_task â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         "run_dataverse_check_for_task" => {
             let task_id = args["taskId"].as_str().unwrap_or("").trim();
             if task_id.is_empty() { return Err("Missing required argument: taskId".into()); }
@@ -8837,7 +8893,7 @@ fn task_mcp_execute_tool(app: &tauri::AppHandle, tool_name: &str, args: &Value) 
                 app, &task_snapshot, persist_inferred, &mut tasks, task_index
             )?;
 
-            // Detect script tasks — JS/TS files are not handled by the C# scanner.
+            // Detect script tasks â€” JS/TS files are not handled by the C# scanner.
             let lower_path = artifact_path.to_lowercase();
             if lower_path.ends_with(".js") || lower_path.ends_with(".ts") {
                 let now = chrono_now_iso();
@@ -9009,7 +9065,7 @@ fn task_mcp_execute_tool(app: &tauri::AppHandle, tool_name: &str, args: &Value) 
             })
         }
 
-        // ── Git commit/push MCP tools ─────────────────────────────────────────
+        // â”€â”€ Git commit/push MCP tools â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         "prepare_commit_for_task" => {
             let task_id = args["taskId"].as_str().unwrap_or("").trim();
             if task_id.is_empty() { return Err("Missing required argument: taskId".into()); }
@@ -9142,7 +9198,7 @@ fn task_mcp_execute_tool(app: &tauri::AppHandle, tool_name: &str, args: &Value) 
             if task["waitingState"].as_str() == Some("consultant-testing") {
                 task["waitingState"] = Value::Null;
             }
-            // Set next step: prepare commit — NOT move to review directly
+            // Set next step: prepare commit â€” NOT move to review directly
             task["mcpNextStep"] = serde_json::json!({
                 "action":    "Prepare commit and push",
                 "reason":    "Consultant testing was confirmed. Commit and push are required before code review.",
@@ -9156,7 +9212,7 @@ fn task_mcp_execute_tool(app: &tauri::AppHandle, tool_name: &str, args: &Value) 
             })
         }
 
-        // ── get_dataverse_verification_report ────────────────────────────────
+        // â”€â”€ get_dataverse_verification_report â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         "get_dataverse_verification_report" => {
             let task_id = args["id"].as_str().unwrap_or("").trim();
             if task_id.is_empty() { return Err("Missing required argument: id".to_string()); }
@@ -9195,7 +9251,7 @@ fn task_mcp_execute_tool(app: &tauri::AppHandle, tool_name: &str, args: &Value) 
             })
         }
 
-        // ── get_external_action_proposal ─────────────────────────────────────
+        // â”€â”€ get_external_action_proposal â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         "get_external_action_proposal" => {
             let task_id = args["id"].as_str().unwrap_or("").trim();
             if task_id.is_empty() { return Err("Missing required argument: id".to_string()); }
@@ -9237,7 +9293,7 @@ fn task_mcp_execute_tool(app: &tauri::AppHandle, tool_name: &str, args: &Value) 
             })
         }
 
-        // ── record_external_action_completed ─────────────────────────────────
+        // â”€â”€ record_external_action_completed â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         "record_external_action_completed" => {
             let task_id = args["taskId"].as_str().unwrap_or("").trim();
             if task_id.is_empty() { return Err("Missing required argument: taskId".to_string()); }
@@ -9285,7 +9341,7 @@ fn task_mcp_execute_tool(app: &tauri::AppHandle, tool_name: &str, args: &Value) 
             })
         }
 
-        // ── get_implementation_verification_state ─────────────────────────────
+        // â”€â”€ get_implementation_verification_state â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         "get_implementation_verification_state" => {
             let task_id = args["id"].as_str().unwrap_or("").trim();
             if task_id.is_empty() { return Err("Missing required argument: id".to_string()); }
@@ -9304,7 +9360,7 @@ fn task_mcp_execute_tool(app: &tauri::AppHandle, tool_name: &str, args: &Value) 
             })
         }
 
-        // ── get_implementation_readiness ──────────────────────────────────────
+        // â”€â”€ get_implementation_readiness â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         "get_implementation_readiness" => {
             let task_id = args["id"].as_str().unwrap_or("").trim();
             if task_id.is_empty() { return Err("Missing required argument: id".to_string()); }
@@ -9552,7 +9608,7 @@ async fn discover_safe_tools(
     let safe_tools = annotate_safe_tools(raw);
     // Only cache when the result contains at least one usable metadata tool.
     // A tools list that contains only primarch_status (Primarch not yet connected)
-    // must not be cached — it would block all future attempts even after Primarch connects.
+    // must not be cached â€” it would block all future attempts even after Primarch connects.
     let metadata_names = [
         "list_columns", "list_attributes", "search_columns",
         "get_entity_schema", "entity_schema", "get_table_schema",
@@ -9614,7 +9670,7 @@ fn validate_working_directory(wd: &str) -> Result<Option<String>, String> {
         Err(e) => {
             if e.raw_os_error() == Some(267) {
                 return Err(format!(
-                    "Working directory is invalid (Windows error 267 — path is not a directory). \
+                    "Working directory is invalid (Windows error 267 â€” path is not a directory). \
                      Check that the working directory field contains a folder path, not the MCP script file.\n\
                      Path: {trimmed}"
                 ));
@@ -9908,7 +9964,7 @@ fn has_next_page_token(value: &Value) -> bool {
     }
 }
 
-/// Recursively collect `logicalName → full attribute JSON object` from a Primarch response.
+/// Recursively collect `logicalName â†’ full attribute JSON object` from a Primarch response.
 /// Populates the `attrs` map with whatever attribute objects are found, keyed by their logical name.
 fn collect_raw_attribute_metadata(value: &Value, attrs: &mut HashMap<String, Value>) {
     match value {
@@ -10349,7 +10405,7 @@ async fn fetch_entity_schema_metadata(
     if schema_completeness == "unknown" && !supports_paging && column_count > 5 {
         schema_completeness = "complete".to_string();
         note = Some(format!(
-            "Non-paginated metadata tool ({tool_name}); {column_count} columns received in a single response — treated as complete schema.",
+            "Non-paginated metadata tool ({tool_name}); {column_count} columns received in a single response â€” treated as complete schema.",
         ));
     }
 
@@ -10373,7 +10429,7 @@ async fn fetch_entity_schema_metadata(
     })
 }
 
-/// Tests connectivity to the Primarch MCP server (tools/list only — no Dataverse read).
+/// Tests connectivity to the Primarch MCP server (tools/list only â€” no Dataverse read).
 #[tauri::command]
 async fn test_primarch_mcp_connection(app: tauri::AppHandle, settings_override: Option<Value>) -> Result<Value, String> {
     let settings = settings_override.unwrap_or(read_json(&app_data_dir(&app)?.join("settings.json"))?);
@@ -10493,7 +10549,7 @@ Return ONLY this JSON:\n{{\"summary\":\"one-sentence what this skeleton does\",\
     let ai_config = get_ai_config(&app).map_err(|e| format!("AI not configured: {e}"))?;
     let text = call_ai_text(&ai_config, &instructions, &prompt).await?;
     let parsed: Value = serde_json::from_str(strip_fences(&text)).unwrap_or_else(|_| serde_json::json!({
-        "summary": "Skeleton generation failed — could not parse AI response.",
+        "summary": "Skeleton generation failed â€” could not parse AI response.",
         "pseudoCode": &text[..text.len().min(2000)],
         "logicalNamesUsed": []
     }));
@@ -10556,7 +10612,7 @@ fn response_text_says_not_found(response: &Value) -> bool {
 /// Attempts an exact attribute existence check via Primarch MCP tools.
 ///
 /// Tries, in order:
-///   1. A dedicated get/describe tool for single-attribute lookup (get_column, get_attribute, …)
+///   1. A dedicated get/describe tool for single-attribute lookup (get_column, get_attribute, â€¦)
 ///   2. list_columns / search_columns with a search/filter parameter
 ///
 /// Returns `(Some(true), tool, reason)` = attribute found,
@@ -10570,7 +10626,7 @@ async fn try_exact_column_lookup(
     entity_name: &str,
     attribute_name: &str,
 ) -> (Option<bool>, String, String) {
-    // ── 1. Dedicated get/describe-attribute tool ──────────────────────────────
+    // â”€â”€ 1. Dedicated get/describe-attribute tool â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     if let Some(tool) = find_safe_tool(tools, &[
         "get_column", "get_attribute", "describe_column", "describe_attribute",
         "column_metadata", "attribute_metadata", "get_table_column",
@@ -10602,24 +10658,24 @@ async fn try_exact_column_lookup(
                     let mut found_names: HashSet<String> = HashSet::new();
                     collect_column_names(&response, &mut found_names);
                     if found_names.contains(attribute_name) {
-                        return (Some(true), tname.clone(), format!("tool={tname} args={args_json} → found in response"));
+                        return (Some(true), tname.clone(), format!("tool={tname} args={args_json} â†’ found in response"));
                     }
                     if response_text_says_not_found(&response) || found_names.is_empty() {
-                        return (Some(false), tname.clone(), format!("tool={tname} args={args_json} → empty/not-found response"));
+                        return (Some(false), tname.clone(), format!("tool={tname} args={args_json} â†’ empty/not-found response"));
                     }
-                    return (None, tname.clone(), format!("tool={tname} args={args_json} → response contained other columns but not '{attribute_name}' (possible partial result)"));
+                    return (None, tname.clone(), format!("tool={tname} args={args_json} â†’ response contained other columns but not '{attribute_name}' (possible partial result)"));
                 }
                 Ok(Err(e)) => {
-                    return (None, tname.clone(), format!("tool={tname} args={args_json} → call error: {e}"));
+                    return (None, tname.clone(), format!("tool={tname} args={args_json} â†’ call error: {e}"));
                 }
                 Err(_) => {
-                    return (None, tname.clone(), format!("tool={tname} args={args_json} → timed out"));
+                    return (None, tname.clone(), format!("tool={tname} args={args_json} â†’ timed out"));
                 }
             }
         }
     }
 
-    // ── 2. list_columns / search_columns with filter/search param ─────────────
+    // â”€â”€ 2. list_columns / search_columns with filter/search param â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     if let Some(tool) = find_safe_tool(tools, &[
         "search_columns", "list_columns", "list_attributes", "search_attributes",
     ]) {
@@ -10651,22 +10707,22 @@ async fn try_exact_column_lookup(
                     let mut found_names: HashSet<String> = HashSet::new();
                     collect_column_names(&response, &mut found_names);
                     if found_names.contains(attribute_name) {
-                        return (Some(true), tname.clone(), format!("tool={tname} {sparam}={attribute_name} args={args_json} → found in response"));
+                        return (Some(true), tname.clone(), format!("tool={tname} {sparam}={attribute_name} args={args_json} â†’ found in response"));
                     }
                     if found_names.is_empty() {
-                        return (Some(false), tname.clone(), format!("tool={tname} {sparam}={attribute_name} args={args_json} → zero results, attribute absent"));
+                        return (Some(false), tname.clone(), format!("tool={tname} {sparam}={attribute_name} args={args_json} â†’ zero results, attribute absent"));
                     }
-                    return (None, tname.clone(), format!("tool={tname} {sparam}={attribute_name} args={args_json} → {n} results but no exact match (possibly substring search)", n = found_names.len()));
+                    return (None, tname.clone(), format!("tool={tname} {sparam}={attribute_name} args={args_json} â†’ {n} results but no exact match (possibly substring search)", n = found_names.len()));
                 }
                 Ok(Err(e)) => {
-                    return (None, tname.clone(), format!("tool={tname} {sparam}={attribute_name} args={args_json} → call error: {e}"));
+                    return (None, tname.clone(), format!("tool={tname} {sparam}={attribute_name} args={args_json} â†’ call error: {e}"));
                 }
                 Err(_) => {
-                    return (None, tname.clone(), format!("tool={tname} {sparam}={attribute_name} args={args_json} → timed out"));
+                    return (None, tname.clone(), format!("tool={tname} {sparam}={attribute_name} args={args_json} â†’ timed out"));
                 }
             }
         } else {
-            // Tool found but has no filter/search param — cannot do exact lookup via this tool
+            // Tool found but has no filter/search param â€” cannot do exact lookup via this tool
             return (None, tname.clone(), format!(
                 "tool={tname} has no searchTerm/search/filter parameter (available params: {}); exact lookup not possible via this tool",
                 params.join(", "),
@@ -10699,7 +10755,7 @@ async fn run_crm_verification_for_scan(
                 "entityLogicalName": ambiguous.entity_logical_name,
                 "relatedEntityLogicalName": ambiguous.related_entity_logical_name,
                 "sourceReason": ambiguous.source_reason,
-                "detail": format!("Local scan only — not checked against Dataverse. {}", ambiguous.detail),
+                "detail": format!("Local scan only â€” not checked against Dataverse. {}", ambiguous.detail),
             }));
         }
         for attr_ref in &scan.attribute_references {
@@ -10709,7 +10765,7 @@ async fn run_crm_verification_for_scan(
                     "displayName": attr_ref.logical_name,
                     "attributeLogicalName": attr_ref.logical_name,
                     "sourceReason": attr_ref.source_reason,
-                    "detail": "Local scan only — not checked against Dataverse.",
+                    "detail": "Local scan only â€” not checked against Dataverse.",
                 }));
             }
         }
@@ -10930,7 +10986,7 @@ async fn run_crm_verification_for_scan(
                             "detail": format!("Detected via {}", attr_ref.context_type),
                         }));
                     } else {
-                        // Attribute appears in the partial response but schema is incomplete —
+                        // Attribute appears in the partial response but schema is incomplete â€”
                         // treat as ambiguous so as not to overstate verification quality.
                         ambiguous_references.push(serde_json::json!({
                             "kind": "attribute",
@@ -10940,7 +10996,7 @@ async fn run_crm_verification_for_scan(
                             "relatedEntityLogicalName": attr_ref.related_entity_logical_name,
                             "sourceReason": attr_ref.source_reason,
                             "detail": format!(
-                                "Attribute present in {} schema ({} columns returned), but schema completeness is unverified — cannot fully confirm.",
+                                "Attribute present in {} schema ({} columns returned), but schema completeness is unverified â€” cannot fully confirm.",
                                 cache_entry.schema_completeness,
                                 cache_entry.column_count,
                             ),
@@ -11004,7 +11060,7 @@ async fn run_crm_verification_for_scan(
             }
         }
 
-        // ── Exact attribute lookup for inconclusive schema results ─────────────
+        // â”€â”€ Exact attribute lookup for inconclusive schema results â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         // For each attribute that was absent from list_columns with unknown/incomplete completeness,
         // try an exact per-attribute MCP lookup to get a definitive found/missing verdict.
         for (entity, attr, completeness, col_count, source_reason, context_type, related_entity) in &attrs_needing_exact_lookup {
@@ -11050,7 +11106,7 @@ async fn run_crm_verification_for_scan(
                     }));
                 }
                 None => {
-                    // Exact lookup unavailable or inconclusive — report as ambiguous with full diagnostic
+                    // Exact lookup unavailable or inconclusive â€” report as ambiguous with full diagnostic
                     ambiguous_references.push(serde_json::json!({
                         "kind": "attribute",
                         "displayName": format!("{}.{}", entity, attr),
@@ -11281,7 +11337,7 @@ async fn run_crm_verification_for_scan(
             }
         }
 
-        // ── Lookup target validation ─────────────────────────────────────────
+        // â”€â”€ Lookup target validation â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         for lookup_assign in &scan.lookup_assignments {
             let entity_name = lookup_assign.entity_logical_name.as_deref().unwrap_or("");
             let attr_name = &lookup_assign.attribute_logical_name;
@@ -11311,15 +11367,15 @@ async fn run_crm_verification_for_scan(
                     } else if !target.is_empty() && targets.contains(&target.to_string()) {
                         confirmed_references.push(serde_json::json!({
                             "kind": "lookup-target",
-                            "displayName": format!("{}.{} → {}", entity_name, attr_name, target),
+                            "displayName": format!("{}.{} â†’ {}", entity_name, attr_name, target),
                             "entityLogicalName": entity_name, "attributeLogicalName": attr_name,
                             "sourceReason": &lookup_assign.source_reason,
-                            "detail": format!("Lookup {}.{} → '{}' is valid (allowed: {}).", entity_name, attr_name, target, targets.join(", ")),
+                            "detail": format!("Lookup {}.{} â†’ '{}' is valid (allowed: {}).", entity_name, attr_name, target, targets.join(", ")),
                         }));
                     } else if !target.is_empty() {
                         missing_references.push(serde_json::json!({
                             "kind": "lookup-target",
-                            "displayName": format!("{}.{} → {} (invalid target)", entity_name, attr_name, target),
+                            "displayName": format!("{}.{} â†’ {} (invalid target)", entity_name, attr_name, target),
                             "entityLogicalName": entity_name, "attributeLogicalName": attr_name,
                             "sourceReason": &lookup_assign.source_reason,
                             "detail": format!("Lookup {}.{} does not allow '{}'. Allowed: {}.", entity_name, attr_name, target, targets.join(", ")),
@@ -11335,7 +11391,7 @@ async fn run_crm_verification_for_scan(
             }
         }
 
-        // ── Choice / OptionSet value validation ──────────────────────────────
+        // â”€â”€ Choice / OptionSet value validation â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         for osa in &scan.option_set_assignments {
             let entity_name = osa.entity_logical_name.as_deref().unwrap_or("");
             let attr_name = &osa.attribute_logical_name;
@@ -11389,7 +11445,7 @@ async fn run_crm_verification_for_scan(
             }
         }
 
-        // ── ValidForCreate / ValidForUpdate / ValidForRead validation ─────────
+        // â”€â”€ ValidForCreate / ValidForUpdate / ValidForRead validation â”€â”€â”€â”€â”€â”€â”€â”€â”€
         {
             let effective_messages: Vec<String> = scan.plugin_context.as_ref()
                 .map(|pc| pc.messages.iter().map(|m| m.to_lowercase()).collect())
@@ -11556,7 +11612,7 @@ async fn run_crm_verification_for_scan(
     }
 }
 
-/// Thin Tauri command wrapper — delegates to run_crm_verification_for_scan.
+/// Thin Tauri command wrapper â€” delegates to run_crm_verification_for_scan.
 /// The verdict is deterministic (based on local scan + metadata lookup results).
 /// Never writes to Dataverse.
 #[tauri::command]
@@ -11590,7 +11646,7 @@ fn scan_cs_file_for_crm(
 }
 
 /// Returns true when `s` looks like a Dataverse logical name:
-/// all-lowercase ASCII, 2–64 chars, starts with a letter, only letters/digits/underscores.
+/// all-lowercase ASCII, 2â€“64 chars, starts with a letter, only letters/digits/underscores.
 /// Excludes common C# keywords and plugin context parameter names.
 fn is_cs_logical_name(s: &str) -> bool {
     if s.len() < 2 || s.len() > 64 { return false; }
@@ -11759,7 +11815,7 @@ fn cs_resolve_identifier_arg(
     const_map.get(ident).cloned()
 }
 
-/// Extracts all non-quoted identifier arguments from a `ColumnSet(…)` call and resolves
+/// Extracts all non-quoted identifier arguments from a `ColumnSet(â€¦)` call and resolves
 /// each through `const_map`. Used to handle `new ColumnSet(Const1, Const2)` patterns.
 fn cs_col_var_args(
     line: &str,
@@ -11809,7 +11865,7 @@ fn scan_cs_logical_names_for_mcp(content: &str, primary_entity_hint: Option<&str
     let mut const_map:      std::collections::HashMap<String, String> = Default::default();
     let mut int_const_map:  std::collections::HashMap<String, i64>    = Default::default();
     let mut entity_var_map: std::collections::HashMap<String, String> = Default::default();
-    // Tracks EntityReference variable → target entity (e.g. ownerRef → systemuser)
+    // Tracks EntityReference variable â†’ target entity (e.g. ownerRef â†’ systemuser)
     let mut entity_ref_targets: std::collections::HashMap<String, String> = Default::default();
     let mut entity_refs:    Vec<Value>  = Vec::new();
     let mut attr_refs:      Vec<Value>  = Vec::new();
@@ -11832,14 +11888,14 @@ fn scan_cs_logical_names_for_mcp(content: &str, primary_entity_hint: Option<&str
         }
         let lower = t.to_lowercase();
 
-        // ── 1. String constants: (const )? string Var = "value"; ───────────
+        // â”€â”€ 1. String constants: (const )? string Var = "value"; â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         if (lower.contains("string ") || lower.contains("const ")) && lower.contains(" = \"") {
             if let Some((var, val)) = extract_cs_const_assignment(t) {
                 if is_cs_logical_name(&val) { const_map.insert(var, val); }
             }
         }
 
-        // ── 1b. Integer constants: (const )? int Var = N; ───────────────────
+        // â”€â”€ 1b. Integer constants: (const )? int Var = N; â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         if lower.contains(" = ") && !lower.contains("\"") {
             if lower.contains("int ") || lower.contains("const ") {
                 if let Some(eq_pos) = t.find(" = ") {
@@ -11857,7 +11913,7 @@ fn scan_cs_logical_names_for_mcp(content: &str, primary_entity_hint: Option<&str
             }
         }
 
-        // ── 2. Entity guards: .LogicalName == "entity" / != "entity" ────────
+        // â”€â”€ 2. Entity guards: .LogicalName == "entity" / != "entity" â”€â”€â”€â”€â”€â”€â”€â”€
         if lower.contains("logicalname") && (lower.contains("== \"") || lower.contains("!= \"")) {
             let entity = extract_after_cs_keyword(t, "LogicalName == \"")
                 .or_else(|| extract_after_cs_keyword(t, "LogicalName != \""));
@@ -11880,7 +11936,7 @@ fn scan_cs_logical_names_for_mcp(content: &str, primary_entity_hint: Option<&str
             }
         }
 
-        // ── 3. MessageName checks ────────────────────────────────────────────
+        // â”€â”€ 3. MessageName checks â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         if lower.contains("messagename") && (lower.contains("== \"") || lower.contains("!= \"")) {
             let msg = extract_after_cs_keyword(t, "MessageName == \"")
                 .or_else(|| extract_after_cs_keyword(t, "MessageName != \""))
@@ -11912,7 +11968,7 @@ fn scan_cs_logical_names_for_mcp(content: &str, primary_entity_hint: Option<&str
             }
         }
 
-        // ── 3b. Stage checks: context.Stage == N ────────────────────────────
+        // â”€â”€ 3b. Stage checks: context.Stage == N â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         if lower.contains(".stage") && lower.contains("== ") {
             if let Some(eq_pos) = lower.find("== ") {
                 let val_str = t[eq_pos + 3..].trim_start();
@@ -11925,7 +11981,7 @@ fn scan_cs_logical_names_for_mcp(content: &str, primary_entity_hint: Option<&str
             }
         }
 
-        // ── 3c. Mode checks: context.Mode == N ─────────────────────────────
+        // â”€â”€ 3c. Mode checks: context.Mode == N â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         if lower.contains(".mode") && lower.contains("== ") {
             if let Some(eq_pos) = lower.find("== ") {
                 let val_str = t[eq_pos + 3..].trim_start();
@@ -11938,7 +11994,7 @@ fn scan_cs_logical_names_for_mcp(content: &str, primary_entity_hint: Option<&str
             }
         }
 
-        // ── 4. new Entity("entity") / new Entity(ConstVar) ──────────────────
+        // â”€â”€ 4. new Entity("entity") / new Entity(ConstVar) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         if lower.contains("new entity(") {
             let entity = extract_after_cs_keyword(t, "Entity(\"")
                 .or_else(|| extract_after_cs_keyword(t, "Entity (\""))
@@ -11953,7 +12009,7 @@ fn scan_cs_logical_names_for_mcp(content: &str, primary_entity_hint: Option<&str
             }
         }
 
-        // ── 5. new EntityReference("entity", ...) / EntityReference(ConstVar) ─
+        // â”€â”€ 5. new EntityReference("entity", ...) / EntityReference(ConstVar) â”€
         if lower.contains("entityreference(") {
             let entity = extract_after_cs_keyword(t, "EntityReference(\"")
                 .filter(|s| is_cs_logical_name(s))
@@ -11967,11 +12023,11 @@ fn scan_cs_logical_names_for_mcp(content: &str, primary_entity_hint: Option<&str
                     // Track which entity this ref variable points to (for lookup assignment validation)
                     entity_ref_targets.insert(v.clone(), entity.clone());
                 }
-                // EntityReference is a lookup target — do not update last_entity_context
+                // EntityReference is a lookup target â€” do not update last_entity_context
             }
         }
 
-        // ── 6. new QueryExpression / QueryByAttribute (literal or ConstVar) ─
+        // â”€â”€ 6. new QueryExpression / QueryByAttribute (literal or ConstVar) â”€
         if lower.contains("queryexpression(") || lower.contains("querybyattribute(") {
             let e = if lower.contains("queryexpression(\"") {
                 extract_after_cs_keyword(t, "QueryExpression(\"")
@@ -11993,7 +12049,7 @@ fn scan_cs_logical_names_for_mcp(content: &str, primary_entity_hint: Option<&str
             }
         }
 
-        // ── 7. Bracket access: entity["attr"] / entity.Attributes["attr"] ───
+        // â”€â”€ 7. Bracket access: entity["attr"] / entity.Attributes["attr"] â”€â”€â”€
         {
             let mut search = t;
             while let Some(pos) = search.find("[\"") {
@@ -12016,7 +12072,7 @@ fn scan_cs_logical_names_for_mcp(content: &str, primary_entity_hint: Option<&str
             }
         }
 
-        // ── 7b. Bracket access with variable: entity[varName] ───────────────
+        // â”€â”€ 7b. Bracket access with variable: entity[varName] â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         // Handles `const string X = "attr"; entity[X]` patterns by resolving
         // through const_map. Skips string-literal brackets (handled above).
         {
@@ -12056,7 +12112,7 @@ fn scan_cs_logical_names_for_mcp(content: &str, primary_entity_hint: Option<&str
             }
         }
 
-        // ── 8. .GetAttributeValue<T>("attr") / .GetAttributeValue<T>(ConstVar) ─
+        // â”€â”€ 8. .GetAttributeValue<T>("attr") / .GetAttributeValue<T>(ConstVar) â”€
         if lower.contains("getattributevalue") {
             let raw_attr_opt = extract_all_cs_string_args(t, "GetAttributeValue").into_iter().next()
                 .or_else(|| {
@@ -12080,7 +12136,7 @@ fn scan_cs_logical_names_for_mcp(content: &str, primary_entity_hint: Option<&str
             }
         }
 
-        // ── 9. .SetAttributeValue("attr" / varName, ...) ─────────────────────
+        // â”€â”€ 9. .SetAttributeValue("attr" / varName, ...) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         if lower.contains("setattributevalue(") {
             let raw_attr_opt: Option<String> = if lower.contains("setattributevalue(\"") {
                 extract_after_cs_keyword(t, "SetAttributeValue(\"")
@@ -12102,7 +12158,7 @@ fn scan_cs_logical_names_for_mcp(content: &str, primary_entity_hint: Option<&str
             }
         }
 
-        // ── 10. .Attributes.Contains("attr" / varName) ──────────────────────
+        // â”€â”€ 10. .Attributes.Contains("attr" / varName) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         if lower.contains("attributes.contains(") {
             let raw_attr_opt: Option<String> = if lower.contains("attributes.contains(\"") {
                 extract_after_cs_keyword(t, "Attributes.Contains(\"")
@@ -12124,12 +12180,12 @@ fn scan_cs_logical_names_for_mcp(content: &str, primary_entity_hint: Option<&str
             }
         }
 
-        // ── 11. new ColumnSet(…) ─────────────────────────────────────────────
+        // â”€â”€ 11. new ColumnSet(â€¦) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         // Handles both literal strings and const-variable arguments.
         // Entity binding:
-        //   - Assignment form (`ColumnSet = new ColumnSet(…)` or `var.ColumnSet = …`):
+        //   - Assignment form (`ColumnSet = new ColumnSet(â€¦)` or `var.ColumnSet = â€¦`):
         //     look for an explicit var before .ColumnSet, then fall back to last_entity_context.
-        //   - Argument form (`new ColumnSet(…)` passed to a method like Retrieve):
+        //   - Argument form (`new ColumnSet(â€¦)` passed to a method like Retrieve):
         //     use primary_entity.
         if lower.contains("new columnset(") {
             let entity_for_col: Option<String> = if lower.contains("columnset = new columnset(") {
@@ -12153,7 +12209,7 @@ fn scan_cs_logical_names_for_mcp(content: &str, primary_entity_hint: Option<&str
                     cs_add_attr_ref(&entity_for_col, &attr, "column-set", &mut attr_refs, &mut ambiguous_attrs);
                 }
             }
-            // Const-variable args: resolve identifiers inside ColumnSet(…) through const_map
+            // Const-variable args: resolve identifiers inside ColumnSet(â€¦) through const_map
             for resolved_attr in cs_col_var_args(t, &const_map) {
                 if is_cs_logical_name(&resolved_attr) {
                     cs_add_attr_ref(&entity_for_col, &resolved_attr, "column-set-var", &mut attr_refs, &mut ambiguous_attrs);
@@ -12161,9 +12217,9 @@ fn scan_cs_logical_names_for_mcp(content: &str, primary_entity_hint: Option<&str
             }
         }
 
-        // ── 12. new ConditionExpression("attr" / ConstVar, …) ─────────────────
+        // â”€â”€ 12. new ConditionExpression("attr" / ConstVar, â€¦) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         // Entity binding:
-        //   - Single-line with var.Criteria.AddCondition(…): entity from the query var.
+        //   - Single-line with var.Criteria.AddCondition(â€¦): entity from the query var.
         //   - Multi-line (ConditionExpression on its own line): use last_entity_context.
         //   - Fallback: primary_entity.
         if lower.contains("conditionexpression(") {
@@ -12192,7 +12248,7 @@ fn scan_cs_logical_names_for_mcp(content: &str, primary_entity_hint: Option<&str
             }
         }
 
-        // ── 13. new OrderExpression("attr", ...) ─────────────────────────────
+        // â”€â”€ 13. new OrderExpression("attr", ...) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         if lower.contains("new orderexpression(\"") {
             if let Some(raw_attr) = extract_after_cs_keyword(t, "OrderExpression(\"") {
                 let attr = cs_resolve_const(&const_map, &raw_attr).to_string();
@@ -12202,7 +12258,7 @@ fn scan_cs_logical_names_for_mcp(content: &str, primary_entity_hint: Option<&str
             }
         }
 
-        // ── 14. OptionSetValue write: entity[attr] = new OptionSetValue(n) ──
+        // â”€â”€ 14. OptionSetValue write: entity[attr] = new OptionSetValue(n) â”€â”€
         if lower.contains("optionsetvalue(") {
             // Extract integer value from OptionSetValue(n) or OptionSetValue(ConstInt)
             if let Some(ov_pos) = lower.find("optionsetvalue(") {
@@ -12236,7 +12292,7 @@ fn scan_cs_logical_names_for_mcp(content: &str, primary_entity_hint: Option<&str
             }
         }
 
-        // ── 15. Lookup assignment: entity[attr] = new EntityReference(target, ...) ──
+        // â”€â”€ 15. Lookup assignment: entity[attr] = new EntityReference(target, ...) â”€â”€
         //        or entity[attr] = existingEntityRefVar
         if lower.contains("] = ") || lower.contains("] =\t") {
             // Detect assignment form (not equality check)
@@ -12287,7 +12343,7 @@ fn scan_cs_logical_names_for_mcp(content: &str, primary_entity_hint: Option<&str
             }
         }
 
-        // ── 16. Field read accesses (GetAttributeValue, Attributes.Contains) ─
+        // â”€â”€ 16. Field read accesses (GetAttributeValue, Attributes.Contains) â”€
         if lower.contains("getattributevalue") {
             // Already handled in section 8; add read access record here
             let raw_attr_opt = extract_all_cs_string_args(t, "GetAttributeValue").into_iter().next()
@@ -12418,7 +12474,7 @@ fn task_mcp_find_customer<'a>(customers: &'a [Value], customer_id: &str) -> Opti
 /// Returns None when no relevant defaults are configured.
 /// crm_base_dir is the global CRM base directory from settings (may be empty).
 fn task_mcp_customer_dev_defaults(customer: &Value, crm_base_dir: &str) -> Option<Value> {
-    // Priority: repositoryRootOverride → repositoryRoot → folderName + crm_base_dir.
+    // Priority: repositoryRootOverride â†’ repositoryRoot â†’ folderName + crm_base_dir.
     // resolvedRepositoryPath is computed client-side and not persisted.
     let repo_root: Option<String> = customer["repositoryRootOverride"].as_str()
         .or_else(|| customer["repositoryRoot"].as_str())
@@ -12656,7 +12712,7 @@ mod task_storage_tests {
         Value::Array(items)
     }
 
-    // ── guard: non-empty file cannot be overwritten with [] ─────────────────
+    // â”€â”€ guard: non-empty file cannot be overwritten with [] â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     #[test]
     fn blocks_empty_overwrite_of_nonempty_file() {
@@ -12678,20 +12734,20 @@ mod task_storage_tests {
         assert_eq!(count_tasks_on_disk(&d.join("tasks.json")).unwrap(), 3);
     }
 
-    // ── first-run: missing tasks.json can be created as [] ──────────────────
+    // â”€â”€ first-run: missing tasks.json can be created as [] â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     #[test]
     fn first_run_missing_file_allows_empty_write() {
         let dir = TempDir::new().unwrap();
         let d   = dir.path().to_path_buf();
 
-        // No tasks.json exists yet → existing_count == 0 → guard not triggered
+        // No tasks.json exists yet â†’ existing_count == 0 â†’ guard not triggered
         save_tasks_impl(&d, &Value::Array(vec![]), false).unwrap();
 
         assert_eq!(count_tasks_on_disk(&d.join("tasks.json")).unwrap(), 0);
     }
 
-    // ── normal save with tasks succeeds ─────────────────────────────────────
+    // â”€â”€ normal save with tasks succeeds â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     #[test]
     fn normal_nonempty_save_works() {
@@ -12703,7 +12759,7 @@ mod task_storage_tests {
         assert_eq!(count_tasks_on_disk(&d.join("tasks.json")).unwrap(), 5);
     }
 
-    // ── explicit reset is the only path that can overwrite with [] ──────────
+    // â”€â”€ explicit reset is the only path that can overwrite with [] â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     #[test]
     fn explicit_reset_allows_empty_overwrite() {
@@ -12712,12 +12768,12 @@ mod task_storage_tests {
 
         save_tasks_impl(&d, &make_tasks(4), false).unwrap();
 
-        // allow_empty_overwrite = true → should succeed
+        // allow_empty_overwrite = true â†’ should succeed
         save_tasks_impl(&d, &Value::Array(vec![]), true).unwrap();
         assert_eq!(count_tasks_on_disk(&d.join("tasks.json")).unwrap(), 0);
     }
 
-    // ── backup pruning keeps only the configured maximum ────────────────────
+    // â”€â”€ backup pruning keeps only the configured maximum â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     #[test]
     fn prune_keeps_at_most_five_backups() {
@@ -12736,7 +12792,7 @@ mod task_storage_tests {
         let kept = list_task_backups(&d);
         assert_eq!(kept.len(), 5, "expected exactly 5 backups after prune");
 
-        // The 5 with highest timestamps (4000–8000) must be kept
+        // The 5 with highest timestamps (4000â€“8000) must be kept
         for bp in &kept {
             let fname = bp.file_name().unwrap().to_str().unwrap();
             let ts: u64 = fname
@@ -12747,7 +12803,7 @@ mod task_storage_tests {
         }
     }
 
-    // ── a backup is created before every overwrite ──────────────────────────
+    // â”€â”€ a backup is created before every overwrite â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     #[test]
     fn backup_is_created_before_overwrite() {
@@ -12758,7 +12814,7 @@ mod task_storage_tests {
         save_tasks_impl(&d, &make_tasks(3), false).unwrap();
         let backups_before = list_task_backups(&d).len();
 
-        // Overwrite with 5 tasks → a backup of the 3-task version should appear
+        // Overwrite with 5 tasks â†’ a backup of the 3-task version should appear
         save_tasks_impl(&d, &make_tasks(5), false).unwrap();
         let backups_after = list_task_backups(&d);
 
@@ -12772,7 +12828,7 @@ mod task_storage_tests {
         assert_eq!(json_array_len(&backup_val), 3);
     }
 
-    // ── check_task_storage: normal non-empty case ───────────────────────────
+    // â”€â”€ check_task_storage: normal non-empty case â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     #[test]
     fn check_storage_normal_nonempty() {
@@ -12787,7 +12843,7 @@ mod task_storage_tests {
         assert_eq!(status.newest_backup_task_count, 0);
     }
 
-    // ── check_task_storage: empty file with non-empty backups ───────────────
+    // â”€â”€ check_task_storage: empty file with non-empty backups â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     #[test]
     fn check_storage_detects_empty_file_with_nonempty_backup() {
@@ -12806,7 +12862,7 @@ mod task_storage_tests {
         assert_eq!(status.newest_backup_task_count, 4);
     }
 
-    // ── check_task_storage: first-run (no file, no backups) ─────────────────
+    // â”€â”€ check_task_storage: first-run (no file, no backups) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     #[test]
     fn check_storage_first_run_all_zero() {
@@ -12918,7 +12974,7 @@ mod tests {
             ..Default::default()
         };
         // Attribute is present in returned columns but schema is not complete.
-        // The classification condition: found && !complete → ambiguous branch.
+        // The classification condition: found && !complete â†’ ambiguous branch.
         let found = entry.attributes.contains("fullname");
         let would_confirm = entry.schema_completeness == "complete";
         assert!(found, "attribute must be in the returned columns");
@@ -12947,14 +13003,14 @@ mod tests {
         // column_count is at least 5 (may be more due to false positives from display name substrings)
         assert!(entry.column_count >= 5, "column_count must be at least 5");
         // The count:5 is inside the nested text string, which find_count_key does not parse.
-        // False-positive tokens from display names ("ERP Relevant" → "elevant", etc.) push
+        // False-positive tokens from display names ("ERP Relevant" â†’ "elevant", etc.) push
         // column_count above 5, so the <=5 incomplete heuristic does not fire.
-        // Result: schema_completeness = "unknown" (conservative — we cannot prove it is complete or truncated).
+        // Result: schema_completeness = "unknown" (conservative â€” we cannot prove it is complete or truncated).
         assert_eq!(entry.schema_completeness, "unknown",
-            "list_columns text-wrapper format: count buried in string → unknown, not incomplete");
+            "list_columns text-wrapper format: count buried in string â†’ unknown, not incomplete");
     }
 
-    // ── validate_working_directory ────────────────────────────────────────
+    // â”€â”€ validate_working_directory â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     #[test]
     fn validate_wd_empty_string_returns_none() {
@@ -12999,7 +13055,7 @@ mod tests {
         );
     }
 
-    // ── task_mcp_customer_dev_defaults ────────────────────────────────────────
+    // â”€â”€ task_mcp_customer_dev_defaults â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     #[test]
     fn customer_dev_defaults_folder_name_plus_crm_base_dir() {
@@ -13047,7 +13103,7 @@ mod tests {
     #[test]
     fn list_columns_full_186_column_response_is_schema_unknown() {
         // With 186 columns returned: column_count > 5, no paging params, no detectable totalCount
-        // → schema_completeness = "unknown" (conservative: we can't prove completeness from this format)
+        // â†’ schema_completeness = "unknown" (conservative: we can't prove completeness from this format)
         let mut cols = Vec::new();
         for i in 0..186u32 {
             cols.push(serde_json::json!({"n": format!("attr_{:03}", i), "d": "Display", "t": "String"}));
@@ -13061,8 +13117,8 @@ mod tests {
             "content": [{"type": "text", "text": text}]
         });
         let entry = build_entity_metadata_cache_entry(&payload, "list_columns", None, false, true);
-        assert!(entry.column_count > 5, "186 columns → count > 5");
-        // totalCount is buried inside text string, find_count_key won't see it → unknown not complete
+        assert!(entry.column_count > 5, "186 columns â†’ count > 5");
+        // totalCount is buried inside text string, find_count_key won't see it â†’ unknown not complete
         assert_eq!(entry.schema_completeness, "unknown",
             "186-column result stays unknown because count is nested in text string");
         // Attributes are still usable: verify a few are present
@@ -13157,3 +13213,4 @@ pub fn run() {
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }
+

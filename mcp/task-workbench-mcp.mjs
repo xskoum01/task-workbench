@@ -1,4 +1,3 @@
-#!/usr/bin/env node
 import fs from 'node:fs/promises';
 import http from 'node:http';
 import os from 'node:os';
@@ -48,8 +47,8 @@ const READ_ONLY_TOOL_NAMES = new Set([
 const TASK_TEMPLATES = [
   {
     id: 'nvr-training-sh-script-prefill',
-    name: 'NVR Training Service Hub — Script: Předvyplnění servisního požadavku',
-    titlePattern: 'Script: Předvyplnění servisního požadavku',
+    name: 'NVR Training Service Hub â€” Script: PĹ™edvyplnÄ›nĂ­ servisnĂ­ho poĹľadavku',
+    titlePattern: 'Script: PĹ™edvyplnÄ›nĂ­ servisnĂ­ho poĹľadavku',
     mode: 'developer',
     workKind: 'script',
     actionType: 'create-new-script',
@@ -68,14 +67,15 @@ const TASK_TEMPLATES = [
       mainHelperSuggestion: 'prefillServiceCaseFromAsset',
     },
     sourceEntity: 'nvr_customerasset',
-    sourceFields: ['nvr_customerid', 'nvr_contactid', 'nvr_isunderwarranty', 'nvr_statuscustom'],
+    sourceFields: ['nvr_customerid', 'nvr_contactid', 'nvr_isunderwarranty'],
     targetFields: ['nvr_customerid', 'nvr_contactid', 'nvr_iswarrantycase'],
-    notes: 'onChange on nvr_assetid. Source entity: nvr_customerasset. Copy nvr_customerid, nvr_contactid, nvr_isunderwarranty, nvr_statuscustom → nvr_servicecase fields nvr_customerid, nvr_contactid, nvr_iswarrantycase. Solution: NVRTrainingServiceHubCore. App: nvr_trainingservicehub.',
+    additionalSourceFields: ['nvr_statuscustom'],
+    notes: 'onChange on nvr_assetid. Source entity: nvr_customerasset. Copy nvr_customerid, nvr_contactid, nvr_isunderwarranty to nvr_servicecase fields nvr_customerid, nvr_contactid, nvr_iswarrantycase. Additional source field available: nvr_statuscustom. Solution: NVRTrainingServiceHubCore. App: nvr_trainingservicehub.',
   },
   {
     id: 'nvr-training-sh-plugin-workorderline',
-    name: 'NVR Training Service Hub — Plugin: Výpočet částek na položce servisní zakázky',
-    titlePattern: 'Plugin: Výpočet částek na položce servisní zakázky',
+    name: 'NVR Training Service Hub â€” Plugin: VĂ˝poÄŤet ÄŤĂˇstek na poloĹľce servisnĂ­ zakĂˇzky',
+    titlePattern: 'Plugin: VĂ˝poÄŤet ÄŤĂˇstek na poloĹľce servisnĂ­ zakĂˇzky',
     mode: 'developer',
     workKind: 'plugin',
     actionType: 'create-new-plugin',
@@ -251,7 +251,7 @@ const TOOL_DEFINITIONS = [
       additionalProperties: false,
     },
   },
-  // ── Task creation / deletion ───────────────────────────────────────────────
+  // â”€â”€ Task creation / deletion â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
   {
     name: 'create_task',
     description: 'Create a new local task-workbench task. Validates all fields strictly. Does not write external systems.',
@@ -297,7 +297,7 @@ const TOOL_DEFINITIONS = [
       additionalProperties: false,
     },
   },
-  // ── New read tools ─────────────────────────────────────────────────────────
+  // â”€â”€ New read tools â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
   {
     name: 'get_task_full_context',
     description: 'Get comprehensive task context: phase, mode, setup, estimate, checklist, notes, PR state, and next step.',
@@ -338,7 +338,7 @@ const TOOL_DEFINITIONS = [
       additionalProperties: false,
     },
   },
-  // ── New write tools ────────────────────────────────────────────────────────
+  // â”€â”€ New write tools â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
   {
     name: 'save_task_analysis',
     description: 'Save local AI analysis: summary, requirements, assumptions, questions, risks, next step. No external writes.',
@@ -612,7 +612,7 @@ const TOOL_DEFINITIONS = [
   },
   {
     name: 'record_manual_pr',
-    description: 'Record a pull request created manually outside task-workbench. Local tracking only — does not call GitHub or Azure DevOps.',
+    description: 'Record a pull request created manually outside task-workbench. Local tracking only â€” does not call GitHub or Azure DevOps.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -696,7 +696,7 @@ const TOOL_DEFINITIONS = [
       'For plugin (C#) tasks: Task Workbench resolves the implementation artifact, scans it for Dataverse logical-name ' +
       'references (entities, attributes, lookups), and verifies them against the connected ' +
       'Dataverse environment through the configured Primarch MCP integration. ' +
-      'For script (JS/TS) tasks: returns a structured "not-supported" result — use the in-app ' +
+      'For script (JS/TS) tasks: returns a structured "not-supported" result â€” use the in-app ' +
       'Verify Implementation modal instead, which handles JavaScript/TypeScript directly. ' +
       'The verification report is saved to the local task state. ' +
       'This tool is READ-ONLY: no Dataverse writes, no Git writes, no file modifications ' +
@@ -744,7 +744,7 @@ const TOOL_DEFINITIONS = [
   {
     name: 'commit_task_changes',
     description:
-      'WRITE — stages the specified files and creates a Git commit in the task repository. ' +
+      'WRITE â€” stages the specified files and creates a Git commit in the task repository. ' +
       'All file paths must be relative to the repository root. ' +
       'Noise files (bin/, obj/, .vs/, copilot-instructions, etc.) are automatically rejected. ' +
       'Does NOT push. Use push_task_branch or commit_and_push_task_changes to push afterwards. ' +
@@ -767,7 +767,7 @@ const TOOL_DEFINITIONS = [
   {
     name: 'push_task_branch',
     description:
-      'WRITE — pushes the current branch of the task repository to origin. ' +
+      'WRITE â€” pushes the current branch of the task repository to origin. ' +
       'Push to main/master is blocked. No force push. ' +
       'Only call this when the user has explicitly requested a push.',
     inputSchema: {
@@ -782,7 +782,7 @@ const TOOL_DEFINITIONS = [
   {
     name: 'commit_and_push_task_changes',
     description:
-      'WRITE — stages files, creates a Git commit, and then pushes the current branch in one step. ' +
+      'WRITE â€” stages files, creates a Git commit, and then pushes the current branch in one step. ' +
       'Equivalent to commit_task_changes followed by push_task_branch. ' +
       'Push to main/master is blocked. No force push. No PR creation. ' +
       'Only call this when the user has explicitly requested a commit and push. ' +
@@ -825,7 +825,7 @@ const TOOL_DEFINITIONS = [
   {
     name: 'mark_testing_confirmed_prepare_commit',
     description:
-      'WRITE (local task state only) — marks consultant testing as confirmed and sets the next step ' +
+      'WRITE (local task state only) â€” marks consultant testing as confirmed and sets the next step ' +
       'to "Prepare commit and push". Does NOT commit, push, or move the task to Code Review. ' +
       'Use this when the consultant has confirmed the change and the developer needs to prepare a commit ' +
       'before requesting code review. ' +
@@ -840,7 +840,7 @@ const TOOL_DEFINITIONS = [
       additionalProperties: false,
     },
   },
-  // ── New read-only tools added in v0.5.0 ───────────────────────────────────
+  // â”€â”€ New read-only tools added in v0.5.0 â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
   {
     name: 'get_dataverse_verification_report',
     description:
@@ -876,7 +876,7 @@ const TOOL_DEFINITIONS = [
   {
     name: 'record_external_action_completed',
     description:
-      'WRITE (local task state only) — records that the developer manually completed the required external action ' +
+      'WRITE (local task state only) â€” records that the developer manually completed the required external action ' +
       '(plugin registration, web resource upload, publish customizations, etc.). ' +
       'Does NOT call Dataverse, GitHub, Azure DevOps, PAC CLI, XrmToolBox, or any external system. ' +
       'If completedAt is omitted the current timestamp is used. ' +
@@ -971,7 +971,7 @@ async function fetchBridgeToken(baseUrl) {
       cachedBridgeToken = token;
     }
   } catch {
-    // token unavailable — proceed without token (will get 401 on write tools)
+    // token unavailable â€” proceed without token (will get 401 on write tools)
   }
 }
 
@@ -1379,6 +1379,8 @@ function sanitizeTechnicalPlan(plan) {
     target: value.target,
     implementationSteps: Array.isArray(value.implementationSteps) ? value.implementationSteps : [],
     dataverseFindings: Array.isArray(value.dataverseFindings) ? value.dataverseFindings : [],
+    fieldMappings: Array.isArray(value.fieldMappings) ? value.fieldMappings : [],
+    unmappedSourceFields: Array.isArray(value.unmappedSourceFields) ? value.unmappedSourceFields : [],
     risks: Array.isArray(value.risks) ? value.risks : [],
     testChecklist: Array.isArray(value.testChecklist) ? value.testChecklist : [],
     externalActionPreview: Array.isArray(value.externalActionPreview) ? value.externalActionPreview : [],
@@ -1578,6 +1580,31 @@ function workActionFromActionType(actionType) {
   return String(actionType ?? '').startsWith('create-') ? 'create' : 'update';
 }
 
+function templateFieldMapping(template, targetEntity) {
+  const sourceEntity = template?.sourceEntity || 'source';
+  const sourceFields = Array.isArray(template?.sourceFields) ? template.sourceFields : [];
+  const targetFields = Array.isArray(template?.targetFields) ? template.targetFields : [];
+  const pairCount = Math.min(sourceFields.length, targetFields.length);
+  const pairs = [];
+  for (let index = 0; index < pairCount; index += 1) {
+    pairs.push({
+      source: `${sourceEntity}.${sourceFields[index]}`,
+      target: `${targetEntity}.${targetFields[index]}`,
+    });
+  }
+  const unmappedSourceFields = [
+    ...sourceFields.slice(pairCount),
+    ...(Array.isArray(template?.additionalSourceFields) ? template.additionalSourceFields : []),
+  ];
+  const mappingLine = pairs.length
+    ? `Map template fields: ${pairs.map((pair) => `${pair.source} -> ${pair.target}`).join('; ')}.`
+    : null;
+  const additionalLine = unmappedSourceFields.length
+    ? `Additional source field${unmappedSourceFields.length === 1 ? '' : 's'} available from template: ${unmappedSourceFields.join(', ')}. No target mapping is defined.`
+    : null;
+  return { pairs, unmappedSourceFields, mappingLine, additionalLine };
+}
+
 function buildTaskFullContext(task, customerDevDefaults) {
   const detail = safeTaskDetail(task);
   detail.implementationReadiness = computeImplementationReadiness(task);
@@ -1599,16 +1626,15 @@ function deterministicPlanDraft(task, template) {
   if (!entity || !['script', 'plugin', 'ribbon'].includes(workKind)) return null;
 
   const isScript = workKind === 'script' || workKind === 'ribbon';
-  const mappingLine = template?.sourceFields?.length || template?.targetFields?.length
-    ? `Map template fields from ${template.sourceEntity || 'source'} (${(template.sourceFields || []).join(', ')}) to ${entity} (${(template.targetFields || []).join(', ')}).`
-    : null;
+  const mapping = templateFieldMapping(template, entity);
   const summary = isScript
     ? `Create/update a Dataverse form script for ${entity}${setup.eventName ? ` (${setup.eventName})` : ''}.`
     : `Create/update a Dataverse plugin for ${entity}.`;
   const implementationSteps = [
     isScript ? `Use the selected script target ${setup.artifactPath || setup.scriptPath || 'the configured script path'}.` : `Use the selected plugin project ${setup.pluginProject || 'the configured plugin project'}.`,
     `Implement ${actionType || 'the requested change'} for ${entity}.`,
-    mappingLine,
+    mapping.mappingLine,
+    mapping.additionalLine,
     'Keep external Dataverse registration/upload as a manual approved action outside this setup step.',
   ].filter(Boolean);
   const testPlan = isScript
@@ -1631,25 +1657,33 @@ function deterministicPlanDraft(task, template) {
         mode: template?.pluginTarget?.mode || '',
         filteringAttributes: template?.pluginTarget?.filteringAttributes || [],
       };
-  return { workKind, summary, implementationSteps, dataverseFindings: [entity, mappingLine].filter(Boolean), risks, testChecklist: testPlan, target };
+  return {
+    workKind,
+    summary,
+    implementationSteps,
+    dataverseFindings: [entity, mapping.mappingLine, mapping.additionalLine].filter(Boolean),
+    risks,
+    testChecklist: testPlan,
+    target,
+    fieldMappings: mapping.pairs,
+    unmappedSourceFields: mapping.unmappedSourceFields,
+  };
 }
 
 function planHasTemplateMapping(plan, template) {
   if (!template?.sourceFields?.length && !template?.targetFields?.length) return true;
-  const haystack = JSON.stringify(plan ?? {});
-  const required = [
-    template.sourceEntity,
-    ...(template.sourceFields || []),
-    ...(template.targetFields || []),
-  ].filter(Boolean);
-  return required.every((value) => haystack.includes(value));
+  const entity = plan?.target?.entityLogicalName || template?.targetEntity || template?.scriptTarget?.entityLogicalName || '';
+  const expected = templateFieldMapping(template, entity).pairs;
+  if (!expected.length) return true;
+  const actual = Array.isArray(plan?.fieldMappings) ? plan.fieldMappings : [];
+  return expected.every((pair) => actual.some((item) => item?.source === pair.source && item?.target === pair.target));
 }
 
 function prepareDeveloperTaskInMemory(task, { customerDevDefaults = null, confirmSetup = true, createTechnicalPlan = true } = {}) {
   const appliedActions = [];
   const skippedActions = [{
     action: 'run_dataverse_check_for_task',
-    reason: 'JS/TS metadata check is not supported by MCP orchestration; run or skip verification separately before implementation.',
+    reason: 'Dataverse metadata verification for JS/TS is not available through MCP. Use the in-app Verify Implementation modal after implementation/upload.',
   }];
   const hardBlockers = [];
   const warnings = [];
@@ -1722,6 +1756,9 @@ function prepareDeveloperTaskInMemory(task, { customerDevDefaults = null, confir
 
   const setup = asObject(task.workflowSetup);
   const workKind = task.crmDeveloperWorkflow?.detectedWorkKind || setup.devTargetKind;
+  if (setup.devTargetKind === 'script' || workKind === 'script' || workKind === 'ribbon') {
+    warnings.push('Dataverse metadata verification for JS/TS is not available through MCP. Use the in-app Verify Implementation modal after implementation/upload.');
+  }
   if (!setup.repositoryRoot) missingInputs.push('repositoryRoot');
   if (!workKind || workKind === 'unknown') missingInputs.push('workKind');
   if (!setup.actionType) missingInputs.push('actionType');
@@ -1937,7 +1974,11 @@ function computeImplementationReadiness(task) {
     || dvCheck.status === 'skipped' || dvCheck.status === 'manually-verified';
 
   if (!dvSatisfied) {
-    blockers.push('Dataverse metadata verification has not been completed or explicitly skipped.');
+    if (isScript) {
+      warnings.push('Dataverse metadata verification for JS/TS is not available through MCP. Use the in-app Verify Implementation modal after implementation/upload.');
+    } else {
+      blockers.push('Dataverse metadata verification has not been completed or explicitly skipped.');
+    }
   } else {
     if (latestVerdict === 'warnings') warnings.push('Dataverse verification completed with warnings. Review before implementing.');
     if (latestVerdict === 'fail')     warnings.push('Dataverse verification found issues. Ensure they are accounted for in the technical plan.');
@@ -2226,7 +2267,7 @@ async function callToolFallback(name, args = {}) {
         valid,
         missingFiles,
         availableFiles: fileStatus.filter((f) => f.present).map((f) => f.file),
-        statusMessage: valid ? 'Valid kit — all required files found.' : `Invalid kit: missing ${missingFiles.join(', ')}`,
+        statusMessage: valid ? 'Valid kit â€” all required files found.' : `Invalid kit: missing ${missingFiles.join(', ')}`,
       };
     }
     case 'get_task_templates': {
@@ -2436,36 +2477,39 @@ async function handleRequest(request) {
   }
 }
 
-let buffer = '';
-let pendingRequests = Promise.resolve();
-process.stdin.setEncoding('utf8');
-process.stdin.on('data', (chunk) => {
-  buffer += chunk;
-  let newlineIndex = buffer.indexOf('\n');
-  while (newlineIndex >= 0) {
-    const line = buffer.slice(0, newlineIndex).trim();
-    buffer = buffer.slice(newlineIndex + 1);
-    if (line.length > 0) {
-      try {
-        const request = JSON.parse(line);
-        pendingRequests = pendingRequests.then(() => handleRequest(request));
-      } catch (error) {
-        writeMessage({
-          jsonrpc: '2.0',
-          error: {
-            code: -32700,
-            message: error instanceof Error ? error.message : String(error),
-          },
-        });
+if (!process.env.VITEST) {
+  let buffer = '';
+  let pendingRequests = Promise.resolve();
+  process.stdin.setEncoding('utf8');
+  process.stdin.on('data', (chunk) => {
+    buffer += chunk;
+    let newlineIndex = buffer.indexOf('\n');
+    while (newlineIndex >= 0) {
+      const line = buffer.slice(0, newlineIndex).trim();
+      buffer = buffer.slice(newlineIndex + 1);
+      if (line.length > 0) {
+        try {
+          const request = JSON.parse(line);
+          pendingRequests = pendingRequests.then(() => handleRequest(request));
+        } catch (error) {
+          writeMessage({
+            jsonrpc: '2.0',
+            error: {
+              code: -32700,
+              message: error instanceof Error ? error.message : String(error),
+            },
+          });
+        }
       }
+      newlineIndex = buffer.indexOf('\n');
     }
-    newlineIndex = buffer.indexOf('\n');
-  }
-});
+  });
 
-process.stdin.on('end', () => {
-  if (!process.env.VITEST) pendingRequests.finally(() => process.exit(0));
-});
+  process.stdin.on('end', () => {
+    pendingRequests.finally(() => process.exit(0));
+  });
+}
 
 // Named exports for unit tests. Does not affect runtime behaviour when executed as a script.
 export { READ_ONLY_TOOL_NAMES, TOOL_DEFINITIONS, TASK_TEMPLATES, matchTaskTemplate, callToolFallback };
+

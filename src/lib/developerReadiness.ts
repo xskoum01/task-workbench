@@ -1,7 +1,7 @@
 import type { Task, Customer } from '../types';
 
 export type BlockerCategory =
-  | 'auto-resolvable'  // AI calls an MCP tool immediately — value is explicit in the task
+  | 'auto-resolvable'  // AI calls an MCP tool immediately â€” value is explicit in the task
   | 'workflow-action'  // AI runs a read-only MCP tool (e.g. Dataverse check)
   | 'proposal'         // AI creates a draft/proposal via MCP tool, then stops for approval
   | 'approval-gate'    // Requires explicit user approval before AI continues
@@ -97,7 +97,7 @@ export function getDeveloperReadiness(task: Task, customer?: Customer): Develope
   const categorizedBlockers: ReadinessBlocker[] = [];
   const warnings: string[] = [];
 
-  // ── Mode gate ──────────────────────────────────────────────────────────────
+  // â”€â”€ Mode gate â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
   if (task.taskMode !== 'developer') {
     const message = 'Task mode is not set to Developer.';
     // Auto-resolvable when task text clearly indicates dev work
@@ -113,7 +113,7 @@ export function getDeveloperReadiness(task: Task, customer?: Customer): Develope
     };
   }
 
-  // ── Work kind gate ─────────────────────────────────────────────────────────
+  // â”€â”€ Work kind gate â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
   const detectedWorkKind = task.crmDeveloperWorkflow?.detectedWorkKind;
   const devTargetKind    = task.workflowSetup?.devTargetKind;
   const isPlugin = devTargetKind === 'plugin' || detectedWorkKind === 'plugin';
@@ -148,7 +148,7 @@ export function getDeveloperReadiness(task: Task, customer?: Customer): Develope
     };
   }
 
-  // ── Common checks ──────────────────────────────────────────────────────────
+  // â”€â”€ Common checks â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
   const customerId = task.customerId || task.workflowSetup?.customerId;
   if (!customerId) {
     addBlocker(categorizedBlockers, 'Customer/environment is not set.', 'hard');
@@ -168,37 +168,41 @@ export function getDeveloperReadiness(task: Task, customer?: Customer): Develope
     }
   }
 
-  // Technical plan — proposal (AI creates a draft), not a hard blocker
+  // Technical plan â€” proposal (AI creates a draft), not a hard blocker
   const plan = task.crmDeveloperWorkflow?.technicalPlan;
   if (!plan) {
     addBlocker(categorizedBlockers, 'Technical implementation plan is missing.', 'proposal', 'save_technical_plan');
   }
 
-  // Dataverse verification — workflow-action (AI runs the check), not a hard blocker
+  // Dataverse verification â€” workflow-action (AI runs the check), not a hard blocker
   if (!isDataverseVerificationSatisfied(task)) {
-    addBlocker(
-      categorizedBlockers,
-      'Dataverse metadata verification has not been completed or explicitly skipped.',
-      'workflow-action',
-      'run_dataverse_check_for_task',
-    );
+    if (isScript) {
+      warnings.push('Dataverse metadata verification for JS/TS is not available through MCP. Use the in-app Verify Implementation modal after implementation/upload.');
+    } else {
+      addBlocker(
+        categorizedBlockers,
+        'Dataverse metadata verification has not been completed or explicitly skipped.',
+        'workflow-action',
+        'run_dataverse_check_for_task',
+      );
+    }
   } else {
     const verdict = task.crmVerificationReports?.[0]?.verdict;
     if (verdict === 'warnings') warnings.push('Dataverse verification completed with warnings. Review before implementing.');
     if (verdict === 'fail')     warnings.push('Dataverse verification found issues. Ensure they are accounted for in the technical plan.');
   }
 
-  // Setup confirmation — approval-gate: only meaningful once other hard blockers are gone
+  // Setup confirmation â€” approval-gate: only meaningful once other hard blockers are gone
   const hardBlockersBeforeConfirm = categorizedBlockers.filter(b => b.category === 'hard');
   if (!task.workflowSetup?.confirmedAt && hardBlockersBeforeConfirm.length === 0) {
     addBlocker(categorizedBlockers, 'Developer setup has not been confirmed.', 'approval-gate', 'confirm_task_setup');
   } else if (!task.workflowSetup?.confirmedAt) {
     // Still add as approval-gate so it shows in blockers string list for backward compat,
-    // but defer — it comes after all hard blockers in practice
+    // but defer â€” it comes after all hard blockers in practice
     addBlocker(categorizedBlockers, 'Developer setup has not been confirmed.', 'approval-gate', 'confirm_task_setup');
   }
 
-  // ── Plugin-specific ────────────────────────────────────────────────────────
+  // â”€â”€ Plugin-specific â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
   if (isPlugin) {
     const pluginProject =
       task.workflowSetup?.pluginProject ??
@@ -234,7 +238,7 @@ export function getDeveloperReadiness(task: Task, customer?: Customer): Develope
     }
   }
 
-  // ── Script-specific ────────────────────────────────────────────────────────
+  // â”€â”€ Script-specific â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
   if (isScript) {
     const targetPath =
       task.workflowSetup?.artifactPath ??
@@ -247,7 +251,7 @@ export function getDeveloperReadiness(task: Task, customer?: Customer): Develope
 
     if (!targetPath) {
       if (actionType === 'update-existing-script') {
-        // Hard blocker — must not guess an existing file
+        // Hard blocker â€” must not guess an existing file
         addBlocker(categorizedBlockers, 'Target script/artifact path is not set.', 'hard');
       } else if (actionType === 'create-new-script') {
         // Auto-resolvable when entity and repo root are both known; proposal when only repo root is known
@@ -295,7 +299,7 @@ export function getDeveloperReadiness(task: Task, customer?: Customer): Develope
     }
 
     if (!entityLogicalName) {
-      // Proposal — AI can set entity via set_task_developer_target when clear from assignment
+      // Proposal â€” AI can set entity via set_task_developer_target when clear from assignment
       addBlocker(
         categorizedBlockers,
         'Target entity logical name (table) is not set.',
@@ -335,3 +339,4 @@ export function getDeveloperReadiness(task: Task, customer?: Customer): Develope
     recommendedNextStep: pickRecommendedNextStep(categorizedBlockers, warnings),
   };
 }
+

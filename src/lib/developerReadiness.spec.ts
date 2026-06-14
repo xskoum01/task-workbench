@@ -83,7 +83,7 @@ function makeReadyScriptTask(overrides: Partial<Task> = {}): Task {
   });
 }
 
-describe('getDeveloperReadiness — mode gate', () => {
+describe('getDeveloperReadiness â€” mode gate', () => {
   it('blocks when taskMode is not developer', () => {
     const r = getDeveloperReadiness(makeTask());
     expect(r.isReady).toBe(false);
@@ -105,7 +105,7 @@ describe('getDeveloperReadiness — mode gate', () => {
   });
 });
 
-describe('getDeveloperReadiness — work kind gate', () => {
+describe('getDeveloperReadiness â€” work kind gate', () => {
   it('blocks when work kind is missing', () => {
     const r = getDeveloperReadiness(makeTask({ taskMode: 'developer' }));
     expect(r.isReady).toBe(false);
@@ -182,7 +182,7 @@ describe('getDeveloperReadiness — work kind gate', () => {
   });
 });
 
-describe('getDeveloperReadiness — common checks', () => {
+describe('getDeveloperReadiness â€” common checks', () => {
   it('blocks when customer is missing', () => {
     const r = getDeveloperReadiness(makeTask({
       taskMode: 'developer',
@@ -300,6 +300,16 @@ describe('getDeveloperReadiness — common checks', () => {
     expect(blocker?.mcpTool).toBe('run_dataverse_check_for_task');
   });
 
+  it('does not require run_dataverse_check_for_task for script tasks when Dataverse verification is missing', () => {
+    const r = getDeveloperReadiness(makeReadyScriptTask({
+      crmVerificationReports: undefined,
+      implementationVerification: undefined,
+    }));
+    expect(r.blockers).not.toContain('Dataverse metadata verification has not been completed or explicitly skipped.');
+    expect(r.categorizedBlockers.find(b => b.mcpTool === 'run_dataverse_check_for_task')).toBeUndefined();
+    expect(r.warnings).toContain('Dataverse metadata verification for JS/TS is not available through MCP. Use the in-app Verify Implementation modal after implementation/upload.');
+  });
+
   it('accepts verdict=warnings as completed verification', () => {
     const r = getDeveloperReadiness(makeReadyPluginTask({
       crmVerificationReports: [{ verdict: 'warnings' }] as CrmVerificationReport[],
@@ -337,7 +347,7 @@ describe('getDeveloperReadiness — common checks', () => {
   });
 });
 
-describe('getDeveloperReadiness — plugin-specific checks', () => {
+describe('getDeveloperReadiness â€” plugin-specific checks', () => {
   it('is fully ready for a complete plugin task', () => {
     const r = getDeveloperReadiness(makeReadyPluginTask());
     expect(r.isReady).toBe(true);
@@ -362,7 +372,7 @@ describe('getDeveloperReadiness — plugin-specific checks', () => {
     const r = getDeveloperReadiness(makeReadyPluginTask({
       workflowSetup: { ...makeReadyPluginTask().workflowSetup, pluginProject: undefined },
     }));
-    // plan.target.pluginProject = 'Acme.Plugins' is still set → should pass
+    // plan.target.pluginProject = 'Acme.Plugins' is still set â†’ should pass
     expect(r.blockers).not.toContain('Plugin project is not selected.');
   });
 
@@ -439,7 +449,7 @@ describe('getDeveloperReadiness — plugin-specific checks', () => {
   });
 });
 
-describe('getDeveloperReadiness — script-specific checks', () => {
+describe('getDeveloperReadiness â€” script-specific checks', () => {
   it('is fully ready for a complete script task', () => {
     const r = getDeveloperReadiness(makeReadyScriptTask());
     expect(r.isReady).toBe(true);
@@ -582,7 +592,7 @@ describe('getDeveloperReadiness — script-specific checks', () => {
   });
 });
 
-describe('getDeveloperReadiness — JS script detection warning', () => {
+describe('getDeveloperReadiness â€” JS script detection warning', () => {
   it('adds warning and adjusted next step when title mentions JavaScript form script', () => {
     const r = getDeveloperReadiness(makeTask({
       taskMode: 'developer',
@@ -624,7 +634,7 @@ describe('getDeveloperReadiness — JS script detection warning', () => {
   });
 });
 
-describe('getDeveloperReadiness — actionType: create-new-script', () => {
+describe('getDeveloperReadiness â€” actionType: create-new-script', () => {
   it('passes when folder path + desiredScriptFile are set', () => {
     const r = getDeveloperReadiness(makeReadyScriptTask({
       workflowSetup: {
@@ -810,7 +820,7 @@ describe('getDeveloperReadiness — actionType: create-new-script', () => {
   });
 });
 
-describe('getDeveloperReadiness — actionType: update-existing-script', () => {
+describe('getDeveloperReadiness â€” actionType: update-existing-script', () => {
   it('passes when scriptPath points to a specific .js file', () => {
     const r = getDeveloperReadiness(makeReadyScriptTask({
       workflowSetup: {
@@ -818,7 +828,7 @@ describe('getDeveloperReadiness — actionType: update-existing-script', () => {
         actionType: 'update-existing-script',
       },
     }));
-    // scriptPath is 'src/scripts/account_form.js' — a specific file
+    // scriptPath is 'src/scripts/account_form.js' â€” a specific file
     expect(r.blockers.some(b => b.includes('Script update'))).toBe(false);
     expect(r.isReady).toBe(true);
   });
@@ -894,7 +904,7 @@ describe('getDeveloperReadiness — actionType: update-existing-script', () => {
   });
 });
 
-describe('getDeveloperReadiness — eventFieldName satisfies form/event check', () => {
+describe('getDeveloperReadiness â€” eventFieldName satisfies form/event check', () => {
   it('passes form/event check when only eventFieldName is set', () => {
     const base = makeReadyScriptTask();
     const r = getDeveloperReadiness(makeReadyScriptTask({
@@ -914,7 +924,7 @@ describe('getDeveloperReadiness — eventFieldName satisfies form/event check', 
   });
 });
 
-describe('getDeveloperReadiness — recommendedNextStep', () => {
+describe('getDeveloperReadiness â€” recommendedNextStep', () => {
   it('returns ready message when all checks pass', () => {
     const r = getDeveloperReadiness(makeReadyPluginTask());
     expect(r.recommendedNextStep).toBe('Ready for code generation.');
@@ -948,7 +958,7 @@ describe('getDeveloperReadiness — recommendedNextStep', () => {
   });
 });
 
-describe('getDeveloperReadiness — categorizedBlockers structure', () => {
+describe('getDeveloperReadiness â€” categorizedBlockers structure', () => {
   it('has categorizedBlockers array', () => {
     const r = getDeveloperReadiness(makeTask());
     expect(Array.isArray(r.categorizedBlockers)).toBe(true);
@@ -970,3 +980,4 @@ describe('getDeveloperReadiness — categorizedBlockers structure', () => {
     expect(r.categorizedBlockers).toHaveLength(0);
   });
 });
+

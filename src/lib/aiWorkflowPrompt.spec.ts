@@ -2,7 +2,7 @@ import { describe, it, expect } from 'vitest';
 import { buildAiWorkflowPrompt } from './aiWorkflowPrompt';
 import type { Task, Customer, CrmVerificationReport } from '../types';
 
-// Minimal task — no developer mode set → produces setup prompt
+// Minimal task â€” no developer mode set â†’ produces setup prompt
 function makeTask(overrides: Partial<Task> = {}): Task {
   return {
     id: 'task-001',
@@ -13,7 +13,7 @@ function makeTask(overrides: Partial<Task> = {}): Task {
   } as unknown as Task;
 }
 
-// Developer mode task with plugin kind but missing most setup → produces setup prompt
+// Developer mode task with plugin kind but missing most setup â†’ produces setup prompt
 function makeDevTask(overrides: Partial<Task> = {}): Task {
   return makeTask({
     taskMode: 'developer',
@@ -22,7 +22,7 @@ function makeDevTask(overrides: Partial<Task> = {}): Task {
   });
 }
 
-// Fully ready developer script task → produces implementation prompt with Script target context
+// Fully ready developer script task â†’ produces implementation prompt with Script target context
 function makeReadyScriptTask(overrides: Partial<Task> = {}): Task {
   return makeTask({
     taskMode: 'developer',
@@ -63,7 +63,7 @@ function makeReadyScriptTask(overrides: Partial<Task> = {}): Task {
   });
 }
 
-// Fully ready developer plugin task → produces implementation prompt
+// Fully ready developer plugin task â†’ produces implementation prompt
 function makeReadyTask(overrides: Partial<Task> = {}): Task {
   return makeTask({
     taskMode: 'developer',
@@ -99,7 +99,7 @@ function makeReadyTask(overrides: Partial<Task> = {}): Task {
   });
 }
 
-describe('buildAiWorkflowPrompt — common header', () => {
+describe('buildAiWorkflowPrompt â€” common header', () => {
   it('includes the task ID', () => {
     expect(buildAiWorkflowPrompt(makeTask())).toContain('task-001');
   });
@@ -202,7 +202,7 @@ describe('buildAiWorkflowPrompt — common header', () => {
   });
 });
 
-describe('buildAiWorkflowPrompt — setup prompt (not ready)', () => {
+describe('buildAiWorkflowPrompt â€” setup prompt (not ready)', () => {
   it('instructs AI not to implement code or modify files', () => {
     expect(buildAiWorkflowPrompt(makeTask())).toContain('Do not implement code or modify files');
   });
@@ -211,7 +211,7 @@ describe('buildAiWorkflowPrompt — setup prompt (not ready)', () => {
     const prompt = buildAiWorkflowPrompt(makeTask());
     expect(prompt).toContain('Do not perform external writes');
     expect(prompt).toContain('during this setup/readiness run');
-    // Must not imply a permanent ban — approved future workflow actions must still be possible
+    // Must not imply a permanent ban â€” approved future workflow actions must still be possible
     expect(prompt).not.toContain('at any stage');
     expect(prompt).toContain('External writes are allowed only later through explicit approved workflow actions');
   });
@@ -293,7 +293,7 @@ describe('buildAiWorkflowPrompt — setup prompt (not ready)', () => {
 
   it('separates blockers by category in setup prompt', () => {
     const prompt = buildAiWorkflowPrompt(makeTask());
-    // Mode missing = auto-resolvable → appears under auto-resolvable section
+    // Mode missing = auto-resolvable â†’ appears under auto-resolvable section
     expect(prompt).toContain('Auto-resolvable');
   });
 
@@ -301,6 +301,19 @@ describe('buildAiWorkflowPrompt — setup prompt (not ready)', () => {
     const prompt = buildAiWorkflowPrompt(makeDevTask());
     expect(prompt).toContain('Read-only workflow actions');
     expect(prompt).toContain('run_dataverse_check_for_task');
+  });
+
+  it('does not instruct JS script setup prompts to call run_dataverse_check_for_task before or after prepare_developer_task', () => {
+    const prompt = buildAiWorkflowPrompt(makeDevTask({
+      workflowSetup: { devTargetKind: 'script' },
+      crmDeveloperWorkflow: { detectedWorkKind: 'script' },
+      crmVerificationReports: undefined,
+      implementationVerification: undefined,
+    }));
+    expect(prompt).toContain('prepare_developer_task');
+    expect(prompt).toContain('Dataverse metadata verification for JS/TS is not available through MCP');
+    expect(prompt).not.toContain('â†’ call `run_dataverse_check_for_task`');
+    expect(prompt).not.toContain('run run_dataverse_check_for_task');
   });
 
   it('shows technical plan as proposal action (not hard blocker)', () => {
@@ -320,7 +333,7 @@ describe('buildAiWorkflowPrompt — setup prompt (not ready)', () => {
   });
 });
 
-describe('buildAiWorkflowPrompt — script context block', () => {
+describe('buildAiWorkflowPrompt â€” script context block', () => {
   it('includes Script target context section for script tasks', () => {
     const prompt = buildAiWorkflowPrompt(makeReadyScriptTask());
     expect(prompt).toContain('Script target context:');
@@ -496,7 +509,7 @@ describe('buildAiWorkflowPrompt — script context block', () => {
   });
 });
 
-describe('buildAiWorkflowPrompt — implementation prompt (ready task)', () => {
+describe('buildAiWorkflowPrompt â€” implementation prompt (ready task)', () => {
   it('does not include NOT implementation-ready warning', () => {
     expect(buildAiWorkflowPrompt(makeReadyTask())).not.toContain('NOT implementation-ready');
   });
@@ -517,6 +530,17 @@ describe('buildAiWorkflowPrompt — implementation prompt (ready task)', () => {
 
   it('rule 7: Primarch Dataverse verification', () => {
     expect(buildAiWorkflowPrompt(makeReadyTask())).toContain('Primarch');
+  });
+
+  it('rule 7: JS script implementation prompt uses in-app verification instead of run_dataverse_check_for_task', () => {
+    const prompt = buildAiWorkflowPrompt(makeReadyScriptTask({
+      crmVerificationReports: undefined,
+      implementationVerification: undefined,
+    }));
+    expect(prompt).toContain('Dataverse metadata verification for JS/TS is not available through MCP');
+    expect(prompt).toContain('Verify Implementation modal');
+    expect(prompt).toContain('do not call run_dataverse_check_for_task');
+    expect(prompt).not.toContain('run run_dataverse_check_for_task');
   });
 
   it('rule 8: script conventions', () => {
@@ -568,7 +592,7 @@ describe('buildAiWorkflowPrompt - prepare_developer_task opening instruction', (
   });
 });
 
-describe('buildAiWorkflowPrompt — task identity and MCP write rules', () => {
+describe('buildAiWorkflowPrompt â€” task identity and MCP write rules', () => {
   it('includes "current task ID is the Task ID shown in this prompt"', () => {
     expect(buildAiWorkflowPrompt(makeTask())).toContain('current task ID is the Task ID shown in this prompt');
   });
@@ -603,7 +627,7 @@ describe('buildAiWorkflowPrompt — task identity and MCP write rules', () => {
   });
 });
 
-describe('buildAiWorkflowPrompt — script target TBD prevention', () => {
+describe('buildAiWorkflowPrompt â€” script target TBD prevention', () => {
   it('does not contain TBD in script target context when no target is set for create-new-script', () => {
     const task = makeTask({
       taskMode: 'developer',
@@ -658,7 +682,7 @@ describe('buildAiWorkflowPrompt — script target TBD prevention', () => {
   });
 });
 
-describe('buildAiWorkflowPrompt — create-new-script naming conventions', () => {
+describe('buildAiWorkflowPrompt â€” create-new-script naming conventions', () => {
   it('includes CRM JS script naming conventions section for create-new-script tasks', () => {
     const task = makeTask({
       taskMode: 'developer',
@@ -733,7 +757,7 @@ describe('buildAiWorkflowPrompt — create-new-script naming conventions', () =>
   });
 });
 
-describe('buildAiWorkflowPrompt — setup prompt categorized sections', () => {
+describe('buildAiWorkflowPrompt â€” setup prompt categorized sections', () => {
   it('non-developer task auto-resolvable section includes set_task_mode call', () => {
     const prompt = buildAiWorkflowPrompt(makeTask());
     expect(prompt).toContain('Auto-resolvable');
@@ -764,7 +788,7 @@ describe('buildAiWorkflowPrompt — setup prompt categorized sections', () => {
   it('NVR script task title triggers auto-resolvable work kind blocker', () => {
     const prompt = buildAiWorkflowPrompt(makeTask({
       taskMode: 'developer',
-      title: '[TEST] Script: Předvyplnění servisního požadavku podle zařízení',
+      title: '[TEST] Script: PĹ™edvyplnÄ›nĂ­ servisnĂ­ho poĹľadavku podle zaĹ™Ă­zenĂ­',
     }));
     expect(prompt).toContain('Auto-resolvable');
     expect(prompt).toContain('set_task_work_classification');
@@ -773,14 +797,14 @@ describe('buildAiWorkflowPrompt — setup prompt categorized sections', () => {
   it('NVR plugin task title triggers auto-resolvable work kind blocker', () => {
     const prompt = buildAiWorkflowPrompt(makeTask({
       taskMode: 'developer',
-      title: '[TEST] Plugin: Výpočet částek na položce servisní zakázky',
+      title: '[TEST] Plugin: VĂ˝poÄŤet ÄŤĂˇstek na poloĹľce servisnĂ­ zakĂˇzky',
     }));
     expect(prompt).toContain('Auto-resolvable');
     expect(prompt).toContain('set_task_work_classification');
   });
 });
 
-// ── Concrete script naming contract ──────────────────────────────────────────
+// â”€â”€ Concrete script naming contract â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 function makeNvrScriptTask(setupOverrides = {}, customerOverride?: Partial<{ scriptFolder: string; repositoryRoot: string }>) {
   return {
@@ -801,7 +825,7 @@ function makeNvrScriptTask(setupOverrides = {}, customerOverride?: Partial<{ scr
   };
 }
 
-describe('buildAiWorkflowPrompt — concrete script naming contract', () => {
+describe('buildAiWorkflowPrompt â€” concrete script naming contract', () => {
   it('shows CRM script naming contract when entity and customer scriptFolder are known', () => {
     const { task, customer } = makeNvrScriptTask({}, {
       scriptFolder: 'C:\\Users\\vskoumal\\Documents\\CRM\\VSK-Test\\Scripts',
@@ -893,13 +917,13 @@ describe('buildAiWorkflowPrompt — concrete script naming contract', () => {
   });
 });
 
-// ── Template-preview contract (no persisted entity) ──────────────────────────
+// â”€â”€ Template-preview contract (no persisted entity) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 function makeFreshNvrTask(customerOverride?: Partial<{ scriptFolder: string; repositoryRoot: string }>) {
   return {
     task: makeTask({
       taskMode: 'developer',
-      title: '[TEST] Script: Předvyplnění servisního požadavku podle zařízení',
+      title: '[TEST] Script: PĹ™edvyplnÄ›nĂ­ servisnĂ­ho poĹľadavku podle zaĹ™Ă­zenĂ­',
     }),
     customer: customerOverride
       ? ({ id: 'cust-vsk', name: 'VSK-Test', ...customerOverride } as unknown as import('../types').Customer)
@@ -907,7 +931,7 @@ function makeFreshNvrTask(customerOverride?: Partial<{ scriptFolder: string; rep
   };
 }
 
-describe('buildAiWorkflowPrompt — template-preview contract (no persisted entity)', () => {
+describe('buildAiWorkflowPrompt â€” template-preview contract (no persisted entity)', () => {
   const vskCustomer = {
     scriptFolder: 'C:\\Users\\vskoumal\\Documents\\CRM\\VSK-Test\\Scripts',
     repositoryRoot: 'C:\\Users\\vskoumal\\Documents\\CRM\\VSK-Test',
@@ -1094,4 +1118,6 @@ describe('buildAiWorkflowPrompt — template-preview contract (no persisted enti
     expect(prompt).toContain('C:\\Users\\vskoumal\\Documents\\CRM\\VSK-Test\\Scripts\\nvr_servicecase_events.js');
   });
 });
+
+
 

@@ -44,7 +44,7 @@ function makeTask(overrides = {}) {
 // tasks array and calling the handler directly via a re-exported path.
 //
 // For tests that only need schema/set inspection we just use TOOL_DEFINITIONS
-// and READ_ONLY_TOOL_NAMES directly — no mock needed.
+// and READ_ONLY_TOOL_NAMES directly â€” no mock needed.
 
 // ---------------------------------------------------------------------------
 // 1. READ_ONLY_TOOL_NAMES classification
@@ -73,7 +73,7 @@ describe('READ_ONLY_TOOL_NAMES', () => {
 });
 
 // ---------------------------------------------------------------------------
-// 2. set_task_work_classification — workKind enum
+// 2. set_task_work_classification â€” workKind enum
 // ---------------------------------------------------------------------------
 
 describe('set_task_work_classification schema', () => {
@@ -98,7 +98,7 @@ describe('set_task_work_classification schema', () => {
 });
 
 // ---------------------------------------------------------------------------
-// 3. save_technical_plan — pluginTarget / scriptTarget schema
+// 3. save_technical_plan â€” pluginTarget / scriptTarget schema
 // ---------------------------------------------------------------------------
 
 describe('save_technical_plan schema', () => {
@@ -212,7 +212,7 @@ describe('new tool definitions (v0.5.0)', () => {
 });
 
 // ---------------------------------------------------------------------------
-// 5. callToolFallback — new read tools (with synthetic task data)
+// 5. callToolFallback â€” new read tools (with synthetic task data)
 // ---------------------------------------------------------------------------
 
 // callToolFallback internally calls loadTasks() which reads from the
@@ -232,7 +232,7 @@ describe('new tool definitions (v0.5.0)', () => {
 // with a real (but empty) data dir, and focus on schema tests for the new
 // tools.
 
-describe('callToolFallback — get_dataverse_verification_report', () => {
+describe('callToolFallback â€” get_dataverse_verification_report', () => {
   it('returns hasReport:false with a message when no report stored', async () => {
     // Provide a synthetic tasks array by writing a temp file
     const os = await import('node:os');
@@ -298,7 +298,7 @@ describe('callToolFallback — get_dataverse_verification_report', () => {
   });
 });
 
-describe('callToolFallback — get_external_action_proposal', () => {
+describe('callToolFallback â€” get_external_action_proposal', () => {
   it('returns hasProposal:false when no workflow state', async () => {
     const os = await import('node:os');
     const fs = await import('node:fs/promises');
@@ -358,7 +358,7 @@ describe('callToolFallback — get_external_action_proposal', () => {
   });
 });
 
-describe('callToolFallback — get_implementation_verification_state', () => {
+describe('callToolFallback â€” get_implementation_verification_state', () => {
   it('returns all null fields when implementationVerification is absent', async () => {
     const os = await import('node:os');
     const fs = await import('node:fs/promises');
@@ -421,10 +421,10 @@ describe('callToolFallback — get_implementation_verification_state', () => {
 });
 
 // ---------------------------------------------------------------------------
-// 6. save_technical_plan fallback — persists pluginTarget / scriptTarget
+// 6. save_technical_plan fallback â€” persists pluginTarget / scriptTarget
 //    (schema validation only; actual persistence is in the bridge/Rust)
 // ---------------------------------------------------------------------------
-describe('save_technical_plan — target field presence in schema', () => {
+describe('save_technical_plan â€” target field presence in schema', () => {
   it('accepts pluginTarget without additionalProperties errors (schema is open to these keys)', () => {
     const schema = findTool('save_technical_plan').inputSchema;
     // Verify the object property names match what we pass in real calls
@@ -454,7 +454,7 @@ describe('save_technical_plan — target field presence in schema', () => {
 });
 
 // ---------------------------------------------------------------------------
-// 7. set_task_developer_target — schema completeness for script target fields
+// 7. set_task_developer_target â€” schema completeness for script target fields
 // ---------------------------------------------------------------------------
 
 describe('set_task_developer_target schema', () => {
@@ -525,10 +525,10 @@ describe('set_task_developer_target schema', () => {
 });
 
 // ---------------------------------------------------------------------------
-// 8. TASK_TEMPLATES — NVR servicecase script template
+// 8. TASK_TEMPLATES â€” NVR servicecase script template
 // ---------------------------------------------------------------------------
 
-describe('TASK_TEMPLATES — NVR servicecase script template', () => {
+describe('TASK_TEMPLATES â€” NVR servicecase script template', () => {
   it('has template for NVR Training Service Hub script task', () => {
     const tpl = TASK_TEMPLATES.find((t) => t.id === 'nvr-training-sh-script-prefill');
     expect(tpl).toBeDefined();
@@ -542,7 +542,7 @@ describe('TASK_TEMPLATES — NVR servicecase script template', () => {
   });
 
   it('matchTaskTemplate matches NVR servicecase title', () => {
-    const matched = matchTaskTemplate('Script: Předvyplnění servisního požadavku');
+    const matched = matchTaskTemplate('Script: PĹ™edvyplnÄ›nĂ­ servisnĂ­ho poĹľadavku');
     expect(matched).not.toBeNull();
     expect(matched.id).toBe('nvr-training-sh-script-prefill');
   });
@@ -564,7 +564,7 @@ describe('TASK_TEMPLATES — NVR servicecase script template', () => {
     const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'tw-mcp-tpl-'));
     const task = makeTask({
       id: 'task-tpl-nvr',
-      title: 'Script: Předvyplnění servisního požadavku',
+      title: 'Script: PĹ™edvyplnÄ›nĂ­ servisnĂ­ho poĹľadavku',
     });
     await fs.writeFile(path.join(tmpDir, 'tasks.json'), JSON.stringify([task]));
 
@@ -583,10 +583,10 @@ describe('TASK_TEMPLATES — NVR servicecase script template', () => {
 });
 
 // ---------------------------------------------------------------------------
-// 9. TASK_TEMPLATES — NVR servicecase scriptNaming enrichment
+// 9. TASK_TEMPLATES â€” NVR servicecase scriptNaming enrichment
 // ---------------------------------------------------------------------------
 
-describe('TASK_TEMPLATES — NVR servicecase scriptNaming block', () => {
+describe('TASK_TEMPLATES â€” NVR servicecase scriptNaming block', () => {
   it('template has scriptNaming block', () => {
     const tpl = TASK_TEMPLATES.find((t) => t.id === 'nvr-training-sh-script-prefill');
     expect(tpl.scriptNaming).toBeDefined();
@@ -627,6 +627,12 @@ describe('TASK_TEMPLATES — NVR servicecase scriptNaming block', () => {
     expect(tpl.sourceFields).toContain('nvr_customerid');
   });
 
+  it('template keeps nvr_statuscustom as additional source context, not a mapped source field', () => {
+    const tpl = TASK_TEMPLATES.find((t) => t.id === 'nvr-training-sh-script-prefill');
+    expect(tpl.sourceFields).not.toContain('nvr_statuscustom');
+    expect(tpl.additionalSourceFields).toContain('nvr_statuscustom');
+  });
+
   it('template targetFields contains nvr_iswarrantycase', () => {
     const tpl = TASK_TEMPLATES.find((t) => t.id === 'nvr-training-sh-script-prefill');
     expect(tpl.targetFields).toContain('nvr_iswarrantycase');
@@ -634,10 +640,10 @@ describe('TASK_TEMPLATES — NVR servicecase scriptNaming block', () => {
 });
 
 // ---------------------------------------------------------------------------
-// 10. set_task_developer_target schema — new naming fields
+// 10. set_task_developer_target schema â€” new naming fields
 // ---------------------------------------------------------------------------
 
-describe('set_task_developer_target schema — naming fields', () => {
+describe('set_task_developer_target schema â€” naming fields', () => {
   it('schema accepts namingSource', () => {
     expect(findTool('set_task_developer_target').inputSchema.properties.namingSource).toBeDefined();
   });
@@ -711,7 +717,6 @@ describe('callToolFallback prepare_developer_task', () => {
       workflowSetup: {},
       crmDeveloperWorkflow: undefined,
       analysisResult: undefined,
-      implementationVerification: { dataverseCheck: { status: 'skipped', skippedAt: '2026-06-12T10:00:00.000Z' } },
     });
     const customer = {
       id: 'cust-prepare',
@@ -734,9 +739,19 @@ describe('callToolFallback prepare_developer_task', () => {
       expect(result.appliedActions).toContain('confirmed_setup');
       expect(result.approvalGates[0].type).toBe('technical-plan-approval');
       expect(result.hardBlockers).toEqual([]);
+      expect(result.skippedActions.some((item) => item.action === 'run_dataverse_check_for_task')).toBe(true);
+      expect(result.warnings).toContain('Dataverse metadata verification for JS/TS is not available through MCP. Use the in-app Verify Implementation modal after implementation/upload.');
+      expect(result.implementationReadiness.blockers).not.toContain('Dataverse metadata verification has not been completed or explicitly skipped.');
       expect(result.task.workflowSetup.primaryEntityLogicalName).toBe('nvr_servicecase');
       expect(result.task.workflowSetup.artifactPath).toBe('Scripts\\nvr_servicecase_events.js');
       expect(result.task.crmWorkflowState.technicalPlan.summary).toContain('Dataverse form script');
+      expect(JSON.stringify(result.task.crmWorkflowState.technicalPlan)).not.toContain('(mapped, exact target TBD)');
+      expect(result.task.crmWorkflowState.technicalPlan.fieldMappings).toEqual([
+        { source: 'nvr_customerasset.nvr_customerid', target: 'nvr_servicecase.nvr_customerid' },
+        { source: 'nvr_customerasset.nvr_contactid', target: 'nvr_servicecase.nvr_contactid' },
+        { source: 'nvr_customerasset.nvr_isunderwarranty', target: 'nvr_servicecase.nvr_iswarrantycase' },
+      ]);
+      expect(result.task.crmWorkflowState.technicalPlan.unmappedSourceFields).toEqual(['nvr_statuscustom']);
 
       const stored = JSON.parse(await fs.readFile(path.join(tmpDir, 'tasks.json'), 'utf8'))[0];
       expect(stored.workflowSetup.absoluteScriptPath).toBe('C:\\Users\\vskoumal\\Documents\\CRM\\VSK-Test\\Scripts\\nvr_servicecase_events.js');
@@ -775,13 +790,69 @@ describe('callToolFallback prepare_developer_task', () => {
       await fs.rm(tmpDir, { recursive: true });
     }
   });
+
+  it('does not zip sourceFields beyond available targetFields and reports unmapped fields separately', async () => {
+    const os = await import('node:os');
+    const fs = await import('node:fs/promises');
+    const path = await import('node:path');
+
+    const template = {
+      id: 'test-uneven-field-map',
+      name: 'Uneven field map',
+      titlePattern: '[TEST] Uneven Field Map',
+      mode: 'developer',
+      workKind: 'script',
+      actionType: 'create-new-script',
+      targetEntity: 'target_table',
+      scriptTarget: { entityLogicalName: 'target_table', eventName: 'onChange', eventFieldName: 'target_lookup' },
+      scriptNaming: { namingSource: 'Scripts_Naming', scriptsFolderRelative: 'Scripts', desiredScriptFile: 'target_table_events.js' },
+      sourceEntity: 'source_table',
+      sourceFields: ['source_a', 'source_b', 'source_unmapped'],
+      targetFields: ['target_a', 'target_b'],
+    };
+    TASK_TEMPLATES.push(template);
+
+    const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'tw-mcp-uneven-map-'));
+    await fs.writeFile(path.join(tmpDir, 'tasks.json'), JSON.stringify([makeTask({
+      id: 'task-uneven-map',
+      title: '[TEST] Uneven Field Map',
+      taskMode: 'general',
+      customerId: 'cust-uneven',
+      workflowSetup: {},
+    })]));
+    await fs.writeFile(path.join(tmpDir, 'customers.json'), JSON.stringify([{
+      id: 'cust-uneven',
+      repositoryRoot: 'C:\\Repo',
+      scriptFolder: 'C:\\Repo\\Scripts',
+    }]));
+
+    const origArgv = process.argv;
+    process.argv = [...process.argv, '--data-dir', tmpDir];
+    try {
+      const result = await callToolFallback('prepare_developer_task', { taskId: 'task-uneven-map' });
+      const plan = result.task.crmWorkflowState.technicalPlan;
+      const rawPlan = JSON.stringify(plan);
+      expect(rawPlan).not.toContain('(mapped, exact target TBD)');
+      expect(rawPlan).not.toContain('source_unmapped ->');
+      expect(plan.fieldMappings).toEqual([
+        { source: 'source_table.source_a', target: 'target_table.target_a' },
+        { source: 'source_table.source_b', target: 'target_table.target_b' },
+      ]);
+      expect(plan.unmappedSourceFields).toEqual(['source_unmapped']);
+      expect(plan.dataverseFindings).toContain('Additional source field available from template: source_unmapped. No target mapping is defined.');
+    } finally {
+      process.argv = origArgv;
+      TASK_TEMPLATES.pop();
+      await fs.rm(tmpDir, { recursive: true });
+    }
+  });
 });
 
 // ---------------------------------------------------------------------------
-// 12. callToolFallback get_task_full_context — developerWorkPacket.scriptNaming
+// 12. callToolFallback get_task_full_context â€” developerWorkPacket.scriptNaming
 // ---------------------------------------------------------------------------
 
-describe('callToolFallback get_task_full_context — developerWorkPacket.scriptNaming', () => {
+describe('callToolFallback get_task_full_context â€” developerWorkPacket.scriptNaming', () => {
   it('includes developerWorkPacket.scriptNaming when entity and customer scriptFolder are set', async () => {
     const os = await import('node:os');
     const fs = await import('node:fs/promises');
@@ -835,7 +906,7 @@ describe('callToolFallback get_task_full_context — developerWorkPacket.scriptN
     const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'tw-mcp-nofolder-'));
     const task = makeTask({
       id: 'task-naming-nofolder',
-      title: '[TEST] Script: Předvyplnění servisního požadavku',
+      title: '[TEST] Script: PĹ™edvyplnÄ›nĂ­ servisnĂ­ho poĹľadavku',
       customerId: 'cust-naming-nofolder',
       workflowSetup: {
         devTargetKind: 'script',
@@ -889,3 +960,4 @@ describe('callToolFallback get_task_full_context — developerWorkPacket.scriptN
     }
   });
 });
+

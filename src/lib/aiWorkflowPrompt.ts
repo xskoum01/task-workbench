@@ -23,7 +23,7 @@ function buildCustomerDevDefaultsLines(customer: Customer | undefined): string[]
   return lines;
 }
 
-// ── Prompt-time template preview ────────────────────────────────────────────
+// Ă˘â€ťâ‚¬Ă˘â€ťâ‚¬ Prompt-time template preview Ă˘â€ťâ‚¬Ă˘â€ťâ‚¬Ă˘â€ťâ‚¬Ă˘â€ťâ‚¬Ă˘â€ťâ‚¬Ă˘â€ťâ‚¬Ă˘â€ťâ‚¬Ă˘â€ťâ‚¬Ă˘â€ťâ‚¬Ă˘â€ťâ‚¬Ă˘â€ťâ‚¬Ă˘â€ťâ‚¬Ă˘â€ťâ‚¬Ă˘â€ťâ‚¬Ă˘â€ťâ‚¬Ă˘â€ťâ‚¬Ă˘â€ťâ‚¬Ă˘â€ťâ‚¬Ă˘â€ťâ‚¬Ă˘â€ťâ‚¬Ă˘â€ťâ‚¬Ă˘â€ťâ‚¬Ă˘â€ťâ‚¬Ă˘â€ťâ‚¬Ă˘â€ťâ‚¬Ă˘â€ťâ‚¬Ă˘â€ťâ‚¬Ă˘â€ťâ‚¬Ă˘â€ťâ‚¬Ă˘â€ťâ‚¬Ă˘â€ťâ‚¬Ă˘â€ťâ‚¬Ă˘â€ťâ‚¬Ă˘â€ťâ‚¬Ă˘â€ťâ‚¬Ă˘â€ťâ‚¬Ă˘â€ťâ‚¬Ă˘â€ťâ‚¬Ă˘â€ťâ‚¬Ă˘â€ťâ‚¬Ă˘â€ťâ‚¬Ă˘â€ťâ‚¬Ă˘â€ťâ‚¬Ă˘â€ťâ‚¬
 
 interface PromptTemplate {
   id: string;
@@ -48,7 +48,7 @@ interface PromptTemplate {
 const PROMPT_TEMPLATES: PromptTemplate[] = [
   {
     id: 'nvr-training-sh-script-prefill',
-    titlePattern: 'Script: Předvyplnění servisního požadavku',
+    titlePattern: 'Script: PÄąâ„˘edvyplnĂ„â€şnÄ‚Â­ servisnÄ‚Â­ho poÄąÄľadavku',
     workKind: 'script',
     actionType: 'create-new-script',
     scriptTarget: {
@@ -67,7 +67,7 @@ const PROMPT_TEMPLATES: PromptTemplate[] = [
   },
   {
     id: 'nvr-training-sh-plugin-service-order',
-    titlePattern: 'Plugin: Výpočet částek',
+    titlePattern: 'Plugin: VÄ‚ËťpoĂ„Ĺ¤et Ă„Ĺ¤Ä‚Ë‡stek',
     workKind: 'plugin',
   },
 ];
@@ -75,10 +75,23 @@ const PROMPT_TEMPLATES: PromptTemplate[] = [
 function matchPromptTemplate(title: string, originalMessage?: string): PromptTemplate | null {
   if (!title) return null;
   const haystack = (title + ' ' + (originalMessage ?? '')).toLowerCase();
-  return PROMPT_TEMPLATES.find(t => haystack.includes(t.titlePattern.toLowerCase())) ?? null;
+  const exactMatch = PROMPT_TEMPLATES.find(t => haystack.includes(t.titlePattern.toLowerCase()));
+  if (exactMatch) return exactMatch;
+
+  if (
+    haystack.includes('[test]') &&
+    haystack.includes('script') &&
+    haystack.includes('servis') &&
+    (haystack.includes('pozadavku') || haystack.includes('poa') || haystack.includes('po')) &&
+    (haystack.includes('zarizeni') || haystack.includes('zaa') || haystack.includes('za'))
+  ) {
+    return PROMPT_TEMPLATES.find(t => t.id === 'nvr-training-sh-script-prefill') ?? null;
+  }
+
+  return null;
 }
 
-// ── Script naming contract ────────────────────────────────────────────────────
+// Ă˘â€ťâ‚¬Ă˘â€ťâ‚¬ Script naming contract Ă˘â€ťâ‚¬Ă˘â€ťâ‚¬Ă˘â€ťâ‚¬Ă˘â€ťâ‚¬Ă˘â€ťâ‚¬Ă˘â€ťâ‚¬Ă˘â€ťâ‚¬Ă˘â€ťâ‚¬Ă˘â€ťâ‚¬Ă˘â€ťâ‚¬Ă˘â€ťâ‚¬Ă˘â€ťâ‚¬Ă˘â€ťâ‚¬Ă˘â€ťâ‚¬Ă˘â€ťâ‚¬Ă˘â€ťâ‚¬Ă˘â€ťâ‚¬Ă˘â€ťâ‚¬Ă˘â€ťâ‚¬Ă˘â€ťâ‚¬Ă˘â€ťâ‚¬Ă˘â€ťâ‚¬Ă˘â€ťâ‚¬Ă˘â€ťâ‚¬Ă˘â€ťâ‚¬Ă˘â€ťâ‚¬Ă˘â€ťâ‚¬Ă˘â€ťâ‚¬Ă˘â€ťâ‚¬Ă˘â€ťâ‚¬Ă˘â€ťâ‚¬Ă˘â€ťâ‚¬Ă˘â€ťâ‚¬Ă˘â€ťâ‚¬Ă˘â€ťâ‚¬Ă˘â€ťâ‚¬Ă˘â€ťâ‚¬Ă˘â€ťâ‚¬Ă˘â€ťâ‚¬Ă˘â€ťâ‚¬Ă˘â€ťâ‚¬Ă˘â€ťâ‚¬Ă˘â€ťâ‚¬Ă˘â€ťâ‚¬Ă˘â€ťâ‚¬Ă˘â€ťâ‚¬Ă˘â€ťâ‚¬Ă˘â€ťâ‚¬Ă˘â€ťâ‚¬Ă˘â€ťâ‚¬Ă˘â€ťâ‚¬Ă˘â€ťâ‚¬
 
 interface ScriptNamingContract {
   namingSource: string;
@@ -225,7 +238,7 @@ function buildScriptNamingContractLines(contract: ScriptNamingContract, pendingS
   return lines;
 }
 
-// ── Script context section ────────────────────────────────────────────────────
+// Ă˘â€ťâ‚¬Ă˘â€ťâ‚¬ Script context section Ă˘â€ťâ‚¬Ă˘â€ťâ‚¬Ă˘â€ťâ‚¬Ă˘â€ťâ‚¬Ă˘â€ťâ‚¬Ă˘â€ťâ‚¬Ă˘â€ťâ‚¬Ă˘â€ťâ‚¬Ă˘â€ťâ‚¬Ă˘â€ťâ‚¬Ă˘â€ťâ‚¬Ă˘â€ťâ‚¬Ă˘â€ťâ‚¬Ă˘â€ťâ‚¬Ă˘â€ťâ‚¬Ă˘â€ťâ‚¬Ă˘â€ťâ‚¬Ă˘â€ťâ‚¬Ă˘â€ťâ‚¬Ă˘â€ťâ‚¬Ă˘â€ťâ‚¬Ă˘â€ťâ‚¬Ă˘â€ťâ‚¬Ă˘â€ťâ‚¬Ă˘â€ťâ‚¬Ă˘â€ťâ‚¬Ă˘â€ťâ‚¬Ă˘â€ťâ‚¬Ă˘â€ťâ‚¬Ă˘â€ťâ‚¬Ă˘â€ťâ‚¬Ă˘â€ťâ‚¬Ă˘â€ťâ‚¬Ă˘â€ťâ‚¬Ă˘â€ťâ‚¬Ă˘â€ťâ‚¬Ă˘â€ťâ‚¬Ă˘â€ťâ‚¬Ă˘â€ťâ‚¬Ă˘â€ťâ‚¬Ă˘â€ťâ‚¬Ă˘â€ťâ‚¬Ă˘â€ťâ‚¬Ă˘â€ťâ‚¬Ă˘â€ťâ‚¬Ă˘â€ťâ‚¬Ă˘â€ťâ‚¬Ă˘â€ťâ‚¬Ă˘â€ťâ‚¬Ă˘â€ťâ‚¬Ă˘â€ťâ‚¬Ă˘â€ťâ‚¬
 
 function buildScriptContextLines(
   task: Task,
@@ -261,9 +274,9 @@ function buildScriptContextLines(
     lines.push(`* Persistence state: not yet saved to task setup`);
     lines.push(`* Required action: save this target via set_task_developer_target`);
   } else if (isCreateNew) {
-    lines.push('* Target file: NOT SET — derive from entity name and naming convention below, then save via set_task_developer_target');
+    lines.push('* Target file: NOT SET Ă˘â‚¬â€ť derive from entity name and naming convention below, then save via set_task_developer_target');
   } else {
-    lines.push('* Target file: NOT SET — do not guess or create a file path');
+    lines.push('* Target file: NOT SET Ă˘â‚¬â€ť do not guess or create a file path');
   }
 
   if (isCreateNew && setup?.desiredScriptFile) {
@@ -303,7 +316,7 @@ function buildScriptContextLines(
       lines.push(
         '',
         'CRM JS script naming conventions:',
-        '* File name format: <entityLogicalName>_events.js (Scripts_Naming convention — do not add extra nvr_ prefix if entity already has it, e.g. nvr_servicecase → nvr_servicecase_events.js)',
+        '* File name format: <entityLogicalName>_events.js (Scripts_Naming convention Ă˘â‚¬â€ť do not add extra nvr_ prefix if entity already has it, e.g. nvr_servicecase Ă˘â€ â€™ nvr_servicecase_events.js)',
         '* OnLoad handler: <entityLogicalName>_OnLoad',
         '* OnChange handler: <fieldLogicalName>_OnChange',
         '* Helper functions: descriptive camelCase without namespace prefixes',
@@ -329,7 +342,7 @@ function buildSetupBlockerSections(categorizedBlockers: ReadinessBlocker[]): str
   if (autoResolvable.length > 0) {
     lines.push('', 'Auto-resolvable (call the MCP tool immediately and reload, do not stop):');
     for (const b of autoResolvable) {
-      const tool = b.mcpTool ? ` → call \`${b.mcpTool}\`` : '';
+      const tool = b.mcpTool ? ` Ă˘â€ â€™ call \`${b.mcpTool}\`` : '';
       lines.push(`* ${b.message}${tool}`);
     }
   }
@@ -337,15 +350,15 @@ function buildSetupBlockerSections(categorizedBlockers: ReadinessBlocker[]): str
   if (workflowActions.length > 0) {
     lines.push('', 'Read-only workflow actions (run the tool, record findings, reload, continue):');
     for (const b of workflowActions) {
-      const tool = b.mcpTool ? ` → call \`${b.mcpTool}\`` : '';
+      const tool = b.mcpTool ? ` Ă˘â€ â€™ call \`${b.mcpTool}\`` : '';
       lines.push(`* ${b.message}${tool}`);
     }
   }
 
   if (proposals.length > 0) {
-    lines.push('', 'Proposal/draft actions (call the MCP tool immediately; for convention-derived setup metadata such as script file name, persist and continue — user approval is required only before code file edits, not before saving task setup metadata):');
+    lines.push('', 'Proposal/draft actions (call the MCP tool immediately; for convention-derived setup metadata such as script file name, persist and continue Ă˘â‚¬â€ť user approval is required only before code file edits, not before saving task setup metadata):');
     for (const b of proposals) {
-      const tool = b.mcpTool ? ` → call \`${b.mcpTool}\`` : '';
+      const tool = b.mcpTool ? ` Ă˘â€ â€™ call \`${b.mcpTool}\`` : '';
       lines.push(`* ${b.message}${tool}`);
     }
   }
@@ -461,44 +474,6 @@ export function buildAiWorkflowPrompt(task: Task, customer?: Customer): string {
     );
     return lines.join('\n');
 
-    lines.push(
-      '',
-      `Recommended next step: ${readiness.recommendedNextStep}`,
-      '',
-      'Setup orchestration (up to 8 safe Task Workbench-only actions):',
-      'When a complete developer target can be derived from customer defaults, task template, and naming convention, save it immediately via set_task_developer_target, reload get_task_full_context, and continue.',
-      '',
-      'Allowed auto-setup actions (no user input needed when the value is explicit):',
-      '* setting task mode to Developer when the task is clearly a development task',
-      '* setting work classification to script/plugin when explicit from the task text',
-      ...(customerDefaultsLines.length
-        ? ['* applying customer/environment developer defaults (repositoryRoot, scriptFolder, pluginFolder) via set_task_developer_target when listed in the Customer developer defaults section above']
-        : []),
-      '* for create-new-script tasks: when entity name is known from template, task text, or customer defaults, derive the script directory and file name using Scripts_Naming (<fullEntityLogicalName>_events.js — do not double the nvr_ prefix if entity already has it, e.g. nvr_servicecase → nvr_servicecase_events.js; do not strip the prefix; do not use dot-notation namespace patterns for helper functions), then call set_task_developer_target with repositoryRoot, selectedScriptTarget, desiredScriptFile, artifactPath, absoluteScriptPath, actionType, primaryEntityLogicalName, eventName, eventFieldName, namingSource, onLoadFunctionName, onChangeFunctionName, mainHelperSuggestion — do not stop or ask the user before saving this metadata',
-      '* updating next step',
-      '* saving analysis or summary when it does not require guessing',
-      '* saving a technical plan draft when enough context exists — do not begin implementation before plan approval',
-      '',
-      'Retry behavior for transient failures:',
-      'Retry required MCP read calls up to 3 times before treating a failure as a hard stop. Do not continue outside Task Workbench.',
-      '',
-      'Setup rules:',
-      '',
-      `1. Load the full task context using \`get_task_full_context\` with id "${task.id}". The response includes a \`customerDevDefaults\` section when the customer has configured developer defaults.`,
-      `2. Call \`get_task_templates\` with taskId "${task.id}". If matchedTemplate is returned, apply its workKind, actionType, targetEntity, and scriptTarget/pluginTarget values via \`set_task_work_classification\` (for workKind/actionType) and \`set_task_developer_target\` (for targetEntity/scriptTarget/pluginTarget) BEFORE treating those fields as missing blockers. Reload \`get_task_full_context\` after applying template values.`,
-      '3. If repository root is not set but \`customerDevDefaults.repositoryRoot\` is present in the \`get_task_full_context\` response — call \`set_task_developer_target\` with that value immediately, reload \`get_task_full_context\`, and continue. Do NOT ask the user for repository root when a customer default is available.',
-      '4. Do not create or modify any files until the task is implementation-ready and the workflow phase allows it.',
-      '5. If work kind is missing, "unknown", or inconsistent with the task assignment — save it via `set_task_work_classification`, reload `get_task_full_context`, and continue.',
-      '6. If target artifact path is missing for update-existing-script — do not guess a file name or directory. Update next step via `set_task_next_step` and stop until the user provides the correct path.',
-      '7. If target artifact path is missing for create-new-script and entity name is known — derive the script directory and file name using Scripts_Naming convention: file = <entityLogicalName>_events.js (do not add another nvr_ prefix if the entity already has it — e.g. nvr_servicecase → nvr_servicecase_events.js, not nvr_nvr_servicecase_events.js), then call `set_task_developer_target` with repositoryRoot, selectedScriptTarget (directory, e.g. from customer scriptFolder or Scripts/), desiredScriptFile, artifactPath (full relative path e.g. Scripts\\nvr_servicecase_events.js), absoluteScriptPath, actionType, primaryEntityLogicalName, eventName, eventFieldName, namingSource, onLoadFunctionName, onChangeFunctionName, mainHelperSuggestion in a single call. Do not save placeholder or undetermined values. Reload `get_task_full_context` and continue. If repo root is also missing, stop and ask only for that.',
-      '8. If technical plan is missing — create a draft via `save_technical_plan` when enough context exists. Mark it ready for approval via `mark_technical_plan_ready_for_approval`. Stop at the approval gate before any file edits.',
-      '9. If Dataverse metadata verification is required but not completed — run `run_dataverse_check_for_task` (Primarch integration). Record all findings locally. Reload `get_task_full_context` and continue. Stop only if the check itself fails or findings contradict the assignment.',
-      '10. If target entity logical name is missing and explicit from the assignment or template — save via `set_task_developer_target` and continue. The technical plan may also document the target entity, but `set_task_developer_target` is the source of truth for developer target metadata.',
-      '11. Confirm setup via `confirm_task_setup` only after all hard blockers and proposal blockers are resolved and no hard setup issues remain.',
-      '12. If Task Workbench MCP becomes unavailable or any required MCP read/write fails after 3 retries — stop immediately. Do not continue outside Task Workbench workflow.',
-      '13. Only ask the user to regenerate this prompt if MCP context cannot be reloaded or the workflow cannot be refreshed through Task Workbench MCP after exhausting safe auto-setup updates.',
-    );
-    return lines.join('\n');
   }
 
   if (readiness.warnings.length > 0) {
@@ -512,13 +487,15 @@ export function buildAiWorkflowPrompt(task: Task, customer?: Customer): string {
     '',
     `1. Load the full task context using \`get_task_full_context\` with id "${task.id}".`,
     '2. Do not create or modify files unless all of these are confirmed from Task Workbench: work kind, repository root, target artifact path, customer/environment, technical plan, and implementation readiness state.',
-    '3. If Task Workbench MCP becomes unavailable or any required MCP read/write fails — stop immediately. Do not continue implementation outside Task Workbench workflow.',
-    '4. If work kind is missing, "unknown", or inconsistent with the task assignment — do not implement. Save/update next step via `set_task_next_step` and stop.',
-    '5. If target artifact path is missing or unclear — do not create a new file by guessing a path or name. For script tasks use only the target file shown in Script target context above. Save/update next step via `set_task_next_step` and stop.',
-    '6. If technical plan is missing or cannot be saved through Task Workbench MCP — do not implement. Stop.',
-    '7. If Dataverse metadata verification is required but not completed — run `run_dataverse_check_for_task` (Primarch integration) first. If verification cannot be recorded in Task Workbench, stop.',
-    '8. For JavaScript/form script tasks — inspect existing repository conventions and similar scripts before writing code. Use conventionsSource and related files listed in Script target context if provided.',
-    '9. For plugin tasks — inspect existing plugin conventions and similar plugin classes before writing code.',
+    '3. If Task Workbench MCP becomes unavailable or any required MCP read/write fails Ă˘â‚¬â€ť stop immediately. Do not continue implementation outside Task Workbench workflow.',
+    '4. If work kind is missing, "unknown", or inconsistent with the task assignment Ă˘â‚¬â€ť do not implement. Save/update next step via `set_task_next_step` and stop.',
+    '5. If target artifact path is missing or unclear Ă˘â‚¬â€ť do not create a new file by guessing a path or name. For script tasks use only the target file shown in Script target context above. Save/update next step via `set_task_next_step` and stop.',
+    '6. If technical plan is missing or cannot be saved through Task Workbench MCP Ă˘â‚¬â€ť do not implement. Stop.',
+    ...(workKind === 'script' || workKind === 'ribbon' || task.workflowSetup?.devTargetKind === 'script'
+      ? ['7. Dataverse metadata verification for JS/TS is not available through MCP. Use the in-app Verify Implementation modal after implementation/upload; do not call run_dataverse_check_for_task for script files.']
+      : ['7. If Dataverse metadata verification is required but not completed - run run_dataverse_check_for_task (Primarch integration) first. If verification cannot be recorded in Task Workbench, stop.']),
+    '8. For JavaScript/form script tasks Ă˘â‚¬â€ť inspect existing repository conventions and similar scripts before writing code. Use conventionsSource and related files listed in Script target context if provided.',
+    '9. For plugin tasks Ă˘â‚¬â€ť inspect existing plugin conventions and similar plugin classes before writing code.',
     '10. Do not perform external writes (Dataverse writes, plugin registration, web resource upload, GitHub/ADO actions, deployments) unless explicitly approved by the user.',
     '11. Record local test results, build results, consultant testing, PR review findings and next step back into Task Workbench.',
     '12. At the end, summarize what was done and what should happen next.',
