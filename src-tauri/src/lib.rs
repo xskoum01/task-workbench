@@ -6536,6 +6536,7 @@ fn task_mcp_read_only_tool_definitions() -> Vec<Value> {
         serde_json::json!({"name":"get_external_action_proposal",          "description":"Return the current external action proposal state for a task (externalActionPreview, approval gate, execution tracking).","readOnly":true}),
         serde_json::json!({"name":"get_implementation_verification_state", "description":"Return the implementation verification state for a task: build check, Dataverse check override, AI code review, local test, consultant testing.","readOnly":true}),
         serde_json::json!({"name":"get_implementation_readiness",          "description":"Return implementation readiness for a developer plugin/script task: isImplementationReady, blockers, warnings, recommendedNextStep.","readOnly":true}),
+        serde_json::json!({"name":"get_task_templates",                    "description":"Return built-in task setup templates and the matched template for a task title, when any.","readOnly":true}),
     ]
 }
 
@@ -6553,6 +6554,7 @@ fn task_mcp_local_write_tool_definitions() -> Vec<Value> {
         serde_json::json!({"name":"set_task_mode",                       "description":"Set task mode: developer or general.","readOnly":false}),
         serde_json::json!({"name":"set_task_work_classification",        "description":"Set work kind (plugin/script/ribbon/repo-only/bugfix/review/general/unknown) and work action. Strict enum validation.","readOnly":false}),
         serde_json::json!({"name":"set_task_developer_target",           "description":"Set developer target: repository root, plugin project, script path, or customer. Does not scan or write any repository files.","readOnly":false}),
+        serde_json::json!({"name":"prepare_developer_task",              "description":"Safe high-level orchestration: apply templates/defaults, derive developer target, draft a technical plan, and stop at the first approval gate or hard blocker. No code, repo, or external writes.","readOnly":false}),
         serde_json::json!({"name":"confirm_task_setup",                  "description":"Record local setup confirmation timestamp. Advances status from new to analyzed.","readOnly":false}),
         serde_json::json!({"name":"set_task_phase",                      "description":"Set task phase: new/analyzed/development/testing/review/done. Maps to internal status+waitingState model.","readOnly":false}),
         serde_json::json!({"name":"record_local_test",                   "description":"Record local test result: not-started/passed/failed/not-needed. Updates checklist only.","readOnly":false}),
@@ -7283,6 +7285,202 @@ fn task_mcp_implementation_readiness(task: &Value) -> Value {
     })
 }
 
+fn task_mcp_builtin_templates() -> Vec<Value> {
+    vec![
+        serde_json::json!({
+            "id": "nvr-training-sh-script-prefill",
+            "name": "NVR Training Service Hub — Script: Předvyplnění servisního požadavku",
+            "titlePattern": "Script: Předvyplnění servisního požadavku",
+            "mode": "developer",
+            "workKind": "script",
+            "actionType": "create-new-script",
+            "targetEntity": "nvr_servicecase",
+            "scriptTarget": {
+                "entityLogicalName": "nvr_servicecase",
+                "eventName": "onChange",
+                "eventFieldName": "nvr_assetid"
+            },
+            "scriptNaming": {
+                "namingSource": "Scripts_Naming",
+                "scriptsFolderRelative": "Scripts",
+                "desiredScriptFile": "nvr_servicecase_events.js",
+                "onLoadFunctionName": "nvr_servicecase_OnLoad",
+                "onChangeFunctionName": "nvr_assetid_OnChange",
+                "mainHelperSuggestion": "prefillServiceCaseFromAsset"
+            },
+            "sourceEntity": "nvr_customerasset",
+            "sourceFields": ["nvr_customerid", "nvr_contactid", "nvr_isunderwarranty", "nvr_statuscustom"],
+            "targetFields": ["nvr_customerid", "nvr_contactid", "nvr_iswarrantycase"],
+            "notes": "onChange on nvr_assetid. Source entity: nvr_customerasset. Copy nvr_customerid, nvr_contactid, nvr_isunderwarranty, nvr_statuscustom → nvr_servicecase fields nvr_customerid, nvr_contactid, nvr_iswarrantycase. Solution: NVRTrainingServiceHubCore. App: nvr_trainingservicehub."
+        }),
+        serde_json::json!({
+            "id": "nvr-training-sh-plugin-workorderline",
+            "name": "NVR Training Service Hub — Plugin: Výpočet částek na položce servisní zakázky",
+            "titlePattern": "Plugin: Výpočet částek na položce servisní zakázky",
+            "mode": "developer",
+            "workKind": "plugin",
+            "actionType": "create-new-plugin",
+            "targetEntity": "nvr_workorderline",
+            "pluginTarget": {
+                "entityLogicalName": "nvr_workorderline",
+                "messages": ["Create", "Update"],
+                "stage": "PreOperation",
+                "mode": "Sync",
+                "filteringAttributes": ["nvr_quantity", "nvr_unitprice", "nvr_discountpercent", "nvr_vatpercent"]
+            },
+            "notes": "Compute nvr_netamount, nvr_vatamount, nvr_totalamount from input fields nvr_quantity, nvr_unitprice, nvr_discountpercent, nvr_vatpercent."
+        }),
+    ]
+}
+
+fn task_mcp_match_template(title: &str) -> Option<Value> {
+    let lower = title.to_lowercase();
+    task_mcp_builtin_templates()
+        .into_iter()
+        .find(|tpl| tpl["titlePattern"].as_str().map(|p| lower.contains(&p.to_lowercase())).unwrap_or(false))
+}
+
+fn task_mcp_script_naming_from_template(task: &Value, template: Option<&Value>, defaults: Option<&Value>) -> Option<Value> {
+    let setup = &task["workflowSetup"];
+    let entity = setup["primaryEntityLogicalName"].as_str()
+        .or_else(|| template.and_then(|t| t["scriptTarget"]["entityLogicalName"].as_str()))
+        .or_else(|| template.and_then(|t| t["targetEntity"].as_str()))
+        .filter(|s| !s.is_empty())?;
+    let event_field = setup["eventFieldName"].as_str()
+        .or_else(|| template.and_then(|t| t["scriptTarget"]["eventFieldName"].as_str()))
+        .unwrap_or("");
+    let repo_root = defaults.and_then(|d| d["repositoryRoot"].as_str()).unwrap_or("");
+    let script_abs = defaults.and_then(|d| d["scriptDirectory"].as_str()).unwrap_or("");
+    let desired = setup["desiredScriptFile"].as_str()
+        .or_else(|| template.and_then(|t| t["scriptNaming"]["desiredScriptFile"].as_str()))
+        .unwrap_or("");
+    let desired = if desired.is_empty() { format!("{entity}_events.js") } else { desired.to_string() };
+    let mut rel = template
+        .and_then(|t| t["scriptNaming"]["scriptsFolderRelative"].as_str())
+        .unwrap_or("")
+        .to_string();
+    if rel.is_empty() && !script_abs.is_empty() {
+        if !repo_root.is_empty() && script_abs.to_lowercase().starts_with(&repo_root.to_lowercase()) {
+            rel = script_abs[repo_root.len()..].trim_start_matches(|c| c == '/' || c == '\\').to_string();
+        }
+        if rel.is_empty() {
+            rel = script_abs.replace('\\', "/").split('/').filter(|s| !s.is_empty()).last().unwrap_or("Scripts").to_string();
+        }
+    }
+    if rel.is_empty() {
+        rel = "Scripts".to_string();
+    }
+    let sep = if script_abs.contains('\\') || repo_root.contains('\\') { "\\" } else { "/" };
+    let absolute_dir = if !script_abs.is_empty() {
+        script_abs.to_string()
+    } else if !repo_root.is_empty() {
+        format!("{repo_root}{sep}{rel}")
+    } else {
+        String::new()
+    };
+    let on_load = setup["onLoadFunctionName"].as_str()
+        .or_else(|| template.and_then(|t| t["scriptNaming"]["onLoadFunctionName"].as_str()))
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("{entity}_OnLoad"));
+    let on_change = setup["onChangeFunctionName"].as_str()
+        .or_else(|| template.and_then(|t| t["scriptNaming"]["onChangeFunctionName"].as_str()))
+        .map(str::to_string)
+        .or_else(|| if event_field.is_empty() { None } else { Some(format!("{event_field}_OnChange")) });
+    let mut value = serde_json::json!({
+        "namingSource": setup["namingSource"].as_str()
+            .or_else(|| template.and_then(|t| t["scriptNaming"]["namingSource"].as_str()))
+            .unwrap_or("Scripts_Naming"),
+        "entityLogicalName": entity,
+        "desiredScriptFile": desired,
+        "scriptsFolderRelative": rel,
+        "scriptPath": format!("{}{}{}", rel, sep, desired),
+        "absoluteScriptPath": if absolute_dir.is_empty() { Value::Null } else { serde_json::json!(format!("{}{}{}", absolute_dir, sep, desired)) },
+        "onLoadFunctionName": on_load,
+        "helperNamingRule": "descriptive camelCase, no nvr_ prefix by default",
+    });
+    if let Some(v) = on_change { value["onChangeFunctionName"] = serde_json::json!(v); }
+    if let Some(v) = setup["mainHelperSuggestion"].as_str()
+        .or_else(|| template.and_then(|t| t["scriptNaming"]["mainHelperSuggestion"].as_str())) {
+        value["mainHelperSuggestion"] = serde_json::json!(v);
+    }
+    Some(value)
+}
+
+fn task_mcp_prepare_plan_draft(task: &Value, template: Option<&Value>) -> Option<Value> {
+    let setup = &task["workflowSetup"];
+    let workflow = &task["crmDeveloperWorkflow"];
+    let work_kind = workflow["detectedWorkKind"].as_str()
+        .or_else(|| setup["devTargetKind"].as_str())
+        .or_else(|| template.and_then(|t| t["workKind"].as_str()))
+        .unwrap_or("unknown");
+    if !matches!(work_kind, "script" | "plugin" | "ribbon") { return None; }
+    let entity = setup["primaryEntityLogicalName"].as_str()
+        .or_else(|| template.and_then(|t| t["targetEntity"].as_str()))
+        .or_else(|| template.and_then(|t| t["scriptTarget"]["entityLogicalName"].as_str()))
+        .or_else(|| template.and_then(|t| t["pluginTarget"]["entityLogicalName"].as_str()))
+        .filter(|s| !s.is_empty())?;
+    let mapping = template.and_then(|t| {
+        let sources = t["sourceFields"].as_array().map(|a| a.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>().join(", ")).unwrap_or_default();
+        let targets = t["targetFields"].as_array().map(|a| a.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>().join(", ")).unwrap_or_default();
+        if sources.is_empty() && targets.is_empty() { None } else { Some(format!("Map template fields from {} ({}) to {} ({}).", t["sourceEntity"].as_str().unwrap_or("source"), sources, entity, targets)) }
+    });
+    let is_script = work_kind == "script" || work_kind == "ribbon";
+    let mut steps = vec![
+        if is_script { format!("Use the selected script target {}.", setup["artifactPath"].as_str().or(setup["scriptPath"].as_str()).unwrap_or("the configured script path")) } else { format!("Use the selected plugin project {}.", setup["pluginProject"].as_str().unwrap_or("the configured plugin project")) },
+        format!("Implement {} for {}.", setup["actionType"].as_str().or_else(|| template.and_then(|t| t["actionType"].as_str())).unwrap_or("the requested change"), entity),
+        "Keep external Dataverse registration/upload as a manual approved action outside this setup step.".to_string(),
+    ];
+    if let Some(m) = mapping.clone() { steps.insert(2, m); }
+    let target = if is_script {
+        serde_json::json!({
+            "entityLogicalName": entity,
+            "scriptPath": setup["artifactPath"].as_str().or(setup["scriptPath"].as_str()).unwrap_or(""),
+            "eventName": setup["eventName"].as_str().or_else(|| template.and_then(|t| t["scriptTarget"]["eventName"].as_str())).unwrap_or(""),
+            "eventFieldName": setup["eventFieldName"].as_str().or_else(|| template.and_then(|t| t["scriptTarget"]["eventFieldName"].as_str())).unwrap_or(""),
+            "functionName": setup["onChangeFunctionName"].as_str().or(setup["onLoadFunctionName"].as_str()).unwrap_or(""),
+        })
+    } else {
+        serde_json::json!({
+            "entityLogicalName": entity,
+            "pluginProject": setup["pluginProject"].as_str().unwrap_or(""),
+            "message": template.and_then(|t| t["pluginTarget"]["messages"].as_array()).and_then(|a| a.first()).and_then(|v| v.as_str()).unwrap_or(""),
+            "stage": template.and_then(|t| t["pluginTarget"]["stage"].as_str()).unwrap_or(""),
+            "mode": template.and_then(|t| t["pluginTarget"]["mode"].as_str()).unwrap_or(""),
+            "filteringAttributes": template.and_then(|t| t["pluginTarget"]["filteringAttributes"].as_array()).cloned().unwrap_or_default(),
+        })
+    };
+    let mut findings = vec![serde_json::json!(entity)];
+    if let Some(m) = mapping {
+        findings.push(Value::String(m));
+    }
+    Some(serde_json::json!({
+        "workKind": work_kind,
+        "summary": if is_script { format!("Create/update a Dataverse form script for {}.", entity) } else { format!("Create/update a Dataverse plugin for {}.", entity) },
+        "implementationSteps": steps,
+        "dataverseFindings": findings,
+        "risks": ["Dataverse metadata and runtime registration still require separate verification before implementation."],
+        "testChecklist": if is_script { serde_json::json!(["Validate the form event wiring manually in the model-driven app.", "Test the happy path and empty/null source values."]) } else { serde_json::json!(["Run/build the plugin project locally.", "Verify message/stage/filtering attributes before manual registration."]) },
+        "target": target,
+    }))
+}
+
+fn task_mcp_plan_has_template_mapping(plan: &Value, template: Option<&Value>) -> bool {
+    let Some(tpl) = template else { return true; };
+    let has_template_mapping = tpl["sourceFields"].as_array().map(|a| !a.is_empty()).unwrap_or(false)
+        || tpl["targetFields"].as_array().map(|a| !a.is_empty()).unwrap_or(false);
+    if !has_template_mapping { return true; }
+    let haystack = serde_json::to_string(plan).unwrap_or_default();
+    let mut required: Vec<String> = Vec::new();
+    if let Some(v) = tpl["sourceEntity"].as_str() { required.push(v.to_string()); }
+    if let Some(arr) = tpl["sourceFields"].as_array() {
+        required.extend(arr.iter().filter_map(|v| v.as_str()).map(str::to_string));
+    }
+    if let Some(arr) = tpl["targetFields"].as_array() {
+        required.extend(arr.iter().filter_map(|v| v.as_str()).map(str::to_string));
+    }
+    required.iter().all(|value| haystack.contains(value))
+}
+
 fn task_mcp_execute_tool(app: &tauri::AppHandle, tool_name: &str, args: &Value) -> Result<Value, String> {
     let mut tasks = task_mcp_load_tasks(app)?;
     let customers = task_mcp_load_customers(app).unwrap_or_default();
@@ -7701,6 +7899,227 @@ fn task_mcp_execute_tool(app: &tauri::AppHandle, tool_name: &str, args: &Value) 
             }
 
             serde_json::json!({"task": detail})
+        }
+
+        "get_task_templates" => {
+            let matched = args["taskId"].as_str()
+                .and_then(|task_id| task_mcp_get_task(&tasks, task_id))
+                .and_then(|task| task_mcp_match_template(task["title"].as_str().unwrap_or("")));
+            serde_json::json!({
+                "templates": task_mcp_builtin_templates(),
+                "matchedTemplate": matched,
+            })
+        }
+
+        "prepare_developer_task" => {
+            let task_id = args["taskId"].as_str().unwrap_or("").trim();
+            if task_id.is_empty() { return Err("Missing required argument: taskId".to_string()); }
+            let mode = args["mode"].as_str().unwrap_or("setup-until-approval-gate");
+            if mode != "setup-until-approval-gate" {
+                return Err(format!("Unsupported prepare_developer_task mode: {mode}"));
+            }
+            let confirm_setup = args["confirmSetup"].as_bool().unwrap_or(true);
+            let create_plan = args["createTechnicalPlan"].as_bool().unwrap_or(true);
+            let index = task_mcp_find_task_index(&tasks, task_id)
+                .ok_or_else(|| format!("Task not found: {task_id}"))?;
+            let customer_id = tasks[index]["customerId"].as_str()
+                .or_else(|| tasks[index]["workflowSetup"]["customerId"].as_str())
+                .unwrap_or("")
+                .to_string();
+            let dev_defaults = task_mcp_find_customer(&customers, &customer_id)
+                .and_then(|c| task_mcp_customer_dev_defaults(c, &crm_base_dir));
+            let template = task_mcp_match_template(tasks[index]["title"].as_str().unwrap_or(""));
+            let now = chrono_now_iso();
+
+            let mut applied: Vec<&str> = Vec::new();
+            let skipped = vec![serde_json::json!({
+                "action": "run_dataverse_check_for_task",
+                "reason": "JS/TS metadata check is not supported by MCP orchestration; run or skip verification separately before implementation."
+            })];
+            let mut hard_blockers: Vec<String> = Vec::new();
+            let mut warnings: Vec<String> = Vec::new();
+            let mut missing: Vec<String> = Vec::new();
+            let mut gates: Vec<Value> = Vec::new();
+
+            {
+                let task = &mut tasks[index];
+                if let Some(ref tpl) = template {
+                    task["taskMode"] = serde_json::json!(tpl["mode"].as_str().unwrap_or("developer"));
+                    if task["workflowSetup"].is_null() { task["workflowSetup"] = serde_json::json!({}); }
+                    if task["crmDeveloperWorkflow"].is_null() { task["crmDeveloperWorkflow"] = serde_json::json!({"createdAt": now}); }
+                    let work_kind = tpl["workKind"].as_str().unwrap_or("unknown");
+                    task["workflowSetup"]["devTargetKind"] = serde_json::json!(if work_kind == "plugin" { "plugin" } else if work_kind == "script" || work_kind == "ribbon" { "script" } else { "repo" });
+                    task["workflowSetup"]["workIntent"] = serde_json::json!(if tpl["actionType"].as_str().unwrap_or("").starts_with("create-") { "create" } else { "update" });
+                    task["workflowSetup"]["actionType"] = tpl["actionType"].clone();
+                    task["workflowSetup"]["primaryEntityLogicalName"] = tpl["targetEntity"].clone();
+                    if !tpl["scriptTarget"].is_null() {
+                        task["workflowSetup"]["eventName"] = tpl["scriptTarget"]["eventName"].clone();
+                        task["workflowSetup"]["eventFieldName"] = tpl["scriptTarget"]["eventFieldName"].clone();
+                    }
+                    if !tpl["scriptNaming"].is_null() {
+                        task["workflowSetup"]["namingSource"] = tpl["scriptNaming"]["namingSource"].clone();
+                        task["workflowSetup"]["desiredScriptFile"] = tpl["scriptNaming"]["desiredScriptFile"].clone();
+                        task["workflowSetup"]["onLoadFunctionName"] = tpl["scriptNaming"]["onLoadFunctionName"].clone();
+                        task["workflowSetup"]["onChangeFunctionName"] = tpl["scriptNaming"]["onChangeFunctionName"].clone();
+                        task["workflowSetup"]["mainHelperSuggestion"] = tpl["scriptNaming"]["mainHelperSuggestion"].clone();
+                    }
+                    if let Some(entity) = tpl["pluginTarget"]["entityLogicalName"].as_str() {
+                        task["workflowSetup"]["primaryEntityLogicalName"] = serde_json::json!(entity);
+                    }
+                    task["crmDeveloperWorkflow"]["detectedWorkKind"] = serde_json::json!(work_kind);
+                    task["crmDeveloperWorkflow"]["updatedAt"] = serde_json::json!(now);
+                    applied.extend(["applied_template", "set_task_mode", "set_task_work_classification"]);
+                }
+
+                if let Some(ref defaults) = dev_defaults {
+                    if task["workflowSetup"].is_null() { task["workflowSetup"] = serde_json::json!({}); }
+                    if task["workflowSetup"]["repositoryRoot"].as_str().unwrap_or("").is_empty() {
+                        if let Some(v) = defaults["repositoryRoot"].as_str() { task["workflowSetup"]["repositoryRoot"] = serde_json::json!(v); }
+                    }
+                    if task["workflowSetup"]["devTargetKind"].as_str() == Some("script") && task["workflowSetup"]["scriptPath"].as_str().unwrap_or("").is_empty() {
+                        if let Some(dir) = defaults["scriptDirectory"].as_str() {
+                            let repo = defaults["repositoryRoot"].as_str().unwrap_or("").trim_end_matches(|c| c == '/' || c == '\\');
+                            let rel = if !repo.is_empty() && dir.to_lowercase().starts_with(&repo.to_lowercase()) {
+                                dir[repo.len()..].trim_start_matches(|c| c == '/' || c == '\\').to_string()
+                            } else {
+                                dir.replace('\\', "/").split('/').filter(|s| !s.is_empty()).last().unwrap_or(dir).to_string()
+                            };
+                            task["workflowSetup"]["scriptPath"] = serde_json::json!(rel);
+                        }
+                    }
+                    if task["workflowSetup"]["devTargetKind"].as_str() == Some("plugin") && task["workflowSetup"]["pluginProject"].as_str().unwrap_or("").is_empty() {
+                        if let Some(v) = defaults["pluginProjectPath"].as_str() { task["workflowSetup"]["pluginProject"] = serde_json::json!(v); }
+                    }
+                    applied.push("applied_customer_defaults");
+                }
+
+                if task["workflowSetup"]["actionType"].as_str() == Some("create-new-script")
+                    && !task["workflowSetup"]["repositoryRoot"].as_str().unwrap_or("").is_empty() {
+                    if let Some(naming) = task_mcp_script_naming_from_template(task, template.as_ref(), dev_defaults.as_ref()) {
+                        task["workflowSetup"]["desiredScriptFile"] = naming["desiredScriptFile"].clone();
+                        task["workflowSetup"]["artifactPath"] = naming["scriptPath"].clone();
+                        task["workflowSetup"]["absoluteScriptPath"] = naming["absoluteScriptPath"].clone();
+                        task["workflowSetup"]["namingSource"] = naming["namingSource"].clone();
+                        task["workflowSetup"]["onLoadFunctionName"] = naming["onLoadFunctionName"].clone();
+                        if !naming["onChangeFunctionName"].is_null() { task["workflowSetup"]["onChangeFunctionName"] = naming["onChangeFunctionName"].clone(); }
+                        if !naming["mainHelperSuggestion"].is_null() { task["workflowSetup"]["mainHelperSuggestion"] = naming["mainHelperSuggestion"].clone(); }
+                        applied.push("saved_developer_target");
+                    }
+                }
+
+                let analysis_text = format!(
+                    "{} {}",
+                    task["analysisResult"]["summary"].as_str().unwrap_or(""),
+                    task["analysisResult"]["summaryEn"].as_str().unwrap_or("")
+                ).to_lowercase();
+                let has_stale_template_questions = analysis_text.contains("open questions")
+                    || analysis_text.contains("which specific fields")
+                    || analysis_text.contains("fields from the asset")
+                    || analysis_text.contains("should be prefilled");
+                if (template.is_some() && has_stale_template_questions)
+                    || task["analysisResult"]["summary"].as_str().unwrap_or("").is_empty() {
+                    let summary = template.as_ref()
+                        .and_then(|t| t["notes"].as_str())
+                        .map(str::to_string)
+                        .unwrap_or_else(|| format!("Developer task setup prepared for: {}.", task["title"].as_str().unwrap_or(task_id)));
+                    task["analysisResult"] = serde_json::json!({
+                        "summary": summary,
+                        "summaryEn": summary,
+                        "confidence": if template.is_some() { 90 } else { 60 },
+                        "suggestedActions": []
+                    });
+                    applied.push("saved_task_analysis");
+                }
+
+                let dev_target_kind = task["workflowSetup"]["devTargetKind"].as_str().unwrap_or("").to_string();
+                let action_type = task["workflowSetup"]["actionType"].as_str().unwrap_or("").to_string();
+                let work_kind = task["crmDeveloperWorkflow"]["detectedWorkKind"].as_str()
+                    .unwrap_or(dev_target_kind.as_str())
+                    .to_string();
+                let confirmed_missing = task["workflowSetup"]["confirmedAt"].as_str().unwrap_or("").is_empty();
+                if task["workflowSetup"]["repositoryRoot"].as_str().unwrap_or("").is_empty() { missing.push("repositoryRoot".into()); }
+                if work_kind.is_empty() || work_kind == "unknown" { missing.push("workKind".into()); }
+                if action_type.is_empty() { missing.push("actionType".into()); }
+                if task["workflowSetup"]["primaryEntityLogicalName"].as_str().unwrap_or("").is_empty() { missing.push("targetEntity".into()); }
+                if dev_target_kind == "script"
+                    && action_type == "create-new-script"
+                    && (task["workflowSetup"]["scriptPath"].as_str().unwrap_or("").is_empty()
+                        || task["workflowSetup"]["desiredScriptFile"].as_str().unwrap_or("").is_empty()
+                        || task["workflowSetup"]["artifactPath"].as_str().unwrap_or("").is_empty()) {
+                    missing.push("script target path".into());
+                }
+                if dev_target_kind == "plugin" && task["workflowSetup"]["pluginProject"].as_str().unwrap_or("").is_empty() {
+                    missing.push("plugin project".into());
+                }
+                if !missing.is_empty() {
+                    hard_blockers.push(format!("Missing required setup input(s): {}.", missing.join(", ")));
+                }
+
+                let has_plan = task["crmDeveloperWorkflow"]["technicalPlan"].is_object();
+                let plan_needs_template_mapping = has_plan
+                    && !task_mcp_plan_has_template_mapping(&task["crmDeveloperWorkflow"]["technicalPlan"], template.as_ref());
+                if create_plan && (!has_plan || plan_needs_template_mapping) && hard_blockers.is_empty() {
+                    if let Some(plan_base) = task_mcp_prepare_plan_draft(task, template.as_ref()) {
+                        task["crmDeveloperWorkflow"]["technicalPlan"] = serde_json::json!({
+                            "generatedAt": now,
+                            "workKind": plan_base["workKind"].clone(),
+                            "summary": plan_base["summary"].clone(),
+                            "implementationSteps": plan_base["implementationSteps"].clone(),
+                            "dataverseFindings": plan_base["dataverseFindings"].clone(),
+                            "risks": plan_base["risks"].clone(),
+                            "testChecklist": plan_base["testChecklist"].clone(),
+                            "externalActionPreview": [],
+                            "target": plan_base["target"].clone(),
+                        });
+                        task["crmDeveloperWorkflow"]["planApproval"] = Value::Null;
+                        task["crmDeveloperWorkflow"]["currentStep"] = serde_json::json!("technical-plan");
+                        task["crmDeveloperWorkflow"]["updatedAt"] = serde_json::json!(now);
+                        applied.extend(["saved_technical_plan", "marked_technical_plan_ready"]);
+                        gates.push(serde_json::json!({"type": "technical-plan-approval", "message": "Review and approve the technical implementation plan."}));
+                    } else {
+                        warnings.push("Technical plan was not created because the task context is not specific enough.".into());
+                    }
+                } else if has_plan && !task_mcp_approval_summary(task["crmDeveloperWorkflow"].get("planApproval"))["approved"].as_bool().unwrap_or(false) {
+                    gates.push(serde_json::json!({"type": "technical-plan-approval", "message": "Review and approve the technical implementation plan."}));
+                }
+
+                if confirm_setup && hard_blockers.is_empty() && confirmed_missing {
+                    task["workflowSetup"]["confirmedAt"] = serde_json::json!(now);
+                    if task["status"].as_str() == Some("new") {
+                        task["status"] = serde_json::json!("analyzed");
+                    }
+                    applied.push("confirmed_setup");
+                }
+                task_mcp_append_audit_note(task, "prepare_developer_task");
+            }
+
+            let task = &tasks[index];
+            let readiness = task_mcp_implementation_readiness(task);
+            let status = if !hard_blockers.is_empty() {
+                "blocked"
+            } else if !gates.is_empty() {
+                "stopped_at_approval_gate"
+            } else if readiness["isImplementationReady"].as_bool().unwrap_or(false) {
+                "ready_for_implementation"
+            } else {
+                "blocked"
+            };
+            let mut detail = task_mcp_safe_task_detail(task);
+            detail["implementationReadiness"] = readiness.clone();
+            if let Some(ref dd) = dev_defaults { detail["customerDevDefaults"] = dd.clone(); }
+            updated = true;
+            serde_json::json!({
+                "taskId": task_id,
+                "status": status,
+                "appliedActions": applied.into_iter().collect::<HashSet<_>>().into_iter().collect::<Vec<_>>(),
+                "skippedActions": skipped,
+                "hardBlockers": hard_blockers,
+                "approvalGates": gates,
+                "warnings": warnings,
+                "missingInputs": missing,
+                "implementationReadiness": readiness,
+                "task": detail,
+            })
         }
 
         "get_task_workflow_overview" => {

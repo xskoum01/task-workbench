@@ -679,7 +679,106 @@ describe('set_task_developer_target schema — naming fields', () => {
 });
 
 // ---------------------------------------------------------------------------
-// 11. callToolFallback get_task_full_context — developerWorkPacket.scriptNaming
+// 11. prepare_developer_task orchestration
+// ---------------------------------------------------------------------------
+
+describe('prepare_developer_task schema', () => {
+  it('tool definition exists and requires taskId', () => {
+    const tool = findTool('prepare_developer_task');
+    expect(tool).toBeDefined();
+    expect(tool.inputSchema.required).toContain('taskId');
+  });
+
+  it('supports setup-until-approval-gate mode only', () => {
+    const modeEnum = toolEnum('prepare_developer_task', 'mode');
+    expect(modeEnum).toEqual(['setup-until-approval-gate']);
+  });
+});
+
+describe('callToolFallback prepare_developer_task', () => {
+  it('applies template/defaults, saves target and plan, then stops at technical plan approval', async () => {
+    const os = await import('node:os');
+    const fs = await import('node:fs/promises');
+    const path = await import('node:path');
+
+    const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'tw-mcp-prepare-'));
+    const task = makeTask({
+      id: 'task-prepare-nvr',
+      title: TASK_TEMPLATES[0].titlePattern,
+      status: 'new',
+      taskMode: 'general',
+      customerId: 'cust-prepare',
+      workflowSetup: {},
+      crmDeveloperWorkflow: undefined,
+      analysisResult: undefined,
+      implementationVerification: { dataverseCheck: { status: 'skipped', skippedAt: '2026-06-12T10:00:00.000Z' } },
+    });
+    const customer = {
+      id: 'cust-prepare',
+      repositoryRoot: 'C:\\Users\\vskoumal\\Documents\\CRM\\VSK-Test',
+      scriptFolder: 'C:\\Users\\vskoumal\\Documents\\CRM\\VSK-Test\\Scripts',
+    };
+    await fs.writeFile(path.join(tmpDir, 'tasks.json'), JSON.stringify([task]));
+    await fs.writeFile(path.join(tmpDir, 'customers.json'), JSON.stringify([customer]));
+
+    const origArgv = process.argv;
+    process.argv = [...process.argv, '--data-dir', tmpDir];
+    try {
+      const result = await callToolFallback('prepare_developer_task', { taskId: 'task-prepare-nvr' });
+      expect(result.status).toBe('stopped_at_approval_gate');
+      expect(result.appliedActions).toContain('applied_template');
+      expect(result.appliedActions).toContain('applied_customer_defaults');
+      expect(result.appliedActions).toContain('saved_developer_target');
+      expect(result.appliedActions).toContain('saved_technical_plan');
+      expect(result.appliedActions).toContain('marked_technical_plan_ready');
+      expect(result.appliedActions).toContain('confirmed_setup');
+      expect(result.approvalGates[0].type).toBe('technical-plan-approval');
+      expect(result.hardBlockers).toEqual([]);
+      expect(result.task.workflowSetup.primaryEntityLogicalName).toBe('nvr_servicecase');
+      expect(result.task.workflowSetup.artifactPath).toBe('Scripts\\nvr_servicecase_events.js');
+      expect(result.task.crmWorkflowState.technicalPlan.summary).toContain('Dataverse form script');
+
+      const stored = JSON.parse(await fs.readFile(path.join(tmpDir, 'tasks.json'), 'utf8'))[0];
+      expect(stored.workflowSetup.absoluteScriptPath).toBe('C:\\Users\\vskoumal\\Documents\\CRM\\VSK-Test\\Scripts\\nvr_servicecase_events.js');
+      expect(stored.crmDeveloperWorkflow.currentStep).toBe('technical-plan');
+      expect(stored.notes).toContain('prepare_developer_task');
+    } finally {
+      process.argv = origArgv;
+      await fs.rm(tmpDir, { recursive: true });
+    }
+  });
+
+  it('blocks before plan/confirm when repository root is missing', async () => {
+    const os = await import('node:os');
+    const fs = await import('node:fs/promises');
+    const path = await import('node:path');
+
+    const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'tw-mcp-prepare-block-'));
+    await fs.writeFile(path.join(tmpDir, 'tasks.json'), JSON.stringify([makeTask({
+      id: 'task-prepare-blocked',
+      title: TASK_TEMPLATES[0].titlePattern,
+      taskMode: 'general',
+      workflowSetup: {},
+    })]));
+
+    const origArgv = process.argv;
+    process.argv = [...process.argv, '--data-dir', tmpDir];
+    try {
+      const result = await callToolFallback('prepare_developer_task', { taskId: 'task-prepare-blocked' });
+      expect(result.status).toBe('blocked');
+      expect(result.missingInputs).toContain('repositoryRoot');
+      expect(result.appliedActions).toContain('applied_template');
+      expect(result.appliedActions).not.toContain('saved_technical_plan');
+      expect(result.appliedActions).not.toContain('confirmed_setup');
+    } finally {
+      process.argv = origArgv;
+      await fs.rm(tmpDir, { recursive: true });
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 12. callToolFallback get_task_full_context — developerWorkPacket.scriptNaming
 // ---------------------------------------------------------------------------
 
 describe('callToolFallback get_task_full_context — developerWorkPacket.scriptNaming', () => {

@@ -463,6 +463,31 @@ const TOOL_DEFINITIONS = [
     },
   },
   {
+    name: 'prepare_developer_task',
+    description: 'High-level safe local orchestration: apply templates/defaults, derive developer target, draft technical plan, and stop at the first approval gate or hard blocker. Does not write code or external systems.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        taskId: { type: 'string' },
+        mode: {
+          type: 'string',
+          enum: ['setup-until-approval-gate'],
+          description: 'Only supported mode. Applies safe setup metadata and stops before implementation.',
+        },
+        confirmSetup: {
+          type: 'boolean',
+          description: 'Defaults to true. Only confirms local setup when no hard blockers remain and target metadata is complete.',
+        },
+        createTechnicalPlan: {
+          type: 'boolean',
+          description: 'Defaults to true. Creates a deterministic technical plan draft when enough context is known.',
+        },
+      },
+      required: ['taskId'],
+      additionalProperties: false,
+    },
+  },
+  {
     name: 'confirm_task_setup',
     description: 'Record local setup confirmation timestamp. Advances status from new to analyzed.',
     inputSchema: {
@@ -1186,6 +1211,12 @@ async function loadTasks() {
   return { tasks: Array.isArray(parsed) ? parsed : [], found: true };
 }
 
+async function saveTasks(tasks) {
+  const tasksFile = await resolveTasksFile();
+  if (!tasksFile) throw new Error('Could not resolve tasks.json for local fallback write.');
+  await fs.writeFile(tasksFile, JSON.stringify(tasks, null, 2));
+}
+
 function asObject(value) {
   return value && typeof value === 'object' && !Array.isArray(value) ? value : {};
 }
@@ -1529,6 +1560,208 @@ function sanitizePullRequestFixUpdateTracking(tracking) {
 
 function getTaskById(tasks, id) {
   return tasks.find((task) => task && String(task.id) === String(id));
+}
+
+function appendMcpAuditNote(task, action) {
+  const existing = String(task.notes ?? '').trim();
+  const line = `[${new Date().toISOString()}] MCP local write: ${action}`;
+  task.notes = existing ? `${existing}\n${line}` : line;
+}
+
+function safeString(value) {
+  const text = String(value ?? '').trim();
+  if (!text || text.length > 500) return '';
+  return /[|&;`$><\n\r]/.test(text) ? '' : text;
+}
+
+function workActionFromActionType(actionType) {
+  return String(actionType ?? '').startsWith('create-') ? 'create' : 'update';
+}
+
+function buildTaskFullContext(task, customerDevDefaults) {
+  const detail = safeTaskDetail(task);
+  detail.implementationReadiness = computeImplementationReadiness(task);
+  if (customerDevDefaults) detail.customerDevDefaults = customerDevDefaults;
+  const workKind = task.crmDeveloperWorkflow?.detectedWorkKind || task.workflowSetup?.devTargetKind;
+  if (workKind === 'script' || workKind === 'ribbon') {
+    const naming = computeScriptNaming(matchTaskTemplate(task.title || ''), customerDevDefaults, task.workflowSetup);
+    if (naming) detail.developerWorkPacket = { scriptNaming: naming };
+  }
+  return detail;
+}
+
+function deterministicPlanDraft(task, template) {
+  const setup = asObject(task.workflowSetup);
+  const workflow = asObject(task.crmDeveloperWorkflow);
+  const workKind = workflow.detectedWorkKind || setup.devTargetKind || template?.workKind || 'unknown';
+  const actionType = setup.actionType || template?.actionType || '';
+  const entity = setup.primaryEntityLogicalName || template?.targetEntity || template?.scriptTarget?.entityLogicalName || template?.pluginTarget?.entityLogicalName || '';
+  if (!entity || !['script', 'plugin', 'ribbon'].includes(workKind)) return null;
+
+  const isScript = workKind === 'script' || workKind === 'ribbon';
+  const mappingLine = template?.sourceFields?.length || template?.targetFields?.length
+    ? `Map template fields from ${template.sourceEntity || 'source'} (${(template.sourceFields || []).join(', ')}) to ${entity} (${(template.targetFields || []).join(', ')}).`
+    : null;
+  const summary = isScript
+    ? `Create/update a Dataverse form script for ${entity}${setup.eventName ? ` (${setup.eventName})` : ''}.`
+    : `Create/update a Dataverse plugin for ${entity}.`;
+  const implementationSteps = [
+    isScript ? `Use the selected script target ${setup.artifactPath || setup.scriptPath || 'the configured script path'}.` : `Use the selected plugin project ${setup.pluginProject || 'the configured plugin project'}.`,
+    `Implement ${actionType || 'the requested change'} for ${entity}.`,
+    mappingLine,
+    'Keep external Dataverse registration/upload as a manual approved action outside this setup step.',
+  ].filter(Boolean);
+  const testPlan = isScript
+    ? ['Validate the form event wiring manually in the model-driven app.', 'Test the happy path and empty/null source values.']
+    : ['Run/build the plugin project locally.', 'Verify message/stage/filtering attributes before manual registration.'];
+  const risks = ['Dataverse metadata and runtime registration still require separate verification before implementation.'];
+  const target = isScript
+    ? {
+        entityLogicalName: entity,
+        scriptPath: setup.artifactPath || setup.scriptPath || '',
+        eventName: setup.eventName || template?.scriptTarget?.eventName || '',
+        eventFieldName: setup.eventFieldName || template?.scriptTarget?.eventFieldName || '',
+        functionName: setup.onChangeFunctionName || setup.onLoadFunctionName || '',
+      }
+    : {
+        entityLogicalName: entity,
+        pluginProject: setup.pluginProject || '',
+        message: template?.pluginTarget?.messages?.[0] || '',
+        stage: template?.pluginTarget?.stage || '',
+        mode: template?.pluginTarget?.mode || '',
+        filteringAttributes: template?.pluginTarget?.filteringAttributes || [],
+      };
+  return { workKind, summary, implementationSteps, dataverseFindings: [entity, mappingLine].filter(Boolean), risks, testChecklist: testPlan, target };
+}
+
+function planHasTemplateMapping(plan, template) {
+  if (!template?.sourceFields?.length && !template?.targetFields?.length) return true;
+  const haystack = JSON.stringify(plan ?? {});
+  const required = [
+    template.sourceEntity,
+    ...(template.sourceFields || []),
+    ...(template.targetFields || []),
+  ].filter(Boolean);
+  return required.every((value) => haystack.includes(value));
+}
+
+function prepareDeveloperTaskInMemory(task, { customerDevDefaults = null, confirmSetup = true, createTechnicalPlan = true } = {}) {
+  const appliedActions = [];
+  const skippedActions = [{
+    action: 'run_dataverse_check_for_task',
+    reason: 'JS/TS metadata check is not supported by MCP orchestration; run or skip verification separately before implementation.',
+  }];
+  const hardBlockers = [];
+  const warnings = [];
+  const missingInputs = [];
+  const approvalGates = [];
+  const template = matchTaskTemplate(task.title || '');
+  const now = new Date().toISOString();
+
+  if (template) {
+    task.taskMode = template.mode || 'developer';
+    if (!task.workflowSetup || typeof task.workflowSetup !== 'object') task.workflowSetup = {};
+    if (!task.crmDeveloperWorkflow || typeof task.crmDeveloperWorkflow !== 'object') task.crmDeveloperWorkflow = { createdAt: now };
+    task.workflowSetup.devTargetKind = template.workKind === 'plugin' ? 'plugin' : template.workKind === 'script' || template.workKind === 'ribbon' ? 'script' : task.workflowSetup.devTargetKind;
+    task.workflowSetup.workIntent = workActionFromActionType(template.actionType);
+    task.workflowSetup.actionType = template.actionType;
+    task.workflowSetup.primaryEntityLogicalName = template.targetEntity;
+    if (template.scriptTarget) {
+      task.workflowSetup.eventName = template.scriptTarget.eventName;
+      task.workflowSetup.eventFieldName = template.scriptTarget.eventFieldName;
+    }
+    if (template.scriptNaming) {
+      task.workflowSetup.namingSource = template.scriptNaming.namingSource;
+      task.workflowSetup.desiredScriptFile = template.scriptNaming.desiredScriptFile;
+      task.workflowSetup.onLoadFunctionName = template.scriptNaming.onLoadFunctionName;
+      task.workflowSetup.onChangeFunctionName = template.scriptNaming.onChangeFunctionName;
+      task.workflowSetup.mainHelperSuggestion = template.scriptNaming.mainHelperSuggestion;
+    }
+    if (template.pluginTarget?.entityLogicalName) task.workflowSetup.primaryEntityLogicalName = template.pluginTarget.entityLogicalName;
+    task.crmDeveloperWorkflow.detectedWorkKind = template.workKind;
+    task.crmDeveloperWorkflow.updatedAt = now;
+    appliedActions.push('applied_template', 'set_task_mode', 'set_task_work_classification');
+  }
+
+  if (customerDevDefaults) {
+    if (!task.workflowSetup || typeof task.workflowSetup !== 'object') task.workflowSetup = {};
+    if (customerDevDefaults.repositoryRoot && !task.workflowSetup.repositoryRoot) task.workflowSetup.repositoryRoot = safeString(customerDevDefaults.repositoryRoot);
+    if (customerDevDefaults.scriptDirectory && task.workflowSetup.devTargetKind === 'script' && !task.workflowSetup.scriptPath) {
+      const repo = String(customerDevDefaults.repositoryRoot || '').replace(/[/\\]+$/, '');
+      const dir = String(customerDevDefaults.scriptDirectory);
+      if (repo && dir.toLowerCase().startsWith(repo.toLowerCase())) {
+        task.workflowSetup.scriptPath = dir.slice(repo.length).replace(/^[/\\]+/, '') || dir;
+      } else {
+        task.workflowSetup.scriptPath = dir.replace(/\\/g, '/').split('/').filter(Boolean).pop() || dir;
+      }
+    }
+    if (customerDevDefaults.pluginProjectPath && task.workflowSetup.devTargetKind === 'plugin' && !task.workflowSetup.pluginProject) task.workflowSetup.pluginProject = safeString(customerDevDefaults.pluginProjectPath);
+    appliedActions.push('applied_customer_defaults');
+  }
+
+  const naming = computeScriptNaming(template, customerDevDefaults, task.workflowSetup);
+  if (task.workflowSetup?.actionType === 'create-new-script' && task.workflowSetup.repositoryRoot && naming) {
+    task.workflowSetup.desiredScriptFile = naming.desiredScriptFile;
+    task.workflowSetup.artifactPath = naming.scriptPath;
+    task.workflowSetup.absoluteScriptPath = naming.absoluteScriptPath;
+    task.workflowSetup.namingSource = naming.namingSource;
+    task.workflowSetup.onLoadFunctionName = naming.onLoadFunctionName;
+    if (naming.onChangeFunctionName) task.workflowSetup.onChangeFunctionName = naming.onChangeFunctionName;
+    if (naming.mainHelperSuggestion) task.workflowSetup.mainHelperSuggestion = naming.mainHelperSuggestion;
+    appliedActions.push('saved_developer_target');
+  }
+
+  const hasStaleTemplateQuestions = /\b(open questions?|which specific fields|fields from the asset|should be prefilled)\b/i.test(
+    `${task.analysisResult?.summary ?? ''} ${task.analysisResult?.summaryEn ?? ''}`,
+  );
+  if ((template && hasStaleTemplateQuestions) || (!task.analysisResult?.summary && (template || task.title))) {
+    const summary = template?.notes || `Developer task setup prepared for: ${task.title || task.id}.`;
+    task.analysisResult = { ...(asObject(task.analysisResult)), summary, summaryEn: summary, confidence: template ? 90 : 60, suggestedActions: [] };
+    appliedActions.push('saved_task_analysis');
+  }
+
+  const setup = asObject(task.workflowSetup);
+  const workKind = task.crmDeveloperWorkflow?.detectedWorkKind || setup.devTargetKind;
+  if (!setup.repositoryRoot) missingInputs.push('repositoryRoot');
+  if (!workKind || workKind === 'unknown') missingInputs.push('workKind');
+  if (!setup.actionType) missingInputs.push('actionType');
+  if (!setup.primaryEntityLogicalName) missingInputs.push('targetEntity');
+  if (setup.devTargetKind === 'script' && setup.actionType === 'create-new-script' && (!setup.scriptPath || !setup.desiredScriptFile || !setup.artifactPath)) missingInputs.push('script target path');
+  if (setup.devTargetKind === 'plugin' && !setup.pluginProject) missingInputs.push('plugin project');
+  if (missingInputs.length) hardBlockers.push(`Missing required setup input(s): ${missingInputs.join(', ')}.`);
+
+  const hasPlan = !!task.crmDeveloperWorkflow?.technicalPlan;
+  const planNeedsTemplateMapping = hasPlan && template && !planHasTemplateMapping(task.crmDeveloperWorkflow.technicalPlan, template);
+  if (createTechnicalPlan && (!hasPlan || planNeedsTemplateMapping) && hardBlockers.length === 0) {
+    const plan = deterministicPlanDraft(task, template);
+    if (plan) {
+      if (!task.crmDeveloperWorkflow || typeof task.crmDeveloperWorkflow !== 'object') task.crmDeveloperWorkflow = { createdAt: now };
+      task.crmDeveloperWorkflow.technicalPlan = { generatedAt: now, ...plan, externalActionPreview: [] };
+      task.crmDeveloperWorkflow.planApproval = null;
+      task.crmDeveloperWorkflow.currentStep = 'technical-plan';
+      task.crmDeveloperWorkflow.updatedAt = now;
+      appliedActions.push('saved_technical_plan', 'marked_technical_plan_ready');
+      approvalGates.push({ type: 'technical-plan-approval', message: 'Review and approve the technical implementation plan.' });
+    } else {
+      warnings.push('Technical plan was not created because the task context is not specific enough.');
+    }
+  } else if (task.crmDeveloperWorkflow?.technicalPlan && !approvalSummary(task.crmDeveloperWorkflow.planApproval).approved) {
+    approvalGates.push({ type: 'technical-plan-approval', message: 'Review and approve the technical implementation plan.' });
+  }
+
+  if (confirmSetup && hardBlockers.length === 0 && !setup.confirmedAt) {
+    task.workflowSetup.confirmedAt = now;
+    if (task.status === 'new') task.status = 'analyzed';
+    appliedActions.push('confirmed_setup');
+  }
+
+  const readiness = computeImplementationReadiness(task);
+  const status = hardBlockers.length
+    ? 'blocked'
+    : approvalGates.length
+      ? 'stopped_at_approval_gate'
+      : readiness.isImplementationReady ? 'ready_for_implementation' : 'blocked';
+  return { taskId: task.id, status, appliedActions: [...new Set(appliedActions)], skippedActions, hardBlockers, approvalGates, warnings, missingInputs, implementationReadiness: readiness };
 }
 
 function nextRecommendedStep(task) {
@@ -2008,6 +2241,36 @@ async function callToolFallback(name, args = {}) {
         matchedTemplate: matchedTemplate ?? undefined,
       };
     }
+    case 'prepare_developer_task': {
+      const taskId = String(args.taskId ?? '').trim();
+      if (!taskId) return { ...common, error: 'Missing required argument: taskId' };
+      const mode = args.mode ?? 'setup-until-approval-gate';
+      if (mode !== 'setup-until-approval-gate') return { ...common, error: `Unsupported mode: ${mode}` };
+      const index = tasks.findIndex((task) => task && String(task.id) === taskId);
+      if (index < 0) return { ...common, error: `Task not found: ${taskId}` };
+
+      const task = tasks[index];
+      let devDefaults = null;
+      const customerId = task.customerId || task.workflowSetup?.customerId;
+      if (customerId) {
+        const [customers, settings] = await Promise.all([loadCustomers(), loadSettings()]);
+        const customer = customers.find((c) => c.id === customerId);
+        devDefaults = computeCustomerDevDefaults(customer, settings?.crmBaseDirectory ?? '');
+      }
+
+      const result = prepareDeveloperTaskInMemory(task, {
+        customerDevDefaults: devDefaults,
+        confirmSetup: args.confirmSetup !== false,
+        createTechnicalPlan: args.createTechnicalPlan !== false,
+      });
+      appendMcpAuditNote(task, 'prepare_developer_task');
+      await saveTasks(tasks);
+      return {
+        ...common,
+        ...result,
+        task: buildTaskFullContext(task, devDefaults),
+      };
+    }
     default:
       throw new Error(`Tool '${name}' is not available in read-only fallback mode.`);
   }
@@ -2082,7 +2345,8 @@ async function callTool(name, args = {}) {
     };
   } catch (error) {
     const fallbackAllowed = isFallbackReadOnlyEnabled() || !!getCliDataDir();
-    if (!fallbackAllowed || !READ_ONLY_TOOL_NAMES.has(name)) {
+    const fallbackWriteAllowed = name === 'prepare_developer_task' && !!getCliDataDir();
+    if (!fallbackAllowed || (!READ_ONLY_TOOL_NAMES.has(name) && !fallbackWriteAllowed)) {
       throw new Error(
         `task-workbench local bridge is not running at ${bridgeUrl}. Start task-workbench app first. `
         + `Optional debug fallback for read-only tools only: pass --fallback-readonly with --data-dir. `

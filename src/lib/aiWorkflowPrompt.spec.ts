@@ -220,38 +220,39 @@ describe('buildAiWorkflowPrompt — setup prompt (not ready)', () => {
     expect(buildAiWorkflowPrompt(makeTask())).toContain('technical plan');
   });
 
-  it('references Primarch for Dataverse verification step', () => {
-    expect(buildAiWorkflowPrompt(makeTask())).toContain('Primarch');
+  it('delegates setup orchestration to prepare_developer_task', () => {
+    const prompt = buildAiWorkflowPrompt(makeTask());
+    expect(prompt).toContain('prepare_developer_task');
+    expect(prompt).toContain('approval gate or hard blocker');
   });
 
   it('stops AI if MCP fails', () => {
     const prompt = buildAiWorkflowPrompt(makeTask());
     expect(prompt).toContain('stop immediately');
-    expect(prompt).toContain('Do not continue outside Task Workbench workflow');
+    expect(prompt).toContain('Task Workbench MCP becomes unavailable');
   });
 
-  it('mentions prompt regeneration only as fallback when MCP refresh fails', () => {
+  it('does not ask for prompt regeneration during orchestration setup', () => {
     const prompt = buildAiWorkflowPrompt(makeTask());
-    expect(prompt).toContain('regenerate this prompt');
-    // Must be conditional — only when MCP cannot be reloaded
-    expect(prompt).toContain('Only ask the user to regenerate this prompt if MCP context cannot be reloaded');
-    // Must NOT unconditionally demand regeneration after each update
+    expect(prompt).not.toContain('regenerate this prompt');
     expect(prompt).not.toContain('ask the user to re-generate this prompt');
   });
 
-  it('includes setup orchestration section with up-to-8 limit', () => {
+  it('includes setup orchestration section using prepare_developer_task', () => {
     const prompt = buildAiWorkflowPrompt(makeTask());
-    expect(prompt).toContain('Setup orchestration (up to 8 safe Task Workbench-only actions):');
+    expect(prompt).toContain('Setup orchestration:');
+    expect(prompt).toContain('prepare_developer_task');
   });
 
-  it('includes allowed auto-setup actions section', () => {
+  it('includes safe local setup write actions section', () => {
     const prompt = buildAiWorkflowPrompt(makeTask());
-    expect(prompt).toContain('Allowed auto-setup actions (no user input needed when the value is explicit):');
+    expect(prompt).toContain('prepare_developer_task is allowed to perform only safe local setup writes');
   });
 
-  it('instructs AI to reload context and continue after safe work classification update', () => {
+  it('instructs AI to use returned context without mandatory reload', () => {
     const prompt = buildAiWorkflowPrompt(makeDevTask());
-    expect(prompt).toContain('reload `get_task_full_context`, and continue');
+    expect(prompt).toContain('Use the returned context/readiness as the source of truth');
+    expect(prompt).toContain('without requiring a follow-up reload');
   });
 
   it('does not tell AI to stop after work classification save', () => {
@@ -262,8 +263,8 @@ describe('buildAiWorkflowPrompt — setup prompt (not ready)', () => {
 
   it('lists safe auto-setup examples including mode and classification', () => {
     const prompt = buildAiWorkflowPrompt(makeTask());
-    expect(prompt).toContain('setting task mode to Developer');
-    expect(prompt).toContain('setting work classification to script/plugin');
+    expect(prompt).toContain('set Developer mode');
+    expect(prompt).toContain('work classification');
   });
 
   it('lists mode blocker for non-developer task', () => {
@@ -310,7 +311,7 @@ describe('buildAiWorkflowPrompt — setup prompt (not ready)', () => {
 
   it('includes retry behavior instructions', () => {
     const prompt = buildAiWorkflowPrompt(makeTask());
-    expect(prompt).toContain('Retry required MCP read calls up to 3 times');
+    expect(prompt).toContain('fails after 3 retries');
   });
 
   it('mode blocker section mentions set_task_mode', () => {
@@ -548,34 +549,22 @@ describe('buildAiWorkflowPrompt — implementation prompt (ready task)', () => {
   });
 });
 
-describe('buildAiWorkflowPrompt — template lookup instruction', () => {
-  it('instructs AI to call get_task_templates with the task ID in the opening sequence', () => {
+describe('buildAiWorkflowPrompt - prepare_developer_task opening instruction', () => {
+  it('instructs AI to call prepare_developer_task first with the task ID', () => {
     const prompt = buildAiWorkflowPrompt(makeTask({ id: 'task-nvr-001' }));
-    expect(prompt).toContain('get_task_templates');
-    expect(prompt).toContain('"task-nvr-001"');
+    expect(prompt).toContain('First MCP call: `prepare_developer_task`');
+    expect(prompt).toContain('task-nvr-001');
   });
 
-  it('instructs AI to apply template values before evaluating missing metadata as blockers', () => {
+  it('treats template/default application as prepare_developer_task responsibility', () => {
     const prompt = buildAiWorkflowPrompt(makeTask());
-    expect(prompt).toContain('apply its values');
-    expect(prompt).toContain('BEFORE evaluating which metadata fields are missing');
+    expect(prompt).toContain('apply matched templates and customer developer defaults');
+    expect(prompt).toContain('target entity/event/script naming metadata');
   });
 
-  it('includes get_task_templates as setup rule 2 with apply-before-evaluate instruction', () => {
+  it('forbids get_task_templates before prepare_developer_task', () => {
     const prompt = buildAiWorkflowPrompt(makeTask());
-    expect(prompt).toContain('apply its workKind, actionType, targetEntity');
-    expect(prompt).toContain('BEFORE treating those fields as missing blockers');
-  });
-
-  it('setup rule 2 instructs reload after applying template values', () => {
-    const prompt = buildAiWorkflowPrompt(makeTask());
-    expect(prompt).toContain('Reload `get_task_full_context` after applying template values');
-  });
-
-  it('get_task_templates call appears in both the opening sequence and the setup rules', () => {
-    const prompt = buildAiWorkflowPrompt(makeTask({ id: 'task-abc' }));
-    const occurrences = (prompt.match(/get_task_templates/g) ?? []).length;
-    expect(occurrences).toBeGreaterThanOrEqual(2);
+    expect(prompt).toContain('Do not call get_task_full_context or get_task_templates before it');
   });
 });
 
@@ -588,17 +577,17 @@ describe('buildAiWorkflowPrompt — task identity and MCP write rules', () => {
     expect(buildAiWorkflowPrompt(makeTask())).toContain('Do not ask the user for the task ID again');
   });
 
-  it('instructs AI not to ask the user what to do with a complete developer target', () => {
-    expect(buildAiWorkflowPrompt(makeTask())).toContain('Do not ask the user what to do with a complete developer target');
+  it('instructs AI not to ask for fields resolved by prepare_developer_task', () => {
+    expect(buildAiWorkflowPrompt(makeTask())).toContain('Do not ask for fields that the returned template/default setup already resolved');
   });
 
-  it('instructs AI to save complete target to current task using set_task_developer_target', () => {
-    expect(buildAiWorkflowPrompt(makeTask())).toContain('Save it to the current task using set_task_developer_target');
+  it('instructs AI to prefer prepare_developer_task over low-level target writes', () => {
+    expect(buildAiWorkflowPrompt(makeTask())).toContain('For setup/readiness, prefer prepare_developer_task');
   });
 
-  it('instructs AI to reload get_task_full_context after saving target and continue', () => {
+  it('instructs AI not to reload get_task_full_context after prepare_developer_task succeeds', () => {
     const prompt = buildAiWorkflowPrompt(makeTask());
-    expect(prompt).toContain('reload get_task_full_context');
+    expect(prompt).toContain('Do not reload get_task_full_context unless prepare_developer_task returns an error or missing context');
   });
 
   it('task identity section appears in both setup and implementation prompts', () => {
@@ -608,10 +597,9 @@ describe('buildAiWorkflowPrompt — task identity and MCP write rules', () => {
     expect(implPrompt).toContain('current task ID is the Task ID shown in this prompt');
   });
 
-  it('setup loop items include create-new-script file name derivation instruction', () => {
+  it('setup loop delegates script file name derivation to prepare_developer_task', () => {
     const prompt = buildAiWorkflowPrompt(makeTask());
-    expect(prompt).toContain('for create-new-script tasks');
-    expect(prompt).toContain('<fullEntityLogicalName>_events.js');
+    expect(prompt).toContain('target entity/event/script naming metadata');
   });
 });
 
@@ -893,19 +881,15 @@ describe('buildAiWorkflowPrompt — concrete script naming contract', () => {
     expect(buildAiWorkflowPrompt(task)).not.toContain('CRM JS script naming conventions');
   });
 
-  it('does not suggest save_technical_plan as primary for target entity in setup rule 10', () => {
+  it('delegates target entity persistence to prepare_developer_task', () => {
     const prompt = buildAiWorkflowPrompt(makeTask());
-    // Rule 10 must use set_task_developer_target, not save_technical_plan, for entity logical name
-    const rule10 = prompt.split('\n').find(l => l.startsWith('10.'));
-    expect(rule10).toBeDefined();
-    expect(rule10).toContain('set_task_developer_target');
-    expect(rule10).not.toMatch(/save_technical_plan.*entity/i);
+    expect(prompt).toContain('prefer prepare_developer_task');
+    expect(prompt).toContain('target derivation');
   });
 
-  it('create-new-script setup rule mentions Scripts_Naming and double-prefix prevention', () => {
+  it('delegates create-new-script naming rules to prepare_developer_task', () => {
     const prompt = buildAiWorkflowPrompt(makeTask());
-    expect(prompt).toContain('Scripts_Naming');
-    expect(prompt).toContain('do not double the nvr_ prefix');
+    expect(prompt).toContain('target entity/event/script naming metadata');
   });
 });
 
@@ -1110,3 +1094,4 @@ describe('buildAiWorkflowPrompt — template-preview contract (no persisted enti
     expect(prompt).toContain('C:\\Users\\vskoumal\\Documents\\CRM\\VSK-Test\\Scripts\\nvr_servicecase_events.js');
   });
 });
+

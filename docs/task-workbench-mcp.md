@@ -6,8 +6,9 @@ task-workbench uses a Primarch-style local MCP bridge architecture:
 - `mcp/task-workbench-mcp.mjs` talks to that bridge
 - reads/writes go through task-workbench app logic (not direct file writes from MCP script)
 
-The MCP script also supports an explicit read-only debug fallback (`--fallback-readonly` with
-`--data-dir`) when the app is not running.
+The MCP script also supports an explicit debug fallback (`--fallback-readonly` with
+`--data-dir`) when the app is not running. Most fallback tools are read-only; the
+`prepare_developer_task` fallback may update only local `tasks.json` setup state.
 
 ## Start
 
@@ -23,7 +24,7 @@ Optional bridge URL override:
 node mcp/task-workbench-mcp.mjs --bridge-url http://127.0.0.1:38473
 ```
 
-Optional fallback debug mode (read-only tools only, no Primarch):
+Optional fallback debug mode (no Primarch):
 
 ```bash
 node mcp/task-workbench-mcp.mjs --fallback-readonly --data-dir "/path/to/task-workbench-data"
@@ -31,7 +32,7 @@ node mcp/task-workbench-mcp.mjs --fallback-readonly --data-dir "/path/to/task-wo
 
 ## Tool groups
 
-### Read-only (19 tools)
+### Read-only
 
 These tools never write to Dataverse, GitHub, Azure DevOps, or the local filesystem
 (except `run_dataverse_check_for_task`, which persists a report to local task state).
@@ -57,8 +58,9 @@ These tools never write to Dataverse, GitHub, Azure DevOps, or the local filesys
 | `get_external_action_proposal` | Return externalActionPreview, approval gate, execution tracking |
 | `get_implementation_verification_state` | Build check, Dataverse check override, AI code review, local test, consultant testing |
 | `get_implementation_readiness` | isImplementationReady, blockers, warnings, recommendedNextStep for plugin/script tasks |
+| `get_task_templates` | Built-in setup templates and matched template for a task title |
 
-### Local-write (26 tools)
+### Local-write
 
 These tools update only local task-workbench state. No external system is called.
 
@@ -85,6 +87,7 @@ These tools update only local task-workbench state. No external system is called
 | `set_task_mode` | Set mode: developer or general |
 | `set_task_work_classification` | Set work kind (`plugin`, `script`, `ribbon`, `repo-only`, `bugfix`, `review`, `general`, `unknown`) and work action |
 | `set_task_developer_target` | Set repo root, plugin project, script path, customer |
+| `prepare_developer_task` | Apply safe template/default setup, derive target, draft a technical plan, and stop at approval gate/blocker |
 | `confirm_task_setup` | Record setup confirmation; advance new → analyzed |
 
 **CRM workflow**
@@ -131,6 +134,7 @@ These tools modify the local Git repository. No PR is created. No GitHub/Azure D
 - No GitHub / Azure DevOps write tools
 - No plugin registration, web resource upload, or customization publish tools
 - No repo file write tools (only Git stage/commit/push with strict guards)
+- `prepare_developer_task` writes only local task setup/plan metadata; it never writes code, registers plugins, uploads web resources, or calls external systems
 - No raw secrets, env vars, bridge tokens, or raw email HTML in tool responses
 - Write tools validate task IDs and enum values before modifying state
 - Write tools sanitize free-text fields (length limits, HTML stripping)
@@ -140,8 +144,5 @@ These tools modify the local Git repository. No PR is created. No GitHub/Azure D
 
 ## Tool count summary (v0.6.0)
 
-- 19 read-only
-- 26 local-write
-- 4 git-write (including read-only preview)
-- 2 test/guarded
-- **Total: 51 tools**
+- Tool counts are published dynamically by `tools/list`.
+- High-level setup should prefer `prepare_developer_task`; low-level setup tools remain available for manual or corrective updates.

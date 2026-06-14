@@ -379,9 +379,15 @@ export function buildAiWorkflowPrompt(task: Task, customer?: Customer): string {
     'You are working on a CRM development task managed by Task Workbench.',
     '',
     'Use Task Workbench MCP tools for task context and workflow updates.',
-    'Start by loading the full current context for this task using the Task Workbench MCP tool `get_task_full_context`.',
-    `Then immediately call \`get_task_templates\` with taskId "${task.id}" to check for a matching built-in template.`,
-    'If a matchedTemplate is returned, apply its values (workKind, actionType, targetEntity, scriptTarget, pluginTarget) via the appropriate MCP tools BEFORE evaluating which metadata fields are missing.',
+    ...(!readiness.isReady
+      ? [
+          `First MCP call: \`prepare_developer_task\` with taskId "${task.id}".`,
+          'Use its returned task/readiness context directly. Do not reload get_task_full_context unless prepare_developer_task returns an error or missing context.',
+          'Stop at the approval gate or hard blocker returned by prepare_developer_task. Do not ask for fields that the returned template/default setup already resolved.',
+        ]
+      : [
+          'Start by loading the full current context for this task using the Task Workbench MCP tool `get_task_full_context`.',
+        ]),
     '',
     `Task ID: ${task.id}`,
     '',
@@ -402,8 +408,8 @@ export function buildAiWorkflowPrompt(task: Task, customer?: Customer): string {
     `* The current task ID is the Task ID shown in this prompt.`,
     '* Use this ID for all Task Workbench MCP read/write calls.',
     '* Do not ask the user for the task ID again unless the prompt does not contain one and get_task_full_context cannot be loaded.',
-    '* When a safe setup value is derived from template, customer defaults, naming conventions, or explicit assignment, persist it immediately with the appropriate MCP write tool, reload get_task_full_context, and continue.',
-    '* Do not ask the user what to do with a complete developer target. Save it to the current task using set_task_developer_target, then reload get_task_full_context.',
+    '* For setup/readiness, prefer prepare_developer_task. It applies templates, customer defaults, target derivation, technical plan drafting, setup confirmation, and returns updated context in one call.',
+    '* Use low-level setup tools only if prepare_developer_task reports a hard blocker that needs a specific corrective write.',
   );
 
   const templatePreview = matchPromptTemplate(task.title ?? '', task.originalMessage);
@@ -430,6 +436,30 @@ export function buildAiWorkflowPrompt(task: Task, customer?: Customer): string {
       lines.push('', 'Warnings (review after resolving blockers):');
       for (const w of readiness.warnings) lines.push(`* ${w}`);
     }
+
+    lines.push(
+      '',
+      `Recommended next step: ${readiness.recommendedNextStep}`,
+      '',
+      'Setup orchestration:',
+      `Call \`prepare_developer_task\` once with { "taskId": "${task.id}", "mode": "setup-until-approval-gate" }. Use the returned context/readiness as the source of truth.`,
+      '',
+      'prepare_developer_task is allowed to perform only safe local setup writes:',
+      '* apply matched templates and customer developer defaults',
+      '* set Developer mode, work classification, target entity/event/script naming metadata',
+      '* save a deterministic task analysis and technical plan draft',
+      '* confirm setup only when no hard blockers remain',
+      '* return approvalGates/hardBlockers/missingInputs without requiring a follow-up reload',
+      '',
+      'Setup rules:',
+      '',
+      '1. First call prepare_developer_task. Do not call get_task_full_context or get_task_templates before it.',
+      '2. If status is stopped_at_approval_gate, summarize the approval gate and stop before file edits.',
+      '3. If status is blocked, ask only for missingInputs/hardBlockers returned by the tool.',
+      '4. If status is ready_for_implementation, continue only if implementationReadiness.isImplementationReady is true and the workflow phase allows code changes.',
+      '5. If Task Workbench MCP becomes unavailable or any required MCP read/write fails after 3 retries, stop immediately.',
+    );
+    return lines.join('\n');
 
     lines.push(
       '',
