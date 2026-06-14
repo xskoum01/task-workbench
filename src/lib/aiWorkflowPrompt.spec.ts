@@ -239,16 +239,14 @@ describe('buildAiWorkflowPrompt — setup prompt (not ready)', () => {
     expect(prompt).not.toContain('ask the user to re-generate this prompt');
   });
 
-  it('includes safe auto-setup loop instructions', () => {
+  it('includes setup orchestration section with up-to-8 limit', () => {
     const prompt = buildAiWorkflowPrompt(makeTask());
-    expect(prompt).toContain('Safe auto-setup loop:');
-    expect(prompt).toContain('up to 8 safe Task Workbench-only setup updates');
+    expect(prompt).toContain('Setup orchestration (up to 8 safe Task Workbench-only actions):');
   });
 
-  it('includes auto-setup orchestration loop description', () => {
+  it('includes allowed auto-setup actions section', () => {
     const prompt = buildAiWorkflowPrompt(makeTask());
-    expect(prompt).toContain('Auto-setup orchestration loop:');
-    expect(prompt).toContain('up to 8 safe Task Workbench-only setup actions');
+    expect(prompt).toContain('Allowed auto-setup actions (no user input needed when the value is explicit):');
   });
 
   it('instructs AI to reload context and continue after safe work classification update', () => {
@@ -581,6 +579,172 @@ describe('buildAiWorkflowPrompt — template lookup instruction', () => {
   });
 });
 
+describe('buildAiWorkflowPrompt — task identity and MCP write rules', () => {
+  it('includes "current task ID is the Task ID shown in this prompt"', () => {
+    expect(buildAiWorkflowPrompt(makeTask())).toContain('current task ID is the Task ID shown in this prompt');
+  });
+
+  it('instructs AI not to ask the user for the task ID again', () => {
+    expect(buildAiWorkflowPrompt(makeTask())).toContain('Do not ask the user for the task ID again');
+  });
+
+  it('instructs AI not to ask the user what to do with a complete developer target', () => {
+    expect(buildAiWorkflowPrompt(makeTask())).toContain('Do not ask the user what to do with a complete developer target');
+  });
+
+  it('instructs AI to save complete target to current task using set_task_developer_target', () => {
+    expect(buildAiWorkflowPrompt(makeTask())).toContain('Save it to the current task using set_task_developer_target');
+  });
+
+  it('instructs AI to reload get_task_full_context after saving target and continue', () => {
+    const prompt = buildAiWorkflowPrompt(makeTask());
+    expect(prompt).toContain('reload get_task_full_context');
+  });
+
+  it('task identity section appears in both setup and implementation prompts', () => {
+    const setupPrompt = buildAiWorkflowPrompt(makeTask());
+    const implPrompt  = buildAiWorkflowPrompt(makeReadyTask());
+    expect(setupPrompt).toContain('current task ID is the Task ID shown in this prompt');
+    expect(implPrompt).toContain('current task ID is the Task ID shown in this prompt');
+  });
+
+  it('setup loop items include create-new-script file name derivation instruction', () => {
+    const prompt = buildAiWorkflowPrompt(makeTask());
+    expect(prompt).toContain('for create-new-script tasks');
+    expect(prompt).toContain('<fullEntityLogicalName>_events.js');
+  });
+});
+
+describe('buildAiWorkflowPrompt — script target TBD prevention', () => {
+  it('does not contain TBD in script target context when no target is set for create-new-script', () => {
+    const task = makeTask({
+      taskMode: 'developer',
+      workflowSetup: {
+        devTargetKind: 'script',
+        repositoryRoot: 'C:/repos/Scripts',
+        actionType: 'create-new-script',
+        primaryEntityLogicalName: 'nvr_servicecase',
+      },
+      crmDeveloperWorkflow: { detectedWorkKind: 'script' },
+    });
+    expect(buildAiWorkflowPrompt(task)).not.toContain('TBD');
+  });
+
+  it('create-new-script without target shows derive-from-convention message not do-not-guess', () => {
+    const task = makeTask({
+      taskMode: 'developer',
+      workflowSetup: {
+        devTargetKind: 'script',
+        repositoryRoot: 'C:/repos/Scripts',
+        actionType: 'create-new-script',
+      },
+      crmDeveloperWorkflow: { detectedWorkKind: 'script' },
+    });
+    const prompt = buildAiWorkflowPrompt(task);
+    expect(prompt).toContain('derive from entity name and naming convention below');
+    expect(prompt).not.toContain('do not guess or create a file path');
+  });
+
+  it('update-existing-script without target still shows do-not-guess message', () => {
+    const task = makeTask({
+      taskMode: 'developer',
+      workflowSetup: {
+        devTargetKind: 'script',
+        repositoryRoot: 'C:/repos/Scripts',
+        actionType: 'update-existing-script',
+      },
+      crmDeveloperWorkflow: { detectedWorkKind: 'script' },
+    });
+    const prompt = buildAiWorkflowPrompt(task);
+    expect(prompt).toContain('do not guess or create a file path');
+  });
+
+  it('prompt does not contain dot-notation namespace patterns in naming conventions', () => {
+    const prompt = buildAiWorkflowPrompt(makeTask({
+      taskMode: 'developer',
+      workflowSetup: { devTargetKind: 'script', actionType: 'create-new-script' },
+      crmDeveloperWorkflow: { detectedWorkKind: 'script' },
+    }));
+    expect(prompt).not.toContain('NVR.ServiceCase');
+    expect(prompt).not.toContain('AssetPrefill');
+  });
+});
+
+describe('buildAiWorkflowPrompt — create-new-script naming conventions', () => {
+  it('includes CRM JS script naming conventions section for create-new-script tasks', () => {
+    const task = makeTask({
+      taskMode: 'developer',
+      workflowSetup: { devTargetKind: 'script', actionType: 'create-new-script' },
+      crmDeveloperWorkflow: { detectedWorkKind: 'script' },
+    });
+    expect(buildAiWorkflowPrompt(task)).toContain('CRM JS script naming conventions');
+  });
+
+  it('naming conventions include entityLogicalName_events.js file format', () => {
+    const task = makeTask({
+      taskMode: 'developer',
+      workflowSetup: { devTargetKind: 'script', actionType: 'create-new-script' },
+      crmDeveloperWorkflow: { detectedWorkKind: 'script' },
+    });
+    expect(buildAiWorkflowPrompt(task)).toContain('<entityLogicalName>_events.js');
+  });
+
+  it('naming conventions include OnLoad and OnChange handler formats', () => {
+    const task = makeTask({
+      taskMode: 'developer',
+      workflowSetup: { devTargetKind: 'script', actionType: 'create-new-script' },
+      crmDeveloperWorkflow: { detectedWorkKind: 'script' },
+    });
+    const prompt = buildAiWorkflowPrompt(task);
+    expect(prompt).toContain('<entityLogicalName>_OnLoad');
+    expect(prompt).toContain('<fieldLogicalName>_OnChange');
+  });
+
+  it('naming conventions specify camelCase helper functions without namespace prefixes', () => {
+    const task = makeTask({
+      taskMode: 'developer',
+      workflowSetup: { devTargetKind: 'script', actionType: 'create-new-script' },
+      crmDeveloperWorkflow: { detectedWorkKind: 'script' },
+    });
+    const prompt = buildAiWorkflowPrompt(task);
+    expect(prompt).toContain('camelCase');
+    expect(prompt).toContain('without namespace prefixes');
+  });
+
+  it('for entity nvr_servicecase derives convention hint nvr_servicecase_events.js', () => {
+    const task = makeTask({
+      taskMode: 'developer',
+      workflowSetup: {
+        devTargetKind: 'script',
+        actionType: 'create-new-script',
+        primaryEntityLogicalName: 'nvr_servicecase',
+      },
+      crmDeveloperWorkflow: { detectedWorkKind: 'script' },
+    });
+    const prompt = buildAiWorkflowPrompt(task);
+    expect(prompt).toContain('nvr_servicecase_events.js');
+    expect(prompt).toContain('nvr_servicecase_OnLoad');
+  });
+
+  it('naming conventions section is absent for create-new-script when target file is already set', () => {
+    const task = makeReadyScriptTask({
+      workflowSetup: {
+        devTargetKind: 'script',
+        repositoryRoot: 'C:/repos',
+        scriptPath: 'C:/repos/Scripts/nvr_servicecase_events.js',
+        actionType: 'create-new-script',
+        primaryEntityLogicalName: 'nvr_servicecase',
+        confirmedAt: '2026-06-01T10:00:00.000Z',
+      },
+    });
+    expect(buildAiWorkflowPrompt(task)).not.toContain('CRM JS script naming conventions');
+  });
+
+  it('naming conventions section is absent for update-existing-script tasks', () => {
+    expect(buildAiWorkflowPrompt(makeReadyScriptTask())).not.toContain('CRM JS script naming conventions');
+  });
+});
+
 describe('buildAiWorkflowPrompt — setup prompt categorized sections', () => {
   it('non-developer task auto-resolvable section includes set_task_mode call', () => {
     const prompt = buildAiWorkflowPrompt(makeTask());
@@ -625,5 +789,324 @@ describe('buildAiWorkflowPrompt — setup prompt categorized sections', () => {
     }));
     expect(prompt).toContain('Auto-resolvable');
     expect(prompt).toContain('set_task_work_classification');
+  });
+});
+
+// ── Concrete script naming contract ──────────────────────────────────────────
+
+function makeNvrScriptTask(setupOverrides = {}, customerOverride?: Partial<{ scriptFolder: string; repositoryRoot: string }>) {
+  return {
+    task: makeTask({
+      taskMode: 'developer',
+      workflowSetup: {
+        devTargetKind: 'script',
+        actionType: 'create-new-script',
+        primaryEntityLogicalName: 'nvr_servicecase',
+        eventFieldName: 'nvr_assetid',
+        ...setupOverrides,
+      },
+      crmDeveloperWorkflow: { detectedWorkKind: 'script' },
+    }),
+    customer: customerOverride
+      ? ({ id: 'cust-vsk', name: 'VSK-Test', ...customerOverride } as unknown as import('../types').Customer)
+      : undefined,
+  };
+}
+
+describe('buildAiWorkflowPrompt — concrete script naming contract', () => {
+  it('shows CRM script naming contract when entity and customer scriptFolder are known', () => {
+    const { task, customer } = makeNvrScriptTask({}, {
+      scriptFolder: 'C:\\Users\\vskoumal\\Documents\\CRM\\VSK-Test\\Scripts',
+      repositoryRoot: 'C:\\Users\\vskoumal\\Documents\\CRM\\VSK-Test',
+    });
+    expect(buildAiWorkflowPrompt(task, customer)).toContain('CRM script naming contract');
+  });
+
+  it('prompt contains absolute script folder when customer scriptFolder is configured', () => {
+    const { task, customer } = makeNvrScriptTask({}, {
+      scriptFolder: 'C:\\Users\\vskoumal\\Documents\\CRM\\VSK-Test\\Scripts',
+      repositoryRoot: 'C:\\Users\\vskoumal\\Documents\\CRM\\VSK-Test',
+    });
+    expect(buildAiWorkflowPrompt(task, customer)).toContain('C:\\Users\\vskoumal\\Documents\\CRM\\VSK-Test\\Scripts');
+  });
+
+  it('prompt contains derived relative target file Scripts\\nvr_servicecase_events.js', () => {
+    const { task, customer } = makeNvrScriptTask({}, {
+      scriptFolder: 'C:\\Users\\vskoumal\\Documents\\CRM\\VSK-Test\\Scripts',
+      repositoryRoot: 'C:\\Users\\vskoumal\\Documents\\CRM\\VSK-Test',
+    });
+    expect(buildAiWorkflowPrompt(task, customer)).toContain('Scripts\\nvr_servicecase_events.js');
+  });
+
+  it('prompt contains derived absolute target file with full Windows path', () => {
+    const { task, customer } = makeNvrScriptTask({}, {
+      scriptFolder: 'C:\\Users\\vskoumal\\Documents\\CRM\\VSK-Test\\Scripts',
+      repositoryRoot: 'C:\\Users\\vskoumal\\Documents\\CRM\\VSK-Test',
+    });
+    expect(buildAiWorkflowPrompt(task, customer)).toContain('C:\\Users\\vskoumal\\Documents\\CRM\\VSK-Test\\Scripts\\nvr_servicecase_events.js');
+  });
+
+  it('prompt contains OnLoad handler nvr_servicecase_OnLoad', () => {
+    const { task, customer } = makeNvrScriptTask({}, {
+      scriptFolder: 'C:\\Users\\vskoumal\\Documents\\CRM\\VSK-Test\\Scripts',
+      repositoryRoot: 'C:\\Users\\vskoumal\\Documents\\CRM\\VSK-Test',
+    });
+    expect(buildAiWorkflowPrompt(task, customer)).toContain('nvr_servicecase_OnLoad');
+  });
+
+  it('prompt contains OnChange handler nvr_assetid_OnChange', () => {
+    const { task, customer } = makeNvrScriptTask({}, {
+      scriptFolder: 'C:\\Users\\vskoumal\\Documents\\CRM\\VSK-Test\\Scripts',
+      repositoryRoot: 'C:\\Users\\vskoumal\\Documents\\CRM\\VSK-Test',
+    });
+    expect(buildAiWorkflowPrompt(task, customer)).toContain('nvr_assetid_OnChange');
+  });
+
+  it('prompt says helpers are descriptive camelCase with no nvr_ prefix by default', () => {
+    const { task, customer } = makeNvrScriptTask({}, {
+      scriptFolder: 'C:\\Users\\vskoumal\\Documents\\CRM\\VSK-Test\\Scripts',
+      repositoryRoot: 'C:\\Users\\vskoumal\\Documents\\CRM\\VSK-Test',
+    });
+    const prompt = buildAiWorkflowPrompt(task, customer);
+    expect(prompt).toContain('descriptive camelCase');
+    expect(prompt).toContain('no nvr_ prefix by default');
+  });
+
+  it('naming contract instructs to save via set_task_developer_target', () => {
+    const { task, customer } = makeNvrScriptTask({}, {
+      scriptFolder: 'C:\\Users\\vskoumal\\Documents\\CRM\\VSK-Test\\Scripts',
+      repositoryRoot: 'C:\\Users\\vskoumal\\Documents\\CRM\\VSK-Test',
+    });
+    expect(buildAiWorkflowPrompt(task, customer)).toContain('Save this derived target via set_task_developer_target with:');
+  });
+
+  it('naming contract shown even without customer when entity is known (partial contract)', () => {
+    const { task } = makeNvrScriptTask();
+    const prompt = buildAiWorkflowPrompt(task);
+    expect(prompt).toContain('CRM script naming contract');
+    expect(prompt).toContain('nvr_servicecase_events.js');
+    expect(prompt).toContain('nvr_servicecase_OnLoad');
+  });
+
+  it('does not show CRM JS script naming conventions when entity is known', () => {
+    const { task } = makeNvrScriptTask();
+    expect(buildAiWorkflowPrompt(task)).not.toContain('CRM JS script naming conventions');
+  });
+
+  it('does not suggest save_technical_plan as primary for target entity in setup rule 10', () => {
+    const prompt = buildAiWorkflowPrompt(makeTask());
+    // Rule 10 must use set_task_developer_target, not save_technical_plan, for entity logical name
+    const rule10 = prompt.split('\n').find(l => l.startsWith('10.'));
+    expect(rule10).toBeDefined();
+    expect(rule10).toContain('set_task_developer_target');
+    expect(rule10).not.toMatch(/save_technical_plan.*entity/i);
+  });
+
+  it('create-new-script setup rule mentions Scripts_Naming and double-prefix prevention', () => {
+    const prompt = buildAiWorkflowPrompt(makeTask());
+    expect(prompt).toContain('Scripts_Naming');
+    expect(prompt).toContain('do not double the nvr_ prefix');
+  });
+});
+
+// ── Template-preview contract (no persisted entity) ──────────────────────────
+
+function makeFreshNvrTask(customerOverride?: Partial<{ scriptFolder: string; repositoryRoot: string }>) {
+  return {
+    task: makeTask({
+      taskMode: 'developer',
+      title: '[TEST] Script: Předvyplnění servisního požadavku podle zařízení',
+    }),
+    customer: customerOverride
+      ? ({ id: 'cust-vsk', name: 'VSK-Test', ...customerOverride } as unknown as import('../types').Customer)
+      : undefined,
+  };
+}
+
+describe('buildAiWorkflowPrompt — template-preview contract (no persisted entity)', () => {
+  const vskCustomer = {
+    scriptFolder: 'C:\\Users\\vskoumal\\Documents\\CRM\\VSK-Test\\Scripts',
+    repositoryRoot: 'C:\\Users\\vskoumal\\Documents\\CRM\\VSK-Test',
+  };
+
+  it('fresh NVR script task with matching title shows CRM script naming contract', () => {
+    const { task, customer } = makeFreshNvrTask(vskCustomer);
+    expect(buildAiWorkflowPrompt(task, customer)).toContain('CRM script naming contract');
+  });
+
+  it('fresh NVR script task prompt contains nvr_servicecase_events.js from template', () => {
+    const { task, customer } = makeFreshNvrTask(vskCustomer);
+    expect(buildAiWorkflowPrompt(task, customer)).toContain('nvr_servicecase_events.js');
+  });
+
+  it('fresh NVR script task prompt contains derived relative path Scripts\\nvr_servicecase_events.js', () => {
+    const { task, customer } = makeFreshNvrTask(vskCustomer);
+    expect(buildAiWorkflowPrompt(task, customer)).toContain('Scripts\\nvr_servicecase_events.js');
+  });
+
+  it('fresh NVR script task prompt contains full Windows absolute path', () => {
+    const { task, customer } = makeFreshNvrTask(vskCustomer);
+    expect(buildAiWorkflowPrompt(task, customer)).toContain(
+      'C:\\Users\\vskoumal\\Documents\\CRM\\VSK-Test\\Scripts\\nvr_servicecase_events.js',
+    );
+  });
+
+  it('fresh NVR script task prompt contains nvr_servicecase_OnLoad', () => {
+    const { task, customer } = makeFreshNvrTask(vskCustomer);
+    expect(buildAiWorkflowPrompt(task, customer)).toContain('nvr_servicecase_OnLoad');
+  });
+
+  it('fresh NVR script task prompt contains nvr_assetid_OnChange', () => {
+    const { task, customer } = makeFreshNvrTask(vskCustomer);
+    expect(buildAiWorkflowPrompt(task, customer)).toContain('nvr_assetid_OnChange');
+  });
+
+  it('fresh NVR script task prompt contains prefillServiceCaseFromAsset helper suggestion', () => {
+    const { task, customer } = makeFreshNvrTask(vskCustomer);
+    expect(buildAiWorkflowPrompt(task, customer)).toContain('prefillServiceCaseFromAsset');
+  });
+
+  it('fresh NVR script task prompt does not contain TBD', () => {
+    const { task, customer } = makeFreshNvrTask(vskCustomer);
+    expect(buildAiWorkflowPrompt(task, customer)).not.toContain('TBD');
+  });
+
+  it('fresh NVR script task naming contract derived file name entry is correct', () => {
+    const { task, customer } = makeFreshNvrTask(vskCustomer);
+    const prompt = buildAiWorkflowPrompt(task, customer);
+    expect(prompt).toContain('* Derived file name: nvr_servicecase_events.js');
+  });
+
+  it('fresh NVR script task prompt does not expose servicecase_events.js without nvr_ prefix', () => {
+    const { task, customer } = makeFreshNvrTask(vskCustomer);
+    const prompt = buildAiWorkflowPrompt(task, customer);
+    expect(prompt).not.toMatch(/\bservicecase_events\.js/);
+  });
+
+  it('fresh NVR script task prompt does not contain NVR.ServiceCase namespace', () => {
+    const { task, customer } = makeFreshNvrTask(vskCustomer);
+    const prompt = buildAiWorkflowPrompt(task, customer);
+    expect(prompt).not.toContain('NVR.ServiceCase');
+    expect(prompt).not.toContain('AssetPrefill');
+  });
+
+  it('fresh NVR script task still instructs AI to call get_task_templates', () => {
+    const { task, customer } = makeFreshNvrTask(vskCustomer);
+    expect(buildAiWorkflowPrompt(task, customer)).toContain('get_task_templates');
+  });
+
+  it('fresh NVR script task without customer shows partial contract with relative path', () => {
+    const { task } = makeFreshNvrTask();
+    const prompt = buildAiWorkflowPrompt(task);
+    expect(prompt).toContain('CRM script naming contract');
+    expect(prompt).toContain('nvr_servicecase_events.js');
+    expect(prompt).not.toContain('C:\\Users\\vskoumal');
+  });
+
+  it('fresh NVR script task with customer shows Target file preview line', () => {
+    const { task, customer } = makeFreshNvrTask(vskCustomer);
+    const prompt = buildAiWorkflowPrompt(task, customer);
+    expect(prompt).toContain('* Target file preview: Scripts\\nvr_servicecase_events.js');
+  });
+
+  it('fresh NVR script task with customer does NOT say Target file: NOT SET', () => {
+    const { task, customer } = makeFreshNvrTask(vskCustomer);
+    const prompt = buildAiWorkflowPrompt(task, customer);
+    expect(prompt).not.toContain('Target file: NOT SET');
+  });
+
+  it('fresh NVR script task with customer shows Persistence state line', () => {
+    const { task, customer } = makeFreshNvrTask(vskCustomer);
+    const prompt = buildAiWorkflowPrompt(task, customer);
+    expect(prompt).toContain('* Persistence state: not yet saved to task setup');
+  });
+
+  it('fresh NVR script task with customer shows Required action line', () => {
+    const { task, customer } = makeFreshNvrTask(vskCustomer);
+    const prompt = buildAiWorkflowPrompt(task, customer);
+    expect(prompt).toContain('* Required action: save this target via set_task_developer_target');
+  });
+
+  it('fresh NVR script task without customer still shows Target file preview via relative path from template', () => {
+    const { task } = makeFreshNvrTask();
+    const prompt = buildAiWorkflowPrompt(task);
+    // Relative path is derivable from the template even without a customer (sep defaults to /)
+    expect(prompt).toContain('* Target file preview: Scripts/nvr_servicecase_events.js');
+    expect(prompt).not.toContain('Target file: NOT SET');
+  });
+
+  it('fresh NVR script task with customer shows Repository root line in naming contract', () => {
+    const { task, customer } = makeFreshNvrTask(vskCustomer);
+    const prompt = buildAiWorkflowPrompt(task, customer);
+    expect(prompt).toContain('* Repository root: C:\\Users\\vskoumal\\Documents\\CRM\\VSK-Test');
+  });
+
+  it('fresh NVR script task with customer shows Scripts folder absolute path in naming contract', () => {
+    const { task, customer } = makeFreshNvrTask(vskCustomer);
+    const prompt = buildAiWorkflowPrompt(task, customer);
+    expect(prompt).toContain('* Scripts folder: C:\\Users\\vskoumal\\Documents\\CRM\\VSK-Test\\Scripts');
+  });
+
+  it('fresh NVR script task with customer shows Derived absolute target file in naming contract', () => {
+    const { task, customer } = makeFreshNvrTask(vskCustomer);
+    const prompt = buildAiWorkflowPrompt(task, customer);
+    expect(prompt).toContain('* Derived absolute target file: C:\\Users\\vskoumal\\Documents\\CRM\\VSK-Test\\Scripts\\nvr_servicecase_events.js');
+  });
+
+  it('fresh NVR script task concrete save instruction includes repositoryRoot', () => {
+    const { task, customer } = makeFreshNvrTask(vskCustomer);
+    const prompt = buildAiWorkflowPrompt(task, customer);
+    expect(prompt).toContain('* repositoryRoot: C:\\Users\\vskoumal\\Documents\\CRM\\VSK-Test');
+  });
+
+  it('fresh NVR script task concrete save instruction includes artifactPath', () => {
+    const { task, customer } = makeFreshNvrTask(vskCustomer);
+    const prompt = buildAiWorkflowPrompt(task, customer);
+    expect(prompt).toContain('* artifactPath: Scripts\\nvr_servicecase_events.js');
+  });
+
+  it('fresh NVR script task concrete save instruction includes absoluteScriptPath', () => {
+    const { task, customer } = makeFreshNvrTask(vskCustomer);
+    const prompt = buildAiWorkflowPrompt(task, customer);
+    expect(prompt).toContain('* absoluteScriptPath: C:\\Users\\vskoumal\\Documents\\CRM\\VSK-Test\\Scripts\\nvr_servicecase_events.js');
+  });
+
+  it('fresh NVR script task concrete save instruction includes actionType', () => {
+    const { task, customer } = makeFreshNvrTask(vskCustomer);
+    const prompt = buildAiWorkflowPrompt(task, customer);
+    expect(prompt).toContain('* actionType: create-new-script');
+  });
+
+  it('fresh NVR script task concrete save instruction includes eventFieldName', () => {
+    const { task, customer } = makeFreshNvrTask(vskCustomer);
+    const prompt = buildAiWorkflowPrompt(task, customer);
+    expect(prompt).toContain('* eventFieldName: nvr_assetid');
+  });
+
+  it('fresh NVR script task with customer does not render forward-slash Windows paths in naming contract', () => {
+    const { task, customer } = makeFreshNvrTask(vskCustomer);
+    const prompt = buildAiWorkflowPrompt(task, customer);
+    // With a Windows customer (backslash paths), no forward-slash paths should appear in the naming contract
+    expect(prompt).not.toContain('Scripts/nvr_servicecase_events.js');
+    expect(prompt).not.toContain('CRM/VSK-Test/Scripts');
+  });
+
+  it('customer with only repositoryRoot (no scriptFolder) derives absolute script path in naming contract', () => {
+    const { task, customer } = makeFreshNvrTask({ repositoryRoot: 'C:\\Users\\vskoumal\\Documents\\CRM\\VSK-Test' });
+    const prompt = buildAiWorkflowPrompt(task, customer);
+    expect(prompt).toContain('C:\\Users\\vskoumal\\Documents\\CRM\\VSK-Test\\Scripts\\nvr_servicecase_events.js');
+  });
+
+  it('customer with resolvedRepositoryPath (computed from folderName + crmBaseDirectory) derives full absolute target', () => {
+    // resolvedRepositoryPath is the computed path set by the app at startup (crmBaseDirectory + folderName)
+    const { task } = makeFreshNvrTask();
+    const customer = {
+      id: 'cust-vsk',
+      name: 'VSK-Test',
+      resolvedRepositoryPath: 'C:\\Users\\vskoumal\\Documents\\CRM\\VSK-Test',
+    } as unknown as import('../types').Customer;
+    const prompt = buildAiWorkflowPrompt(task, customer);
+    expect(prompt).toContain('* Repository root: C:\\Users\\vskoumal\\Documents\\CRM\\VSK-Test');
+    expect(prompt).toContain('C:\\Users\\vskoumal\\Documents\\CRM\\VSK-Test\\Scripts\\nvr_servicecase_events.js');
   });
 });

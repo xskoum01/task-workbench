@@ -719,6 +719,95 @@ describe('getDeveloperReadiness — actionType: create-new-script', () => {
     }));
     expect(r.recommendedNextStep).toContain('directory and file name');
   });
+
+  it('missing target path is auto-resolvable when entity and repoRoot are both known', () => {
+    const r = getDeveloperReadiness(makeReadyScriptTask({
+      workflowSetup: {
+        ...makeReadyScriptTask().workflowSetup,
+        scriptPath: undefined,
+        artifactPath: undefined,
+        actionType: 'create-new-script',
+        primaryEntityLogicalName: 'nvr_servicecase',
+        repositoryRoot: 'C:/repos/Acme',
+      },
+      crmDeveloperWorkflow: {
+        ...makeReadyScriptTask().crmDeveloperWorkflow,
+        technicalPlan: {
+          ...makeReadyScriptTask().crmDeveloperWorkflow!.technicalPlan!,
+          target: { ...makeReadyScriptTask().crmDeveloperWorkflow!.technicalPlan!.target, scriptPath: undefined },
+        },
+      },
+    }));
+    const blocker = r.categorizedBlockers.find(b => b.message.includes('Target script/artifact path is not set.'));
+    expect(blocker?.category).toBe('auto-resolvable');
+    expect(blocker?.mcpTool).toBe('set_task_developer_target');
+  });
+
+  it('missing target path is proposal when only repoRoot is known (no entity)', () => {
+    const r = getDeveloperReadiness(makeReadyScriptTask({
+      workflowSetup: {
+        ...makeReadyScriptTask().workflowSetup,
+        scriptPath: undefined,
+        artifactPath: undefined,
+        actionType: 'create-new-script',
+        primaryEntityLogicalName: undefined,
+        repositoryRoot: 'C:/repos/Acme',
+      },
+      crmDeveloperWorkflow: {
+        ...makeReadyScriptTask().crmDeveloperWorkflow,
+        technicalPlan: {
+          ...makeReadyScriptTask().crmDeveloperWorkflow!.technicalPlan!,
+          target: { ...makeReadyScriptTask().crmDeveloperWorkflow!.technicalPlan!.target, scriptPath: undefined, entityLogicalName: undefined },
+        },
+      },
+    }));
+    const blocker = r.categorizedBlockers.find(b => b.message.includes('Target script/artifact path is not set.'));
+    expect(blocker?.category).toBe('proposal');
+    expect(blocker?.mcpTool).toBe('set_task_developer_target');
+  });
+
+  it('missing target path is hard when neither entity nor repoRoot is known', () => {
+    const r = getDeveloperReadiness(makeReadyScriptTask({
+      workflowSetup: {
+        ...makeReadyScriptTask().workflowSetup,
+        scriptPath: undefined,
+        artifactPath: undefined,
+        actionType: 'create-new-script',
+        primaryEntityLogicalName: undefined,
+        repositoryRoot: undefined,
+      },
+      crmDeveloperWorkflow: {
+        ...makeReadyScriptTask().crmDeveloperWorkflow,
+        technicalPlan: {
+          ...makeReadyScriptTask().crmDeveloperWorkflow!.technicalPlan!,
+          target: { ...makeReadyScriptTask().crmDeveloperWorkflow!.technicalPlan!.target, scriptPath: undefined, entityLogicalName: undefined },
+        },
+      },
+    }));
+    const blocker = r.categorizedBlockers.find(b => b.message.includes('Target script/artifact path is not set.'));
+    expect(blocker?.category).toBe('hard');
+    expect(blocker?.mcpTool).toBeUndefined();
+  });
+
+  it('create-new-script with artifactPath set (full relative path) does not block for missing directory', () => {
+    const r = getDeveloperReadiness(makeReadyScriptTask({
+      workflowSetup: {
+        ...makeReadyScriptTask().workflowSetup,
+        scriptPath: undefined,
+        artifactPath: 'Scripts\\nvr_servicecase_events.js',
+        actionType: 'create-new-script',
+        desiredScriptFile: undefined,
+      },
+      crmDeveloperWorkflow: {
+        ...makeReadyScriptTask().crmDeveloperWorkflow,
+        technicalPlan: {
+          ...makeReadyScriptTask().crmDeveloperWorkflow!.technicalPlan!,
+          target: { ...makeReadyScriptTask().crmDeveloperWorkflow!.technicalPlan!.target, scriptPath: undefined },
+        },
+      },
+    }));
+    expect(r.blockers.some(b => b.includes('directory and file name'))).toBe(false);
+  });
 });
 
 describe('getDeveloperReadiness — actionType: update-existing-script', () => {

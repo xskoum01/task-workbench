@@ -7684,10 +7684,20 @@ fn task_mcp_execute_tool(app: &tauri::AppHandle, tool_name: &str, args: &Value) 
             let customer_id = task["customerId"].as_str()
                 .or_else(|| task["workflowSetup"]["customerId"].as_str())
                 .unwrap_or("");
-            if let Some(dev_defaults) = task_mcp_find_customer(&customers, customer_id)
-                .and_then(|c| task_mcp_customer_dev_defaults(c, &crm_base_dir))
-            {
-                detail["customerDevDefaults"] = dev_defaults;
+            let dev_defaults = task_mcp_find_customer(&customers, customer_id)
+                .and_then(|c| task_mcp_customer_dev_defaults(c, &crm_base_dir));
+            if let Some(ref dd) = dev_defaults {
+                detail["customerDevDefaults"] = dd.clone();
+            }
+
+            // Compute developerWorkPacket.scriptNaming for script/ribbon tasks
+            let work_kind_val = task["crmDeveloperWorkflow"]["detectedWorkKind"].as_str()
+                .or_else(|| task["workflowSetup"]["devTargetKind"].as_str())
+                .unwrap_or("");
+            if work_kind_val == "script" || work_kind_val == "ribbon" {
+                if let Some(naming) = task_mcp_compute_script_naming(task, dev_defaults.as_ref()) {
+                    detail["developerWorkPacket"] = serde_json::json!({ "scriptNaming": naming });
+                }
             }
 
             serde_json::json!({"task": detail})
@@ -7889,6 +7899,12 @@ fn task_mcp_execute_tool(app: &tauri::AppHandle, tool_name: &str, args: &Value) 
             let event_name          = args["eventName"].as_str().map(str::trim).filter(|s| !s.is_empty());
             let event_field_name    = args["eventFieldName"].as_str().map(str::trim).filter(|s| !s.is_empty());
             let desired_script_file = args["desiredScriptFile"].as_str().map(str::trim).filter(|s| !s.is_empty());
+            let naming_source     = args["namingSource"].as_str().map(str::trim).filter(|s| !s.is_empty());
+            let on_load_fn        = args["onLoadFunctionName"].as_str().map(str::trim).filter(|s| !s.is_empty());
+            let on_change_fn      = args["onChangeFunctionName"].as_str().map(str::trim).filter(|s| !s.is_empty());
+            let main_helper          = args["mainHelperSuggestion"].as_str().map(str::trim).filter(|s| !s.is_empty());
+            let absolute_script_path = args["absoluteScriptPath"].as_str().map(str::trim).filter(|s| !s.is_empty());
+            let artifact_path        = args["artifactPath"].as_str().map(str::trim).filter(|s| !s.is_empty());
 
             const VALID_ACTION_TYPES: &[&str] = &[
                 "create-new-script", "update-existing-script",
@@ -7908,6 +7924,12 @@ fn task_mcp_execute_tool(app: &tauri::AppHandle, tool_name: &str, args: &Value) 
                 ("eventName", event_name),
                 ("eventFieldName", event_field_name),
                 ("desiredScriptFile", desired_script_file),
+                ("namingSource", naming_source),
+                ("onLoadFunctionName", on_load_fn),
+                ("onChangeFunctionName", on_change_fn),
+                ("mainHelperSuggestion", main_helper),
+                ("absoluteScriptPath", absolute_script_path),
+                ("artifactPath", artifact_path),
             ] {
                 if let Some(v) = opt_val {
                     if v.len() > 500 { return Err(format!("{name} exceeds 500 characters")); }
@@ -7930,6 +7952,12 @@ fn task_mcp_execute_tool(app: &tauri::AppHandle, tool_name: &str, args: &Value) 
             if let Some(v) = event_name          { task["workflowSetup"]["eventName"]                = serde_json::json!(v); }
             if let Some(v) = event_field_name    { task["workflowSetup"]["eventFieldName"]           = serde_json::json!(v); }
             if let Some(v) = desired_script_file { task["workflowSetup"]["desiredScriptFile"]        = serde_json::json!(v); }
+            if let Some(v) = naming_source       { task["workflowSetup"]["namingSource"]             = serde_json::json!(v); }
+            if let Some(v) = on_load_fn          { task["workflowSetup"]["onLoadFunctionName"]       = serde_json::json!(v); }
+            if let Some(v) = on_change_fn        { task["workflowSetup"]["onChangeFunctionName"]     = serde_json::json!(v); }
+            if let Some(v) = main_helper          { task["workflowSetup"]["mainHelperSuggestion"]     = serde_json::json!(v); }
+            if let Some(v) = absolute_script_path { task["workflowSetup"]["absoluteScriptPath"]      = serde_json::json!(v); }
+            if let Some(v) = artifact_path        { task["workflowSetup"]["artifactPath"]             = serde_json::json!(v); }
             task_mcp_append_audit_note(task, "set_task_developer_target");
             updated = true;
             serde_json::json!({"task": task_mcp_safe_task_summary(task)})
@@ -11999,6 +12027,100 @@ fn task_mcp_customer_dev_defaults(customer: &Value, crm_base_dir: &str) -> Optio
     if let Some(v) = plugin_dir  { obj["pluginProjectPath"]       = serde_json::json!(v); }
     if let Some(v) = js_conv     { obj["jsConventionsSource"]     = serde_json::json!(v); }
     if let Some(v) = plugin_conv { obj["pluginConventionsSource"] = serde_json::json!(v); }
+    Some(obj)
+}
+
+/// Computes a resolved script naming block for a script task.
+/// Uses customer dev defaults (scriptDirectory, repositoryRoot), task workflowSetup,
+/// and technical plan target to derive file name, function names, and paths.
+/// Returns None when the entity logical name cannot be determined.
+fn task_mcp_compute_script_naming(task: &Value, customer_dev_defaults: Option<&Value>) -> Option<Value> {
+    let setup = &task["workflowSetup"];
+    let plan_target = &task["crmDeveloperWorkflow"]["technicalPlan"]["target"];
+
+    let entity_name = setup["primaryEntityLogicalName"].as_str()
+        .or_else(|| plan_target["entityLogicalName"].as_str())
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)?;
+
+    let event_field_name = setup["eventFieldName"].as_str()
+        .or_else(|| plan_target["eventFieldName"].as_str())
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+
+    let scripts_folder_abs = customer_dev_defaults
+        .and_then(|d| d["scriptDirectory"].as_str())
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+
+    let repo_root = customer_dev_defaults
+        .and_then(|d| d["repositoryRoot"].as_str())
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+
+    // Derive relative folder from absolute minus repo root
+    let scripts_folder_rel: Option<String> = scripts_folder_abs.as_deref().and_then(|abs| {
+        if let Some(root) = repo_root.as_deref() {
+            let norm_root = root.trim_end_matches(|c: char| c == '/' || c == '\\');
+            if abs.to_lowercase().starts_with(&norm_root.to_lowercase()) {
+                let rel = &abs[norm_root.len()..];
+                let rel = rel.trim_start_matches(|c: char| c == '/' || c == '\\');
+                if !rel.is_empty() {
+                    return Some(rel.to_string());
+                }
+            }
+        }
+        // Fallback: last path component
+        abs.replace('\\', "/").split('/').filter(|s| !s.is_empty()).last().map(str::to_string)
+    });
+
+    let uses_backslash = scripts_folder_abs.as_deref().map(|s| s.contains('\\')).unwrap_or(false)
+        || repo_root.as_deref().map(|s| s.contains('\\')).unwrap_or(false);
+    let sep = if uses_backslash { "\\" } else { "/" };
+
+    let naming_source = setup["namingSource"].as_str()
+        .filter(|s| !s.is_empty())
+        .unwrap_or("Scripts_Naming")
+        .to_string();
+
+    let desired_script_file = setup["desiredScriptFile"].as_str()
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("{}_events.js", entity_name));
+
+    let script_path = scripts_folder_rel.as_deref()
+        .map(|rel| format!("{}{}{}", rel, sep, desired_script_file));
+
+    let absolute_script_path = scripts_folder_abs.as_deref()
+        .map(|abs| format!("{}{}{}", abs, sep, desired_script_file));
+
+    let on_load_fn = setup["onLoadFunctionName"].as_str()
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("{}_OnLoad", entity_name));
+
+    let on_change_fn = setup["onChangeFunctionName"].as_str()
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .or_else(|| event_field_name.as_deref().map(|f| format!("{}_OnChange", f)));
+
+    let main_helper = setup["mainHelperSuggestion"].as_str()
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+
+    let mut obj = serde_json::json!({
+        "namingSource": naming_source,
+        "entityLogicalName": entity_name,
+        "desiredScriptFile": desired_script_file,
+        "onLoadFunctionName": on_load_fn,
+        "helperNamingRule": "descriptive camelCase, no nvr_ prefix by default",
+    });
+    if let Some(v) = scripts_folder_abs   { obj["scriptsFolderAbsolute"]  = serde_json::json!(v); }
+    if let Some(v) = scripts_folder_rel   { obj["scriptsFolderRelative"]  = serde_json::json!(v); }
+    if let Some(v) = script_path          { obj["scriptPath"]             = serde_json::json!(v); }
+    if let Some(v) = absolute_script_path { obj["absoluteScriptPath"]     = serde_json::json!(v); }
+    if let Some(v) = on_change_fn         { obj["onChangeFunctionName"]   = serde_json::json!(v); }
+    if let Some(v) = main_helper          { obj["mainHelperSuggestion"]   = serde_json::json!(v); }
     Some(obj)
 }
 

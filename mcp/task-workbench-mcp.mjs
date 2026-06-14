@@ -59,6 +59,17 @@ const TASK_TEMPLATES = [
       eventName: 'onChange',
       eventFieldName: 'nvr_assetid',
     },
+    scriptNaming: {
+      namingSource: 'Scripts_Naming',
+      scriptsFolderRelative: 'Scripts',
+      desiredScriptFile: 'nvr_servicecase_events.js',
+      onLoadFunctionName: 'nvr_servicecase_OnLoad',
+      onChangeFunctionName: 'nvr_assetid_OnChange',
+      mainHelperSuggestion: 'prefillServiceCaseFromAsset',
+    },
+    sourceEntity: 'nvr_customerasset',
+    sourceFields: ['nvr_customerid', 'nvr_contactid', 'nvr_isunderwarranty', 'nvr_statuscustom'],
+    targetFields: ['nvr_customerid', 'nvr_contactid', 'nvr_iswarrantycase'],
     notes: 'onChange on nvr_assetid. Source entity: nvr_customerasset. Copy nvr_customerid, nvr_contactid, nvr_isunderwarranty, nvr_statuscustom → nvr_servicecase fields nvr_customerid, nvr_contactid, nvr_iswarrantycase. Solution: NVRTrainingServiceHubCore. App: nvr_trainingservicehub.',
   },
   {
@@ -396,7 +407,10 @@ const TOOL_DEFINITIONS = [
         taskId:                     { type: 'string' },
         repositoryRoot:             { type: 'string' },
         selectedPluginProject:      { type: 'string' },
-        selectedScriptTarget:       { type: 'string' },
+        selectedScriptTarget: {
+          type: 'string',
+          description: 'Target directory or script folder path for script tasks (e.g. "Scripts"). Saved to workflowSetup.scriptPath. For create-new-script, set this to the directory where the new file will be created (from customer scriptFolder default or "Scripts/").',
+        },
         primaryEntityLogicalName:   {
           type: 'string',
           description: 'Primary Dataverse entity logical name (e.g. "account", "nvr_servicecase"). Saved to workflowSetup.primaryEntityLogicalName.',
@@ -412,13 +426,37 @@ const TOOL_DEFINITIONS = [
         },
         eventFieldName: {
           type: 'string',
-          description: 'Field/column logical name that triggers the event (for onChange events). Mirrors plan.target.eventFieldName.',
+          description: 'Field/column logical name that triggers the event (for onChange events, e.g. "nvr_assetid"). Mirrors plan.target.eventFieldName.',
         },
         desiredScriptFile: {
           type: 'string',
-          description: 'Desired output file name for a new script (e.g. "prefillServiceCase.js"). Used when action is create-new-script.',
+          description: 'Desired output file name for a new script following project naming convention (e.g. "nvr_servicecase_events.js" for entity nvr_servicecase). Used when action is create-new-script.',
         },
-        customerId:                 { type: 'string' },
+        customerId: { type: 'string' },
+        namingSource: {
+          type: 'string',
+          description: 'Naming convention source identifier (e.g. "Scripts_Naming"). Set when derived from a template.',
+        },
+        onLoadFunctionName: {
+          type: 'string',
+          description: 'OnLoad handler function name derived from Scripts_Naming (e.g. "nvr_servicecase_OnLoad").',
+        },
+        onChangeFunctionName: {
+          type: 'string',
+          description: 'OnChange handler function name derived from Scripts_Naming (e.g. "nvr_assetid_OnChange").',
+        },
+        mainHelperSuggestion: {
+          type: 'string',
+          description: 'Suggested main helper function name (e.g. "prefillServiceCaseFromAsset"). Descriptive camelCase, no nvr_ prefix.',
+        },
+        absoluteScriptPath: {
+          type: 'string',
+          description: 'Absolute path of the target script file computed from repositoryRoot + scriptFolder + desiredScriptFile (e.g. "C:\\\\Users\\\\...\\\\Scripts\\\\nvr_servicecase_events.js"). Persisted when known before file creation.',
+        },
+        artifactPath: {
+          type: 'string',
+          description: 'Full relative path of the target script file (selectedScriptTarget + desiredScriptFile, e.g. "Scripts\\\\nvr_servicecase_events.js"). Saved to workflowSetup.artifactPath. For create-new-script, set this to the combined folder + file path.',
+        },
       },
       required: ['taskId'],
       additionalProperties: false,
@@ -1035,6 +1073,101 @@ function computeCustomerDevDefaults(customer, crmBaseDir) {
   return result;
 }
 
+/**
+ * Compute a resolved script naming block from customer dev defaults, task setup, and a matched template.
+ * Returns null when the entity logical name cannot be determined.
+ */
+function computeScriptNaming(template, customerDevDefaults, taskSetup) {
+  const entityName =
+    (taskSetup && taskSetup.primaryEntityLogicalName) ||
+    (template && template.scriptTarget && template.scriptTarget.entityLogicalName) ||
+    (template && template.targetEntity) ||
+    null;
+  if (!entityName) return null;
+
+  const eventFieldName =
+    (taskSetup && taskSetup.eventFieldName) ||
+    (template && template.scriptTarget && template.scriptTarget.eventFieldName) ||
+    null;
+
+  let scriptsFolderAbsolute = (customerDevDefaults && customerDevDefaults.scriptDirectory) || null;
+  const repoRoot = (customerDevDefaults && customerDevDefaults.repositoryRoot) || null;
+
+  // Derive relative folder from absolute path minus repositoryRoot prefix
+  let scriptsFolderRelative =
+    (template && template.scriptNaming && template.scriptNaming.scriptsFolderRelative) || null;
+  if (!scriptsFolderRelative && scriptsFolderAbsolute) {
+    if (repoRoot) {
+      const normRepo = repoRoot.replace(/[/\\]+$/, '');
+      if (scriptsFolderAbsolute.toLowerCase().startsWith(normRepo.toLowerCase())) {
+        const rel = scriptsFolderAbsolute.slice(normRepo.length).replace(/^[/\\]+/, '');
+        if (rel) scriptsFolderRelative = rel;
+      }
+    }
+    if (!scriptsFolderRelative) {
+      scriptsFolderRelative =
+        scriptsFolderAbsolute.replace(/\\/g, '/').split('/').filter(Boolean).pop() || 'Scripts';
+    }
+  }
+
+  // Use backslash when any path uses backslash (Windows convention)
+  const sep =
+    (scriptsFolderAbsolute && scriptsFolderAbsolute.includes('\\')) ||
+    (repoRoot && repoRoot.includes('\\'))
+      ? '\\'
+      : '/';
+
+  // Derive absolute from repositoryRoot + relative folder when scriptDirectory not explicitly set
+  if (!scriptsFolderAbsolute && repoRoot && scriptsFolderRelative) {
+    scriptsFolderAbsolute = `${repoRoot}${sep}${scriptsFolderRelative}`;
+  }
+
+  const desiredScriptFile =
+    (taskSetup && taskSetup.desiredScriptFile) ||
+    (template && template.scriptNaming && template.scriptNaming.desiredScriptFile) ||
+    `${entityName}_events.js`;
+
+  const scriptPath = scriptsFolderRelative ? `${scriptsFolderRelative}${sep}${desiredScriptFile}` : null;
+  const absoluteScriptPath = scriptsFolderAbsolute
+    ? `${scriptsFolderAbsolute}${sep}${desiredScriptFile}`
+    : null;
+
+  const onLoadFunctionName =
+    (taskSetup && taskSetup.onLoadFunctionName) ||
+    (template && template.scriptNaming && template.scriptNaming.onLoadFunctionName) ||
+    `${entityName}_OnLoad`;
+
+  const onChangeFunctionName =
+    (taskSetup && taskSetup.onChangeFunctionName) ||
+    (template && template.scriptNaming && template.scriptNaming.onChangeFunctionName) ||
+    (eventFieldName ? `${eventFieldName}_OnChange` : null);
+
+  const mainHelperSuggestion =
+    (taskSetup && taskSetup.mainHelperSuggestion) ||
+    (template && template.scriptNaming && template.scriptNaming.mainHelperSuggestion) ||
+    null;
+
+  const namingSource =
+    (taskSetup && taskSetup.namingSource) ||
+    (template && template.scriptNaming && template.scriptNaming.namingSource) ||
+    'Scripts_Naming';
+
+  const result = {
+    namingSource,
+    entityLogicalName: entityName,
+    desiredScriptFile,
+    onLoadFunctionName,
+    helperNamingRule: 'descriptive camelCase, no nvr_ prefix by default',
+  };
+  if (scriptsFolderAbsolute) result.scriptsFolderAbsolute = scriptsFolderAbsolute;
+  if (scriptsFolderRelative) result.scriptsFolderRelative = scriptsFolderRelative;
+  if (scriptPath) result.scriptPath = scriptPath;
+  if (absoluteScriptPath) result.absoluteScriptPath = absoluteScriptPath;
+  if (onChangeFunctionName) result.onChangeFunctionName = onChangeFunctionName;
+  if (mainHelperSuggestion) result.mainHelperSuggestion = mainHelperSuggestion;
+  return result;
+}
+
 async function loadTasks() {
   const tasksFile = await resolveTasksFile();
   if (!tasksFile) {
@@ -1182,6 +1315,11 @@ function sanitizeWorkflowSetup(setup) {
     eventName: setup.eventName,
     eventFieldName: setup.eventFieldName,
     desiredScriptFile: setup.desiredScriptFile,
+    namingSource: setup.namingSource,
+    onLoadFunctionName: setup.onLoadFunctionName,
+    onChangeFunctionName: setup.onChangeFunctionName,
+    mainHelperSuggestion: setup.mainHelperSuggestion,
+    absoluteScriptPath: setup.absoluteScriptPath,
   };
 }
 
@@ -1675,13 +1813,22 @@ async function callToolFallback(name, args = {}) {
       if (!task) return { ...common, error: `Task not found: ${args.id}` };
       const detail = safeTaskDetail(task);
       detail.implementationReadiness = computeImplementationReadiness(task);
+      let devDefaults = null;
       const customerId = task.customerId || task.workflowSetup?.customerId;
       if (customerId) {
         const [customers, settings] = await Promise.all([loadCustomers(), loadSettings()]);
         const customer = customers.find((c) => c.id === customerId);
         const crmBaseDir = settings?.crmBaseDirectory ?? '';
-        const devDefaults = computeCustomerDevDefaults(customer, crmBaseDir);
+        devDefaults = computeCustomerDevDefaults(customer, crmBaseDir);
         if (devDefaults) detail.customerDevDefaults = devDefaults;
+      }
+      // Compute developerWorkPacket.scriptNaming for script/ribbon tasks
+      const workKindVal =
+        task.crmDeveloperWorkflow?.detectedWorkKind || task.workflowSetup?.devTargetKind;
+      if (workKindVal === 'script' || workKindVal === 'ribbon') {
+        const template = matchTaskTemplate(task.title || '');
+        const scriptNaming = computeScriptNaming(template, devDefaults, task.workflowSetup);
+        if (scriptNaming) detail.developerWorkPacket = { scriptNaming };
       }
       return { ...common, task: detail };
     }

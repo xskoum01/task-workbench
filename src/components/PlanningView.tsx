@@ -188,7 +188,7 @@ interface PlanningTaskRowProps {
 }
 
 function PlanningTaskRow({ task, selected, onSelect }: PlanningTaskRowProps) {
-  const { getCustomerById, updateTask } = useApp();
+  const { getCustomerById, updateTask, settings } = useApp();
   const customer = getCustomerById(task.customerId);
 
   // Use stored planning data, or compute on the fly as fallback
@@ -227,7 +227,7 @@ function PlanningTaskRow({ task, selected, onSelect }: PlanningTaskRowProps) {
       <div className="planning-task-main">
         <div className="planning-task-title-row">
           <div className="planning-task-title">{task.title}</div>
-          <CopyAiWorkflowPromptButton task={task} />
+          <CopyAiWorkflowPromptButton task={task} customer={customer} crmBaseDirectory={settings?.crmBaseDirectory} />
         </div>
 
         <div className="planning-task-meta">

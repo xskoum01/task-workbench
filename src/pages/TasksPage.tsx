@@ -45,7 +45,7 @@ const STATUS_FILTERS: { value: TaskStatus | 'all'; label: string }[] = [
 export default function TasksPage() {
   const {
     tasks, getCustomerById, updateTask, deleteTask, reloadTasks,
-    taskLoadFailed, error, taskStorageStatus, restoreTasksFromLatestBackup,
+    taskLoadFailed, error, taskStorageStatus, restoreTasksFromLatestBackup, settings,
   } = useApp();
 
   const [viewMode, setViewMode]           = useState<ViewMode>('planning');
@@ -310,7 +310,7 @@ export default function TasksPage() {
                     <div className="task-list-item-main">
                       <div className="task-list-item-title-row">
                         <div className="task-list-item-title">{task.title}</div>
-                        <CopyAiWorkflowPromptButton task={task} />
+                        <CopyAiWorkflowPromptButton task={task} customer={customer} crmBaseDirectory={settings?.crmBaseDirectory} />
                       </div>
                       <div className="task-list-item-meta">
                         <SourceBadge source={task.source} />

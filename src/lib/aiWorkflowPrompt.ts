@@ -23,9 +23,217 @@ function buildCustomerDevDefaultsLines(customer: Customer | undefined): string[]
   return lines;
 }
 
-function buildScriptContextLines(task: Task, customer?: Customer): string[] | null {
-  const workKind      = task.crmDeveloperWorkflow?.detectedWorkKind;
-  const devTargetKind = task.workflowSetup?.devTargetKind;
+// ── Prompt-time template preview ────────────────────────────────────────────
+
+interface PromptTemplate {
+  id: string;
+  titlePattern: string;
+  workKind: 'script' | 'plugin';
+  actionType?: 'create-new-script' | 'update-existing-script';
+  scriptTarget?: {
+    entityLogicalName: string;
+    eventName?: string;
+    eventFieldName?: string;
+  };
+  scriptNaming?: {
+    namingSource: string;
+    scriptsFolderRelative: string;
+    desiredScriptFile: string;
+    onLoadFunctionName: string;
+    onChangeFunctionName?: string;
+    mainHelperSuggestion?: string;
+  };
+}
+
+const PROMPT_TEMPLATES: PromptTemplate[] = [
+  {
+    id: 'nvr-training-sh-script-prefill',
+    titlePattern: 'Script: Předvyplnění servisního požadavku',
+    workKind: 'script',
+    actionType: 'create-new-script',
+    scriptTarget: {
+      entityLogicalName: 'nvr_servicecase',
+      eventName: 'onChange',
+      eventFieldName: 'nvr_assetid',
+    },
+    scriptNaming: {
+      namingSource: 'Scripts_Naming',
+      scriptsFolderRelative: 'Scripts',
+      desiredScriptFile: 'nvr_servicecase_events.js',
+      onLoadFunctionName: 'nvr_servicecase_OnLoad',
+      onChangeFunctionName: 'nvr_assetid_OnChange',
+      mainHelperSuggestion: 'prefillServiceCaseFromAsset',
+    },
+  },
+  {
+    id: 'nvr-training-sh-plugin-service-order',
+    titlePattern: 'Plugin: Výpočet částek',
+    workKind: 'plugin',
+  },
+];
+
+function matchPromptTemplate(title: string, originalMessage?: string): PromptTemplate | null {
+  if (!title) return null;
+  const haystack = (title + ' ' + (originalMessage ?? '')).toLowerCase();
+  return PROMPT_TEMPLATES.find(t => haystack.includes(t.titlePattern.toLowerCase())) ?? null;
+}
+
+// ── Script naming contract ────────────────────────────────────────────────────
+
+interface ScriptNamingContract {
+  namingSource: string;
+  scriptsFolderAbsolute: string | null;
+  scriptsFolderRelative: string | null;
+  entityLogicalName: string;
+  desiredScriptFile: string;
+  scriptPath: string | null;
+  absoluteScriptPath: string | null;
+  repositoryRoot: string | null;
+  actionType: string | null;
+  eventName: string | null;
+  eventFieldName: string | null;
+  onLoadFunctionName: string;
+  onChangeFunctionName: string | null;
+  helperNamingRule: string;
+  mainHelperSuggestion: string | null;
+}
+
+function deriveRelativeFolder(absoluteFolder: string, repositoryRoot?: string): string | null {
+  if (repositoryRoot) {
+    const normRepo = repositoryRoot.replace(/[/\\]+$/, '');
+    if (absoluteFolder.toLowerCase().startsWith(normRepo.toLowerCase())) {
+      const rel = absoluteFolder.slice(normRepo.length).replace(/^[/\\]+/, '');
+      if (rel) return rel;
+    }
+  }
+  return absoluteFolder.replace(/\\/g, '/').split('/').filter(Boolean).pop() ?? null;
+}
+
+function normalizeToSep(p: string, sep: '\\' | '/'): string {
+  return sep === '\\' ? p.replace(/\//g, '\\') : p.replace(/\\/g, '/');
+}
+
+function isWindowsPath(p: string | undefined): boolean {
+  if (!p) return false;
+  return p.includes('\\') || /^[A-Za-z]:/.test(p);
+}
+
+function computeScriptNamingContract(
+  task: Task,
+  customer?: Customer,
+  templatePreview?: PromptTemplate | null,
+): ScriptNamingContract | null {
+  const setup      = task.workflowSetup;
+  const planTarget = task.crmDeveloperWorkflow?.technicalPlan?.target;
+
+  const entityName = setup?.primaryEntityLogicalName
+    ?? planTarget?.entityLogicalName
+    ?? templatePreview?.scriptTarget?.entityLogicalName;
+  if (!entityName) return null;
+
+  const eventFieldName = setup?.eventFieldName
+    ?? planTarget?.eventFieldName
+    ?? templatePreview?.scriptTarget?.eventFieldName;
+
+  const rawRepoRoot = setup?.repositoryRoot ?? getCustomerDefaultRepoRoot(customer) ?? undefined;
+  const sep: '\\' | '/' = (isWindowsPath(customer?.scriptFolder) || isWindowsPath(rawRepoRoot)) ? '\\' : '/';
+
+  const normCustomerScriptFolder = customer?.scriptFolder ? normalizeToSep(customer.scriptFolder, sep) : null;
+  const normRepoRoot             = rawRepoRoot ? normalizeToSep(rawRepoRoot, sep) : undefined;
+
+  const scriptsFolderRelativeFromTemplate = templatePreview?.scriptNaming?.scriptsFolderRelative ?? null;
+
+  const scriptsFolderAbsolute: string | null = normCustomerScriptFolder
+    ?? (normRepoRoot && scriptsFolderRelativeFromTemplate
+      ? `${normRepoRoot}${sep}${scriptsFolderRelativeFromTemplate}`
+      : null);
+
+  const scriptsFolderRelative: string | null = scriptsFolderAbsolute
+    ? deriveRelativeFolder(scriptsFolderAbsolute, normRepoRoot)
+    : scriptsFolderRelativeFromTemplate;
+
+  const desiredScriptFile = setup?.desiredScriptFile
+    ?? templatePreview?.scriptNaming?.desiredScriptFile
+    ?? `${entityName}_events.js`;
+  const scriptPath         = scriptsFolderRelative ? `${scriptsFolderRelative}${sep}${desiredScriptFile}` : null;
+  const absoluteScriptPath = scriptsFolderAbsolute ? `${scriptsFolderAbsolute}${sep}${desiredScriptFile}` : null;
+
+  const onLoadFunctionName = setup?.onLoadFunctionName
+    ?? templatePreview?.scriptNaming?.onLoadFunctionName
+    ?? `${entityName}_OnLoad`;
+  const onChangeFunctionName = setup?.onChangeFunctionName
+    ?? templatePreview?.scriptNaming?.onChangeFunctionName
+    ?? (eventFieldName ? `${eventFieldName}_OnChange` : null);
+
+  return {
+    namingSource:         setup?.namingSource ?? templatePreview?.scriptNaming?.namingSource ?? 'Scripts_Naming',
+    scriptsFolderAbsolute,
+    scriptsFolderRelative,
+    entityLogicalName:    entityName,
+    desiredScriptFile,
+    scriptPath,
+    absoluteScriptPath,
+    repositoryRoot:       normRepoRoot ?? null,
+    actionType:           setup?.actionType ?? templatePreview?.actionType ?? null,
+    eventName:            planTarget?.eventName ?? setup?.eventName ?? templatePreview?.scriptTarget?.eventName ?? null,
+    eventFieldName:       eventFieldName ?? null,
+    onLoadFunctionName,
+    onChangeFunctionName,
+    helperNamingRule:     'descriptive camelCase, no nvr_ prefix by default',
+    mainHelperSuggestion: setup?.mainHelperSuggestion
+      ?? templatePreview?.scriptNaming?.mainHelperSuggestion
+      ?? null,
+  };
+}
+
+function buildScriptNamingContractLines(contract: ScriptNamingContract, pendingSetup: boolean): string[] {
+  const lines: string[] = [
+    '',
+    `CRM script naming contract (${contract.namingSource}):`,
+    `* Naming source: ${contract.namingSource}`,
+  ];
+  if (contract.repositoryRoot)         lines.push(`* Repository root: ${contract.repositoryRoot}`);
+  if (contract.scriptsFolderAbsolute)  lines.push(`* Scripts folder: ${contract.scriptsFolderAbsolute}`);
+  if (contract.scriptsFolderRelative)  lines.push(`* Relative target directory: ${contract.scriptsFolderRelative}`);
+  lines.push(`* Entity logical name: ${contract.entityLogicalName}`);
+  lines.push(`* Derived file name: ${contract.desiredScriptFile}`);
+  if (contract.scriptPath)        lines.push(`* Derived relative target file: ${contract.scriptPath}`);
+  if (contract.absoluteScriptPath) lines.push(`* Derived absolute target file: ${contract.absoluteScriptPath}`);
+  lines.push(`* OnLoad handler: ${contract.onLoadFunctionName}`);
+  if (contract.onChangeFunctionName) lines.push(`* OnChange handler: ${contract.onChangeFunctionName}`);
+  lines.push(`* Helper functions: ${contract.helperNamingRule}`);
+  if (contract.mainHelperSuggestion) lines.push(`* Main helper suggestion: ${contract.mainHelperSuggestion}`);
+
+  if (pendingSetup) {
+    lines.push('', 'Save this derived target via set_task_developer_target with:');
+    if (contract.repositoryRoot)        lines.push(`* repositoryRoot: ${contract.repositoryRoot}`);
+    if (contract.scriptsFolderRelative) lines.push(`* selectedScriptTarget: ${contract.scriptsFolderRelative}`);
+    lines.push(`* desiredScriptFile: ${contract.desiredScriptFile}`);
+    if (contract.scriptPath)            lines.push(`* artifactPath: ${contract.scriptPath}`);
+    if (contract.absoluteScriptPath)    lines.push(`* absoluteScriptPath: ${contract.absoluteScriptPath}`);
+    if (contract.actionType)            lines.push(`* actionType: ${contract.actionType}`);
+    lines.push(`* primaryEntityLogicalName: ${contract.entityLogicalName}`);
+    if (contract.eventName)             lines.push(`* eventName: ${contract.eventName}`);
+    if (contract.eventFieldName)        lines.push(`* eventFieldName: ${contract.eventFieldName}`);
+    lines.push(`* namingSource: ${contract.namingSource}`);
+    lines.push(`* onLoadFunctionName: ${contract.onLoadFunctionName}`);
+    if (contract.onChangeFunctionName)  lines.push(`* onChangeFunctionName: ${contract.onChangeFunctionName}`);
+    if (contract.mainHelperSuggestion)  lines.push(`* mainHelperSuggestion: ${contract.mainHelperSuggestion}`);
+    lines.push('', 'Do not ask the user what to do with this target. Do not ask for the task ID. Reload get_task_full_context after saving.');
+  }
+
+  return lines;
+}
+
+// ── Script context section ────────────────────────────────────────────────────
+
+function buildScriptContextLines(
+  task: Task,
+  customer?: Customer,
+  templatePreview?: PromptTemplate | null,
+): string[] | null {
+  const workKind      = task.crmDeveloperWorkflow?.detectedWorkKind ?? templatePreview?.workKind;
+  const devTargetKind = task.workflowSetup?.devTargetKind ?? templatePreview?.workKind;
   const isScriptTask  = devTargetKind === 'script' || workKind === 'script' || workKind === 'ribbon';
   if (!isScriptTask) return null;
 
@@ -34,24 +242,42 @@ function buildScriptContextLines(task: Task, customer?: Customer): string[] | nu
 
   const lines: string[] = ['', 'Script target context:'];
 
-  if (setup?.actionType) lines.push(`* Action type: ${setup.actionType}`);
+  const actionType = setup?.actionType ?? templatePreview?.actionType;
+  if (actionType) lines.push(`* Action type: ${actionType}`);
 
-  const targetFile = setup?.artifactPath ?? setup?.scriptPath ?? target?.scriptPath;
-  if (targetFile)  lines.push(`* Target file: ${targetFile}`);
-  else             lines.push('* Target file: NOT SET — do not guess or create a file path');
+  const targetFile  = setup?.artifactPath ?? setup?.scriptPath ?? target?.scriptPath;
+  const isCreateNew = actionType === 'create-new-script';
 
-  if (setup?.actionType === 'create-new-script' && setup.desiredScriptFile) {
+  // Compute preview contract early so we can show a concrete path even before it is persisted
+  const previewContract    = (isCreateNew && !targetFile)
+    ? computeScriptNamingContract(task, customer, templatePreview)
+    : null;
+  const derivedPreviewPath = previewContract?.scriptPath ?? null;
+
+  if (targetFile) {
+    lines.push(`* Target file: ${targetFile}`);
+  } else if (isCreateNew && derivedPreviewPath) {
+    lines.push(`* Target file preview: ${derivedPreviewPath}`);
+    lines.push(`* Persistence state: not yet saved to task setup`);
+    lines.push(`* Required action: save this target via set_task_developer_target`);
+  } else if (isCreateNew) {
+    lines.push('* Target file: NOT SET — derive from entity name and naming convention below, then save via set_task_developer_target');
+  } else {
+    lines.push('* Target file: NOT SET — do not guess or create a file path');
+  }
+
+  if (isCreateNew && setup?.desiredScriptFile) {
     lines.push(`* Desired file name: ${setup.desiredScriptFile}`);
   }
 
-  const entity = setup?.primaryEntityLogicalName ?? target?.entityLogicalName;
+  const entity = setup?.primaryEntityLogicalName ?? target?.entityLogicalName ?? templatePreview?.scriptTarget?.entityLogicalName;
   if (entity) lines.push(`* Table (logical name): ${entity}`);
 
   if (target?.webResourceName) lines.push(`* Web resource name: ${target.webResourceName}`);
   if (target?.formName)        lines.push(`* Form name: ${target.formName}`);
 
-  const eventName      = target?.eventName      ?? setup?.eventName;
-  const eventFieldName = target?.eventFieldName ?? setup?.eventFieldName;
+  const eventName      = target?.eventName      ?? setup?.eventName      ?? templatePreview?.scriptTarget?.eventName;
+  const eventFieldName = target?.eventFieldName ?? setup?.eventFieldName ?? templatePreview?.scriptTarget?.eventFieldName;
   if (eventName)       lines.push(`* Event: ${eventName}`);
   if (eventFieldName)  lines.push(`* Event field (onChange): ${eventFieldName}`);
 
@@ -65,6 +291,27 @@ function buildScriptContextLines(task: Task, customer?: Customer): string[] | nu
 
   if (setup?.scriptFormRegistration === 'manual-later') {
     lines.push('* Form/event registration: will be done manually (not part of this implementation)');
+  }
+
+  // For create-new-script tasks without a resolved target: show the concrete naming contract
+  // when the entity name is known (from task, plan, or template preview); fall back to generic conventions otherwise.
+  if (isCreateNew && !targetFile) {
+    const contract = previewContract; // already computed above to avoid double work
+    if (contract) {
+      lines.push(...buildScriptNamingContractLines(contract, true));
+    } else {
+      lines.push(
+        '',
+        'CRM JS script naming conventions:',
+        '* File name format: <entityLogicalName>_events.js (Scripts_Naming convention — do not add extra nvr_ prefix if entity already has it, e.g. nvr_servicecase → nvr_servicecase_events.js)',
+        '* OnLoad handler: <entityLogicalName>_OnLoad',
+        '* OnChange handler: <fieldLogicalName>_OnChange',
+        '* Helper functions: descriptive camelCase without namespace prefixes',
+        '* Script directory: customer scriptFolder (see Customer developer defaults) or Scripts/',
+        '* Do not invent web resource subfolder paths not present in customer defaults.',
+        '* Do not set file names or web resource names to placeholder or undetermined values.',
+      );
+    }
   }
 
   return lines;
@@ -96,7 +343,7 @@ function buildSetupBlockerSections(categorizedBlockers: ReadinessBlocker[]): str
   }
 
   if (proposals.length > 0) {
-    lines.push('', 'Proposal/draft actions (create draft via MCP tool, then pause for approval before file edits):');
+    lines.push('', 'Proposal/draft actions (call the MCP tool immediately; for convention-derived setup metadata such as script file name, persist and continue — user approval is required only before code file edits, not before saving task setup metadata):');
     for (const b of proposals) {
       const tool = b.mcpTool ? ` → call \`${b.mcpTool}\`` : '';
       lines.push(`* ${b.message}${tool}`);
@@ -149,10 +396,22 @@ export function buildAiWorkflowPrompt(task: Task, customer?: Customer): string {
   if (workKind)    lines.push(`* Work classification: ${workKind}`);
   if (customerId)  lines.push(`* Customer/environment: ${customerId}`);
 
+  lines.push(
+    '',
+    'Current task identity and MCP writes:',
+    `* The current task ID is the Task ID shown in this prompt.`,
+    '* Use this ID for all Task Workbench MCP read/write calls.',
+    '* Do not ask the user for the task ID again unless the prompt does not contain one and get_task_full_context cannot be loaded.',
+    '* When a safe setup value is derived from template, customer defaults, naming conventions, or explicit assignment, persist it immediately with the appropriate MCP write tool, reload get_task_full_context, and continue.',
+    '* Do not ask the user what to do with a complete developer target. Save it to the current task using set_task_developer_target, then reload get_task_full_context.',
+  );
+
+  const templatePreview = matchPromptTemplate(task.title ?? '', task.originalMessage);
+
   const customerDefaultsLines = buildCustomerDevDefaultsLines(customer);
   if (customerDefaultsLines.length) lines.push(...customerDefaultsLines);
 
-  const scriptContext = buildScriptContextLines(task, customer);
+  const scriptContext = buildScriptContextLines(task, customer, templatePreview);
   if (scriptContext) lines.push(...scriptContext);
 
   if (!readiness.isReady) {
@@ -176,18 +435,16 @@ export function buildAiWorkflowPrompt(task: Task, customer?: Customer): string {
       '',
       `Recommended next step: ${readiness.recommendedNextStep}`,
       '',
-      'Auto-setup orchestration loop:',
-      'Perform up to 8 safe Task Workbench-only setup actions in sequence. After each action, reload `get_task_full_context` and re-evaluate readiness. Continue until you reach an approval gate, a hard blocker, or all issues are resolved. Stop only on hard blockers, approval gates, MCP failure, file writes, external writes, or if the same blocker repeats twice.',
+      'Setup orchestration (up to 8 safe Task Workbench-only actions):',
+      'When a complete developer target can be derived from customer defaults, task template, and naming convention, save it immediately via set_task_developer_target, reload get_task_full_context, and continue.',
       '',
-      'Safe auto-setup loop:',
-      'When a readiness issue can be resolved by updating Task Workbench metadata only, and the correct value is explicit from the task title, original message, or current setup — resolve it immediately using the appropriate Task Workbench MCP write tool. After each update, reload the task with `get_task_full_context` and continue evaluating readiness. You may perform up to 8 safe Task Workbench-only setup updates in this run. Stop if the same blocker repeats twice.',
-      '',
-      'Safe Task Workbench-only updates (no user input needed when the value is explicit):',
+      'Allowed auto-setup actions (no user input needed when the value is explicit):',
       '* setting task mode to Developer when the task is clearly a development task',
       '* setting work classification to script/plugin when explicit from the task text',
       ...(customerDefaultsLines.length
         ? ['* applying customer/environment developer defaults (repositoryRoot, scriptFolder, pluginFolder) via set_task_developer_target when listed in the Customer developer defaults section above']
         : []),
+      '* for create-new-script tasks: when entity name is known from template, task text, or customer defaults, derive the script directory and file name using Scripts_Naming (<fullEntityLogicalName>_events.js — do not double the nvr_ prefix if entity already has it, e.g. nvr_servicecase → nvr_servicecase_events.js; do not strip the prefix; do not use dot-notation namespace patterns for helper functions), then call set_task_developer_target with repositoryRoot, selectedScriptTarget, desiredScriptFile, artifactPath, absoluteScriptPath, actionType, primaryEntityLogicalName, eventName, eventFieldName, namingSource, onLoadFunctionName, onChangeFunctionName, mainHelperSuggestion — do not stop or ask the user before saving this metadata',
       '* updating next step',
       '* saving analysis or summary when it does not require guessing',
       '* saving a technical plan draft when enough context exists — do not begin implementation before plan approval',
@@ -198,15 +455,15 @@ export function buildAiWorkflowPrompt(task: Task, customer?: Customer): string {
       'Setup rules:',
       '',
       `1. Load the full task context using \`get_task_full_context\` with id "${task.id}". The response includes a \`customerDevDefaults\` section when the customer has configured developer defaults.`,
-      `2. Call \`get_task_templates\` with taskId "${task.id}". If matchedTemplate is returned, apply its workKind, actionType, targetEntity, and scriptTarget/pluginTarget values via \`set_task_work_classification\`, \`set_task_developer_target\`, or \`save_technical_plan\` BEFORE treating those fields as missing blockers. Reload \`get_task_full_context\` after applying template values.`,
+      `2. Call \`get_task_templates\` with taskId "${task.id}". If matchedTemplate is returned, apply its workKind, actionType, targetEntity, and scriptTarget/pluginTarget values via \`set_task_work_classification\` (for workKind/actionType) and \`set_task_developer_target\` (for targetEntity/scriptTarget/pluginTarget) BEFORE treating those fields as missing blockers. Reload \`get_task_full_context\` after applying template values.`,
       '3. If repository root is not set but \`customerDevDefaults.repositoryRoot\` is present in the \`get_task_full_context\` response — call \`set_task_developer_target\` with that value immediately, reload \`get_task_full_context\`, and continue. Do NOT ask the user for repository root when a customer default is available.',
       '4. Do not create or modify any files until the task is implementation-ready and the workflow phase allows it.',
       '5. If work kind is missing, "unknown", or inconsistent with the task assignment — save it via `set_task_work_classification`, reload `get_task_full_context`, and continue.',
       '6. If target artifact path is missing for update-existing-script — do not guess a file name or directory. Update next step via `set_task_next_step` and stop until the user provides the correct path.',
-      '7. If target artifact path is missing for create-new-script and repo root is known — propose a path based on conventions, save via `set_task_developer_target`, and continue. If repo root is also missing, stop and ask only for that.',
+      '7. If target artifact path is missing for create-new-script and entity name is known — derive the script directory and file name using Scripts_Naming convention: file = <entityLogicalName>_events.js (do not add another nvr_ prefix if the entity already has it — e.g. nvr_servicecase → nvr_servicecase_events.js, not nvr_nvr_servicecase_events.js), then call `set_task_developer_target` with repositoryRoot, selectedScriptTarget (directory, e.g. from customer scriptFolder or Scripts/), desiredScriptFile, artifactPath (full relative path e.g. Scripts\\nvr_servicecase_events.js), absoluteScriptPath, actionType, primaryEntityLogicalName, eventName, eventFieldName, namingSource, onLoadFunctionName, onChangeFunctionName, mainHelperSuggestion in a single call. Do not save placeholder or undetermined values. Reload `get_task_full_context` and continue. If repo root is also missing, stop and ask only for that.',
       '8. If technical plan is missing — create a draft via `save_technical_plan` when enough context exists. Mark it ready for approval via `mark_technical_plan_ready_for_approval`. Stop at the approval gate before any file edits.',
       '9. If Dataverse metadata verification is required but not completed — run `run_dataverse_check_for_task` (Primarch integration). Record all findings locally. Reload `get_task_full_context` and continue. Stop only if the check itself fails or findings contradict the assignment.',
-      '10. If target entity logical name is missing and explicit from the assignment or template — save via `save_technical_plan` or `set_task_developer_target` and continue.',
+      '10. If target entity logical name is missing and explicit from the assignment or template — save via `set_task_developer_target` and continue. The technical plan may also document the target entity, but `set_task_developer_target` is the source of truth for developer target metadata.',
       '11. Confirm setup via `confirm_task_setup` only after all hard blockers and proposal blockers are resolved and no hard setup issues remain.',
       '12. If Task Workbench MCP becomes unavailable or any required MCP read/write fails after 3 retries — stop immediately. Do not continue outside Task Workbench workflow.',
       '13. Only ask the user to regenerate this prompt if MCP context cannot be reloaded or the workflow cannot be refreshed through Task Workbench MCP after exhausting safe auto-setup updates.',

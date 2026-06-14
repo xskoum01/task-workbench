@@ -567,6 +567,16 @@ export interface WorkflowSetup {
   conventionsSource?: string;
   /** Paths of similar existing script files included for AI conventions context. */
   relatedExistingFiles?: string[];
+  /** Naming convention source identifier (e.g. 'Scripts_Naming'). Set when derived from template. */
+  namingSource?: string;
+  /** OnLoad handler function name (e.g. 'nvr_servicecase_OnLoad'). */
+  onLoadFunctionName?: string;
+  /** OnChange handler function name (e.g. 'nvr_assetid_OnChange'). */
+  onChangeFunctionName?: string;
+  /** Suggested main helper function name (e.g. 'prefillServiceCaseFromAsset'). */
+  mainHelperSuggestion?: string;
+  /** Absolute path of the target script file, derived from repositoryRoot + scriptFolder + desiredScriptFile. Persisted when known before file creation. */
+  absoluteScriptPath?: string;
 }
 
 /**

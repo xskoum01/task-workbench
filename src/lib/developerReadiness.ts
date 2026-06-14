@@ -241,28 +241,30 @@ export function getDeveloperReadiness(task: Task, customer?: Customer): Develope
       task.workflowSetup?.scriptPath ??
       plan?.target?.scriptPath;
 
-    const actionType = task.workflowSetup?.actionType;
-    const repoRoot   = task.workflowSetup?.repositoryRoot;
+    const actionType        = task.workflowSetup?.actionType;
+    const repoRoot          = task.workflowSetup?.repositoryRoot;
+    const entityLogicalName = task.workflowSetup?.primaryEntityLogicalName ?? plan?.target?.entityLogicalName;
 
     if (!targetPath) {
       if (actionType === 'update-existing-script') {
         // Hard blocker — must not guess an existing file
         addBlocker(categorizedBlockers, 'Target script/artifact path is not set.', 'hard');
       } else if (actionType === 'create-new-script') {
-        // Proposal — can suggest path when repo root is known
-        const category: BlockerCategory = repoRoot ? 'proposal' : 'hard';
+        // Auto-resolvable when entity and repo root are both known; proposal when only repo root is known
+        const canDerive = !!(entityLogicalName && repoRoot);
+        const category: BlockerCategory = canDerive ? 'auto-resolvable' : (repoRoot ? 'proposal' : 'hard');
         addBlocker(
           categorizedBlockers,
           'Target script/artifact path is not set.',
           category,
-          category === 'proposal' ? 'set_task_developer_target' : undefined,
+          category !== 'hard' ? 'set_task_developer_target' : undefined,
         );
       } else {
         addBlocker(categorizedBlockers, 'Target script/artifact path is not set.', 'hard');
       }
     } else {
       if (actionType === 'create-new-script') {
-        const hasDir = !!(task.workflowSetup?.scriptPath || plan?.target?.scriptPath);
+        const hasDir = !!(task.workflowSetup?.scriptPath || plan?.target?.scriptPath || task.workflowSetup?.artifactPath);
         const hasFileName =
           !!(task.workflowSetup?.artifactPath) ||
           isSpecificFilePath(task.workflowSetup?.scriptPath) ||
@@ -292,16 +294,13 @@ export function getDeveloperReadiness(task: Task, customer?: Customer): Develope
       }
     }
 
-    const entityLogicalName =
-      task.workflowSetup?.primaryEntityLogicalName ??
-      plan?.target?.entityLogicalName;
     if (!entityLogicalName) {
-      // Proposal — AI can add entity to plan when it's clear from assignment
+      // Proposal — AI can set entity via set_task_developer_target when clear from assignment
       addBlocker(
         categorizedBlockers,
         'Target entity logical name (table) is not set.',
         'proposal',
-        'save_technical_plan',
+        'set_task_developer_target',
       );
     }
 

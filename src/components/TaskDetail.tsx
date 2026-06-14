@@ -3451,7 +3451,7 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
           <div className="detail-panel-header-content">
             <div className="detail-panel-title-row">
               <div className="detail-panel-title">{task.title}</div>
-              <CopyAiWorkflowPromptButton task={task} customer={customer} variant="detail" onSuccess={setFeedback} />
+              <CopyAiWorkflowPromptButton task={task} customer={customer} crmBaseDirectory={settings?.crmBaseDirectory} variant="detail" onSuccess={setFeedback} />
             </div>
             <div style={{ marginTop: 4, display: 'flex', gap: 6, alignItems: 'center' }}>
               <TypeBadge type={task.taskType} />

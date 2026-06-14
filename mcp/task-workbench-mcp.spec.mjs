@@ -6,7 +6,7 @@
  * the script's process.exit handler from firing during tests.
  */
 import { describe, it, expect } from 'vitest';
-import { READ_ONLY_TOOL_NAMES, TOOL_DEFINITIONS, callToolFallback } from './task-workbench-mcp.mjs';
+import { READ_ONLY_TOOL_NAMES, TOOL_DEFINITIONS, TASK_TEMPLATES, matchTaskTemplate, callToolFallback } from './task-workbench-mcp.mjs';
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -450,5 +450,343 @@ describe('save_technical_plan — target field presence in schema', () => {
     expect(stKeys).toContain('formName');
     expect(stKeys).toContain('eventName');
     expect(stKeys).toContain('functionName');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 7. set_task_developer_target — schema completeness for script target fields
+// ---------------------------------------------------------------------------
+
+describe('set_task_developer_target schema', () => {
+  it('tool definition exists', () => {
+    expect(findTool('set_task_developer_target')).toBeDefined();
+  });
+
+  it('requires taskId', () => {
+    expect(findTool('set_task_developer_target').inputSchema.required).toContain('taskId');
+  });
+
+  it('has selectedScriptTarget (target directory) property', () => {
+    const tool = findTool('set_task_developer_target');
+    expect(tool.inputSchema.properties.selectedScriptTarget).toBeDefined();
+  });
+
+  it('selectedScriptTarget description mentions target directory', () => {
+    const desc = findTool('set_task_developer_target').inputSchema.properties.selectedScriptTarget.description;
+    expect(desc).toMatch(/directory|folder/i);
+  });
+
+  it('has desiredScriptFile property', () => {
+    expect(findTool('set_task_developer_target').inputSchema.properties.desiredScriptFile).toBeDefined();
+  });
+
+  it('desiredScriptFile description references naming convention example', () => {
+    const desc = findTool('set_task_developer_target').inputSchema.properties.desiredScriptFile.description;
+    expect(desc).toContain('nvr_servicecase_events.js');
+  });
+
+  it('has primaryEntityLogicalName property', () => {
+    expect(findTool('set_task_developer_target').inputSchema.properties.primaryEntityLogicalName).toBeDefined();
+  });
+
+  it('has actionType property with create-new-script enum value', () => {
+    const actionTypeEnum = toolEnum('set_task_developer_target', 'actionType');
+    expect(actionTypeEnum).toContain('create-new-script');
+    expect(actionTypeEnum).toContain('update-existing-script');
+    expect(actionTypeEnum).toContain('create-new-plugin');
+    expect(actionTypeEnum).toContain('update-existing-plugin');
+  });
+
+  it('has eventName property', () => {
+    expect(findTool('set_task_developer_target').inputSchema.properties.eventName).toBeDefined();
+  });
+
+  it('has eventFieldName property', () => {
+    expect(findTool('set_task_developer_target').inputSchema.properties.eventFieldName).toBeDefined();
+  });
+
+  it('eventFieldName description mentions onChange events', () => {
+    const desc = findTool('set_task_developer_target').inputSchema.properties.eventFieldName.description;
+    expect(desc).toMatch(/onChange|change/i);
+  });
+
+  it('has repositoryRoot property', () => {
+    expect(findTool('set_task_developer_target').inputSchema.properties.repositoryRoot).toBeDefined();
+  });
+
+  it('all required script target fields exist for NVR servicecase scenario', () => {
+    const props = findTool('set_task_developer_target').inputSchema.properties;
+    // For a complete create-new-script call: selectedScriptTarget (dir), desiredScriptFile (name),
+    // primaryEntityLogicalName, actionType, eventName, eventFieldName, repositoryRoot
+    for (const field of ['selectedScriptTarget', 'desiredScriptFile', 'primaryEntityLogicalName', 'actionType', 'eventName', 'eventFieldName', 'repositoryRoot']) {
+      expect(props[field], `field '${field}' should be in schema`).toBeDefined();
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 8. TASK_TEMPLATES — NVR servicecase script template
+// ---------------------------------------------------------------------------
+
+describe('TASK_TEMPLATES — NVR servicecase script template', () => {
+  it('has template for NVR Training Service Hub script task', () => {
+    const tpl = TASK_TEMPLATES.find((t) => t.id === 'nvr-training-sh-script-prefill');
+    expect(tpl).toBeDefined();
+  });
+
+  it('NVR servicecase template has correct entity, event, and eventFieldName', () => {
+    const tpl = TASK_TEMPLATES.find((t) => t.id === 'nvr-training-sh-script-prefill');
+    expect(tpl.scriptTarget.entityLogicalName).toBe('nvr_servicecase');
+    expect(tpl.scriptTarget.eventName).toBe('onChange');
+    expect(tpl.scriptTarget.eventFieldName).toBe('nvr_assetid');
+  });
+
+  it('matchTaskTemplate matches NVR servicecase title', () => {
+    const matched = matchTaskTemplate('Script: Předvyplnění servisního požadavku');
+    expect(matched).not.toBeNull();
+    expect(matched.id).toBe('nvr-training-sh-script-prefill');
+  });
+
+  it('matchTaskTemplate returns null for unrelated title', () => {
+    expect(matchTaskTemplate('Plugin: Calculate something')).toBeNull();
+  });
+
+  it('NVR servicecase template specifies create-new-script action type', () => {
+    const tpl = TASK_TEMPLATES.find((t) => t.id === 'nvr-training-sh-script-prefill');
+    expect(tpl.actionType).toBe('create-new-script');
+  });
+
+  it('callToolFallback get_task_templates returns matchedTemplate for NVR task title', async () => {
+    const os = await import('node:os');
+    const fs = await import('node:fs/promises');
+    const path = await import('node:path');
+
+    const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'tw-mcp-tpl-'));
+    const task = makeTask({
+      id: 'task-tpl-nvr',
+      title: 'Script: Předvyplnění servisního požadavku',
+    });
+    await fs.writeFile(path.join(tmpDir, 'tasks.json'), JSON.stringify([task]));
+
+    const origArgv = process.argv;
+    process.argv = [...process.argv, '--data-dir', tmpDir, '--fallback-readonly'];
+    try {
+      const result = await callToolFallback('get_task_templates', { taskId: 'task-tpl-nvr' });
+      expect(result.matchedTemplate).toBeDefined();
+      expect(result.matchedTemplate.id).toBe('nvr-training-sh-script-prefill');
+      expect(result.matchedTemplate.scriptTarget.entityLogicalName).toBe('nvr_servicecase');
+    } finally {
+      process.argv = origArgv;
+      await fs.rm(tmpDir, { recursive: true });
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 9. TASK_TEMPLATES — NVR servicecase scriptNaming enrichment
+// ---------------------------------------------------------------------------
+
+describe('TASK_TEMPLATES — NVR servicecase scriptNaming block', () => {
+  it('template has scriptNaming block', () => {
+    const tpl = TASK_TEMPLATES.find((t) => t.id === 'nvr-training-sh-script-prefill');
+    expect(tpl.scriptNaming).toBeDefined();
+  });
+
+  it('scriptNaming.namingSource is Scripts_Naming', () => {
+    const tpl = TASK_TEMPLATES.find((t) => t.id === 'nvr-training-sh-script-prefill');
+    expect(tpl.scriptNaming.namingSource).toBe('Scripts_Naming');
+  });
+
+  it('scriptNaming.desiredScriptFile is nvr_servicecase_events.js', () => {
+    const tpl = TASK_TEMPLATES.find((t) => t.id === 'nvr-training-sh-script-prefill');
+    expect(tpl.scriptNaming.desiredScriptFile).toBe('nvr_servicecase_events.js');
+  });
+
+  it('scriptNaming.onLoadFunctionName is nvr_servicecase_OnLoad', () => {
+    const tpl = TASK_TEMPLATES.find((t) => t.id === 'nvr-training-sh-script-prefill');
+    expect(tpl.scriptNaming.onLoadFunctionName).toBe('nvr_servicecase_OnLoad');
+  });
+
+  it('scriptNaming.onChangeFunctionName is nvr_assetid_OnChange', () => {
+    const tpl = TASK_TEMPLATES.find((t) => t.id === 'nvr-training-sh-script-prefill');
+    expect(tpl.scriptNaming.onChangeFunctionName).toBe('nvr_assetid_OnChange');
+  });
+
+  it('scriptNaming.mainHelperSuggestion is prefillServiceCaseFromAsset', () => {
+    const tpl = TASK_TEMPLATES.find((t) => t.id === 'nvr-training-sh-script-prefill');
+    expect(tpl.scriptNaming.mainHelperSuggestion).toBe('prefillServiceCaseFromAsset');
+  });
+
+  it('template has sourceEntity nvr_customerasset', () => {
+    const tpl = TASK_TEMPLATES.find((t) => t.id === 'nvr-training-sh-script-prefill');
+    expect(tpl.sourceEntity).toBe('nvr_customerasset');
+  });
+
+  it('template sourceFields contains nvr_customerid', () => {
+    const tpl = TASK_TEMPLATES.find((t) => t.id === 'nvr-training-sh-script-prefill');
+    expect(tpl.sourceFields).toContain('nvr_customerid');
+  });
+
+  it('template targetFields contains nvr_iswarrantycase', () => {
+    const tpl = TASK_TEMPLATES.find((t) => t.id === 'nvr-training-sh-script-prefill');
+    expect(tpl.targetFields).toContain('nvr_iswarrantycase');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 10. set_task_developer_target schema — new naming fields
+// ---------------------------------------------------------------------------
+
+describe('set_task_developer_target schema — naming fields', () => {
+  it('schema accepts namingSource', () => {
+    expect(findTool('set_task_developer_target').inputSchema.properties.namingSource).toBeDefined();
+  });
+
+  it('schema accepts onLoadFunctionName', () => {
+    expect(findTool('set_task_developer_target').inputSchema.properties.onLoadFunctionName).toBeDefined();
+  });
+
+  it('schema accepts onChangeFunctionName', () => {
+    expect(findTool('set_task_developer_target').inputSchema.properties.onChangeFunctionName).toBeDefined();
+  });
+
+  it('schema accepts mainHelperSuggestion', () => {
+    expect(findTool('set_task_developer_target').inputSchema.properties.mainHelperSuggestion).toBeDefined();
+  });
+
+  it('mainHelperSuggestion description mentions camelCase', () => {
+    const desc = findTool('set_task_developer_target').inputSchema.properties.mainHelperSuggestion.description;
+    expect(desc).toMatch(/camelCase/i);
+  });
+
+  it('schema accepts absoluteScriptPath', () => {
+    expect(findTool('set_task_developer_target').inputSchema.properties.absoluteScriptPath).toBeDefined();
+  });
+
+  it('absoluteScriptPath description mentions repositoryRoot', () => {
+    const desc = findTool('set_task_developer_target').inputSchema.properties.absoluteScriptPath.description;
+    expect(desc).toMatch(/repositoryRoot/i);
+  });
+
+  it('schema accepts artifactPath', () => {
+    expect(findTool('set_task_developer_target').inputSchema.properties.artifactPath).toBeDefined();
+  });
+
+  it('artifactPath description mentions folder and file', () => {
+    const desc = findTool('set_task_developer_target').inputSchema.properties.artifactPath.description;
+    expect(desc).toMatch(/folder|selectedScriptTarget|desiredScriptFile/i);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 11. callToolFallback get_task_full_context — developerWorkPacket.scriptNaming
+// ---------------------------------------------------------------------------
+
+describe('callToolFallback get_task_full_context — developerWorkPacket.scriptNaming', () => {
+  it('includes developerWorkPacket.scriptNaming when entity and customer scriptFolder are set', async () => {
+    const os = await import('node:os');
+    const fs = await import('node:fs/promises');
+    const path = await import('node:path');
+
+    const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'tw-mcp-naming-'));
+    const task = makeTask({
+      id: 'task-naming-001',
+      title: '[TEST] Script naming test',
+      customerId: 'cust-naming-001',
+      workflowSetup: {
+        devTargetKind: 'script',
+        actionType: 'create-new-script',
+        primaryEntityLogicalName: 'nvr_servicecase',
+        eventFieldName: 'nvr_assetid',
+      },
+      crmDeveloperWorkflow: { detectedWorkKind: 'script' },
+    });
+    const customer = {
+      id: 'cust-naming-001',
+      name: 'VSK-Test',
+      scriptFolder: 'C:\\Users\\vskoumal\\Documents\\CRM\\VSK-Test\\Scripts',
+      repositoryRoot: 'C:\\Users\\vskoumal\\Documents\\CRM\\VSK-Test',
+    };
+    await fs.writeFile(path.join(tmpDir, 'tasks.json'), JSON.stringify([task]));
+    await fs.writeFile(path.join(tmpDir, 'customers.json'), JSON.stringify([customer]));
+
+    const origArgv = process.argv;
+    process.argv = [...process.argv, '--data-dir', tmpDir, '--fallback-readonly'];
+    try {
+      const result = await callToolFallback('get_task_full_context', { id: 'task-naming-001' });
+      const naming = result.task.developerWorkPacket?.scriptNaming;
+      expect(naming).toBeDefined();
+      expect(naming.desiredScriptFile).toBe('nvr_servicecase_events.js');
+      expect(naming.onLoadFunctionName).toBe('nvr_servicecase_OnLoad');
+      expect(naming.onChangeFunctionName).toBe('nvr_assetid_OnChange');
+      expect(naming.absoluteScriptPath).toBe('C:\\Users\\vskoumal\\Documents\\CRM\\VSK-Test\\Scripts\\nvr_servicecase_events.js');
+      expect(naming.scriptPath).toBe('Scripts\\nvr_servicecase_events.js');
+      expect(naming.scriptsFolderRelative).toBe('Scripts');
+    } finally {
+      process.argv = origArgv;
+      await fs.rm(tmpDir, { recursive: true });
+    }
+  });
+
+  it('derives absoluteScriptPath from repositoryRoot when customer has no scriptFolder', async () => {
+    const os = await import('node:os');
+    const fs = await import('node:fs/promises');
+    const path = await import('node:path');
+
+    const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'tw-mcp-nofolder-'));
+    const task = makeTask({
+      id: 'task-naming-nofolder',
+      title: '[TEST] Script: Předvyplnění servisního požadavku',
+      customerId: 'cust-naming-nofolder',
+      workflowSetup: {
+        devTargetKind: 'script',
+        actionType: 'create-new-script',
+        primaryEntityLogicalName: 'nvr_servicecase',
+        eventFieldName: 'nvr_assetid',
+      },
+      crmDeveloperWorkflow: { detectedWorkKind: 'script' },
+    });
+    const customer = {
+      id: 'cust-naming-nofolder',
+      name: 'VSK-Test-NoFolder',
+      repositoryRoot: 'C:\\Users\\vskoumal\\Documents\\CRM\\VSK-Test',
+      // No scriptFolder
+    };
+    await fs.writeFile(path.join(tmpDir, 'tasks.json'), JSON.stringify([task]));
+    await fs.writeFile(path.join(tmpDir, 'customers.json'), JSON.stringify([customer]));
+
+    const origArgv = process.argv;
+    process.argv = [...process.argv, '--data-dir', tmpDir, '--fallback-readonly'];
+    try {
+      const result = await callToolFallback('get_task_full_context', { id: 'task-naming-nofolder' });
+      const naming = result.task.developerWorkPacket?.scriptNaming;
+      expect(naming?.absoluteScriptPath).toBe('C:\\Users\\vskoumal\\Documents\\CRM\\VSK-Test\\Scripts\\nvr_servicecase_events.js');
+    } finally {
+      process.argv = origArgv;
+      await fs.rm(tmpDir, { recursive: true });
+    }
+  });
+
+  it('developerWorkPacket absent when task has no entity logical name', async () => {
+    const os = await import('node:os');
+    const fs = await import('node:fs/promises');
+    const path = await import('node:path');
+
+    const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'tw-mcp-naming2-'));
+    const task = makeTask({
+      id: 'task-naming-002',
+      crmDeveloperWorkflow: { detectedWorkKind: 'script' },
+    });
+    await fs.writeFile(path.join(tmpDir, 'tasks.json'), JSON.stringify([task]));
+
+    const origArgv = process.argv;
+    process.argv = [...process.argv, '--data-dir', tmpDir, '--fallback-readonly'];
+    try {
+      const result = await callToolFallback('get_task_full_context', { id: 'task-naming-002' });
+      expect(result.task.developerWorkPacket).toBeUndefined();
+    } finally {
+      process.argv = origArgv;
+      await fs.rm(tmpDir, { recursive: true });
+    }
   });
 });
