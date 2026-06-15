@@ -112,11 +112,11 @@ describe('buildAiWorkflowPrompt â€” common header', () => {
     expect(buildAiWorkflowPrompt(makeTask())).toContain('Task Workbench MCP');
   });
 
-  it('instructs AI to load context using get_task_full_context', () => {
-    expect(buildAiWorkflowPrompt(makeTask())).toContain('get_task_full_context');
+  it('instructs AI to start with get_developer_work_packet', () => {
+    expect(buildAiWorkflowPrompt(makeTask())).toContain('First MCP call: `get_developer_work_packet`');
   });
 
-  it('includes the task ID in the get_task_full_context instruction', () => {
+  it('includes the task ID in the first setup/readiness MCP call instruction', () => {
     expect(buildAiWorkflowPrompt(makeTask({ id: 'abc-123' }))).toContain('"abc-123"');
   });
 
@@ -216,14 +216,14 @@ describe('buildAiWorkflowPrompt â€” setup prompt (not ready)', () => {
     expect(prompt).toContain('External writes are allowed only later through explicit approved workflow actions');
   });
 
-  it('references technical plan in setup rules', () => {
-    expect(buildAiWorkflowPrompt(makeTask())).toContain('technical plan');
+  it('references implementation guidance from the work packet in setup rules', () => {
+    expect(buildAiWorkflowPrompt(makeTask())).toContain('writeTarget, implementation, conventions, and reviewTestCommit');
   });
 
-  it('delegates setup orchestration to prepare_developer_task', () => {
+  it('delegates setup/readiness decision to get_developer_work_packet', () => {
     const prompt = buildAiWorkflowPrompt(makeTask());
-    expect(prompt).toContain('prepare_developer_task');
-    expect(prompt).toContain('approval gate or hard blocker');
+    expect(prompt).toContain('get_developer_work_packet');
+    expect(prompt).toContain('canWriteCode decision');
   });
 
   it('stops AI if MCP fails', () => {
@@ -238,21 +238,21 @@ describe('buildAiWorkflowPrompt â€” setup prompt (not ready)', () => {
     expect(prompt).not.toContain('ask the user to re-generate this prompt');
   });
 
-  it('includes setup orchestration section using prepare_developer_task', () => {
+  it('includes work packet flow section using get_developer_work_packet', () => {
     const prompt = buildAiWorkflowPrompt(makeTask());
-    expect(prompt).toContain('Setup orchestration:');
-    expect(prompt).toContain('prepare_developer_task');
+    expect(prompt).toContain('Work packet flow:');
+    expect(prompt).toContain('get_developer_work_packet');
   });
 
-  it('includes safe local setup write actions section', () => {
+  it('keeps prepare_developer_task as conditional setup fallback', () => {
     const prompt = buildAiWorkflowPrompt(makeTask());
-    expect(prompt).toContain('prepare_developer_task is allowed to perform only safe local setup writes');
+    expect(prompt).toContain('Use prepare_developer_task only when the work packet explicitly says setup is incomplete');
   });
 
-  it('instructs AI to use returned context without mandatory reload', () => {
+  it('instructs AI to use returned work packet without mandatory reload', () => {
     const prompt = buildAiWorkflowPrompt(makeDevTask());
-    expect(prompt).toContain('Use the returned context/readiness as the source of truth');
-    expect(prompt).toContain('without requiring a follow-up reload');
+    expect(prompt).toContain('Use the returned work packet as the source of truth');
+    expect(prompt).toContain('Use get_task_full_context only as fallback');
   });
 
   it('does not tell AI to stop after work classification save', () => {
@@ -261,10 +261,10 @@ describe('buildAiWorkflowPrompt â€” setup prompt (not ready)', () => {
     expect(prompt).not.toMatch(/set_task_work_classification[^.]*and stop/);
   });
 
-  it('lists safe auto-setup examples including mode and classification', () => {
+  it('hides internal workflow state behind the work packet', () => {
     const prompt = buildAiWorkflowPrompt(makeTask());
-    expect(prompt).toContain('set Developer mode');
-    expect(prompt).toContain('work classification');
+    expect(prompt).toContain('hides Task Workbench internal workflow state');
+    expect(prompt).toContain('do not reason over internal gates');
   });
 
   it('lists mode blocker for non-developer task', () => {
@@ -313,6 +313,8 @@ describe('buildAiWorkflowPrompt â€” setup prompt (not ready)', () => {
     expect(prompt).toContain('prepare_developer_task');
     expect(prompt).toContain('Dataverse metadata verification for JS/TS is not available through MCP');
     expect(prompt).not.toContain('â†’ call `run_dataverse_check_for_task`');
+    expect(prompt).not.toContain('-> call `run_dataverse_check_for_task`');
+    expect(prompt).not.toContain('do not call run_dataverse_check_for_task');
     expect(prompt).not.toContain('run run_dataverse_check_for_task');
   });
 
@@ -500,8 +502,8 @@ describe('buildAiWorkflowPrompt â€” script context block', () => {
     expect(buildAiWorkflowPrompt(makeReadyTask())).not.toContain('Script target context:');
   });
 
-  it('rule 5 mentions script target context for not-guessing', () => {
-    expect(buildAiWorkflowPrompt(makeReadyTask())).toContain('script tasks use only the target file shown in Script target context');
+  it('does not contain old rule 5 about guessing target file (removed - delegated to work packet)', () => {
+    expect(buildAiWorkflowPrompt(makeReadyTask())).not.toContain('script tasks use only the target file shown in Script target context');
   });
 
   it('rule 8 references conventionsSource', () => {
@@ -519,7 +521,7 @@ describe('buildAiWorkflowPrompt â€” implementation prompt (ready task)', ()
   });
 
   it('rule 2: no files without confirmed context', () => {
-    expect(buildAiWorkflowPrompt(makeReadyTask())).toContain('Do not create or modify files unless all of these are confirmed');
+    expect(buildAiWorkflowPrompt(makeReadyTask())).toContain('Do not create or modify files unless canWriteCode is true');
   });
 
   it('rule 3: MCP unavailability stop', () => {
@@ -539,7 +541,7 @@ describe('buildAiWorkflowPrompt â€” implementation prompt (ready task)', ()
     }));
     expect(prompt).toContain('Dataverse metadata verification for JS/TS is not available through MCP');
     expect(prompt).toContain('Verify Implementation modal');
-    expect(prompt).toContain('do not call run_dataverse_check_for_task');
+    expect(prompt).not.toContain('run_dataverse_check_for_task');
     expect(prompt).not.toContain('run run_dataverse_check_for_task');
   });
 
@@ -573,22 +575,46 @@ describe('buildAiWorkflowPrompt â€” implementation prompt (ready task)', ()
   });
 });
 
-describe('buildAiWorkflowPrompt - prepare_developer_task opening instruction', () => {
-  it('instructs AI to call prepare_developer_task first with the task ID', () => {
+describe('buildAiWorkflowPrompt - developer work packet opening instruction', () => {
+  it('instructs AI to call get_developer_work_packet first with the task ID', () => {
     const prompt = buildAiWorkflowPrompt(makeTask({ id: 'task-nvr-001' }));
-    expect(prompt).toContain('First MCP call: `prepare_developer_task`');
+    expect(prompt).toContain('First MCP call: `get_developer_work_packet`');
     expect(prompt).toContain('task-nvr-001');
   });
 
-  it('treats template/default application as prepare_developer_task responsibility', () => {
+  it('does not start setup/readiness prompts with get_task_full_context', () => {
     const prompt = buildAiWorkflowPrompt(makeTask());
-    expect(prompt).toContain('apply matched templates and customer developer defaults');
-    expect(prompt).toContain('target entity/event/script naming metadata');
+    expect(prompt).not.toContain('Start by loading the full current context');
+    expect(prompt).not.toContain('First MCP call: `get_task_full_context`');
   });
 
-  it('forbids get_task_templates before prepare_developer_task', () => {
+  it('uses get_developer_work_packet as the implementation-ready entrypoint', () => {
+    const prompt = buildAiWorkflowPrompt(makeReadyTask());
+    expect(prompt).toContain('First MCP call: `get_developer_work_packet`');
+    expect(prompt).toContain('Use `get_task_full_context` only as a fallback');
+    expect(prompt).not.toContain('Start by loading the full current context');
+  });
+
+  it('does not contain contradictory full-context-first and prepare-first instructions', () => {
+    const setupPrompt = buildAiWorkflowPrompt(makeTask());
+    const readyPrompt = buildAiWorkflowPrompt(makeReadyTask());
+    expect(setupPrompt).not.toContain('Start by loading the full current context');
+    expect(readyPrompt).not.toContain('Start by loading the full current context');
+  });
+
+  it('does not render mojibake markers in generated prompt text', () => {
+    expect(buildAiWorkflowPrompt(makeTask())).not.toContain('Ă˘');
+    expect(buildAiWorkflowPrompt(makeReadyTask())).not.toContain('Ă˘');
+  });
+
+  it('treats template/default application as a conditional prepare_developer_task responsibility', () => {
     const prompt = buildAiWorkflowPrompt(makeTask());
-    expect(prompt).toContain('Do not call get_task_full_context or get_task_templates before it');
+    expect(prompt).toContain('Use prepare_developer_task only when the work packet explicitly says setup is incomplete');
+  });
+
+  it('forbids low-level reads before get_developer_work_packet', () => {
+    const prompt = buildAiWorkflowPrompt(makeTask());
+    expect(prompt).toContain('Do not call get_task_full_context, get_implementation_readiness, or get_task_templates before it');
   });
 });
 
@@ -601,17 +627,17 @@ describe('buildAiWorkflowPrompt â€” task identity and MCP write rules', () 
     expect(buildAiWorkflowPrompt(makeTask())).toContain('Do not ask the user for the task ID again');
   });
 
-  it('instructs AI not to ask for fields resolved by prepare_developer_task', () => {
-    expect(buildAiWorkflowPrompt(makeTask())).toContain('Do not ask for fields that the returned template/default setup already resolved');
+  it('instructs AI to rely on the work packet for working fields', () => {
+    expect(buildAiWorkflowPrompt(makeTask())).toContain('where to write, what to implement, conventions, verification, and review/test/commit guidance');
   });
 
-  it('instructs AI to prefer prepare_developer_task over low-level target writes', () => {
-    expect(buildAiWorkflowPrompt(makeTask())).toContain('For setup/readiness, prefer prepare_developer_task');
+  it('instructs AI to prefer get_developer_work_packet over low-level target writes', () => {
+    expect(buildAiWorkflowPrompt(makeTask())).toContain('For AI work, prefer get_developer_work_packet');
   });
 
-  it('instructs AI not to reload get_task_full_context after prepare_developer_task succeeds', () => {
+  it('instructs AI not to load get_task_full_context unless the work packet fails', () => {
     const prompt = buildAiWorkflowPrompt(makeTask());
-    expect(prompt).toContain('Do not reload get_task_full_context unless prepare_developer_task returns an error or missing context');
+    expect(prompt).toContain('Use get_task_full_context only as fallback when get_developer_work_packet returns an error or missing context');
   });
 
   it('task identity section appears in both setup and implementation prompts', () => {
@@ -621,9 +647,9 @@ describe('buildAiWorkflowPrompt â€” task identity and MCP write rules', () 
     expect(implPrompt).toContain('current task ID is the Task ID shown in this prompt');
   });
 
-  it('setup loop delegates script file name derivation to prepare_developer_task', () => {
+  it('setup loop delegates script file name usage to the work packet', () => {
     const prompt = buildAiWorkflowPrompt(makeTask());
-    expect(prompt).toContain('target entity/event/script naming metadata');
+    expect(prompt).toContain('implement only the work described by writeTarget');
   });
 });
 
@@ -788,7 +814,7 @@ describe('buildAiWorkflowPrompt â€” setup prompt categorized sections', () 
   it('NVR script task title triggers auto-resolvable work kind blocker', () => {
     const prompt = buildAiWorkflowPrompt(makeTask({
       taskMode: 'developer',
-      title: '[TEST] Script: PĹ™edvyplnÄ›nĂ­ servisnĂ­ho poĹľadavku podle zaĹ™Ă­zenĂ­',
+      title: '[TEST] Script: Předvyplnění servisního požadavku podle zařízení',
     }));
     expect(prompt).toContain('Auto-resolvable');
     expect(prompt).toContain('set_task_work_classification');
@@ -797,7 +823,7 @@ describe('buildAiWorkflowPrompt â€” setup prompt categorized sections', () 
   it('NVR plugin task title triggers auto-resolvable work kind blocker', () => {
     const prompt = buildAiWorkflowPrompt(makeTask({
       taskMode: 'developer',
-      title: '[TEST] Plugin: VĂ˝poÄŤet ÄŤĂˇstek na poloĹľce servisnĂ­ zakĂˇzky',
+      title: '[TEST] Plugin: Výpočet částek na položce servisní zakázky',
     }));
     expect(prompt).toContain('Auto-resolvable');
     expect(prompt).toContain('set_task_work_classification');
@@ -905,15 +931,15 @@ describe('buildAiWorkflowPrompt â€” concrete script naming contract', () =>
     expect(buildAiWorkflowPrompt(task)).not.toContain('CRM JS script naming conventions');
   });
 
-  it('delegates target entity persistence to prepare_developer_task', () => {
+  it('delegates target entity persistence to the work packet flow', () => {
     const prompt = buildAiWorkflowPrompt(makeTask());
-    expect(prompt).toContain('prefer prepare_developer_task');
-    expect(prompt).toContain('target derivation');
+    expect(prompt).toContain('prefer get_developer_work_packet');
+    expect(prompt).toContain('writeTarget');
   });
 
-  it('delegates create-new-script naming rules to prepare_developer_task', () => {
+  it('delegates create-new-script naming rules to the work packet', () => {
     const prompt = buildAiWorkflowPrompt(makeTask());
-    expect(prompt).toContain('target entity/event/script naming metadata');
+    expect(prompt).toContain('writeTarget');
   });
 });
 
@@ -923,7 +949,7 @@ function makeFreshNvrTask(customerOverride?: Partial<{ scriptFolder: string; rep
   return {
     task: makeTask({
       taskMode: 'developer',
-      title: '[TEST] Script: PĹ™edvyplnÄ›nĂ­ servisnĂ­ho poĹľadavku podle zaĹ™Ă­zenĂ­',
+      title: '[TEST] Script: Předvyplnění servisního požadavku podle zařízení',
     }),
     customer: customerOverride
       ? ({ id: 'cust-vsk', name: 'VSK-Test', ...customerOverride } as unknown as import('../types').Customer)
@@ -1116,6 +1142,69 @@ describe('buildAiWorkflowPrompt â€” template-preview contract (no persisted
     const prompt = buildAiWorkflowPrompt(task, customer);
     expect(prompt).toContain('* Repository root: C:\\Users\\vskoumal\\Documents\\CRM\\VSK-Test');
     expect(prompt).toContain('C:\\Users\\vskoumal\\Documents\\CRM\\VSK-Test\\Scripts\\nvr_servicecase_events.js');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Implementation prompt new AI-facing rules (work packet as source of truth)
+// ---------------------------------------------------------------------------
+
+describe('buildAiWorkflowPrompt – implementation prompt AI-facing rules', () => {
+  it('contains "Use the returned developer work packet as the only source of truth"', () => {
+    expect(buildAiWorkflowPrompt(makeReadyTask())).toContain(
+      'Use the returned developer work packet as the only source of truth',
+    );
+  });
+
+  it('contains "If workPacket.canWriteCode is false, stop"', () => {
+    expect(buildAiWorkflowPrompt(makeReadyTask())).toContain('If workPacket.canWriteCode is false, stop');
+  });
+
+  it('contains "If workPacket.canWriteCode is true, implement only files listed"', () => {
+    expect(buildAiWorkflowPrompt(makeReadyTask())).toContain(
+      'If workPacket.canWriteCode is true, implement only files listed',
+    );
+  });
+
+  it('contains "Known target preview only, not write authorization"', () => {
+    expect(buildAiWorkflowPrompt(makeReadyTask())).toContain(
+      'Known target preview only, not write authorization',
+    );
+  });
+
+  it('does not contain Phase: for implementation-ready task', () => {
+    expect(buildAiWorkflowPrompt(makeReadyTask())).not.toContain('Phase:');
+  });
+
+  it('does not contain Phase: for implementation-ready script task', () => {
+    expect(buildAiWorkflowPrompt(makeReadyScriptTask())).not.toContain('Phase:');
+  });
+
+  it('does not contain "If technical plan is missing"', () => {
+    expect(buildAiWorkflowPrompt(makeReadyTask())).not.toContain('If technical plan is missing');
+  });
+
+  it('does not contain "If work kind is missing"', () => {
+    expect(buildAiWorkflowPrompt(makeReadyTask())).not.toContain('If work kind is missing');
+  });
+
+  it('does not contain "If target artifact path is missing"', () => {
+    expect(buildAiWorkflowPrompt(makeReadyTask())).not.toContain('If target artifact path is missing');
+  });
+
+  it('JS/TS script implementation prompt does not contain run_dataverse_check_for_task', () => {
+    const prompt = buildAiWorkflowPrompt(makeReadyScriptTask({
+      crmVerificationReports: undefined,
+      implementationVerification: undefined,
+    }));
+    expect(prompt).not.toContain('run_dataverse_check_for_task');
+  });
+
+  it('does not contain mojibake markers', () => {
+    const prompt = buildAiWorkflowPrompt(makeReadyTask());
+    expect(prompt).not.toContain('Ă˘');
+    expect(prompt).not.toContain('PĹ™');
+    expect(prompt).not.toContain('PĹ');
   });
 });
 

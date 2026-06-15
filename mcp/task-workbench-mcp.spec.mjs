@@ -67,8 +67,150 @@ describe('READ_ONLY_TOOL_NAMES', () => {
     expect(READ_ONLY_TOOL_NAMES.has('get_implementation_verification_state')).toBe(true);
   });
 
+  it('contains get_developer_work_packet', () => {
+    expect(READ_ONLY_TOOL_NAMES.has('get_developer_work_packet')).toBe(true);
+  });
+
   it('does NOT contain record_external_action_completed (it is a write tool)', () => {
     expect(READ_ONLY_TOOL_NAMES.has('record_external_action_completed')).toBe(false);
+  });
+});
+
+describe('callToolFallback get_developer_work_packet', () => {
+  it('returns a simple no-code decision when technical plan approval is pending', async () => {
+    const os = await import('node:os');
+    const fs = await import('node:fs/promises');
+    const path = await import('node:path');
+
+    const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'tw-mcp-packet-blocked-'));
+    // customerId and all required setup fields are present so isImplementationReady=true;
+    // canWriteCode must still be false because planApproval.approved=false.
+    await fs.writeFile(path.join(tmpDir, 'tasks.json'), JSON.stringify([makeTask({
+      id: 'task-packet-blocked',
+      title: '[TEST] Script: Predvyplneni servisniho pozadavku',
+      customerId: 'cust-blocked',
+      workflowSetup: {
+        devTargetKind: 'script',
+        repositoryRoot: 'C:\\Repo',
+        actionType: 'create-new-script',
+        primaryEntityLogicalName: 'nvr_servicecase',
+        artifactPath: 'Scripts\\nvr_servicecase_events.js',
+        absoluteScriptPath: 'C:\\Repo\\Scripts\\nvr_servicecase_events.js',
+        eventName: 'onChange',
+        eventFieldName: 'nvr_assetid',
+        confirmedAt: '2026-06-01T10:00:00.000Z',
+      },
+      crmDeveloperWorkflow: {
+        detectedWorkKind: 'script',
+        currentStep: 'technical-plan-approval',
+        technicalPlan: {
+          workKind: 'script',
+          summary: 'Create the service case prefill script.',
+          target: { entityLogicalName: 'nvr_servicecase', scriptPath: 'Scripts\\nvr_servicecase_events.js', eventFieldName: 'nvr_assetid' },
+          implementationSteps: ['Implement the onChange prefill.'],
+          fieldMappings: [{ source: 'nvr_customerasset.nvr_customerid', target: 'nvr_servicecase.nvr_customerid' }],
+          risks: [],
+          testChecklist: ['Test asset selection.'],
+        },
+        planApproval: { approved: false },
+      },
+    })]));
+
+    const origArgv = process.argv;
+    process.argv = [...process.argv, '--data-dir', tmpDir, '--fallback-readonly'];
+    try {
+      const packet = await callToolFallback('get_developer_work_packet', { taskId: 'task-packet-blocked' });
+      expect(packet.canWriteCode).toBe(false);
+      expect(packet.status).toBe('not_ready');
+      expect(packet.decisionReason).toContain('Technical plan approval is required');
+      expect(packet.blockingUserAction).toContain('approve the technical implementation plan');
+      expect(packet.writeTarget.artifactPath).toBe('Scripts\\nvr_servicecase_events.js');
+      expect(packet.implementation.fieldMappings).toEqual([
+        { source: 'nvr_customerasset.nvr_customerid', target: 'nvr_servicecase.nvr_customerid' },
+      ]);
+    } finally {
+      process.argv = origArgv;
+      await fs.rm(tmpDir, { recursive: true });
+    }
+  });
+
+  it('returns a ready-to-code packet with target, conventions, Dataverse warning, and validation guidance', async () => {
+    const os = await import('node:os');
+    const fs = await import('node:fs/promises');
+    const path = await import('node:path');
+
+    const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'tw-mcp-packet-ready-'));
+    await fs.writeFile(path.join(tmpDir, 'tasks.json'), JSON.stringify([makeTask({
+      id: 'task-packet-ready',
+      title: '[TEST] Script: Predvyplneni servisniho pozadavku',
+      customerId: 'cust-ready',
+      workflowSetup: {
+        devTargetKind: 'script',
+        repositoryRoot: 'C:\\Repo',
+        actionType: 'create-new-script',
+        primaryEntityLogicalName: 'nvr_servicecase',
+        artifactPath: 'Scripts\\nvr_servicecase_events.js',
+        absoluteScriptPath: 'C:\\Repo\\Scripts\\nvr_servicecase_events.js',
+        eventName: 'onChange',
+        eventFieldName: 'nvr_assetid',
+        onLoadFunctionName: 'nvr_servicecase_OnLoad',
+        onChangeFunctionName: 'nvr_assetid_OnChange',
+        mainHelperSuggestion: 'prefillServiceCaseFromAsset',
+        conventionsSource: 'Scripts\\nvr_contact_events.js',
+        relatedExistingFiles: ['Scripts\\nvr_contact_events.js'],
+        confirmedAt: '2026-06-01T10:00:00.000Z',
+      },
+      crmDeveloperWorkflow: {
+        detectedWorkKind: 'script',
+        currentStep: 'code-generation',
+        technicalPlan: {
+          workKind: 'script',
+          summary: 'Create the service case prefill script.',
+          target: { entityLogicalName: 'nvr_servicecase', scriptPath: 'Scripts\\nvr_servicecase_events.js', eventName: 'onChange', eventFieldName: 'nvr_assetid' },
+          implementationSteps: ['Implement asset lookup prefill.', 'Keep form registration manual.'],
+          fieldMappings: [
+            { source: 'nvr_customerasset.nvr_customerid', target: 'nvr_servicecase.nvr_customerid' },
+            { source: 'nvr_customerasset.nvr_contactid', target: 'nvr_servicecase.nvr_contactid' },
+          ],
+          unmappedSourceFields: ['nvr_statuscustom'],
+          risks: ['Handle empty asset values.'],
+          testChecklist: ['Run local lint/build if available.', 'Test onChange with empty and populated asset.'],
+        },
+        planApproval: { approved: true, approvedAt: '2026-06-01T10:05:00.000Z' },
+      },
+      implementationVerification: {
+        dataverseCheck: { status: 'skipped', reason: 'JS/TS verification is in-app only.' },
+      },
+    })]));
+
+    const origArgv = process.argv;
+    process.argv = [...process.argv, '--data-dir', tmpDir, '--fallback-readonly'];
+    try {
+      const packet = await callToolFallback('get_developer_work_packet', { taskId: 'task-packet-ready' });
+      expect(packet.canWriteCode).toBe(true);
+      expect(packet.status).toBe('ready_to_code');
+      expect(packet.writeTarget).toMatchObject({
+        kind: 'script',
+        repositoryRoot: 'C:\\Repo',
+        artifactPath: 'Scripts\\nvr_servicecase_events.js',
+        absolutePath: 'C:\\Repo\\Scripts\\nvr_servicecase_events.js',
+        targetEntity: 'nvr_servicecase',
+        eventName: 'onChange',
+        eventFieldName: 'nvr_assetid',
+        helperSuggestion: 'prefillServiceCaseFromAsset',
+      });
+      expect(packet.writeTarget.handlers).toEqual({ onLoad: 'nvr_servicecase_OnLoad', onChange: 'nvr_assetid_OnChange' });
+      expect(packet.conventions.sources).toContain('Scripts\\nvr_contact_events.js');
+      expect(packet.conventions.relatedFiles).toContain('Scripts\\nvr_contact_events.js');
+      expect(packet.dataverse.verificationStatus).toBe('not_available_for_js_ts_mcp');
+      expect(packet.dataverse.instruction).toContain('Verify Implementation modal');
+      expect(JSON.stringify(packet)).not.toContain('run_dataverse_check_for_task');
+      expect(packet.reviewTestCommit.localValidation).toContain('Test onChange with empty and populated asset.');
+      expect(packet.reviewTestCommit.commit.join(' ')).toContain('Commit only files related to this task');
+    } finally {
+      process.argv = origArgv;
+      await fs.rm(tmpDir, { recursive: true });
+    }
   });
 });
 
@@ -542,7 +684,7 @@ describe('TASK_TEMPLATES â€” NVR servicecase script template', () => {
   });
 
   it('matchTaskTemplate matches NVR servicecase title', () => {
-    const matched = matchTaskTemplate('Script: PĹ™edvyplnÄ›nĂ­ servisnĂ­ho poĹľadavku');
+    const matched = matchTaskTemplate('Script: Předvyplnění servisního požadavku');
     expect(matched).not.toBeNull();
     expect(matched.id).toBe('nvr-training-sh-script-prefill');
   });
@@ -564,7 +706,7 @@ describe('TASK_TEMPLATES â€” NVR servicecase script template', () => {
     const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'tw-mcp-tpl-'));
     const task = makeTask({
       id: 'task-tpl-nvr',
-      title: 'Script: PĹ™edvyplnÄ›nĂ­ servisnĂ­ho poĹľadavku',
+      title: 'Script: Předvyplnění servisního požadavku',
     });
     await fs.writeFile(path.join(tmpDir, 'tasks.json'), JSON.stringify([task]));
 
@@ -698,6 +840,14 @@ describe('prepare_developer_task schema', () => {
   it('supports setup-until-approval-gate mode only', () => {
     const modeEnum = toolEnum('prepare_developer_task', 'mode');
     expect(modeEnum).toEqual(['setup-until-approval-gate']);
+  });
+});
+
+describe('get_developer_work_packet schema', () => {
+  it('tool definition exists and requires taskId', () => {
+    const tool = findTool('get_developer_work_packet');
+    expect(tool).toBeDefined();
+    expect(tool.inputSchema.required).toContain('taskId');
   });
 });
 
@@ -906,7 +1056,7 @@ describe('callToolFallback get_task_full_context â€” developerWorkPacket.sc
     const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'tw-mcp-nofolder-'));
     const task = makeTask({
       id: 'task-naming-nofolder',
-      title: '[TEST] Script: PĹ™edvyplnÄ›nĂ­ servisnĂ­ho poĹľadavku',
+      title: '[TEST] Script: Předvyplnění servisního požadavku',
       customerId: 'cust-naming-nofolder',
       workflowSetup: {
         devTargetKind: 'script',

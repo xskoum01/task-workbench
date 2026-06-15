@@ -58,7 +58,12 @@ These tools never write to Dataverse, GitHub, Azure DevOps, or the local filesys
 | `get_external_action_proposal` | Return externalActionPreview, approval gate, execution tracking |
 | `get_implementation_verification_state` | Build check, Dataverse check override, AI code review, local test, consultant testing |
 | `get_implementation_readiness` | isImplementationReady, blockers, warnings, recommendedNextStep for plugin/script tasks |
+| `get_developer_work_packet` | AI-facing work packet: canWriteCode, why, target path, implementation instructions, conventions, verification, review/test/commit guidance |
 | `get_task_templates` | Built-in setup templates and matched template for a task title |
+
+AI clients should use `get_developer_work_packet` as the default first read for
+developer work. It hides Task Workbench internal workflow state and returns a
+single decision: whether code may be written and what to do next.
 
 ### Local-write
 

@@ -6536,6 +6536,7 @@ fn task_mcp_read_only_tool_definitions() -> Vec<Value> {
         serde_json::json!({"name":"get_external_action_proposal",          "description":"Return the current external action proposal state for a task (externalActionPreview, approval gate, execution tracking).","readOnly":true}),
         serde_json::json!({"name":"get_implementation_verification_state", "description":"Return the implementation verification state for a task: build check, Dataverse check override, AI code review, local test, consultant testing.","readOnly":true}),
         serde_json::json!({"name":"get_implementation_readiness",          "description":"Return implementation readiness for a developer plugin/script task: isImplementationReady, blockers, warnings, recommendedNextStep.","readOnly":true}),
+        serde_json::json!({"name":"get_developer_work_packet",              "description":"Return a simplified AI-facing developer work packet: canWriteCode, reason, target, implementation, conventions, Dataverse verification, and review/test/commit guidance.","readOnly":true}),
         serde_json::json!({"name":"get_task_templates",                    "description":"Return built-in task setup templates and the matched template for a task title, when any.","readOnly":true}),
     ]
 }
@@ -6829,6 +6830,174 @@ fn task_mcp_safe_task_detail(task: &Value) -> Value {
         "url": task["adoContext"]["url"].as_str(),
     });
     detail
+}
+
+fn task_mcp_developer_work_packet(task: &Value, customer_dev_defaults: Option<&Value>) -> Value {
+    let setup = task.get("workflowSetup").unwrap_or(&Value::Null);
+    let workflow = task.get("crmDeveloperWorkflow").unwrap_or(&Value::Null);
+    let plan = &workflow["technicalPlan"];
+    let plan_target = &plan["target"];
+    let readiness = task_mcp_implementation_readiness(task);
+    let can_write = readiness["isImplementationReady"].as_bool().unwrap_or(false);
+    let work_kind = workflow["detectedWorkKind"].as_str()
+        .or_else(|| setup["devTargetKind"].as_str())
+        .or_else(|| plan["workKind"].as_str())
+        .unwrap_or("unknown");
+    let is_script = work_kind == "script" || work_kind == "ribbon" || setup["devTargetKind"].as_str() == Some("script");
+    let script_naming = if is_script { task_mcp_compute_script_naming(task, customer_dev_defaults) } else { None };
+    let verification = task_mcp_latest_verification(task);
+    let approval = task_mcp_approval_summary(workflow.get("planApproval"));
+
+    let mut decision_reason = if can_write {
+        "Task Workbench says implementation is ready. Use this packet as the working contract.".to_string()
+    } else {
+        readiness["recommendedNextStep"].as_str()
+            .unwrap_or("Task Workbench says implementation is not ready yet.")
+            .to_string()
+    };
+    let mut blocking_user_action = Value::Null;
+    if !can_write {
+        if plan.is_object() && !approval["approved"].as_bool().unwrap_or(false) {
+            decision_reason = "Technical plan approval is required in Task Workbench before code changes.".to_string();
+            blocking_user_action = serde_json::json!("Review and approve the technical implementation plan in Task Workbench.");
+        } else if !plan.is_object() {
+            blocking_user_action = serde_json::json!("Run prepare_developer_task to create/refresh setup and the technical plan.");
+        } else if readiness["blockers"].as_array().is_some_and(|a| !a.is_empty()) {
+            blocking_user_action = serde_json::json!("Resolve the listed blockers in Task Workbench.");
+        }
+    }
+
+    let repository_root = setup["repositoryRoot"].as_str()
+        .or_else(|| customer_dev_defaults.and_then(|d| d["repositoryRoot"].as_str()));
+    let target_entity = setup["primaryEntityLogicalName"].as_str()
+        .or_else(|| plan_target["entityLogicalName"].as_str());
+
+    let write_target = if is_script {
+        serde_json::json!({
+            "kind": "script",
+            "repositoryRoot": repository_root,
+            "artifactPath": setup["artifactPath"].as_str()
+                .or_else(|| setup["scriptPath"].as_str())
+                .or_else(|| plan_target["scriptPath"].as_str())
+                .or_else(|| script_naming.as_ref().and_then(|n| n["scriptPath"].as_str())),
+            "absolutePath": setup["absoluteScriptPath"].as_str()
+                .or_else(|| script_naming.as_ref().and_then(|n| n["absoluteScriptPath"].as_str())),
+            "targetEntity": target_entity,
+            "actionType": setup["actionType"].as_str(),
+            "eventName": setup["eventName"].as_str().or_else(|| plan_target["eventName"].as_str()),
+            "eventFieldName": setup["eventFieldName"].as_str().or_else(|| plan_target["eventFieldName"].as_str()),
+            "handlers": {
+                "onLoad": setup["onLoadFunctionName"].as_str()
+                    .or_else(|| script_naming.as_ref().and_then(|n| n["onLoadFunctionName"].as_str())),
+                "onChange": setup["onChangeFunctionName"].as_str()
+                    .or_else(|| script_naming.as_ref().and_then(|n| n["onChangeFunctionName"].as_str())),
+            },
+            "helperSuggestion": setup["mainHelperSuggestion"].as_str()
+                .or_else(|| script_naming.as_ref().and_then(|n| n["mainHelperSuggestion"].as_str())),
+        })
+    } else {
+        serde_json::json!({
+            "kind": if work_kind == "plugin" { "plugin" } else { work_kind },
+            "repositoryRoot": repository_root,
+            "artifactPath": setup["pluginProject"].as_str().or_else(|| plan_target["pluginProject"].as_str()),
+            "targetEntity": target_entity,
+            "actionType": setup["actionType"].as_str(),
+            "pluginProject": setup["pluginProject"].as_str().or_else(|| plan_target["pluginProject"].as_str()),
+            "message": plan_target["message"].as_str(),
+            "stage": plan_target["stage"].as_str(),
+            "mode": plan_target["mode"].as_str(),
+            "filteringAttributes": plan_target["filteringAttributes"].as_array().cloned().unwrap_or_default(),
+        })
+    };
+
+    let mut convention_sources: Vec<Value> = Vec::new();
+    if let Some(v) = setup["conventionsSource"].as_str().filter(|s| !s.is_empty()) {
+        convention_sources.push(serde_json::json!(v));
+    }
+    if let Some(defaults) = customer_dev_defaults {
+        let key = if is_script { "jsConventionsSource" } else { "pluginConventionsSource" };
+        if let Some(v) = defaults[key].as_str().filter(|s| !s.is_empty()) {
+            convention_sources.push(serde_json::json!(v));
+        }
+    }
+
+    serde_json::json!({
+        "taskId": task["id"].as_str().unwrap_or(""),
+        "status": if can_write { "ready_to_code" } else { "not_ready" },
+        "canWriteCode": can_write,
+        "decisionReason": decision_reason,
+        "blockingUserAction": blocking_user_action,
+        "blockers": readiness["blockers"].as_array().cloned().unwrap_or_default(),
+        "warnings": readiness["warnings"].as_array().cloned().unwrap_or_default(),
+        "recommendedNextAction": if can_write {
+            "Implement only the work described in this packet.".to_string()
+        } else {
+            blocking_user_action.as_str()
+                .or_else(|| readiness["recommendedNextStep"].as_str())
+                .unwrap_or("Resolve Task Workbench blockers before implementation.")
+                .to_string()
+        },
+        "writeTarget": write_target,
+        "implementation": {
+            "workKind": work_kind,
+            "summary": task_mcp_summarize(plan["summary"].as_str()
+                .or_else(|| task["analysisResult"]["summaryEn"].as_str())
+                .or_else(|| task["analysisResult"]["summary"].as_str())
+                .or_else(|| task["title"].as_str()), TASK_MCP_MAX_SUMMARY_LENGTH),
+            "steps": plan["implementationSteps"].as_array().cloned().unwrap_or_default(),
+            "fieldMappings": plan["fieldMappings"].as_array().cloned().unwrap_or_default(),
+            "unmappedSourceFields": plan["unmappedSourceFields"].as_array().cloned().unwrap_or_default(),
+            "risks": plan["risks"].as_array().cloned().unwrap_or_default(),
+        },
+        "conventions": {
+            "sources": convention_sources,
+            "relatedFiles": setup["relatedExistingFiles"].as_array().cloned().unwrap_or_default(),
+            "rules": if is_script {
+                vec![
+                    serde_json::json!("Inspect existing form scripts before editing."),
+                    serde_json::json!("Use the handler/helper names from writeTarget."),
+                    serde_json::json!("Do not register or upload web resources from MCP."),
+                ]
+            } else {
+                vec![
+                    serde_json::json!("Inspect the existing plugin project conventions before editing."),
+                    serde_json::json!("Respect message/stage/filtering attributes from writeTarget."),
+                    serde_json::json!("Do not register plugins from MCP."),
+                ]
+            },
+        },
+        "dataverse": {
+            "verificationStatus": if is_script { "not_available_for_js_ts_mcp" } else { verification["verdict"].as_str().unwrap_or("unknown") },
+            "report": verification,
+            "instruction": if is_script {
+                "Dataverse metadata verification for JS/TS is not available through MCP. Use the in-app Verify Implementation modal after implementation/upload."
+            } else {
+                "Use the stored Dataverse verification report. If missing or failing, resolve before implementation."
+            },
+        },
+        "reviewTestCommit": {
+            "beforeCoding": [
+                "Use this work packet as the source of truth.",
+                "Do not call low-level setup tools unless this packet explicitly says setup is incomplete."
+            ],
+            "localValidation": plan["testChecklist"].as_array().cloned().unwrap_or_default(),
+            "afterImplementation": [
+                "Record build/local test results back into Task Workbench.",
+                "Request/record consultant testing when the workflow requires it.",
+                "Do not perform Dataverse upload, plugin registration, GitHub/ADO writes, or deployment without explicit approval."
+            ],
+            "commit": [
+                "Use Task Workbench git tools only after implementation and validation are complete.",
+                "Commit only files related to this task.",
+                "Push only through the guarded task branch flow; no force push and no direct main/master push."
+            ],
+        },
+        "internalStateSummary": {
+            "currentStep": workflow["currentStep"].as_str(),
+            "planApproved": approval["approved"].as_bool().unwrap_or(false),
+        },
+        "task": task_mcp_safe_task_summary(task),
+    })
 }
 
 fn task_mcp_allowed_statuses() -> &'static [&'static str] {
@@ -7960,6 +8129,19 @@ fn task_mcp_execute_tool(app: &tauri::AppHandle, tool_name: &str, args: &Value) 
                 "templates": task_mcp_builtin_templates(),
                 "matchedTemplate": matched,
             })
+        }
+
+        "get_developer_work_packet" => {
+            let task_id = args["taskId"].as_str().unwrap_or("").trim();
+            if task_id.is_empty() { return Err("Missing required argument: taskId".to_string()); }
+            let task = task_mcp_get_task(&tasks, task_id)
+                .ok_or_else(|| format!("Task not found: {task_id}"))?;
+            let customer_id = task["customerId"].as_str()
+                .or_else(|| task["workflowSetup"]["customerId"].as_str())
+                .unwrap_or("");
+            let dev_defaults = task_mcp_find_customer(&customers, customer_id)
+                .and_then(|c| task_mcp_customer_dev_defaults(c, &crm_base_dir));
+            task_mcp_developer_work_packet(task, dev_defaults.as_ref())
         }
 
         "prepare_developer_task" => {

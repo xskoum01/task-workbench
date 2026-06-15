@@ -37,6 +37,7 @@ const READ_ONLY_TOOL_NAMES = new Set([
   'get_external_action_proposal',
   'get_implementation_verification_state',
   'get_implementation_readiness',
+  'get_developer_work_packet',
   'get_task_templates',
 ]);
 
@@ -47,8 +48,8 @@ const READ_ONLY_TOOL_NAMES = new Set([
 const TASK_TEMPLATES = [
   {
     id: 'nvr-training-sh-script-prefill',
-    name: 'NVR Training Service Hub â€” Script: PĹ™edvyplnÄ›nĂ­ servisnĂ­ho poĹľadavku',
-    titlePattern: 'Script: PĹ™edvyplnÄ›nĂ­ servisnĂ­ho poĹľadavku',
+    name: 'NVR Training Service Hub – Script: Předvyplnění servisního požadavku',
+    titlePattern: 'Script: Předvyplnění servisního požadavku',
     mode: 'developer',
     workKind: 'script',
     actionType: 'create-new-script',
@@ -74,8 +75,8 @@ const TASK_TEMPLATES = [
   },
   {
     id: 'nvr-training-sh-plugin-workorderline',
-    name: 'NVR Training Service Hub â€” Plugin: VĂ˝poÄŤet ÄŤĂˇstek na poloĹľce servisnĂ­ zakĂˇzky',
-    titlePattern: 'Plugin: VĂ˝poÄŤet ÄŤĂˇstek na poloĹľce servisnĂ­ zakĂˇzky',
+    name: 'NVR Training Service Hub – Plugin: Výpočet částek na položce servisní zakázky',
+    titlePattern: 'Plugin: Výpočet částek na položce servisní zakázky',
     mode: 'developer',
     workKind: 'plugin',
     actionType: 'create-new-plugin',
@@ -928,6 +929,21 @@ const TOOL_DEFINITIONS = [
     },
   },
   {
+    name: 'get_developer_work_packet',
+    description:
+      'Read-only. Returns a simplified AI-facing developer work packet: whether code may be written, why, ' +
+      'where to write, what to implement, applicable conventions, Dataverse verification status, and review/test/commit guidance. ' +
+      'This hides internal Task Workbench workflow gates and does NOT write anything.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        taskId: { type: 'string', description: 'Task ID.' },
+      },
+      required: ['taskId'],
+      additionalProperties: false,
+    },
+  },
+  {
     name: 'get_task_templates',
     description:
       'Read-only. Returns built-in task templates that can be used to auto-resolve missing setup fields. ' +
@@ -1617,6 +1633,132 @@ function buildTaskFullContext(task, customerDevDefaults) {
   return detail;
 }
 
+function buildDeveloperWorkPacket(task, customerDevDefaults = null) {
+  const setup = asObject(task.workflowSetup);
+  const workflow = asObject(task.crmDeveloperWorkflow);
+  const plan = sanitizeTechnicalPlan(workflow.technicalPlan);
+  const readiness = computeImplementationReadiness(task);
+  const template = matchTaskTemplate(task.title || '');
+  const workKind = workflow.detectedWorkKind || setup.devTargetKind || plan?.workKind || 'unknown';
+  const isScript = workKind === 'script' || workKind === 'ribbon' || setup.devTargetKind === 'script';
+  const targetEntity = setup.primaryEntityLogicalName || plan?.target?.entityLogicalName || template?.targetEntity || '';
+  const scriptNaming = isScript ? computeScriptNaming(template, customerDevDefaults, setup) : null;
+  const verification = latestVerification(task);
+  const approval = approvalSummary(workflow.planApproval);
+  const next = nextRecommendedStep(task);
+
+  const blockers = [...(Array.isArray(readiness.blockers) ? readiness.blockers : [])];
+  const planApprovalRequired = !!plan && !approval.approved;
+  const canWriteCode = readiness.isImplementationReady && !planApprovalRequired;
+
+  let decisionReason;
+  let blockingUserAction = null;
+  if (canWriteCode) {
+    decisionReason = 'Task Workbench says implementation is ready. Use this packet as the working contract.';
+  } else if (planApprovalRequired) {
+    decisionReason = 'Technical plan approval is required in Task Workbench before code changes.';
+    blockingUserAction = 'Review and approve the technical implementation plan in Task Workbench.';
+  } else {
+    decisionReason = readiness.recommendedNextStep || 'Task Workbench says implementation is not ready yet.';
+    if (!plan) {
+      blockingUserAction = 'Run prepare_developer_task to create/refresh setup and the technical plan.';
+    } else if (blockers.length > 0) {
+      blockingUserAction = 'Resolve the listed blockers in Task Workbench.';
+    }
+  }
+
+  const writeTarget = isScript
+    ? {
+        kind: 'script',
+        repositoryRoot: setup.repositoryRoot || customerDevDefaults?.repositoryRoot || null,
+        artifactPath: setup.artifactPath || setup.scriptPath || plan?.target?.scriptPath || scriptNaming?.scriptPath || null,
+        absolutePath: setup.absoluteScriptPath || scriptNaming?.absoluteScriptPath || null,
+        targetEntity: targetEntity || null,
+        actionType: setup.actionType || template?.actionType || null,
+        eventName: setup.eventName || plan?.target?.eventName || template?.scriptTarget?.eventName || null,
+        eventFieldName: setup.eventFieldName || plan?.target?.eventFieldName || template?.scriptTarget?.eventFieldName || null,
+        handlers: {
+          onLoad: setup.onLoadFunctionName || scriptNaming?.onLoadFunctionName || null,
+          onChange: setup.onChangeFunctionName || scriptNaming?.onChangeFunctionName || null,
+        },
+        helperSuggestion: setup.mainHelperSuggestion || scriptNaming?.mainHelperSuggestion || null,
+      }
+    : {
+        kind: workKind === 'plugin' ? 'plugin' : workKind,
+        repositoryRoot: setup.repositoryRoot || customerDevDefaults?.repositoryRoot || null,
+        artifactPath: setup.pluginProject || plan?.target?.pluginProject || null,
+        targetEntity: targetEntity || null,
+        actionType: setup.actionType || template?.actionType || null,
+        pluginProject: setup.pluginProject || plan?.target?.pluginProject || null,
+        message: plan?.target?.message || template?.pluginTarget?.messages?.[0] || null,
+        stage: plan?.target?.stage || template?.pluginTarget?.stage || null,
+        mode: plan?.target?.mode || template?.pluginTarget?.mode || null,
+        filteringAttributes: plan?.target?.filteringAttributes || template?.pluginTarget?.filteringAttributes || [],
+      };
+
+  const conventionSources = [
+    setup.conventionsSource,
+    isScript ? customerDevDefaults?.conventionsSource || customerDevDefaults?.jsConventionsSource : customerDevDefaults?.pluginConventionsSource,
+  ].filter(Boolean);
+
+  return {
+    taskId: task.id,
+    status: canWriteCode ? 'ready_to_code' : 'not_ready',
+    canWriteCode,
+    decisionReason,
+    blockingUserAction,
+    blockers,
+    warnings: Array.isArray(readiness.warnings) ? readiness.warnings : [],
+    recommendedNextAction: canWriteCode ? 'Implement only the work described in this packet.' : (blockingUserAction || next.reason || readiness.recommendedNextStep),
+    writeTarget,
+    implementation: {
+      workKind,
+      summary: plan?.summary || summarize(task.analysisResult?.summaryEn ?? task.analysisResult?.summary ?? task.title),
+      steps: plan?.implementationSteps || [],
+      fieldMappings: plan?.fieldMappings || [],
+      unmappedSourceFields: plan?.unmappedSourceFields || [],
+      risks: plan?.risks || [],
+    },
+    conventions: {
+      sources: conventionSources,
+      relatedFiles: Array.isArray(setup.relatedExistingFiles) ? setup.relatedExistingFiles : [],
+      rules: isScript
+        ? ['Inspect existing form scripts before editing.', 'Use the handler/helper names from writeTarget.', 'Do not register or upload web resources from MCP.']
+        : ['Inspect the existing plugin project conventions before editing.', 'Respect message/stage/filtering attributes from writeTarget.', 'Do not register plugins from MCP.'],
+    },
+    dataverse: {
+      verificationStatus: isScript ? 'not_available_for_js_ts_mcp' : verification.verdict,
+      report: verification,
+      instruction: isScript
+        ? 'Dataverse metadata verification for JS/TS is not available through MCP. Use the in-app Verify Implementation modal after implementation/upload.'
+        : 'Use the stored Dataverse verification report. If missing or failing, resolve before implementation.',
+    },
+    reviewTestCommit: {
+      beforeCoding: [
+        'Use this work packet as the source of truth.',
+        'Do not call low-level setup tools unless this packet explicitly says setup is incomplete.',
+      ],
+      localValidation: plan?.testChecklist || [],
+      afterImplementation: [
+        'Record build/local test results back into Task Workbench.',
+        'Request/record consultant testing when the workflow requires it.',
+        'Do not perform Dataverse upload, plugin registration, GitHub/ADO writes, or deployment without explicit approval.',
+      ],
+      commit: [
+        'Use Task Workbench git tools only after implementation and validation are complete.',
+        'Commit only files related to this task.',
+        'Push only through the guarded task branch flow; no force push and no direct main/master push.',
+      ],
+    },
+    internalStateSummary: {
+      currentStep: workflow.currentStep || null,
+      planApproved: approval.approved,
+      nextRecommendedStep: next.step,
+    },
+    task: safeTaskSummary(task),
+  };
+}
+
 function deterministicPlanDraft(task, template) {
   const setup = asObject(task.workflowSetup);
   const workflow = asObject(task.crmDeveloperWorkflow);
@@ -2233,6 +2375,20 @@ async function callToolFallback(name, args = {}) {
       const task = getTaskById(tasks, args.id);
       if (!task) return { ...common, error: `Task not found: ${args.id}` };
       return { ...common, taskId: task.id, ...computeImplementationReadiness(task) };
+    }
+    case 'get_developer_work_packet': {
+      const taskId = String(args.taskId ?? '').trim();
+      if (!taskId) return { ...common, error: 'Missing required argument: taskId' };
+      const task = getTaskById(tasks, taskId);
+      if (!task) return { ...common, error: `Task not found: ${taskId}` };
+      let devDefaults = null;
+      const customerId = task.customerId || task.workflowSetup?.customerId;
+      if (customerId) {
+        const [customers, settings] = await Promise.all([loadCustomers(), loadSettings()]);
+        const customer = customers.find((c) => c.id === customerId);
+        devDefaults = computeCustomerDevDefaults(customer, settings?.crmBaseDirectory ?? '');
+      }
+      return { ...common, ...buildDeveloperWorkPacket(task, devDefaults) };
     }
     case 'get_power_platform_ai_kit_status': {
       const settings = await loadSettings();

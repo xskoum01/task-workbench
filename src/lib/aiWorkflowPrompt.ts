@@ -23,7 +23,7 @@ function buildCustomerDevDefaultsLines(customer: Customer | undefined): string[]
   return lines;
 }
 
-// Ă˘â€ťâ‚¬Ă˘â€ťâ‚¬ Prompt-time template preview Ă˘â€ťâ‚¬Ă˘â€ťâ‚¬Ă˘â€ťâ‚¬Ă˘â€ťâ‚¬Ă˘â€ťâ‚¬Ă˘â€ťâ‚¬Ă˘â€ťâ‚¬Ă˘â€ťâ‚¬Ă˘â€ťâ‚¬Ă˘â€ťâ‚¬Ă˘â€ťâ‚¬Ă˘â€ťâ‚¬Ă˘â€ťâ‚¬Ă˘â€ťâ‚¬Ă˘â€ťâ‚¬Ă˘â€ťâ‚¬Ă˘â€ťâ‚¬Ă˘â€ťâ‚¬Ă˘â€ťâ‚¬Ă˘â€ťâ‚¬Ă˘â€ťâ‚¬Ă˘â€ťâ‚¬Ă˘â€ťâ‚¬Ă˘â€ťâ‚¬Ă˘â€ťâ‚¬Ă˘â€ťâ‚¬Ă˘â€ťâ‚¬Ă˘â€ťâ‚¬Ă˘â€ťâ‚¬Ă˘â€ťâ‚¬Ă˘â€ťâ‚¬Ă˘â€ťâ‚¬Ă˘â€ťâ‚¬Ă˘â€ťâ‚¬Ă˘â€ťâ‚¬Ă˘â€ťâ‚¬Ă˘â€ťâ‚¬Ă˘â€ťâ‚¬Ă˘â€ťâ‚¬Ă˘â€ťâ‚¬Ă˘â€ťâ‚¬Ă˘â€ťâ‚¬Ă˘â€ťâ‚¬Ă˘â€ťâ‚¬
+// Prompt-time template preview
 
 interface PromptTemplate {
   id: string;
@@ -48,7 +48,7 @@ interface PromptTemplate {
 const PROMPT_TEMPLATES: PromptTemplate[] = [
   {
     id: 'nvr-training-sh-script-prefill',
-    titlePattern: 'Script: PÄąâ„˘edvyplnĂ„â€şnÄ‚Â­ servisnÄ‚Â­ho poÄąÄľadavku',
+    titlePattern: 'Script: Predvyplneni servisniho pozadavku',
     workKind: 'script',
     actionType: 'create-new-script',
     scriptTarget: {
@@ -67,7 +67,7 @@ const PROMPT_TEMPLATES: PromptTemplate[] = [
   },
   {
     id: 'nvr-training-sh-plugin-service-order',
-    titlePattern: 'Plugin: VÄ‚ËťpoĂ„Ĺ¤et Ă„Ĺ¤Ä‚Ë‡stek',
+    titlePattern: 'Plugin: Vypocet castek',
     workKind: 'plugin',
   },
 ];
@@ -91,7 +91,7 @@ function matchPromptTemplate(title: string, originalMessage?: string): PromptTem
   return null;
 }
 
-// Ă˘â€ťâ‚¬Ă˘â€ťâ‚¬ Script naming contract Ă˘â€ťâ‚¬Ă˘â€ťâ‚¬Ă˘â€ťâ‚¬Ă˘â€ťâ‚¬Ă˘â€ťâ‚¬Ă˘â€ťâ‚¬Ă˘â€ťâ‚¬Ă˘â€ťâ‚¬Ă˘â€ťâ‚¬Ă˘â€ťâ‚¬Ă˘â€ťâ‚¬Ă˘â€ťâ‚¬Ă˘â€ťâ‚¬Ă˘â€ťâ‚¬Ă˘â€ťâ‚¬Ă˘â€ťâ‚¬Ă˘â€ťâ‚¬Ă˘â€ťâ‚¬Ă˘â€ťâ‚¬Ă˘â€ťâ‚¬Ă˘â€ťâ‚¬Ă˘â€ťâ‚¬Ă˘â€ťâ‚¬Ă˘â€ťâ‚¬Ă˘â€ťâ‚¬Ă˘â€ťâ‚¬Ă˘â€ťâ‚¬Ă˘â€ťâ‚¬Ă˘â€ťâ‚¬Ă˘â€ťâ‚¬Ă˘â€ťâ‚¬Ă˘â€ťâ‚¬Ă˘â€ťâ‚¬Ă˘â€ťâ‚¬Ă˘â€ťâ‚¬Ă˘â€ťâ‚¬Ă˘â€ťâ‚¬Ă˘â€ťâ‚¬Ă˘â€ťâ‚¬Ă˘â€ťâ‚¬Ă˘â€ťâ‚¬Ă˘â€ťâ‚¬Ă˘â€ťâ‚¬Ă˘â€ťâ‚¬Ă˘â€ťâ‚¬Ă˘â€ťâ‚¬Ă˘â€ťâ‚¬Ă˘â€ťâ‚¬Ă˘â€ťâ‚¬Ă˘â€ťâ‚¬Ă˘â€ťâ‚¬Ă˘â€ťâ‚¬
+// Script naming contract
 
 interface ScriptNamingContract {
   namingSource: string;
@@ -232,13 +232,13 @@ function buildScriptNamingContractLines(contract: ScriptNamingContract, pendingS
     lines.push(`* onLoadFunctionName: ${contract.onLoadFunctionName}`);
     if (contract.onChangeFunctionName)  lines.push(`* onChangeFunctionName: ${contract.onChangeFunctionName}`);
     if (contract.mainHelperSuggestion)  lines.push(`* mainHelperSuggestion: ${contract.mainHelperSuggestion}`);
-    lines.push('', 'Do not ask the user what to do with this target. Do not ask for the task ID. Reload get_task_full_context after saving.');
+    lines.push('', 'Do not ask the user what to do with this target. Do not ask for the task ID. In normal setup, prepare_developer_task saves this metadata and returns the updated context.');
   }
 
   return lines;
 }
 
-// Ă˘â€ťâ‚¬Ă˘â€ťâ‚¬ Script context section Ă˘â€ťâ‚¬Ă˘â€ťâ‚¬Ă˘â€ťâ‚¬Ă˘â€ťâ‚¬Ă˘â€ťâ‚¬Ă˘â€ťâ‚¬Ă˘â€ťâ‚¬Ă˘â€ťâ‚¬Ă˘â€ťâ‚¬Ă˘â€ťâ‚¬Ă˘â€ťâ‚¬Ă˘â€ťâ‚¬Ă˘â€ťâ‚¬Ă˘â€ťâ‚¬Ă˘â€ťâ‚¬Ă˘â€ťâ‚¬Ă˘â€ťâ‚¬Ă˘â€ťâ‚¬Ă˘â€ťâ‚¬Ă˘â€ťâ‚¬Ă˘â€ťâ‚¬Ă˘â€ťâ‚¬Ă˘â€ťâ‚¬Ă˘â€ťâ‚¬Ă˘â€ťâ‚¬Ă˘â€ťâ‚¬Ă˘â€ťâ‚¬Ă˘â€ťâ‚¬Ă˘â€ťâ‚¬Ă˘â€ťâ‚¬Ă˘â€ťâ‚¬Ă˘â€ťâ‚¬Ă˘â€ťâ‚¬Ă˘â€ťâ‚¬Ă˘â€ťâ‚¬Ă˘â€ťâ‚¬Ă˘â€ťâ‚¬Ă˘â€ťâ‚¬Ă˘â€ťâ‚¬Ă˘â€ťâ‚¬Ă˘â€ťâ‚¬Ă˘â€ťâ‚¬Ă˘â€ťâ‚¬Ă˘â€ťâ‚¬Ă˘â€ťâ‚¬Ă˘â€ťâ‚¬Ă˘â€ťâ‚¬Ă˘â€ťâ‚¬Ă˘â€ťâ‚¬Ă˘â€ťâ‚¬Ă˘â€ťâ‚¬Ă˘â€ťâ‚¬
+// Script context section
 
 function buildScriptContextLines(
   task: Task,
@@ -274,9 +274,9 @@ function buildScriptContextLines(
     lines.push(`* Persistence state: not yet saved to task setup`);
     lines.push(`* Required action: save this target via set_task_developer_target`);
   } else if (isCreateNew) {
-    lines.push('* Target file: NOT SET Ă˘â‚¬â€ť derive from entity name and naming convention below, then save via set_task_developer_target');
+    lines.push('* Target file: NOT SET - derive from entity name and naming convention below, then save through prepare_developer_task');
   } else {
-    lines.push('* Target file: NOT SET Ă˘â‚¬â€ť do not guess or create a file path');
+    lines.push('* Target file: NOT SET - do not guess or create a file path');
   }
 
   if (isCreateNew && setup?.desiredScriptFile) {
@@ -316,7 +316,7 @@ function buildScriptContextLines(
       lines.push(
         '',
         'CRM JS script naming conventions:',
-        '* File name format: <entityLogicalName>_events.js (Scripts_Naming convention Ă˘â‚¬â€ť do not add extra nvr_ prefix if entity already has it, e.g. nvr_servicecase Ă˘â€ â€™ nvr_servicecase_events.js)',
+        '* File name format: <entityLogicalName>_events.js (Scripts_Naming convention - do not add extra nvr_ prefix if entity already has it, e.g. nvr_servicecase -> nvr_servicecase_events.js)',
         '* OnLoad handler: <entityLogicalName>_OnLoad',
         '* OnChange handler: <fieldLogicalName>_OnChange',
         '* Helper functions: descriptive camelCase without namespace prefixes',
@@ -342,7 +342,7 @@ function buildSetupBlockerSections(categorizedBlockers: ReadinessBlocker[]): str
   if (autoResolvable.length > 0) {
     lines.push('', 'Auto-resolvable (call the MCP tool immediately and reload, do not stop):');
     for (const b of autoResolvable) {
-      const tool = b.mcpTool ? ` Ă˘â€ â€™ call \`${b.mcpTool}\`` : '';
+      const tool = b.mcpTool ? ` -> call \`${b.mcpTool}\`` : '';
       lines.push(`* ${b.message}${tool}`);
     }
   }
@@ -350,15 +350,15 @@ function buildSetupBlockerSections(categorizedBlockers: ReadinessBlocker[]): str
   if (workflowActions.length > 0) {
     lines.push('', 'Read-only workflow actions (run the tool, record findings, reload, continue):');
     for (const b of workflowActions) {
-      const tool = b.mcpTool ? ` Ă˘â€ â€™ call \`${b.mcpTool}\`` : '';
+      const tool = b.mcpTool ? ` -> call \`${b.mcpTool}\`` : '';
       lines.push(`* ${b.message}${tool}`);
     }
   }
 
   if (proposals.length > 0) {
-    lines.push('', 'Proposal/draft actions (call the MCP tool immediately; for convention-derived setup metadata such as script file name, persist and continue Ă˘â‚¬â€ť user approval is required only before code file edits, not before saving task setup metadata):');
+    lines.push('', 'Proposal/draft actions (call the MCP tool immediately; for convention-derived setup metadata such as script file name, persist and continue - user approval is required only before code file edits, not before saving task setup metadata):');
     for (const b of proposals) {
-      const tool = b.mcpTool ? ` Ă˘â€ â€™ call \`${b.mcpTool}\`` : '';
+      const tool = b.mcpTool ? ` -> call \`${b.mcpTool}\`` : '';
       lines.push(`* ${b.message}${tool}`);
     }
   }
@@ -392,15 +392,9 @@ export function buildAiWorkflowPrompt(task: Task, customer?: Customer): string {
     'You are working on a CRM development task managed by Task Workbench.',
     '',
     'Use Task Workbench MCP tools for task context and workflow updates.',
-    ...(!readiness.isReady
-      ? [
-          `First MCP call: \`prepare_developer_task\` with taskId "${task.id}".`,
-          'Use its returned task/readiness context directly. Do not reload get_task_full_context unless prepare_developer_task returns an error or missing context.',
-          'Stop at the approval gate or hard blocker returned by prepare_developer_task. Do not ask for fields that the returned template/default setup already resolved.',
-        ]
-      : [
-          'Start by loading the full current context for this task using the Task Workbench MCP tool `get_task_full_context`.',
-        ]),
+    `First MCP call: \`get_developer_work_packet\` with taskId "${task.id}".`,
+    'Use the returned work packet as the source of truth for whether code may be written, where to write, what to implement, conventions, verification, and review/test/commit guidance.',
+    'Do not inspect internal workflow phase/currentStep/approval state unless get_developer_work_packet returns an error or missing context.',
     '',
     `Task ID: ${task.id}`,
     '',
@@ -410,7 +404,7 @@ export function buildAiWorkflowPrompt(task: Task, customer?: Customer): string {
     `* Status: ${task.status}`,
   ];
 
-  if (currentStep) lines.push(`* Phase: ${currentStep}`);
+  if (currentStep && !readiness.isReady) lines.push(`* Phase: ${currentStep}`);
   if (mode)        lines.push(`* Mode: ${mode}`);
   if (workKind)    lines.push(`* Work classification: ${workKind}`);
   if (customerId)  lines.push(`* Customer/environment: ${customerId}`);
@@ -421,8 +415,9 @@ export function buildAiWorkflowPrompt(task: Task, customer?: Customer): string {
     `* The current task ID is the Task ID shown in this prompt.`,
     '* Use this ID for all Task Workbench MCP read/write calls.',
     '* Do not ask the user for the task ID again unless the prompt does not contain one and get_task_full_context cannot be loaded.',
-    '* For setup/readiness, prefer prepare_developer_task. It applies templates, customer defaults, target derivation, technical plan drafting, setup confirmation, and returns updated context in one call.',
-    '* Use low-level setup tools only if prepare_developer_task reports a hard blocker that needs a specific corrective write.',
+    '* For AI work, prefer get_developer_work_packet. It hides Task Workbench internal workflow state and returns a clear canWriteCode decision plus working instructions.',
+    '* Use prepare_developer_task only when the work packet explicitly says setup is incomplete and recommends preparing the developer task.',
+    '* Do not use low-level setup tools unless a high-level tool reports a specific corrective action that cannot be handled otherwise.',
   );
 
   const templatePreview = matchPromptTemplate(task.title ?? '', task.originalMessage);
@@ -454,23 +449,22 @@ export function buildAiWorkflowPrompt(task: Task, customer?: Customer): string {
       '',
       `Recommended next step: ${readiness.recommendedNextStep}`,
       '',
-      'Setup orchestration:',
-      `Call \`prepare_developer_task\` once with { "taskId": "${task.id}", "mode": "setup-until-approval-gate" }. Use the returned context/readiness as the source of truth.`,
+      'Work packet flow:',
+      `Call \`get_developer_work_packet\` once with { "taskId": "${task.id}" }. Use the returned canWriteCode decision as the source of truth.`,
       '',
-      'prepare_developer_task is allowed to perform only safe local setup writes:',
-      '* apply matched templates and customer developer defaults',
-      '* set Developer mode, work classification, target entity/event/script naming metadata',
-      '* save a deterministic task analysis and technical plan draft',
-      '* confirm setup only when no hard blockers remain',
-      '* return approvalGates/hardBlockers/missingInputs without requiring a follow-up reload',
+      'If canWriteCode is false:',
+      '* do not implement code or modify files',
+      '* summarize decisionReason and blockingUserAction from the packet',
+      '* call prepare_developer_task only if recommendedNextAction says setup should be prepared/refreshed',
+      '* otherwise stop and wait for the required Task Workbench/user action',
       '',
       'Setup rules:',
       '',
-      '1. First call prepare_developer_task. Do not call get_task_full_context or get_task_templates before it.',
-      '2. If status is stopped_at_approval_gate, summarize the approval gate and stop before file edits.',
-      '3. If status is blocked, ask only for missingInputs/hardBlockers returned by the tool.',
-      '4. If status is ready_for_implementation, continue only if implementationReadiness.isImplementationReady is true and the workflow phase allows code changes.',
-      '5. If Task Workbench MCP becomes unavailable or any required MCP read/write fails after 3 retries, stop immediately.',
+      '1. First call get_developer_work_packet. Do not call get_task_full_context, get_implementation_readiness, or get_task_templates before it.',
+      '2. If canWriteCode is false, do not reason over internal gates; report the packet decision and stop unless the packet recommends prepare_developer_task.',
+      '3. If canWriteCode is true, implement only the work described by writeTarget, implementation, conventions, and reviewTestCommit.',
+      '4. Use get_task_full_context only as fallback when get_developer_work_packet returns an error or missing context.',
+      '5. If Task Workbench MCP becomes unavailable or any required MCP read/write fails after 3 retries - stop immediately.',
     );
     return lines.join('\n');
 
@@ -483,22 +477,24 @@ export function buildAiWorkflowPrompt(task: Task, customer?: Customer): string {
 
   lines.push(
     '',
+    'Use the returned developer work packet as the only source of truth for implementation.',
+    'Known target preview only, not write authorization: task metadata and script context above show known values but file writes require workPacket.canWriteCode === true.',
+    '',
     'Implementation rules:',
     '',
-    `1. Load the full task context using \`get_task_full_context\` with id "${task.id}".`,
-    '2. Do not create or modify files unless all of these are confirmed from Task Workbench: work kind, repository root, target artifact path, customer/environment, technical plan, and implementation readiness state.',
-    '3. If Task Workbench MCP becomes unavailable or any required MCP read/write fails Ă˘â‚¬â€ť stop immediately. Do not continue implementation outside Task Workbench workflow.',
-    '4. If work kind is missing, "unknown", or inconsistent with the task assignment Ă˘â‚¬â€ť do not implement. Save/update next step via `set_task_next_step` and stop.',
-    '5. If target artifact path is missing or unclear Ă˘â‚¬â€ť do not create a new file by guessing a path or name. For script tasks use only the target file shown in Script target context above. Save/update next step via `set_task_next_step` and stop.',
-    '6. If technical plan is missing or cannot be saved through Task Workbench MCP Ă˘â‚¬â€ť do not implement. Stop.',
+    `1. Confirm canWriteCode from the already-returned developer work packet. If no fresh work packet is available, call \`get_developer_work_packet\` with taskId "${task.id}". Use \`get_task_full_context\` only as a fallback for error or missing context.`,
+    '2. Do not create or modify files unless canWriteCode is true and writeTarget gives a repository root plus target artifact path.',
+    '3. If workPacket.canWriteCode is false, stop. Report decisionReason and blockingUserAction from the packet. Do not create or modify files.',
+    '4. If workPacket.canWriteCode is true, implement only files listed in workPacket.writeTarget.',
+    '5. If Task Workbench MCP becomes unavailable or any required MCP read/write fails - stop immediately. Do not continue implementation outside Task Workbench workflow.',
     ...(workKind === 'script' || workKind === 'ribbon' || task.workflowSetup?.devTargetKind === 'script'
-      ? ['7. Dataverse metadata verification for JS/TS is not available through MCP. Use the in-app Verify Implementation modal after implementation/upload; do not call run_dataverse_check_for_task for script files.']
-      : ['7. If Dataverse metadata verification is required but not completed - run run_dataverse_check_for_task (Primarch integration) first. If verification cannot be recorded in Task Workbench, stop.']),
-    '8. For JavaScript/form script tasks Ă˘â‚¬â€ť inspect existing repository conventions and similar scripts before writing code. Use conventionsSource and related files listed in Script target context if provided.',
-    '9. For plugin tasks Ă˘â‚¬â€ť inspect existing plugin conventions and similar plugin classes before writing code.',
-    '10. Do not perform external writes (Dataverse writes, plugin registration, web resource upload, GitHub/ADO actions, deployments) unless explicitly approved by the user.',
-    '11. Record local test results, build results, consultant testing, PR review findings and next step back into Task Workbench.',
-    '12. At the end, summarize what was done and what should happen next.',
+      ? ['6. Dataverse metadata verification for JS/TS is not available through MCP. Use the in-app Verify Implementation modal after implementation/upload for script files.']
+      : ['6. If Dataverse metadata verification is required but not completed - run run_dataverse_check_for_task (Primarch integration) first. If verification cannot be recorded in Task Workbench, stop.']),
+    '7. For JavaScript/form script tasks - inspect existing repository conventions and similar scripts before writing code. Use conventionsSource and related files listed in Script target context if provided.',
+    '8. For plugin tasks - inspect existing plugin conventions and similar plugin classes before writing code.',
+    '9. Do not perform external writes (Dataverse writes, plugin registration, web resource upload, GitHub/ADO actions, deployments) unless explicitly approved by the user.',
+    '10. Record local test results, build results, consultant testing, PR review findings and next step back into Task Workbench.',
+    '11. At the end, summarize what was done and what should happen next.',
   );
 
   return lines.join('\n');
