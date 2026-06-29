@@ -482,19 +482,33 @@ export function buildAiWorkflowPrompt(task: Task, customer?: Customer): string {
     '',
     'Implementation rules:',
     '',
-    `1. Confirm canWriteCode from the already-returned developer work packet. If no fresh work packet is available, call \`get_developer_work_packet\` with taskId "${task.id}". Use \`get_task_full_context\` only as a fallback for error or missing context.`,
-    '2. Do not create or modify files unless canWriteCode is true and writeTarget gives a repository root plus target artifact path.',
-    '3. If workPacket.canWriteCode is false, stop. Report decisionReason and blockingUserAction from the packet. Do not create or modify files.',
-    '4. If workPacket.canWriteCode is true, implement only files listed in workPacket.writeTarget.',
+    '1. If workPacket.canWriteCode is false, stop. Report decisionReason and blockingUserAction from the packet. Do not create or modify files.',
+    '2. If workPacket.canWriteCode is true, implement only files listed in workPacket.writeTarget / targetFiles.',
+    '3. Do not guess paths, entities, fields, mappings, handlers, or web resource names outside the work packet.',
+    '4. Inspect only conventions and similar files recommended by the work packet before writing code.',
     '5. If Task Workbench MCP becomes unavailable or any required MCP read/write fails - stop immediately. Do not continue implementation outside Task Workbench workflow.',
     ...(workKind === 'script' || workKind === 'ribbon' || task.workflowSetup?.devTargetKind === 'script'
       ? ['6. Dataverse metadata verification for JS/TS is not available through MCP. Use the in-app Verify Implementation modal after implementation/upload for script files.']
       : ['6. If Dataverse metadata verification is required but not completed - run run_dataverse_check_for_task (Primarch integration) first. If verification cannot be recorded in Task Workbench, stop.']),
-    '7. For JavaScript/form script tasks - inspect existing repository conventions and similar scripts before writing code. Use conventionsSource and related files listed in Script target context if provided.',
-    '8. For plugin tasks - inspect existing plugin conventions and similar plugin classes before writing code.',
-    '9. Do not perform external writes (Dataverse writes, plugin registration, web resource upload, GitHub/ADO actions, deployments) unless explicitly approved by the user.',
-    '10. Record local test results, build results, consultant testing, PR review findings and next step back into Task Workbench.',
-    '11. At the end, summarize what was done and what should happen next.',
+    '7. Do not perform external writes: Dataverse writes, web resource upload, plugin registration, GitHub/ADO actions, deployments.',
+    '8. Record local test results, build results, consultant testing, PR review findings and next step back into Task Workbench using the packet guidance.',
+    '9. At the end, summarize what was changed and what should happen next.',
+    '10. Implement only exact field mappings returned in workPacket.implementation.fieldMappings. Do not add, infer, or substitute fields. Unmapped source fields are context only and must not be written to target fields. If workPacket.implementation.requiresFieldMappings is true and fieldMappings is empty, stop immediately — report workPacket.implementation.missingRequiredMappings to the user; do not write scaffold or TODO code as a substitute.',
+    '11. Fields listed in workPacket.implementation.validationFields are read-only source context for conditional logic — never write them to target entity fields.',
+    '12. Follow AI Kit mandatory rules from workPacket.aiKit before writing code. After implementation, run or request AI Kit review, or record it as the required next step.',
+    '13. If the target file contains TODO comments, FIXME comments, placeholder handlers, or scaffold code, do not accept it as complete. Decide based on what the packet provides: (a) if workPacket.implementation.fieldMappings and the business rules in this packet provide enough information to replace the TODO/scaffold safely, fix the file by replacing every TODO with real implementation — do not leave any TODO in output; (b) if the packet does not provide enough information to replace a TODO (e.g. requiresFieldMappings is true but fieldMappings is empty), stop immediately and report the blocker to the user. Do not call continue_developer_workflow or record_local_test while any TODO, FIXME, or placeholder comment remains in implementation code.',
+    '14. Before writing changes or accepting an existing target file as complete, inspect it. Existing code containing TODO comments, placeholder/stub handlers, or fields outside workPacket.implementation.fieldMappings is not acceptable as complete. Inspect and follow workPacket.aiKit.rulesFiles when provided; if empty, follow workPacket.aiKit.mandatoryRulesSummary.',
+  );
+
+  lines.push(
+    '',
+    'Post-implementation workflow (call after every file write):',
+    '',
+    '1. Call `continue_developer_workflow` with the task ID. Do not stop after creating files.',
+    '2. Follow the returned nextAction and instructionForAI until the tool returns wait_for_user or mark_done.',
+    '3. For any requiresUserApproval=true action (branch create, push, Dataverse write), ask the user for explicit confirmation first.',
+    '4. If workPacket.implementation.fieldMappings is empty when mappings are expected, stop. Do not write TODO or scaffold code as a substitute for missing mappings.',
+    '5. TODO comments in final implementation output are never acceptable. Do not call continue_developer_workflow or record_local_test until every TODO, FIXME, and placeholder comment has been replaced with actual implementation. If the packet provides enough information to replace a TODO, do so. If not, report the blocker.',
   );
 
   return lines.join('\n');

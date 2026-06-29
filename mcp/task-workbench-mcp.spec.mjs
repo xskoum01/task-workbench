@@ -215,6 +215,541 @@ describe('callToolFallback get_developer_work_packet', () => {
 });
 
 // ---------------------------------------------------------------------------
+// 1b. get_developer_work_packet – derived target guard, field mappings, aiKit
+// ---------------------------------------------------------------------------
+
+describe('callToolFallback get_developer_work_packet – derived target and field mapping guards', () => {
+  it('returns canWriteCode=false when target path is not persisted in task setup (derived preview only)', async () => {
+    const os = await import('node:os');
+    const fs = await import('node:fs/promises');
+    const path = await import('node:path');
+
+    const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'tw-mcp-preview-'));
+    // Plan approval is granted, but NO artifactPath/scriptPath saved in workflowSetup.
+    await fs.writeFile(path.join(tmpDir, 'tasks.json'), JSON.stringify([makeTask({
+      id: 'task-preview-only',
+      taskMode: 'developer',
+      customerId: 'cust-test',
+      workflowSetup: {
+        devTargetKind: 'script',
+        repositoryRoot: 'C:\\Repo',
+        actionType: 'create-new-script',
+        primaryEntityLogicalName: 'nvr_servicecase',
+        confirmedAt: '2026-06-01T10:00:00.000Z',
+        // NO artifactPath, NO scriptPath — target only exists as naming contract preview
+      },
+      crmDeveloperWorkflow: {
+        detectedWorkKind: 'script',
+        technicalPlan: {
+          workKind: 'script',
+          summary: 'Create script.',
+          target: { entityLogicalName: 'nvr_servicecase', scriptPath: '', eventFieldName: 'nvr_assetid' },
+          implementationSteps: [],
+          fieldMappings: [],
+          risks: [],
+          testChecklist: [],
+        },
+        planApproval: { approved: true },
+      },
+    })]));
+
+    const origArgv = process.argv;
+    process.argv = [...process.argv, '--data-dir', tmpDir, '--fallback-readonly'];
+    try {
+      const packet = await callToolFallback('get_developer_work_packet', { taskId: 'task-preview-only' });
+      expect(packet.canWriteCode).toBe(false);
+      expect(packet.status).toBe('not_ready');
+      expect(packet.decisionReason).toContain('has not been saved to task setup');
+    } finally {
+      process.argv = origArgv;
+      await fs.rm(tmpDir, { recursive: true });
+    }
+  });
+
+  it('returns recommendedNextAction referencing prepare_developer_task or set_task_developer_target when target not persisted', async () => {
+    const os = await import('node:os');
+    const fs = await import('node:fs/promises');
+    const path = await import('node:path');
+
+    const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'tw-mcp-preview2-'));
+    await fs.writeFile(path.join(tmpDir, 'tasks.json'), JSON.stringify([makeTask({
+      id: 'task-preview-2',
+      taskMode: 'developer',
+      customerId: 'cust-test',
+      workflowSetup: {
+        devTargetKind: 'script',
+        repositoryRoot: 'C:\\Repo',
+        primaryEntityLogicalName: 'nvr_servicecase',
+        confirmedAt: '2026-06-01T10:00:00.000Z',
+        // NO artifactPath, NO actionType, NO scriptPath
+      },
+      crmDeveloperWorkflow: {
+        detectedWorkKind: 'script',
+        planApproval: { approved: true },
+      },
+    })]));
+
+    const origArgv = process.argv;
+    process.argv = [...process.argv, '--data-dir', tmpDir, '--fallback-readonly'];
+    try {
+      const packet = await callToolFallback('get_developer_work_packet', { taskId: 'task-preview-2' });
+      expect(packet.canWriteCode).toBe(false);
+      expect(packet.recommendedNextAction).toMatch(/prepare_developer_task|set_task_developer_target/);
+    } finally {
+      process.argv = origArgv;
+      await fs.rm(tmpDir, { recursive: true });
+    }
+  });
+
+  it('returns exact 3-pair field mappings (customer/contact/warranty) for NVR servicecase script', async () => {
+    const os = await import('node:os');
+    const fs = await import('node:fs/promises');
+    const path = await import('node:path');
+
+    const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'tw-mcp-fields-'));
+    await fs.writeFile(path.join(tmpDir, 'tasks.json'), JSON.stringify([makeTask({
+      id: 'task-fields',
+      customerId: 'cust-test',
+      workflowSetup: {
+        devTargetKind: 'script',
+        repositoryRoot: 'C:\\Repo',
+        actionType: 'create-new-script',
+        primaryEntityLogicalName: 'nvr_servicecase',
+        artifactPath: 'Scripts\\nvr_servicecase_events.js',
+        absoluteScriptPath: 'C:\\Repo\\Scripts\\nvr_servicecase_events.js',
+        confirmedAt: '2026-06-01T10:00:00.000Z',
+      },
+      crmDeveloperWorkflow: {
+        detectedWorkKind: 'script',
+        technicalPlan: {
+          workKind: 'script',
+          summary: 'Prefill service case from asset.',
+          target: { entityLogicalName: 'nvr_servicecase', scriptPath: 'Scripts\\nvr_servicecase_events.js', eventFieldName: 'nvr_assetid' },
+          implementationSteps: [],
+          fieldMappings: [
+            { source: 'nvr_customerasset.nvr_customerid', target: 'nvr_servicecase.nvr_customerid' },
+            { source: 'nvr_customerasset.nvr_contactid', target: 'nvr_servicecase.nvr_contactid' },
+            { source: 'nvr_customerasset.nvr_isunderwarranty', target: 'nvr_servicecase.nvr_iswarrantycase' },
+          ],
+          unmappedSourceFields: ['nvr_customerasset.nvr_statuscustom'],
+          risks: [],
+          testChecklist: [],
+        },
+        planApproval: { approved: true },
+      },
+      implementationVerification: { dataverseCheck: { status: 'skipped' } },
+    })]));
+
+    const origArgv = process.argv;
+    process.argv = [...process.argv, '--data-dir', tmpDir, '--fallback-readonly'];
+    try {
+      const packet = await callToolFallback('get_developer_work_packet', { taskId: 'task-fields' });
+      expect(packet.implementation.fieldMappings).toHaveLength(3);
+      expect(packet.implementation.fieldMappings[0]).toEqual({ source: 'nvr_customerasset.nvr_customerid', target: 'nvr_servicecase.nvr_customerid' });
+      expect(packet.implementation.fieldMappings[1]).toEqual({ source: 'nvr_customerasset.nvr_contactid', target: 'nvr_servicecase.nvr_contactid' });
+      expect(packet.implementation.fieldMappings[2]).toEqual({ source: 'nvr_customerasset.nvr_isunderwarranty', target: 'nvr_servicecase.nvr_iswarrantycase' });
+    } finally {
+      process.argv = origArgv;
+      await fs.rm(tmpDir, { recursive: true });
+    }
+  });
+
+  it('lists nvr_statuscustom only in unmappedSourceFields with a forbiddenAssumptions entry, not in fieldMappings', async () => {
+    const os = await import('node:os');
+    const fs = await import('node:fs/promises');
+    const path = await import('node:path');
+
+    const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'tw-mcp-unmapped-'));
+    await fs.writeFile(path.join(tmpDir, 'tasks.json'), JSON.stringify([makeTask({
+      id: 'task-unmapped',
+      customerId: 'cust-test',
+      workflowSetup: {
+        devTargetKind: 'script',
+        repositoryRoot: 'C:\\Repo',
+        actionType: 'create-new-script',
+        primaryEntityLogicalName: 'nvr_servicecase',
+        artifactPath: 'Scripts\\nvr_servicecase_events.js',
+        confirmedAt: '2026-06-01T10:00:00.000Z',
+      },
+      crmDeveloperWorkflow: {
+        detectedWorkKind: 'script',
+        technicalPlan: {
+          workKind: 'script',
+          summary: 'Prefill.',
+          target: { entityLogicalName: 'nvr_servicecase', scriptPath: 'Scripts\\nvr_servicecase_events.js' },
+          implementationSteps: [],
+          fieldMappings: [{ source: 'nvr_customerasset.nvr_customerid', target: 'nvr_servicecase.nvr_customerid' }],
+          unmappedSourceFields: ['nvr_customerasset.nvr_statuscustom'],
+          risks: [],
+          testChecklist: [],
+        },
+        planApproval: { approved: true },
+      },
+      implementationVerification: { dataverseCheck: { status: 'skipped' } },
+    })]));
+
+    const origArgv = process.argv;
+    process.argv = [...process.argv, '--data-dir', tmpDir, '--fallback-readonly'];
+    try {
+      const packet = await callToolFallback('get_developer_work_packet', { taskId: 'task-unmapped' });
+      const mappedSources = packet.implementation.fieldMappings.map((m) => m.source);
+      expect(mappedSources).not.toContain('nvr_customerasset.nvr_statuscustom');
+      expect(packet.implementation.unmappedSourceFields).toContain('nvr_customerasset.nvr_statuscustom');
+      expect(packet.implementation.forbiddenAssumptions).toEqual(
+        expect.arrayContaining([expect.stringContaining('nvr_statuscustom')])
+      );
+    } finally {
+      process.argv = origArgv;
+      await fs.rm(tmpDir, { recursive: true });
+    }
+  });
+
+  it('work packet includes aiKit section with mandatory rules against stub handlers', async () => {
+    const os = await import('node:os');
+    const fs = await import('node:fs/promises');
+    const path = await import('node:path');
+
+    const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'tw-mcp-aikit-'));
+    await fs.writeFile(path.join(tmpDir, 'tasks.json'), JSON.stringify([makeTask({
+      id: 'task-aikit',
+      customerId: 'cust-test',
+      workflowSetup: {
+        devTargetKind: 'script',
+        repositoryRoot: 'C:\\Repo',
+        actionType: 'create-new-script',
+        primaryEntityLogicalName: 'nvr_servicecase',
+        artifactPath: 'Scripts\\nvr_servicecase_events.js',
+        confirmedAt: '2026-06-01T10:00:00.000Z',
+      },
+      crmDeveloperWorkflow: {
+        detectedWorkKind: 'script',
+        technicalPlan: {
+          workKind: 'script',
+          summary: 'Test.',
+          target: { entityLogicalName: 'nvr_servicecase', scriptPath: 'Scripts\\nvr_servicecase_events.js' },
+          implementationSteps: [],
+          fieldMappings: [],
+          risks: [],
+          testChecklist: [],
+        },
+        planApproval: { approved: true },
+      },
+      implementationVerification: { dataverseCheck: { status: 'skipped' } },
+    })]));
+
+    const origArgv = process.argv;
+    process.argv = [...process.argv, '--data-dir', tmpDir, '--fallback-readonly'];
+    try {
+      const packet = await callToolFallback('get_developer_work_packet', { taskId: 'task-aikit' });
+      expect(packet.aiKit).toBeDefined();
+      expect(packet.aiKit.mustInspectBeforeWriting).toBe(true);
+      expect(packet.aiKit.mandatoryRulesSummary).toEqual(
+        expect.arrayContaining([expect.stringContaining('stub')])
+      );
+      expect(packet.aiKit.reviewRequiredAfterImplementation).toBe(true);
+    } finally {
+      process.argv = origArgv;
+      await fs.rm(tmpDir, { recursive: true });
+    }
+  });
+
+  it('reviewTestCommit.afterImplementation references record_local_test and workflow advance tool', async () => {
+    const os = await import('node:os');
+    const fs = await import('node:fs/promises');
+    const path = await import('node:path');
+
+    const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'tw-mcp-review-'));
+    await fs.writeFile(path.join(tmpDir, 'tasks.json'), JSON.stringify([makeTask({
+      id: 'task-review-step',
+      customerId: 'cust-test',
+      workflowSetup: {
+        devTargetKind: 'script',
+        repositoryRoot: 'C:\\Repo',
+        actionType: 'create-new-script',
+        primaryEntityLogicalName: 'nvr_servicecase',
+        artifactPath: 'Scripts\\nvr_servicecase_events.js',
+        confirmedAt: '2026-06-01T10:00:00.000Z',
+      },
+      crmDeveloperWorkflow: {
+        detectedWorkKind: 'script',
+        technicalPlan: {
+          workKind: 'script',
+          summary: 'Test.',
+          target: { entityLogicalName: 'nvr_servicecase', scriptPath: 'Scripts\\nvr_servicecase_events.js' },
+          implementationSteps: [],
+          fieldMappings: [],
+          risks: [],
+          testChecklist: [],
+        },
+        planApproval: { approved: true },
+      },
+      implementationVerification: { dataverseCheck: { status: 'skipped' } },
+    })]));
+
+    const origArgv = process.argv;
+    process.argv = [...process.argv, '--data-dir', tmpDir, '--fallback-readonly'];
+    try {
+      const packet = await callToolFallback('get_developer_work_packet', { taskId: 'task-review-step' });
+      const afterImpl = packet.reviewTestCommit.afterImplementation.join(' ');
+      expect(afterImpl).toContain('record_local_test');
+      expect(afterImpl).toContain('continue_developer_workflow');
+    } finally {
+      process.argv = origArgv;
+      await fs.rm(tmpDir, { recursive: true });
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 1c. continue_developer_workflow – guided post-implementation steps
+// ---------------------------------------------------------------------------
+
+describe('callToolFallback continue_developer_workflow', () => {
+  it('returns record_results when local test has not been recorded yet', async () => {
+    const os = await import('node:os');
+    const fs = await import('node:fs/promises');
+    const path = await import('node:path');
+
+    const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'tw-mcp-cdw-notest-'));
+    await fs.writeFile(path.join(tmpDir, 'tasks.json'), JSON.stringify([makeTask({
+      id: 'task-cdw-notest',
+      taskMode: 'developer',
+      workflowSetup: { devTargetKind: 'script', repositoryRoot: 'C:\\Repo', artifactPath: 'Scripts\\nvr.js' },
+      crmDeveloperWorkflow: { detectedWorkKind: 'script' },
+      // No localTestRecord
+    })]));
+
+    const origArgv = process.argv;
+    process.argv = [...process.argv, '--data-dir', tmpDir, '--fallback-readonly'];
+    try {
+      const result = await callToolFallback('continue_developer_workflow', { taskId: 'task-cdw-notest' });
+      expect(result.nextAction).toBe('record_results');
+      expect(result.canProceed).toBe(false);
+      expect(result.recommendedTool).toBe('record_local_test');
+    } finally {
+      process.argv = origArgv;
+      await fs.rm(tmpDir, { recursive: true });
+    }
+  });
+
+  it('returns wait_for_user for Dataverse verification after local test recorded (script task)', async () => {
+    const os = await import('node:os');
+    const fs = await import('node:fs/promises');
+    const path = await import('node:path');
+
+    const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'tw-mcp-cdw-nodv-'));
+    await fs.writeFile(path.join(tmpDir, 'tasks.json'), JSON.stringify([makeTask({
+      id: 'task-cdw-nodv',
+      taskMode: 'developer',
+      workflowSetup: { devTargetKind: 'script', repositoryRoot: 'C:\\Repo', artifactPath: 'Scripts\\nvr.js' },
+      crmDeveloperWorkflow: { detectedWorkKind: 'script' },
+      localTestRecord: { status: 'passed', updatedAt: '2026-06-15T10:00:00.000Z' },
+      // No implementationVerification — Dataverse check not done
+    })]));
+
+    const origArgv = process.argv;
+    process.argv = [...process.argv, '--data-dir', tmpDir, '--fallback-readonly'];
+    try {
+      const result = await callToolFallback('continue_developer_workflow', { taskId: 'task-cdw-nodv' });
+      expect(result.nextAction).toBe('wait_for_user');
+      expect(result.requiresUserApproval).toBe(true);
+      expect(result.blockingUserAction).toContain('Verify Implementation modal');
+      expect(result.nextAction).not.toBe('mark_done');
+    } finally {
+      process.argv = origArgv;
+      await fs.rm(tmpDir, { recursive: true });
+    }
+  });
+
+  it('returns wait_for_user for AI Kit review after Dataverse verification done', async () => {
+    const os = await import('node:os');
+    const fs = await import('node:fs/promises');
+    const path = await import('node:path');
+
+    const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'tw-mcp-cdw-noaikit-'));
+    await fs.writeFile(path.join(tmpDir, 'tasks.json'), JSON.stringify([makeTask({
+      id: 'task-cdw-noaikit',
+      taskMode: 'developer',
+      workflowSetup: { devTargetKind: 'script', repositoryRoot: 'C:\\Repo', artifactPath: 'Scripts\\nvr.js' },
+      crmDeveloperWorkflow: { detectedWorkKind: 'script' },
+      localTestRecord: { status: 'passed', updatedAt: '2026-06-15T10:00:00.000Z' },
+      implementationVerification: { dataverseCheck: { status: 'skipped' } },
+      // No aiKitReview — AI Kit review not done
+    })]));
+
+    const origArgv = process.argv;
+    process.argv = [...process.argv, '--data-dir', tmpDir, '--fallback-readonly'];
+    try {
+      const result = await callToolFallback('continue_developer_workflow', { taskId: 'task-cdw-noaikit' });
+      expect(result.nextAction).toBe('wait_for_user');
+      expect(result.requiresUserApproval).toBe(true);
+      expect(result.blockingUserAction).toContain('AI Kit review');
+    } finally {
+      process.argv = origArgv;
+      await fs.rm(tmpDir, { recursive: true });
+    }
+  });
+
+  it('returns propose_branch with requiresUserApproval=true after all verifications done', async () => {
+    const os = await import('node:os');
+    const fs = await import('node:fs/promises');
+    const path = await import('node:path');
+
+    const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'tw-mcp-cdw-branch-'));
+    await fs.writeFile(path.join(tmpDir, 'tasks.json'), JSON.stringify([makeTask({
+      id: 'task-cdw-branch',
+      taskMode: 'developer',
+      workflowSetup: { devTargetKind: 'script', repositoryRoot: 'C:\\Repo', artifactPath: 'Scripts\\nvr.js' },
+      crmDeveloperWorkflow: { detectedWorkKind: 'script' },
+      localTestRecord: { status: 'passed', updatedAt: '2026-06-15T10:00:00.000Z' },
+      implementationVerification: { dataverseCheck: { status: 'skipped' } },
+      aiKitReview: { status: 'passed', completedAt: '2026-06-15T10:05:00.000Z' },
+    })]));
+
+    const origArgv = process.argv;
+    process.argv = [...process.argv, '--data-dir', tmpDir, '--fallback-readonly'];
+    try {
+      const result = await callToolFallback('continue_developer_workflow', { taskId: 'task-cdw-branch' });
+      expect(result.nextAction).toBe('propose_branch');
+      // Branch creation must require explicit user approval
+      expect(result.requiresUserApproval).toBe(true);
+      expect(result.forbiddenWrites).not.toContain('commit_task_changes');
+    } finally {
+      process.argv = origArgv;
+      await fs.rm(tmpDir, { recursive: true });
+    }
+  });
+
+  it('workflow does not reach mark_done after only record_local_test', async () => {
+    const os = await import('node:os');
+    const fs = await import('node:fs/promises');
+    const path = await import('node:path');
+
+    const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'tw-mcp-cdw-nodone-'));
+    await fs.writeFile(path.join(tmpDir, 'tasks.json'), JSON.stringify([makeTask({
+      id: 'task-cdw-nodone',
+      taskMode: 'developer',
+      workflowSetup: { devTargetKind: 'script', repositoryRoot: 'C:\\Repo', artifactPath: 'Scripts\\nvr.js' },
+      crmDeveloperWorkflow: { detectedWorkKind: 'script' },
+      localTestRecord: { status: 'passed', updatedAt: '2026-06-15T10:00:00.000Z' },
+      // Only local test recorded — no verification, no AI Kit review
+    })]));
+
+    const origArgv = process.argv;
+    process.argv = [...process.argv, '--data-dir', tmpDir, '--fallback-readonly'];
+    try {
+      const result = await callToolFallback('continue_developer_workflow', { taskId: 'task-cdw-nodone' });
+      expect(result.nextAction).not.toBe('mark_done');
+      expect(result.canProceed).toBe(false);
+    } finally {
+      process.argv = origArgv;
+      await fs.rm(tmpDir, { recursive: true });
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 1d. get_developer_work_packet – fieldMappings guard (empty = canWriteCode=false)
+// ---------------------------------------------------------------------------
+
+describe('callToolFallback get_developer_work_packet – fieldMappings guard', () => {
+  it('returns canWriteCode=false when template expects field mappings but plan has none', async () => {
+    const os = await import('node:os');
+    const fs = await import('node:fs/promises');
+    const path = await import('node:path');
+
+    const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'tw-mcp-fmguard-'));
+    await fs.writeFile(path.join(tmpDir, 'tasks.json'), JSON.stringify([makeTask({
+      id: 'task-fmguard',
+      taskMode: 'developer',
+      title: '[TEST] Script: Předvyplnění servisního požadavku podle zařízení',
+      customerId: 'cust-test',
+      workflowSetup: {
+        devTargetKind: 'script',
+        repositoryRoot: 'C:\\Repo',
+        actionType: 'create-new-script',
+        primaryEntityLogicalName: 'nvr_servicecase',
+        artifactPath: 'Scripts\\nvr_servicecase_events.js',
+        confirmedAt: '2026-06-01T10:00:00.000Z',
+      },
+      crmDeveloperWorkflow: {
+        detectedWorkKind: 'script',
+        technicalPlan: {
+          workKind: 'script',
+          summary: 'Create script.',
+          target: { entityLogicalName: 'nvr_servicecase', scriptPath: 'Scripts\\nvr_servicecase_events.js', eventFieldName: 'nvr_assetid' },
+          implementationSteps: [],
+          fieldMappings: [],  // EMPTY — template requires mappings, so this should block
+          risks: [],
+          testChecklist: [],
+        },
+        planApproval: { approved: true },
+      },
+      implementationVerification: { dataverseCheck: { status: 'skipped' } },
+    })]));
+
+    const origArgv = process.argv;
+    process.argv = [...process.argv, '--data-dir', tmpDir, '--fallback-readonly'];
+    try {
+      const packet = await callToolFallback('get_developer_work_packet', { taskId: 'task-fmguard' });
+      expect(packet.canWriteCode).toBe(false);
+      expect(packet.decisionReason).toContain('Field mappings are missing');
+      expect(packet.blockingUserAction).toContain('prepare_developer_task');
+    } finally {
+      process.argv = origArgv;
+      await fs.rm(tmpDir, { recursive: true });
+    }
+  });
+
+  it('does not block canWriteCode for tasks without template-defined source fields (no field mapping required)', async () => {
+    const os = await import('node:os');
+    const fs = await import('node:fs/promises');
+    const path = await import('node:path');
+
+    const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'tw-mcp-fmguard2-'));
+    await fs.writeFile(path.join(tmpDir, 'tasks.json'), JSON.stringify([makeTask({
+      id: 'task-fmguard2',
+      taskMode: 'developer',
+      title: 'Custom script without template',  // No template match
+      customerId: 'cust-test',
+      workflowSetup: {
+        devTargetKind: 'script',
+        repositoryRoot: 'C:\\Repo',
+        actionType: 'create-new-script',
+        primaryEntityLogicalName: 'account',
+        artifactPath: 'Scripts\\account_events.js',
+        confirmedAt: '2026-06-01T10:00:00.000Z',
+      },
+      crmDeveloperWorkflow: {
+        detectedWorkKind: 'script',
+        technicalPlan: {
+          workKind: 'script',
+          summary: 'Create script.',
+          target: { entityLogicalName: 'account', scriptPath: 'Scripts\\account_events.js', eventName: 'OnLoad' },
+          implementationSteps: [],
+          fieldMappings: [],  // Empty but no template requires them
+          risks: [],
+          testChecklist: [],
+        },
+        planApproval: { approved: true },
+      },
+      implementationVerification: { dataverseCheck: { status: 'skipped' } },
+    })]));
+
+    const origArgv = process.argv;
+    process.argv = [...process.argv, '--data-dir', tmpDir, '--fallback-readonly'];
+    try {
+      const packet = await callToolFallback('get_developer_work_packet', { taskId: 'task-fmguard2' });
+      // No template → no fieldMappings requirement → canWriteCode should not be blocked by empty mappings
+      expect(packet.canWriteCode).toBe(true);
+    } finally {
+      process.argv = origArgv;
+      await fs.rm(tmpDir, { recursive: true });
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
 // 2. set_task_work_classification â€” workKind enum
 // ---------------------------------------------------------------------------
 
@@ -1111,3 +1646,874 @@ describe('callToolFallback get_task_full_context â€” developerWorkPacket.sc
   });
 });
 
+// ---------------------------------------------------------------------------
+// 13. get_developer_work_packet – plan-based fieldMappings guard
+// ---------------------------------------------------------------------------
+
+describe('callToolFallback get_developer_work_packet – plan-based fieldMappings guard', () => {
+  async function importHelpers() {
+    const os = await import('node:os');
+    const fs = await import('node:fs/promises');
+    const path = await import('node:path');
+    return { os, fs, path };
+  }
+
+  async function writeTask(tmpDir, fs, path, taskOverrides) {
+    await fs.writeFile(path.join(tmpDir, 'tasks.json'), JSON.stringify([makeTask(taskOverrides)]));
+  }
+
+  it('returns canWriteCode=false when non-template plan has unmappedSourceFields but empty fieldMappings', async () => {
+    const { os, fs, path } = await importHelpers();
+    const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'tw-mcp-plan-guard-'));
+    await writeTask(tmpDir, fs, path, {
+      id: 'task-plan-guard',
+      title: 'Custom CRM Script Task',
+      customerId: 'cust-test',
+      workflowSetup: {
+        devTargetKind: 'script', repositoryRoot: 'C:\\Repo', actionType: 'create-new-script',
+        primaryEntityLogicalName: 'account', artifactPath: 'Scripts\\account_events.js',
+        confirmedAt: '2026-06-01T10:00:00.000Z',
+      },
+      crmDeveloperWorkflow: {
+        detectedWorkKind: 'script',
+        technicalPlan: {
+          workKind: 'script', summary: 'Create account script.',
+          target: { entityLogicalName: 'account', scriptPath: 'Scripts\\account_events.js', eventName: 'OnLoad' },
+          implementationSteps: [],
+          fieldMappings: [],                                              // EMPTY
+          unmappedSourceFields: ['related.field_a', 'related.field_b'],  // plan knows about fields but has no targets
+          risks: [], testChecklist: [],
+        },
+        planApproval: { approved: true },
+      },
+      implementationVerification: { dataverseCheck: { status: 'skipped' } },
+    });
+    const origArgv = process.argv;
+    process.argv = [...process.argv, '--data-dir', tmpDir, '--fallback-readonly'];
+    try {
+      const packet = await callToolFallback('get_developer_work_packet', { taskId: 'task-plan-guard' });
+      expect(packet.canWriteCode).toBe(false);
+      expect(packet.status).toBe('not_ready');
+      expect(packet.decisionReason).toContain('Field mappings are missing');
+    } finally {
+      process.argv = origArgv;
+      await fs.rm(tmpDir, { recursive: true });
+    }
+  });
+
+  it('sets implementation.requiresFieldMappings=true when plan signals all fields unmapped', async () => {
+    const { os, fs, path } = await importHelpers();
+    const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'tw-mcp-reqfmap-'));
+    await writeTask(tmpDir, fs, path, {
+      id: 'task-reqfmap',
+      title: 'Custom CRM Script Task',
+      customerId: 'cust-test',
+      workflowSetup: {
+        devTargetKind: 'script', repositoryRoot: 'C:\\Repo',
+        artifactPath: 'Scripts\\account_events.js', confirmedAt: '2026-06-01T10:00:00.000Z',
+      },
+      crmDeveloperWorkflow: {
+        detectedWorkKind: 'script',
+        technicalPlan: {
+          workKind: 'script', summary: 'Script.',
+          target: { entityLogicalName: 'account', scriptPath: 'Scripts\\account_events.js' },
+          implementationSteps: [], fieldMappings: [],
+          unmappedSourceFields: ['related.field_a'],
+          risks: [], testChecklist: [],
+        },
+        planApproval: { approved: true },
+      },
+      implementationVerification: { dataverseCheck: { status: 'skipped' } },
+    });
+    const origArgv = process.argv;
+    process.argv = [...process.argv, '--data-dir', tmpDir, '--fallback-readonly'];
+    try {
+      const packet = await callToolFallback('get_developer_work_packet', { taskId: 'task-reqfmap' });
+      expect(packet.implementation.requiresFieldMappings).toBe(true);
+      expect(packet.implementation.scaffoldOnly).toBe(true);
+    } finally {
+      process.argv = origArgv;
+      await fs.rm(tmpDir, { recursive: true });
+    }
+  });
+
+  it('populates implementation.missingRequiredMappings from plan unmappedSourceFields when non-template', async () => {
+    const { os, fs, path } = await importHelpers();
+    const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'tw-mcp-missing-'));
+    await writeTask(tmpDir, fs, path, {
+      id: 'task-missing-maps',
+      title: 'Custom CRM Script Task',
+      customerId: 'cust-test',
+      workflowSetup: {
+        devTargetKind: 'script', repositoryRoot: 'C:\\Repo',
+        artifactPath: 'Scripts\\account_events.js', confirmedAt: '2026-06-01T10:00:00.000Z',
+      },
+      crmDeveloperWorkflow: {
+        detectedWorkKind: 'script',
+        technicalPlan: {
+          workKind: 'script', summary: 'Script.',
+          target: { entityLogicalName: 'account', scriptPath: 'Scripts\\account_events.js' },
+          implementationSteps: [], fieldMappings: [],
+          unmappedSourceFields: ['src.field_a', 'src.field_b'],
+          risks: [], testChecklist: [],
+        },
+        planApproval: { approved: true },
+      },
+      implementationVerification: { dataverseCheck: { status: 'skipped' } },
+    });
+    const origArgv = process.argv;
+    process.argv = [...process.argv, '--data-dir', tmpDir, '--fallback-readonly'];
+    try {
+      const packet = await callToolFallback('get_developer_work_packet', { taskId: 'task-missing-maps' });
+      expect(packet.implementation.missingRequiredMappings.length).toBeGreaterThan(0);
+      expect(packet.implementation.missingRequiredMappings.some((m) => m.includes('src.field_a'))).toBe(true);
+    } finally {
+      process.argv = origArgv;
+      await fs.rm(tmpDir, { recursive: true });
+    }
+  });
+
+  it('populates implementation.validationFields from template additionalSourceFields', async () => {
+    const { os, fs, path } = await importHelpers();
+    const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'tw-mcp-valfields-'));
+    await writeTask(tmpDir, fs, path, {
+      id: 'task-valfields',
+      title: '[TEST] Script: Předvyplnění servisního požadavku podle zařízení', // NVR template match
+      customerId: 'cust-test',
+      workflowSetup: {
+        devTargetKind: 'script', repositoryRoot: 'C:\\Repo',
+        primaryEntityLogicalName: 'nvr_servicecase',
+        artifactPath: 'Scripts\\nvr_servicecase_events.js', confirmedAt: '2026-06-01T10:00:00.000Z',
+      },
+      crmDeveloperWorkflow: {
+        detectedWorkKind: 'script',
+        technicalPlan: {
+          workKind: 'script', summary: 'Prefill.',
+          target: { entityLogicalName: 'nvr_servicecase', scriptPath: 'Scripts\\nvr_servicecase_events.js', eventFieldName: 'nvr_assetid' },
+          implementationSteps: [],
+          fieldMappings: [
+            { source: 'nvr_customerasset.nvr_customerid', target: 'nvr_servicecase.nvr_customerid' },
+            { source: 'nvr_customerasset.nvr_contactid', target: 'nvr_servicecase.nvr_contactid' },
+            { source: 'nvr_customerasset.nvr_isunderwarranty', target: 'nvr_servicecase.nvr_iswarrantycase' },
+          ],
+          unmappedSourceFields: ['nvr_customerasset.nvr_statuscustom'],
+          risks: [], testChecklist: [],
+        },
+        planApproval: { approved: true },
+      },
+      implementationVerification: { dataverseCheck: { status: 'skipped' } },
+    });
+    const origArgv = process.argv;
+    process.argv = [...process.argv, '--data-dir', tmpDir, '--fallback-readonly'];
+    try {
+      const packet = await callToolFallback('get_developer_work_packet', { taskId: 'task-valfields' });
+      // nvr_statuscustom is in template.additionalSourceFields — must appear in validationFields
+      expect(packet.implementation.validationFields).toEqual(
+        expect.arrayContaining([expect.stringContaining('nvr_statuscustom')])
+      );
+      // must NOT appear in fieldMappings
+      const mappedSources = packet.implementation.fieldMappings.map((m) => m.source);
+      expect(mappedSources.some((s) => s.includes('nvr_statuscustom'))).toBe(false);
+    } finally {
+      process.argv = origArgv;
+      await fs.rm(tmpDir, { recursive: true });
+    }
+  });
+
+  it('allows canWriteCode=true when plan has both fieldMappings and unmappedSourceFields (partial is fine)', async () => {
+    const { os, fs, path } = await importHelpers();
+    const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'tw-mcp-partial-'));
+    await writeTask(tmpDir, fs, path, {
+      id: 'task-partial',
+      title: 'Custom CRM Script Task',
+      customerId: 'cust-test',
+      workflowSetup: {
+        devTargetKind: 'script', repositoryRoot: 'C:\\Repo',
+        primaryEntityLogicalName: 'account',
+        actionType: 'create-new-script',
+        artifactPath: 'Scripts\\account_events.js', confirmedAt: '2026-06-01T10:00:00.000Z',
+      },
+      crmDeveloperWorkflow: {
+        detectedWorkKind: 'script',
+        technicalPlan: {
+          workKind: 'script', summary: 'Script.',
+          target: { entityLogicalName: 'account', scriptPath: 'Scripts\\account_events.js', eventName: 'OnLoad' },
+          implementationSteps: [],
+          fieldMappings: [{ source: 'src.field_a', target: 'account.field_x' }],
+          unmappedSourceFields: ['src.validation_field'],
+          risks: [], testChecklist: [],
+        },
+        planApproval: { approved: true },
+      },
+      implementationVerification: { dataverseCheck: { status: 'skipped' } },
+    });
+    const origArgv = process.argv;
+    process.argv = [...process.argv, '--data-dir', tmpDir, '--fallback-readonly'];
+    try {
+      const packet = await callToolFallback('get_developer_work_packet', { taskId: 'task-partial' });
+      expect(packet.canWriteCode).toBe(true);
+      expect(packet.implementation.scaffoldOnly).toBe(false);
+      expect(packet.implementation.requiresFieldMappings).toBe(false);
+    } finally {
+      process.argv = origArgv;
+      await fs.rm(tmpDir, { recursive: true });
+    }
+  });
+
+  it('sets implementation.requiresFieldMappings=false for tasks with empty fieldMappings and no unmapped fields', async () => {
+    const { os, fs, path } = await importHelpers();
+    const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'tw-mcp-no-req-'));
+    await writeTask(tmpDir, fs, path, {
+      id: 'task-no-req',
+      title: 'Custom script without template',
+      customerId: 'cust-test',
+      workflowSetup: {
+        devTargetKind: 'script', repositoryRoot: 'C:\\Repo',
+        primaryEntityLogicalName: 'account',
+        artifactPath: 'Scripts\\account_events.js', confirmedAt: '2026-06-01T10:00:00.000Z',
+      },
+      crmDeveloperWorkflow: {
+        detectedWorkKind: 'script',
+        technicalPlan: {
+          workKind: 'script', summary: 'Script.',
+          target: { entityLogicalName: 'account', scriptPath: 'Scripts\\account_events.js', eventName: 'OnLoad' },
+          implementationSteps: [], fieldMappings: [],   // empty — and no unmappedSourceFields
+          risks: [], testChecklist: [],
+        },
+        planApproval: { approved: true },
+      },
+      implementationVerification: { dataverseCheck: { status: 'skipped' } },
+    });
+    const origArgv = process.argv;
+    process.argv = [...process.argv, '--data-dir', tmpDir, '--fallback-readonly'];
+    try {
+      const packet = await callToolFallback('get_developer_work_packet', { taskId: 'task-no-req' });
+      expect(packet.implementation.requiresFieldMappings).toBe(false);
+      expect(packet.implementation.scaffoldOnly).toBe(false);
+      expect(packet.implementation.missingRequiredMappings).toEqual([]);
+      expect(packet.canWriteCode).toBe(true);
+    } finally {
+      process.argv = origArgv;
+      await fs.rm(tmpDir, { recursive: true });
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 14. get_developer_work_packet – text-based field mapping detection
+// ---------------------------------------------------------------------------
+
+describe('callToolFallback get_developer_work_packet – text-based field mapping detection', () => {
+  async function importHelpers() {
+    const os = await import('node:os');
+    const fs = await import('node:fs/promises');
+    const path = await import('node:path');
+    return { os, fs, path };
+  }
+
+  // Original assignment with "Source entity/fields" and "Target entity/fields" sections
+  // but NO matching template title and NO unmappedSourceFields in the plan.
+  const NVR_ORIGINAL_MESSAGE = [
+    'Source entity: nvr_customerasset',
+    'Source fields: nvr_customerid, nvr_contactid, nvr_isunderwarranty, nvr_statuscustom',
+    'Target entity: nvr_servicecase',
+    'Target fields: nvr_customerid, nvr_contactid, nvr_iswarrantycase',
+  ].join('\n');
+
+  function makeTextDetectionTask(id, extraOverrides) {
+    return makeTask({
+      id,
+      title: 'Customní skript pro předvyplnění', // does NOT match any template titlePattern
+      customerId: 'cust-test',
+      originalMessage: NVR_ORIGINAL_MESSAGE,
+      workflowSetup: {
+        devTargetKind: 'script',
+        repositoryRoot: 'C:\\Repo',
+        primaryEntityLogicalName: 'nvr_servicecase',
+        actionType: 'create-new-script',
+        artifactPath: 'Scripts\\nvr_servicecase_events.js',
+        confirmedAt: '2026-06-01T10:00:00.000Z',
+      },
+      crmDeveloperWorkflow: {
+        detectedWorkKind: 'script',
+        technicalPlan: {
+          workKind: 'script',
+          summary: 'Create prefill script.',
+          target: {
+            entityLogicalName: 'nvr_servicecase',
+            scriptPath: 'Scripts\\nvr_servicecase_events.js',
+            eventName: 'onChange',
+            eventFieldName: 'nvr_assetid',
+          },
+          implementationSteps: [],
+          fieldMappings: [],        // empty — not set in plan
+          unmappedSourceFields: [], // empty — not set in plan
+          risks: [],
+          testChecklist: [],
+        },
+        planApproval: { approved: true },
+      },
+      implementationVerification: { dataverseCheck: { status: 'skipped' } },
+      ...(extraOverrides || {}),
+    });
+  }
+
+  it('extracts 3-pair fieldMappings from original assignment text when plan has none', async () => {
+    const { os, fs, path } = await importHelpers();
+    const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'tw-mcp-txtextract-'));
+    await fs.writeFile(path.join(tmpDir, 'tasks.json'), JSON.stringify([makeTextDetectionTask('task-txt-extract')]));
+    const origArgv = process.argv;
+    process.argv = [...process.argv, '--data-dir', tmpDir, '--fallback-readonly'];
+    try {
+      const packet = await callToolFallback('get_developer_work_packet', { taskId: 'task-txt-extract' });
+      expect(packet.canWriteCode).toBe(true);
+      expect(packet.implementation.fieldMappings).toHaveLength(3);
+      expect(packet.implementation.fieldMappings[0]).toMatchObject({ source: 'nvr_customerasset.nvr_customerid', target: 'nvr_servicecase.nvr_customerid' });
+      expect(packet.implementation.fieldMappings[1]).toMatchObject({ source: 'nvr_customerasset.nvr_contactid', target: 'nvr_servicecase.nvr_contactid' });
+      expect(packet.implementation.fieldMappings[2]).toMatchObject({ source: 'nvr_customerasset.nvr_isunderwarranty', target: 'nvr_servicecase.nvr_iswarrantycase' });
+    } finally {
+      process.argv = origArgv;
+      await fs.rm(tmpDir, { recursive: true });
+    }
+  });
+
+  it('puts nvr_statuscustom (4th source field with no target pair) into validationFields', async () => {
+    const { os, fs, path } = await importHelpers();
+    const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'tw-mcp-txtval-'));
+    await fs.writeFile(path.join(tmpDir, 'tasks.json'), JSON.stringify([makeTextDetectionTask('task-txt-val')]));
+    const origArgv = process.argv;
+    process.argv = [...process.argv, '--data-dir', tmpDir, '--fallback-readonly'];
+    try {
+      const packet = await callToolFallback('get_developer_work_packet', { taskId: 'task-txt-val' });
+      expect(packet.implementation.validationFields).toEqual(
+        expect.arrayContaining([expect.stringContaining('nvr_statuscustom')])
+      );
+      const sources = packet.implementation.fieldMappings.map((m) => m.source);
+      expect(sources.some((s) => s.includes('nvr_statuscustom'))).toBe(false);
+    } finally {
+      process.argv = origArgv;
+      await fs.rm(tmpDir, { recursive: true });
+    }
+  });
+
+  it('returns canWriteCode=false when text detects mapping work but extraction fails (no safe pairs)', async () => {
+    const { os, fs, path } = await importHelpers();
+    const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'tw-mcp-txtblock-'));
+    // Has source/target entity context but no "Source fields:" / "Target fields:" lines
+    const task = makeTextDetectionTask('task-txt-block', {
+      originalMessage: 'Source entity: nvr_customerasset\nTarget entity: nvr_servicecase\nCopy fields: nvr_customerid, nvr_contactid, nvr_isunderwarranty',
+    });
+    await fs.writeFile(path.join(tmpDir, 'tasks.json'), JSON.stringify([task]));
+    const origArgv = process.argv;
+    process.argv = [...process.argv, '--data-dir', tmpDir, '--fallback-readonly'];
+    try {
+      const packet = await callToolFallback('get_developer_work_packet', { taskId: 'task-txt-block' });
+      expect(packet.canWriteCode).toBe(false);
+      expect(packet.implementation.requiresFieldMappings).toBe(true);
+      expect(packet.implementation.scaffoldOnly).toBe(true);
+      expect(packet.implementation.missingRequiredMappings.length).toBeGreaterThan(0);
+    } finally {
+      process.argv = origArgv;
+      await fs.rm(tmpDir, { recursive: true });
+    }
+  });
+
+  it('does not fire detection on tasks with CRM field names but no source/target entity context', async () => {
+    const { os, fs, path } = await importHelpers();
+    const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'tw-mcp-txt-nofire-'));
+    const task = makeTextDetectionTask('task-txt-nofire', {
+      originalMessage: 'Fix the nvr_servicecase form. The nvr_customerid field is not updating when the form loads.',
+    });
+    await fs.writeFile(path.join(tmpDir, 'tasks.json'), JSON.stringify([task]));
+    const origArgv = process.argv;
+    process.argv = [...process.argv, '--data-dir', tmpDir, '--fallback-readonly'];
+    try {
+      const packet = await callToolFallback('get_developer_work_packet', { taskId: 'task-txt-nofire' });
+      expect(packet.canWriteCode).toBe(true);
+      expect(packet.implementation.requiresFieldMappings).toBe(false);
+    } finally {
+      process.argv = origArgv;
+      await fs.rm(tmpDir, { recursive: true });
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 15. continue_developer_workflow – scaffold/TODO guard
+// ---------------------------------------------------------------------------
+
+describe('callToolFallback continue_developer_workflow – scaffold guard blocks advancement', () => {
+  async function importHelpers() {
+    const os = await import('node:os');
+    const fs = await import('node:fs/promises');
+    const path = await import('node:path');
+    return { os, fs, path };
+  }
+
+  it('returns define_field_mappings when template requires mappings but none defined, even after local test recorded', async () => {
+    const { os, fs, path } = await importHelpers();
+    const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'tw-mcp-cdwf-scaffold-'));
+    const task = makeTask({
+      id: 'task-cdwf-scaffold',
+      title: '[TEST] Script: Předvyplnění servisního požadavku podle zařízení',
+      customerId: 'cust-test',
+      workflowSetup: {
+        devTargetKind: 'script', repositoryRoot: 'C:\\Repo',
+        primaryEntityLogicalName: 'nvr_servicecase', actionType: 'create-new-script',
+        artifactPath: 'Scripts\\nvr_servicecase_events.js', confirmedAt: '2026-06-01T10:00:00.000Z',
+      },
+      crmDeveloperWorkflow: {
+        detectedWorkKind: 'script',
+        technicalPlan: {
+          workKind: 'script', summary: 'Prefill.',
+          target: { entityLogicalName: 'nvr_servicecase', scriptPath: 'Scripts\\nvr_servicecase_events.js', eventName: 'onChange', eventFieldName: 'nvr_assetid' },
+          implementationSteps: [],
+          fieldMappings: [],        // template exists but no mappings
+          unmappedSourceFields: [],
+          risks: [], testChecklist: [],
+        },
+        planApproval: { approved: true },
+      },
+      // AI already "recorded" test results on scaffold code
+      localTestRecord: { status: 'passed', recordedAt: '2026-06-01T12:00:00.000Z' },
+      implementationVerification: { dataverseCheck: { status: 'skipped' } },
+    });
+    await fs.writeFile(path.join(tmpDir, 'tasks.json'), JSON.stringify([task]));
+    const origArgv = process.argv;
+    process.argv = [...process.argv, '--data-dir', tmpDir, '--fallback-readonly'];
+    try {
+      const result = await callToolFallback('continue_developer_workflow', { taskId: 'task-cdwf-scaffold' });
+      expect(result.nextAction).toBe('define_field_mappings');
+      expect(result.canProceed).toBe(false);
+      expect(result.forbiddenWrites).toEqual(expect.arrayContaining(['record_local_test']));
+      expect(result.forbiddenWrites).toEqual(expect.arrayContaining(['commit_task_changes']));
+    } finally {
+      process.argv = origArgv;
+      await fs.rm(tmpDir, { recursive: true });
+    }
+  });
+
+  it('does not trigger scaffold guard when fieldMappings are present', async () => {
+    const { os, fs, path } = await importHelpers();
+    const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'tw-mcp-cdwf-ready-'));
+    const task = makeTask({
+      id: 'task-cdwf-ready',
+      title: '[TEST] Script: Předvyplnění servisního požadavku podle zařízení',
+      customerId: 'cust-test',
+      workflowSetup: {
+        devTargetKind: 'script', repositoryRoot: 'C:\\Repo',
+        primaryEntityLogicalName: 'nvr_servicecase', actionType: 'create-new-script',
+        artifactPath: 'Scripts\\nvr_servicecase_events.js', confirmedAt: '2026-06-01T10:00:00.000Z',
+      },
+      crmDeveloperWorkflow: {
+        detectedWorkKind: 'script',
+        technicalPlan: {
+          workKind: 'script', summary: 'Prefill.',
+          target: { entityLogicalName: 'nvr_servicecase', scriptPath: 'Scripts\\nvr_servicecase_events.js', eventName: 'onChange', eventFieldName: 'nvr_assetid' },
+          implementationSteps: [],
+          fieldMappings: [
+            { source: 'nvr_customerasset.nvr_customerid', target: 'nvr_servicecase.nvr_customerid' },
+            { source: 'nvr_customerasset.nvr_contactid', target: 'nvr_servicecase.nvr_contactid' },
+            { source: 'nvr_customerasset.nvr_isunderwarranty', target: 'nvr_servicecase.nvr_iswarrantycase' },
+          ],
+          unmappedSourceFields: [],
+          risks: [], testChecklist: [],
+        },
+        planApproval: { approved: true },
+      },
+      implementationVerification: { dataverseCheck: { status: 'skipped' } },
+    });
+    await fs.writeFile(path.join(tmpDir, 'tasks.json'), JSON.stringify([task]));
+    const origArgv = process.argv;
+    process.argv = [...process.argv, '--data-dir', tmpDir, '--fallback-readonly'];
+    try {
+      const result = await callToolFallback('continue_developer_workflow', { taskId: 'task-cdwf-ready' });
+      // Not blocked — should proceed to record_results since local test is not done
+      expect(result.nextAction).toBe('record_results');
+    } finally {
+      process.argv = origArgv;
+      await fs.rm(tmpDir, { recursive: true });
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 16. get_developer_work_packet – consistency guard + plan-text-based detection
+// ---------------------------------------------------------------------------
+
+describe('callToolFallback get_developer_work_packet – consistency guard and plan-based detection', () => {
+  async function importHelpers() {
+    const os = await import('node:os');
+    const fs = await import('node:fs/promises');
+    const path = await import('node:path');
+    return { os, fs, path };
+  }
+
+  function makeConsistencyTask(id, planOverrides, taskOverrides) {
+    return makeTask({
+      id,
+      title: 'Custom CRM Script Task',
+      customerId: 'cust-test',
+      workflowSetup: {
+        devTargetKind: 'script', repositoryRoot: 'C:\\Repo',
+        primaryEntityLogicalName: 'nvr_servicecase', actionType: 'create-new-script',
+        artifactPath: 'Scripts\\nvr_servicecase_events.js', confirmedAt: '2026-06-01T10:00:00.000Z',
+      },
+      crmDeveloperWorkflow: {
+        detectedWorkKind: 'script',
+        technicalPlan: {
+          workKind: 'script', summary: 'Prefill script.',
+          target: { entityLogicalName: 'nvr_servicecase', scriptPath: 'Scripts\\nvr_servicecase_events.js', eventName: 'onChange', eventFieldName: 'nvr_assetid' },
+          implementationSteps: [], fieldMappings: [], unmappedSourceFields: [],
+          risks: [], testChecklist: [],
+          ...(planOverrides || {}),
+        },
+        planApproval: { approved: true },
+      },
+      implementationVerification: { dataverseCheck: { status: 'skipped' } },
+      ...(taskOverrides || {}),
+    });
+  }
+
+  it('canWriteCode=true with requiresFieldMappings=true is impossible (consistency guard)', async () => {
+    const { os, fs, path } = await importHelpers();
+    const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'tw-mcp-consgrd-'));
+    const task = makeConsistencyTask('task-consgrd', {
+      risks: ['Field mappings are not defined for nvr_customerasset -> nvr_servicecase'],
+    });
+    await fs.writeFile(path.join(tmpDir, 'tasks.json'), JSON.stringify([task]));
+    const origArgv = process.argv;
+    process.argv = [...process.argv, '--data-dir', tmpDir, '--fallback-readonly'];
+    try {
+      const packet = await callToolFallback('get_developer_work_packet', { taskId: 'task-consgrd' });
+      if (packet.implementation.requiresFieldMappings && packet.implementation.fieldMappings.length === 0) {
+        expect(packet.canWriteCode).toBe(false);
+      }
+      if (!packet.canWriteCode && packet.implementation.requiresFieldMappings) {
+        expect(packet.implementation.scaffoldOnly).toBe(true);
+      }
+    } finally {
+      process.argv = origArgv;
+      await fs.rm(tmpDir, { recursive: true });
+    }
+  });
+
+  it('detects field mapping requirement from plan risks text', async () => {
+    const { os, fs, path } = await importHelpers();
+    const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'tw-mcp-plnrisk-'));
+    const task = makeConsistencyTask('task-plnrisk', {
+      risks: [
+        'Field mappings are not defined - nvr_customerasset -> nvr_servicecase mapping must be completed.',
+        'nvr_customerid, nvr_contactid, nvr_isunderwarranty fields must be mapped.',
+      ],
+    });
+    await fs.writeFile(path.join(tmpDir, 'tasks.json'), JSON.stringify([task]));
+    const origArgv = process.argv;
+    process.argv = [...process.argv, '--data-dir', tmpDir, '--fallback-readonly'];
+    try {
+      const packet = await callToolFallback('get_developer_work_packet', { taskId: 'task-plnrisk' });
+      expect(packet.canWriteCode).toBe(false);
+      expect(packet.implementation.requiresFieldMappings).toBe(true);
+      expect(packet.implementation.scaffoldOnly).toBe(true);
+    } finally {
+      process.argv = origArgv;
+      await fs.rm(tmpDir, { recursive: true });
+    }
+  });
+
+  it('detects field mapping requirement from plan steps with TODO + CRM field names', async () => {
+    const { os, fs, path } = await importHelpers();
+    const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'tw-mcp-plnsteps-'));
+    const task = makeConsistencyTask('task-plnsteps', {
+      implementationSteps: [
+        'Create nvr_assetid_OnChange handler function',
+        'Retrieve nvr_customerasset record via WebApi',
+        'TODO: map nvr_customerasset fields to nvr_servicecase (nvr_customerid, nvr_contactid, nvr_isunderwarranty)',
+      ],
+    });
+    await fs.writeFile(path.join(tmpDir, 'tasks.json'), JSON.stringify([task]));
+    const origArgv = process.argv;
+    process.argv = [...process.argv, '--data-dir', tmpDir, '--fallback-readonly'];
+    try {
+      const packet = await callToolFallback('get_developer_work_packet', { taskId: 'task-plnsteps' });
+      expect(packet.canWriteCode).toBe(false);
+      expect(packet.implementation.requiresFieldMappings).toBe(true);
+    } finally {
+      process.argv = origArgv;
+      await fs.rm(tmpDir, { recursive: true });
+    }
+  });
+
+  it('detectionSources lists scanned text sources when text detection fires', async () => {
+    const { os, fs, path } = await importHelpers();
+    const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'tw-mcp-detsrc-'));
+    const task = makeConsistencyTask('task-detsrc', {
+      risks: ['Field mappings are not defined for nvr_customerasset, nvr_servicecase, nvr_customerid, nvr_contactid'],
+    });
+    await fs.writeFile(path.join(tmpDir, 'tasks.json'), JSON.stringify([task]));
+    const origArgv = process.argv;
+    process.argv = [...process.argv, '--data-dir', tmpDir, '--fallback-readonly'];
+    try {
+      const packet = await callToolFallback('get_developer_work_packet', { taskId: 'task-detsrc' });
+      if (packet.implementation.requiresFieldMappings) {
+        expect(Array.isArray(packet.implementation.detectionSources)).toBe(true);
+        expect(packet.implementation.detectionSources.length).toBeGreaterThan(0);
+        expect(packet.implementation.detectionSources).toContain('planRisks');
+      }
+    } finally {
+      process.argv = origArgv;
+      await fs.rm(tmpDir, { recursive: true });
+    }
+  });
+
+  it('original message structured fields win over scaffold plan steps (extraction beats detection-only block)', async () => {
+    const { os, fs, path } = await importHelpers();
+    const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'tw-mcp-msgwin-'));
+    const task = makeConsistencyTask(
+      'task-msgwin',
+      {
+        implementationSteps: ['Create handler', 'TODO: map nvr_customerasset fields to nvr_servicecase'],
+        risks: ['Field mappings are not defined'],
+        fieldMappings: [], unmappedSourceFields: [],
+      },
+      {
+        originalMessage: [
+          'Source entity: nvr_customerasset',
+          'Source fields: nvr_customerid, nvr_contactid, nvr_isunderwarranty, nvr_statuscustom',
+          'Target entity: nvr_servicecase',
+          'Target fields: nvr_customerid, nvr_contactid, nvr_iswarrantycase',
+        ].join('\n'),
+      }
+    );
+    await fs.writeFile(path.join(tmpDir, 'tasks.json'), JSON.stringify([task]));
+    const origArgv = process.argv;
+    process.argv = [...process.argv, '--data-dir', tmpDir, '--fallback-readonly'];
+    try {
+      const packet = await callToolFallback('get_developer_work_packet', { taskId: 'task-msgwin' });
+      // originalMessage has extractable "Source fields/Target fields" → extraction should succeed
+      expect(packet.implementation.fieldMappings.length).toBeGreaterThanOrEqual(3);
+      expect(packet.canWriteCode).toBe(true);
+      const mappedSources = packet.implementation.fieldMappings.map((m) => m.source);
+      expect(mappedSources.some((s) => s.includes('nvr_statuscustom'))).toBe(false);
+      expect(packet.implementation.validationFields.some((f) => f.includes('nvr_statuscustom'))).toBe(true);
+    } finally {
+      process.argv = origArgv;
+      await fs.rm(tmpDir, { recursive: true });
+    }
+  });
+});
+
+describe('callToolFallback get_developer_work_packet – Czech scaffold guard and sanitization', () => {
+  async function importHelpers() {
+    const os = await import('node:os');
+    const fs = await import('node:fs/promises');
+    const path = await import('node:path');
+    return { os, fs, path };
+  }
+
+  function makeCzechTask(id, planOverrides, taskOverrides) {
+    return makeTask({
+      id,
+      title: 'Czech CRM Script Task',
+      customerId: 'cust-test',
+      workflowSetup: {
+        devTargetKind: 'script', repositoryRoot: 'C:\\Repo',
+        primaryEntityLogicalName: 'nvr_servicecase', actionType: 'create-new-script',
+        artifactPath: 'Scripts\\nvr_servicecase_events.js', confirmedAt: '2026-06-01T10:00:00.000Z',
+      },
+      crmDeveloperWorkflow: {
+        detectedWorkKind: 'script',
+        technicalPlan: {
+          workKind: 'script', summary: 'Prefill script.',
+          target: { entityLogicalName: 'nvr_servicecase', scriptPath: 'Scripts\\nvr_servicecase_events.js', eventName: 'onChange', eventFieldName: 'nvr_assetid' },
+          implementationSteps: [], fieldMappings: [], unmappedSourceFields: [],
+          risks: [], testChecklist: [],
+          ...(planOverrides || {}),
+        },
+        planApproval: { approved: true },
+      },
+      implementationVerification: { dataverseCheck: { status: 'skipped' } },
+      ...(taskOverrides || {}),
+    });
+  }
+
+  it('Czech risk "nejsou definovány" blocks canWriteCode when fieldMappings empty', async () => {
+    const { os, fs, path } = await importHelpers();
+    const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'tw-mcp-cz-risk-'));
+    const task = makeCzechTask('task-cz-risk', {
+      implementationSteps: [
+        'Create nvr_assetid_OnChange handler',
+        'Retrieve nvr_customerasset record via WebApi',
+      ],
+      risks: [
+        'Field mappings nejsou definovány – skript obsahuje pouze strukturu a TODO komentáře; mapování musí být doplněno před ostrým provozem',
+      ],
+    });
+    await fs.writeFile(path.join(tmpDir, 'tasks.json'), JSON.stringify([task]));
+    const origArgv = process.argv;
+    process.argv = [...process.argv, '--data-dir', tmpDir, '--fallback-readonly'];
+    try {
+      const packet = await callToolFallback('get_developer_work_packet', { taskId: 'task-cz-risk' });
+      expect(packet.canWriteCode).toBe(false);
+      expect(packet.implementation.scaffoldOnly).toBe(true);
+    } finally {
+      process.argv = origArgv;
+      await fs.rm(tmpDir, { recursive: true });
+    }
+  });
+
+  it('Czech step "Připravit TODO komentáře" blocks canWriteCode when fieldMappings empty', async () => {
+    const { os, fs, path } = await importHelpers();
+    const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'tw-mcp-cz-step-'));
+    const task = makeCzechTask('task-cz-step', {
+      implementationSteps: [
+        'Create nvr_assetid_OnChange handler',
+        'Retrieve nvr_customerasset record via WebApi',
+        'Připravit TODO komentáře pro doplnění konkrétních field mappings',
+      ],
+    });
+    await fs.writeFile(path.join(tmpDir, 'tasks.json'), JSON.stringify([task]));
+    const origArgv = process.argv;
+    process.argv = [...process.argv, '--data-dir', tmpDir, '--fallback-readonly'];
+    try {
+      const packet = await callToolFallback('get_developer_work_packet', { taskId: 'task-cz-step' });
+      expect(packet.canWriteCode).toBe(false);
+      expect(packet.implementation.scaffoldOnly).toBe(true);
+    } finally {
+      process.argv = origArgv;
+      await fs.rm(tmpDir, { recursive: true });
+    }
+  });
+
+  it('canWriteCode=true packet never contains TODO/scaffold in implementation steps', async () => {
+    const { os, fs, path } = await importHelpers();
+    const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'tw-mcp-no-todo-'));
+    const task = makeCzechTask(
+      'task-no-todo',
+      {
+        implementationSteps: [
+          'Create handler for nvr_assetid onChange',
+          'Připravit TODO komentáře pro doplnění konkrétních field mappings',
+        ],
+        fieldMappings: [], unmappedSourceFields: [],
+      },
+      {
+        originalMessage: [
+          'Source entity: nvr_customerasset',
+          'Source fields: nvr_customerid, nvr_contactid, nvr_isunderwarranty',
+          'Target entity: nvr_servicecase',
+          'Target fields: nvr_customerid, nvr_contactid, nvr_iswarrantycase',
+        ].join('\n'),
+      }
+    );
+    await fs.writeFile(path.join(tmpDir, 'tasks.json'), JSON.stringify([task]));
+    const origArgv = process.argv;
+    process.argv = [...process.argv, '--data-dir', tmpDir, '--fallback-readonly'];
+    try {
+      const packet = await callToolFallback('get_developer_work_packet', { taskId: 'task-no-todo' });
+      if (packet.canWriteCode) {
+        const stepsText = packet.implementation.steps.join('\n');
+        expect(/\btodo\b/i.test(stepsText)).toBe(false);
+      }
+    } finally {
+      process.argv = origArgv;
+      await fs.rm(tmpDir, { recursive: true });
+    }
+  });
+
+  it('extracts nvr_customerasset as source entity (not nvr_assetid) from originalMessage', async () => {
+    const { os, fs, path } = await importHelpers();
+    const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'tw-mcp-src-ent-'));
+    const task = makeCzechTask(
+      'task-src-entity',
+      { fieldMappings: [], unmappedSourceFields: [] },
+      {
+        originalMessage: [
+          'Source entity: nvr_customerasset',
+          'Source fields: nvr_customerid, nvr_contactid, nvr_isunderwarranty',
+          'Target entity: nvr_servicecase',
+          'Target fields: nvr_customerid, nvr_contactid, nvr_iswarrantycase',
+        ].join('\n'),
+      }
+    );
+    await fs.writeFile(path.join(tmpDir, 'tasks.json'), JSON.stringify([task]));
+    const origArgv = process.argv;
+    process.argv = [...process.argv, '--data-dir', tmpDir, '--fallback-readonly'];
+    try {
+      const packet = await callToolFallback('get_developer_work_packet', { taskId: 'task-src-entity' });
+      if (packet.implementation.fieldMappings.length > 0) {
+        expect(packet.implementation.fieldMappings.every((m) => m.source.startsWith('nvr_customerasset.'))).toBe(true);
+        expect(packet.implementation.fieldMappings.some((m) => m.source.startsWith('nvr_assetid.'))).toBe(false);
+      }
+    } finally {
+      process.argv = origArgv;
+      await fs.rm(tmpDir, { recursive: true });
+    }
+  });
+
+  it('extracts field mappings from Czech abbreviated Zdroj/Cíl format', async () => {
+    const { os, fs, path } = await importHelpers();
+    const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'tw-mcp-cz-abbrev-'));
+    const task = makeCzechTask(
+      'task-cz-abbrev',
+      { fieldMappings: [], unmappedSourceFields: [] },
+      {
+        originalMessage: [
+          'Zdroj: nvr_customerasset',
+          'Pole zdroje: nvr_customerid, nvr_contactid, nvr_isunderwarranty',
+          'Cíl: nvr_servicecase',
+          'Pole cíle: nvr_customerid, nvr_contactid, nvr_iswarrantycase',
+        ].join('\n'),
+      }
+    );
+    await fs.writeFile(path.join(tmpDir, 'tasks.json'), JSON.stringify([task]));
+    const origArgv = process.argv;
+    process.argv = [...process.argv, '--data-dir', tmpDir, '--fallback-readonly'];
+    try {
+      const packet = await callToolFallback('get_developer_work_packet', { taskId: 'task-cz-abbrev' });
+      expect(packet.implementation.fieldMappings.length).toBeGreaterThanOrEqual(2);
+      expect(packet.canWriteCode).toBe(true);
+      expect(packet.implementation.fieldMappings.every((m) => m.source.startsWith('nvr_customerasset.'))).toBe(true);
+      expect(packet.implementation.fieldMappings.every((m) => m.target.startsWith('nvr_servicecase.'))).toBe(true);
+    } finally {
+      process.argv = origArgv;
+      await fs.rm(tmpDir, { recursive: true });
+    }
+  });
+
+  it('final packet invariant fires on exact real-task Czech text when uniqueCrmNames < 2', async () => {
+    // Exercises the FINAL PACKET INVARIANT (not Guard 1 or Guard 2 enforcement).
+    // The task has ONLY scaffold steps/risks — no other CRM entity names in any text source,
+    // so uniqueCrmNames.size < 2 and planSignalsIncomplete stays false. Input-side
+    // detection does not fire, requiresFieldMappings=false, canWriteCode=true before guards.
+    // Guard 2 sets scaffoldSignalDetected=true (diagnostic).
+    // The final packet invariant then sees TODO in sanitizedSteps and enforces canWriteCode=false.
+    const { os, fs, path } = await importHelpers();
+    const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'tw-mcp-final-inv-'));
+    const task = makeCzechTask('task-final-inv', {
+      implementationSteps: [
+        'Připravit TODO komentáře pro doplnění konkrétních field mappings',
+      ],
+      risks: [
+        'Field mappings nejsou definovány – skript obsahuje pouze strukturu a TODO komentáře; mapování musí být doplněno před ostrým provozem',
+      ],
+      fieldMappings: [], unmappedSourceFields: [],
+      summary: 'Prefill script.',
+    });
+    await fs.writeFile(path.join(tmpDir, 'tasks.json'), JSON.stringify([task]));
+    const origArgv = process.argv;
+    process.argv = [...process.argv, '--data-dir', tmpDir, '--fallback-readonly'];
+    try {
+      const packet = await callToolFallback('get_developer_work_packet', { taskId: 'task-final-inv' });
+      expect(packet.canWriteCode).toBe(false);
+      expect(packet.implementation.scaffoldOnly).toBe(true);
+      expect(packet.implementation.finalConsistencyGuardApplied).toBe(true);
+      expect(packet.implementation.scaffoldSignalDetected).toBe(true);
+      expect(packet.implementation.fieldMappingsCount).toBe(0);
+      expect(typeof packet.packetGeneratorVersion).toBe('string');
+    } finally {
+      process.argv = origArgv;
+      await fs.rm(tmpDir, { recursive: true });
+    }
+  });
+});

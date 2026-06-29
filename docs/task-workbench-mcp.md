@@ -59,6 +59,7 @@ These tools never write to Dataverse, GitHub, Azure DevOps, or the local filesys
 | `get_implementation_verification_state` | Build check, Dataverse check override, AI code review, local test, consultant testing |
 | `get_implementation_readiness` | isImplementationReady, blockers, warnings, recommendedNextStep for plugin/script tasks |
 | `get_developer_work_packet` | AI-facing work packet: canWriteCode, why, target path, implementation instructions, conventions, verification, review/test/commit guidance |
+| `continue_developer_workflow` | Next required post-implementation step: record results, Dataverse verification, AI Kit review, or branch creation. Call after every file write. |
 | `get_task_templates` | Built-in setup templates and matched template for a task title |
 
 AI clients should use `get_developer_work_packet` as the default first read for

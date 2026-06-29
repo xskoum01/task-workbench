@@ -6537,6 +6537,7 @@ fn task_mcp_read_only_tool_definitions() -> Vec<Value> {
         serde_json::json!({"name":"get_implementation_verification_state", "description":"Return the implementation verification state for a task: build check, Dataverse check override, AI code review, local test, consultant testing.","readOnly":true}),
         serde_json::json!({"name":"get_implementation_readiness",          "description":"Return implementation readiness for a developer plugin/script task: isImplementationReady, blockers, warnings, recommendedNextStep.","readOnly":true}),
         serde_json::json!({"name":"get_developer_work_packet",              "description":"Return a simplified AI-facing developer work packet: canWriteCode, reason, target, implementation, conventions, Dataverse verification, and review/test/commit guidance.","readOnly":true}),
+        serde_json::json!({"name":"continue_developer_workflow",           "description":"Return the next required post-implementation workflow step: record results, Dataverse verification, AI Kit review, or branch creation. Call after every file write until it returns wait_for_user or mark_done.","readOnly":true}),
         serde_json::json!({"name":"get_task_templates",                    "description":"Return built-in task setup templates and the matched template for a task title, when any.","readOnly":true}),
     ]
 }
@@ -6832,7 +6833,7 @@ fn task_mcp_safe_task_detail(task: &Value) -> Value {
     detail
 }
 
-fn task_mcp_developer_work_packet(task: &Value, customer_dev_defaults: Option<&Value>) -> Value {
+fn task_mcp_developer_work_packet(task: &Value, customer_dev_defaults: Option<&Value>, ai_kit_path: Option<&str>) -> Value {
     let setup = task.get("workflowSetup").unwrap_or(&Value::Null);
     let workflow = task.get("crmDeveloperWorkflow").unwrap_or(&Value::Null);
     let plan = &workflow["technicalPlan"];
@@ -6921,6 +6922,56 @@ fn task_mcp_developer_work_packet(task: &Value, customer_dev_defaults: Option<&V
         }
     }
 
+    let convention_rules: Vec<Value> = if is_script {
+        vec![
+            serde_json::json!("Inspect existing form scripts before editing."),
+            serde_json::json!("Use the handler/helper names from writeTarget."),
+            serde_json::json!("Do not register or upload web resources from MCP."),
+        ]
+    } else {
+        vec![
+            serde_json::json!("Inspect the existing plugin project conventions before editing."),
+            serde_json::json!("Respect message/stage/filtering attributes from writeTarget."),
+            serde_json::json!("Do not register plugins from MCP."),
+        ]
+    };
+
+    let forbidden_assumptions: Vec<String> = plan["unmappedSourceFields"].as_array()
+        .map(|fields| fields.iter()
+            .filter_map(|f| f.as_str().or_else(|| f["source"].as_str()))
+            .map(|f| format!("Do not map or write to target from source field '{f}' — it is unmapped context only."))
+            .collect())
+        .unwrap_or_default();
+
+    let ai_kit_available = ai_kit_path.is_some();
+    let ai_kit_rules_files: Vec<String> = if let Some(kit) = ai_kit_path.filter(|s| !s.is_empty()) {
+        let rules_rel = if work_kind == "plugin" {
+            "ai-rules/crm-plugin-rules.md"
+        } else if work_kind == "ribbon" {
+            "ai-rules/crm-ribbon-rules.md"
+        } else {
+            "ai-rules/crm-javascript-rules.md"
+        };
+        let sep = if kit.ends_with('/') || kit.ends_with('\\') { "" } else { "/" };
+        vec![format!("{kit}{sep}{rules_rel}")]
+    } else {
+        vec![]
+    };
+    let ai_kit_review_note = if is_script {
+        "Run AI Kit review for the created/updated script before upload or registration."
+    } else {
+        "Run AI Kit review for the created/updated plugin before registration."
+    };
+
+    let recommended_next_action = if can_write {
+        "Implement only the work described in this packet.".to_string()
+    } else {
+        blocking_user_action.as_str()
+            .or_else(|| readiness["recommendedNextStep"].as_str())
+            .unwrap_or("Resolve Task Workbench blockers before implementation.")
+            .to_string()
+    };
+
     serde_json::json!({
         "taskId": task["id"].as_str().unwrap_or(""),
         "status": if can_write { "ready_to_code" } else { "not_ready" },
@@ -6929,14 +6980,7 @@ fn task_mcp_developer_work_packet(task: &Value, customer_dev_defaults: Option<&V
         "blockingUserAction": blocking_user_action,
         "blockers": readiness["blockers"].as_array().cloned().unwrap_or_default(),
         "warnings": readiness["warnings"].as_array().cloned().unwrap_or_default(),
-        "recommendedNextAction": if can_write {
-            "Implement only the work described in this packet.".to_string()
-        } else {
-            blocking_user_action.as_str()
-                .or_else(|| readiness["recommendedNextStep"].as_str())
-                .unwrap_or("Resolve Task Workbench blockers before implementation.")
-                .to_string()
-        },
+        "recommendedNextAction": recommended_next_action,
         "writeTarget": write_target,
         "implementation": {
             "workKind": work_kind,
@@ -6947,24 +6991,13 @@ fn task_mcp_developer_work_packet(task: &Value, customer_dev_defaults: Option<&V
             "steps": plan["implementationSteps"].as_array().cloned().unwrap_or_default(),
             "fieldMappings": plan["fieldMappings"].as_array().cloned().unwrap_or_default(),
             "unmappedSourceFields": plan["unmappedSourceFields"].as_array().cloned().unwrap_or_default(),
+            "forbiddenAssumptions": forbidden_assumptions,
             "risks": plan["risks"].as_array().cloned().unwrap_or_default(),
         },
         "conventions": {
             "sources": convention_sources,
             "relatedFiles": setup["relatedExistingFiles"].as_array().cloned().unwrap_or_default(),
-            "rules": if is_script {
-                vec![
-                    serde_json::json!("Inspect existing form scripts before editing."),
-                    serde_json::json!("Use the handler/helper names from writeTarget."),
-                    serde_json::json!("Do not register or upload web resources from MCP."),
-                ]
-            } else {
-                vec![
-                    serde_json::json!("Inspect the existing plugin project conventions before editing."),
-                    serde_json::json!("Respect message/stage/filtering attributes from writeTarget."),
-                    serde_json::json!("Do not register plugins from MCP."),
-                ]
-            },
+            "rules": convention_rules,
         },
         "dataverse": {
             "verificationStatus": if is_script { "not_available_for_js_ts_mcp" } else { verification["verdict"].as_str().unwrap_or("unknown") },
@@ -6975,6 +7008,20 @@ fn task_mcp_developer_work_packet(task: &Value, customer_dev_defaults: Option<&V
                 "Use the stored Dataverse verification report. If missing or failing, resolve before implementation."
             },
         },
+        "aiKit": {
+            "available": ai_kit_available,
+            "mustInspectBeforeWriting": true,
+            "rulesFiles": ai_kit_rules_files,
+            "mandatoryRulesSummary": [
+                "No TODO comments, placeholder methods, or stub implementations in production code.",
+                "Do not create placeholder or stub handlers.",
+                "Do not add early returns unless existing scripts in the repository use them.",
+                "Implement only exact fields and entities from the work packet.",
+                "Do not invent fields, mappings, or web resource names.",
+            ],
+            "reviewRequiredAfterImplementation": true,
+            "reviewNote": ai_kit_review_note,
+        },
         "reviewTestCommit": {
             "beforeCoding": [
                 "Use this work packet as the source of truth.",
@@ -6982,8 +7029,9 @@ fn task_mcp_developer_work_packet(task: &Value, customer_dev_defaults: Option<&V
             ],
             "localValidation": plan["testChecklist"].as_array().cloned().unwrap_or_default(),
             "afterImplementation": [
-                "Record build/local test results back into Task Workbench.",
-                "Request/record consultant testing when the workflow requires it.",
+                "Record build/local test results back into Task Workbench using record_local_test.",
+                "After recording results, call continue_developer_workflow to get the next required workflow step.",
+                "Do not stop after creating files — follow continue_developer_workflow until it returns wait_for_user or mark_done.",
                 "Do not perform Dataverse upload, plugin registration, GitHub/ADO writes, or deployment without explicit approval."
             ],
             "commit": [
@@ -7260,6 +7308,96 @@ fn task_mcp_next_recommended_step(task: &Value) -> Value {
         "step": current,
         "attentionRequired": true,
         "reason": "Continue the current local CRM workflow step.",
+    })
+}
+
+fn task_mcp_compute_continue_workflow_step(task: &Value) -> Value {
+    let setup    = task.get("workflowSetup").unwrap_or(&Value::Null);
+    let workflow = task.get("crmDeveloperWorkflow").unwrap_or(&Value::Null);
+    let work_kind = workflow["detectedWorkKind"].as_str()
+        .or_else(|| setup["devTargetKind"].as_str())
+        .unwrap_or("unknown");
+    let is_script = work_kind == "script" || work_kind == "ribbon"
+        || setup["devTargetKind"].as_str() == Some("script");
+
+    // 1. Local test must be recorded
+    let local_test_status = task["localTestRecord"]["status"].as_str().unwrap_or("");
+    let local_test_done = local_test_status == "passed" || local_test_status == "not-needed";
+    if !local_test_done {
+        return serde_json::json!({
+            "nextAction": "record_results",
+            "canProceed": false,
+            "requiresUserApproval": false,
+            "blockingUserAction": null,
+            "recommendedTool": "record_local_test",
+            "instructionForAI": "Record local build/test results using record_local_test before proceeding. Do not commit or push without a recorded test result.",
+            "allowedWrites": ["record_local_test"],
+            "forbiddenWrites": ["commit_task_changes", "push_task_branch", "commit_and_push_task_changes"],
+        });
+    }
+
+    // 2. Dataverse verification
+    let dv_check = &task["implementationVerification"]["dataverseCheck"];
+    let first_verdict = task["crmVerificationReports"].as_array()
+        .and_then(|a| a.first())
+        .and_then(|r| r["verdict"].as_str())
+        .unwrap_or("");
+    let dv_done = !dv_check["skippedAt"].is_null()
+        || !dv_check["manuallyVerifiedAt"].is_null()
+        || matches!(dv_check["status"].as_str().unwrap_or(""), "skipped" | "done" | "manually-verified")
+        || matches!(first_verdict, "pass" | "warnings" | "fail");
+    if !dv_done {
+        if is_script {
+            return serde_json::json!({
+                "nextAction": "wait_for_user",
+                "canProceed": false,
+                "requiresUserApproval": true,
+                "blockingUserAction": "Run Verify Implementation modal in Task Workbench, then call continue_developer_workflow again.",
+                "recommendedTool": null,
+                "instructionForAI": "Dataverse metadata verification for JS/TS requires the in-app Verify Implementation modal. Call continue_developer_workflow again after the user confirms verification in Task Workbench.",
+                "allowedWrites": [],
+                "forbiddenWrites": ["commit_task_changes", "push_task_branch", "commit_and_push_task_changes"],
+            });
+        }
+        return serde_json::json!({
+            "nextAction": "verify_dataverse",
+            "canProceed": true,
+            "requiresUserApproval": false,
+            "blockingUserAction": null,
+            "recommendedTool": "run_dataverse_check_for_task",
+            "instructionForAI": "Run Dataverse metadata verification using run_dataverse_check_for_task, then call continue_developer_workflow again.",
+            "allowedWrites": ["run_dataverse_check_for_task"],
+            "forbiddenWrites": ["commit_task_changes", "push_task_branch", "commit_and_push_task_changes"],
+        });
+    }
+
+    // 3. AI Kit review
+    let ai_kit_review = &task["aiKitReview"];
+    let ai_kit_done = !ai_kit_review["completedAt"].is_null()
+        || matches!(ai_kit_review["status"].as_str().unwrap_or(""), "passed" | "skipped");
+    if !ai_kit_done {
+        return serde_json::json!({
+            "nextAction": "wait_for_user",
+            "canProceed": false,
+            "requiresUserApproval": true,
+            "blockingUserAction": "Run AI Kit review in Task Workbench, then call continue_developer_workflow again.",
+            "recommendedTool": null,
+            "instructionForAI": "AI Kit review is required before branch creation. Call continue_developer_workflow again after the user completes AI Kit review in Task Workbench.",
+            "allowedWrites": [],
+            "forbiddenWrites": ["commit_task_changes", "push_task_branch", "commit_and_push_task_changes"],
+        });
+    }
+
+    // 4. Propose branch — requires explicit user approval
+    serde_json::json!({
+        "nextAction": "propose_branch",
+        "canProceed": true,
+        "requiresUserApproval": true,
+        "blockingUserAction": "Ask the user to confirm the proposed branch name before creating the branch.",
+        "recommendedTool": "prepare_commit_for_task",
+        "instructionForAI": "Implementation, verification, and AI Kit review are complete. Propose a branch name and ask the user to confirm before creating the branch. Do not call commit_task_changes or push_task_branch without explicit user approval.",
+        "allowedWrites": [],
+        "forbiddenWrites": [],
     })
 }
 
@@ -8141,7 +8279,10 @@ fn task_mcp_execute_tool(app: &tauri::AppHandle, tool_name: &str, args: &Value) 
                 .unwrap_or("");
             let dev_defaults = task_mcp_find_customer(&customers, customer_id)
                 .and_then(|c| task_mcp_customer_dev_defaults(c, &crm_base_dir));
-            task_mcp_developer_work_packet(task, dev_defaults.as_ref())
+            let ai_kit_path = settings["powerPlatformAiKitPath"].as_str()
+                .filter(|s| !s.trim().is_empty())
+                .map(str::to_string);
+            task_mcp_developer_work_packet(task, dev_defaults.as_ref(), ai_kit_path.as_deref())
         }
 
         "prepare_developer_task" => {
@@ -9556,6 +9697,16 @@ fn task_mcp_execute_tool(app: &tauri::AppHandle, tool_name: &str, args: &Value) 
                 "warnings":                 readiness["warnings"],
                 "recommendedNextStep":      readiness["recommendedNextStep"],
             })
+        }
+
+        "continue_developer_workflow" => {
+            let task_id = args["taskId"].as_str().unwrap_or("").trim();
+            if task_id.is_empty() { return Err("Missing required argument: taskId".to_string()); }
+            let task = task_mcp_get_task(&tasks, task_id)
+                .ok_or_else(|| format!("Task not found: {task_id}"))?;
+            let mut result = task_mcp_compute_continue_workflow_step(task);
+            result["taskId"] = serde_json::json!(task_id);
+            result
         }
 
         _ => return Err(format!("Unknown MCP tool: {tool_name}")),
@@ -13306,6 +13457,144 @@ mod tests {
         // Attributes are still usable: verify a few are present
         assert!(entry.attributes.contains("attr_000"));
         assert!(entry.attributes.contains("attr_185"));
+    }
+
+    // --- MCP tool registry ---------------------------------------------------
+
+    #[test]
+    fn read_only_tool_list_contains_continue_developer_workflow() {
+        let tools = task_mcp_read_only_tool_definitions();
+        let names: Vec<&str> = tools.iter()
+            .filter_map(|t| t["name"].as_str())
+            .collect();
+        assert!(
+            names.contains(&"continue_developer_workflow"),
+            "read-only tool list must contain continue_developer_workflow; got: {names:?}"
+        );
+    }
+
+    #[test]
+    fn continue_developer_workflow_is_marked_read_only() {
+        let tools = task_mcp_read_only_tool_definitions();
+        let tool = tools.iter().find(|t| t["name"].as_str() == Some("continue_developer_workflow"));
+        assert!(tool.is_some(), "continue_developer_workflow not found in read-only tools");
+        assert_eq!(
+            tool.unwrap()["readOnly"].as_bool(),
+            Some(true),
+            "continue_developer_workflow must have readOnly: true"
+        );
+    }
+
+    #[test]
+    fn continue_developer_workflow_without_local_test_returns_record_results() {
+        let task = serde_json::json!({
+            "id": "task-test-cdw",
+            "taskMode": "developer",
+            "workflowSetup": { "devTargetKind": "script" },
+            "crmDeveloperWorkflow": { "detectedWorkKind": "script" },
+        });
+        let result = task_mcp_compute_continue_workflow_step(&task);
+        assert_eq!(result["nextAction"].as_str(), Some("record_results"));
+        assert_eq!(result["recommendedTool"].as_str(), Some("record_local_test"));
+        assert_eq!(result["canProceed"].as_bool(), Some(false));
+    }
+
+    #[test]
+    fn continue_developer_workflow_after_all_done_requires_user_approval_for_branch() {
+        let task = serde_json::json!({
+            "id": "task-test-cdw-done",
+            "taskMode": "developer",
+            "workflowSetup": { "devTargetKind": "script" },
+            "crmDeveloperWorkflow": { "detectedWorkKind": "script" },
+            "localTestRecord": { "status": "passed" },
+            "implementationVerification": { "dataverseCheck": { "status": "skipped" } },
+            "aiKitReview": { "status": "passed", "completedAt": "2026-06-15T10:00:00.000Z" },
+        });
+        let result = task_mcp_compute_continue_workflow_step(&task);
+        assert_eq!(result["nextAction"].as_str(), Some("propose_branch"));
+        assert_eq!(result["requiresUserApproval"].as_bool(), Some(true));
+    }
+
+    #[test]
+    fn work_packet_aikit_has_must_inspect_before_writing() {
+        let task = serde_json::json!({
+            "id": "task-aikit",
+            "taskMode": "developer",
+            "workflowSetup": {
+                "devTargetKind": "script",
+                "repositoryRoot": "C:/Repo",
+                "artifactPath": "Scripts/nvr.js",
+                "primaryEntityLogicalName": "account",
+                "confirmedAt": "2026-06-01T10:00:00.000Z",
+                "actionType": "update-existing-script",
+            },
+            "crmDeveloperWorkflow": {
+                "detectedWorkKind": "script",
+                "technicalPlan": {
+                    "workKind": "script",
+                    "summary": "Update script.",
+                    "target": {
+                        "entityLogicalName": "account",
+                        "scriptPath": "Scripts/nvr.js",
+                        "eventName": "OnLoad",
+                    },
+                    "implementationSteps": [],
+                    "fieldMappings": [],
+                    "risks": [],
+                    "testChecklist": [],
+                },
+                "planApproval": { "approved": true },
+            },
+            "implementationVerification": { "dataverseCheck": { "status": "skipped" } },
+            "customerId": "cust-test",
+        });
+        let packet = task_mcp_developer_work_packet(&task, None, None);
+        assert_eq!(
+            packet["aiKit"]["mustInspectBeforeWriting"].as_bool(),
+            Some(true),
+            "aiKit.mustInspectBeforeWriting must be true"
+        );
+    }
+
+    #[test]
+    fn work_packet_aikit_rules_files_populated_when_kit_path_given() {
+        let task = serde_json::json!({
+            "id": "task-aikit-path",
+            "taskMode": "developer",
+            "workflowSetup": {
+                "devTargetKind": "script",
+                "repositoryRoot": "C:/Repo",
+                "artifactPath": "Scripts/nvr.js",
+                "primaryEntityLogicalName": "account",
+                "confirmedAt": "2026-06-01T10:00:00.000Z",
+                "actionType": "update-existing-script",
+            },
+            "crmDeveloperWorkflow": {
+                "detectedWorkKind": "script",
+                "technicalPlan": {
+                    "workKind": "script",
+                    "summary": "Update script.",
+                    "target": {
+                        "entityLogicalName": "account",
+                        "scriptPath": "Scripts/nvr.js",
+                        "eventName": "OnLoad",
+                    },
+                    "implementationSteps": [],
+                    "fieldMappings": [],
+                    "risks": [],
+                    "testChecklist": [],
+                },
+                "planApproval": { "approved": true },
+            },
+            "implementationVerification": { "dataverseCheck": { "status": "skipped" } },
+        });
+        let packet = task_mcp_developer_work_packet(&task, None, Some("C:/repos/power-platform-ai-kit"));
+        assert_eq!(packet["aiKit"]["available"].as_bool(), Some(true));
+        let rules = packet["aiKit"]["rulesFiles"].as_array().expect("rulesFiles must be array");
+        assert!(!rules.is_empty(), "rulesFiles must not be empty when kit path given");
+        let first = rules[0].as_str().unwrap_or("");
+        assert!(first.contains("crm-javascript-rules.md"), "script task must use javascript rules: {first}");
+        assert!(first.contains("power-platform-ai-kit"), "must include kit path: {first}");
     }
 }
 // --- Entry point -----------------------------------------------------------

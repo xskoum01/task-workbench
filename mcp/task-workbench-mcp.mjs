@@ -39,6 +39,7 @@ const READ_ONLY_TOOL_NAMES = new Set([
   'get_implementation_readiness',
   'get_developer_work_packet',
   'get_task_templates',
+  'continue_developer_workflow',
 ]);
 
 /**
@@ -944,6 +945,21 @@ const TOOL_DEFINITIONS = [
     },
   },
   {
+    name: 'continue_developer_workflow',
+    description:
+      'Read-only. Returns the next required workflow step after implementation. ' +
+      'Always call this after creating or modifying files — do not stop just because a file was created. ' +
+      'Returns nextAction, canProceed, requiresUserApproval, blockingUserAction, recommendedTool, instructionForAI, allowedWrites, forbiddenWrites.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        taskId: { type: 'string', description: 'Task ID.' },
+      },
+      required: ['taskId'],
+      additionalProperties: false,
+    },
+  },
+  {
     name: 'get_task_templates',
     description:
       'Read-only. Returns built-in task templates that can be used to auto-resolve missing setup fields. ' +
@@ -1633,6 +1649,141 @@ function buildTaskFullContext(task, customerDevDefaults) {
   return detail;
 }
 
+/**
+ * Scans all available task text for CRM source→target field mapping work indicators.
+ * Returns { required, mappings, validationFields, sources }:
+ *   required         – text clearly indicates field mapping work is needed
+ *   mappings         – extracted {source,target} pairs if safely parseable, otherwise []
+ *   validationFields – field refs identified as read-only (source-only, no target write)
+ *   sources          – list of text source names that were scanned and non-empty (for debug)
+ */
+function detectAndExtractFieldMappings(task) {
+  const stripHtml = (s) => (typeof s === 'string' ? s.replace(/<[^>]+>/g, ' ') : '');
+  const workflow = asObject(task.crmDeveloperWorkflow);
+  const plan = asObject(
+    workflow.technicalPlan && typeof workflow.technicalPlan === 'object' ? workflow.technicalPlan : null
+  );
+  const joinArray = (arr) =>
+    Array.isArray(arr)
+      ? arr.map((x) => (typeof x === 'string' ? x : (x?.description || x?.step || x?.risk || x?.text || JSON.stringify(x)))).join('\n')
+      : '';
+
+  // Gather text from every stored text source in priority order.
+  const textSources = {
+    originalMessage: stripHtml(task.originalMessage),
+    description: stripHtml(task.description),
+    analysisEn: stripHtml(task.analysisResult?.summaryEn ?? ''),
+    analysis: stripHtml(task.analysisResult?.summary ?? ''),
+    requirements: joinArray(task.analysisResult?.requirements),
+    planSummary: stripHtml(typeof plan.summary === 'string' ? plan.summary : ''),
+    planSteps: joinArray(plan.implementationSteps),
+    planRisks: joinArray(plan.risks),
+  };
+
+  const sources = Object.entries(textSources)
+    .filter(([, v]) => v.trim().length > 0)
+    .map(([k]) => k);
+
+  const rawText = Object.values(textSources).join('\n').trim();
+  if (!rawText) return { required: false, mappings: [], validationFields: [], sources };
+
+  // Detect source/target entity context — English, Czech full form, Czech abbreviated
+  const hasSourceContext =
+    /\b(?:source|src)\s+entit/i.test(rawText) ||
+    /\bzdroj(?:ov[aá])?\s+entit/i.test(rawText) ||
+    /\bzdroj\s*[:/]/i.test(rawText);
+  const hasTargetContext =
+    /\b(?:target|destination)\s+entit/i.test(rawText) ||
+    /\bc[íi]lov[aá]\s+entit/i.test(rawText) ||
+    /\bc[íi]l\s*[:/]/i.test(rawText);
+
+  // Count unique CRM-style logical names (entity_field or field_name pattern)
+  const crmNames = rawText.toLowerCase().match(/\b[a-z][a-z0-9]*_[a-z][a-z0-9_]+\b/g) || [];
+  const uniqueCrmNames = new Set(crmNames);
+
+  // Detect when plan text itself signals incomplete field mapping work.
+  // Czech variants are added because plan steps/risks may be generated in Czech.
+  const planSignalsIncomplete =
+    (
+      /field\s+mappings?\s+(?:are\s+)?not\s+defined|define\s+field\s+mappings?/i.test(rawText) ||
+      /field\s+mappings?\s+nejsou\s+definov/i.test(rawText) ||
+      /mapov[aá]n[íi]\s+mus[íi]\s+b[ýy]t\s+dopl/i.test(rawText) ||
+      /doplnění\s+(?:konkrétn[íi]ch\s+)?field\s+mappings?/i.test(rawText) ||
+      /připravit\s+todo\s+komentáře/i.test(rawText) ||
+      /todo.*map.*field/i.test(rawText) ||
+      /field.*map.*todo/i.test(rawText) ||
+      /todo[^\n]{0,80}field\s+map/i.test(rawText) ||
+      /field\s+map[^\n]{0,80}todo/i.test(rawText)
+    ) && uniqueCrmNames.size >= 2;
+
+  const detected = ((hasSourceContext || hasTargetContext) && uniqueCrmNames.size >= 3) || planSignalsIncomplete;
+  if (!detected) return { required: false, mappings: [], validationFields: [], sources };
+
+  // --- Extraction attempt 1: explicit entity.field -> entity.field arrows ---
+  const arrowRe =
+    /\b([a-z][a-z0-9]*_[a-z][a-z0-9_]*\.[a-z][a-z0-9_]+)\s*(?:->|→|=>)\s*([a-z][a-z0-9]*_[a-z][a-z0-9_]*\.[a-z][a-z0-9_]+)\b/gi;
+  const arrowMatches = [...rawText.matchAll(arrowRe)];
+  if (arrowMatches.length >= 2) {
+    const seen = new Set();
+    const mappings = [];
+    for (const m of arrowMatches) {
+      const key = `${m[1].toLowerCase()}=>${m[2].toLowerCase()}`;
+      if (!seen.has(key)) { seen.add(key); mappings.push({ source: m[1].toLowerCase(), target: m[2].toLowerCase() }); }
+    }
+    return { required: true, mappings, validationFields: [], sources };
+  }
+
+  // --- Extraction attempt 2: "Source entity: X / Source fields: a,b,c / Target entity: Y / Target fields: d,e,f" ---
+  const srcEntityM = rawText.match(/\b(?:source\s+entity|zdrojov[aá]\s+entit[ay]?|zdroj(?:ov[aá]\s+entit[ay]?)?)\s*[:/]\s*([a-z][a-z0-9_]+)/i);
+  const tgtEntityM = rawText.match(/\b(?:target\s+entity|c[íi]lov[aá]\s+entit[ay]?|c[íi]l)\s*[:/]\s*([a-z][a-z0-9_]+)/i);
+  const srcFieldsM = rawText.match(/\b(?:source\s+fields?|zdrojov[aá]\s+pol[ei]|pole\s+zdroje?)\s*[:/]\s*([^\n\r]{3,200})/i);
+  const tgtFieldsM = rawText.match(/\b(?:target\s+fields?|c[íi]lov[aá]\s+pol[ei]|pole\s+c[íi]le?)\s*[:/]\s*([^\n\r]{3,200})/i);
+
+  if (srcEntityM && tgtEntityM && srcFieldsM && tgtFieldsM) {
+    const srcEntity = srcEntityM[1].toLowerCase();
+    const tgtEntity = tgtEntityM[1].toLowerCase();
+    const parseFields = (str) =>
+      str
+        .split(/[,;\s]+/)
+        .map((f) => f.trim().toLowerCase().replace(/[^a-z0-9_]/g, ''))
+        .filter((f) => /^[a-z][a-z0-9_]+$/.test(f) && f.length > 2);
+    const srcFields = parseFields(srcFieldsM[1]);
+    const tgtFields = parseFields(tgtFieldsM[1]);
+
+    if (srcFields.length >= 2 && tgtFields.length >= 2) {
+      const pairCount = Math.min(srcFields.length, tgtFields.length);
+      const mappings = [];
+      for (let i = 0; i < pairCount; i++) {
+        mappings.push({ source: `${srcEntity}.${srcFields[i]}`, target: `${tgtEntity}.${tgtFields[i]}` });
+      }
+      const validationFields = srcFields.slice(pairCount).map((f) => `${srcEntity}.${f}`);
+      return { required: true, mappings, validationFields, sources };
+    }
+  }
+
+  // Detected mapping work but extraction not safe — block without specific pairs
+  return { required: true, mappings: [], validationFields: [], sources };
+}
+
+/**
+ * Returns true when a script task requires field mappings that have not been defined.
+ * Used by computeContinueWorkflowStep to prevent advancement to testing on scaffold code.
+ */
+function isScaffoldOnlyTask(task) {
+  const workflow = asObject(task.crmDeveloperWorkflow);
+  const plan = sanitizeTechnicalPlan(workflow.technicalPlan);
+  const emptyFieldMappings = !plan?.fieldMappings || plan.fieldMappings.length === 0;
+  if (!emptyFieldMappings) return false;
+  const template = matchTaskTemplate(task.title || '');
+  if (template && Array.isArray(template.sourceFields) && template.sourceFields.length > 0) return true;
+  if (Array.isArray(plan?.unmappedSourceFields) && plan.unmappedSourceFields.length > 0) return true;
+  const detection = detectAndExtractFieldMappings(task);
+  return detection.required && detection.mappings.length === 0;
+}
+
+// Bump when the packet shape or guard logic changes so callers can detect a stale MCP runtime.
+const DEVELOPER_WORK_PACKET_VERSION = '4';
+
 function buildDeveloperWorkPacket(task, customerDevDefaults = null) {
   const setup = asObject(task.workflowSetup);
   const workflow = asObject(task.crmDeveloperWorkflow);
@@ -1649,7 +1800,30 @@ function buildDeveloperWorkPacket(task, customerDevDefaults = null) {
 
   const blockers = [...(Array.isArray(readiness.blockers) ? readiness.blockers : [])];
   const planApprovalRequired = !!plan && !approval.approved;
-  const canWriteCode = readiness.isImplementationReady && !planApprovalRequired;
+  const emptyFieldMappings = !plan?.fieldMappings || plan.fieldMappings.length === 0;
+  const templateNeedsMapping = !!(template && Array.isArray(template.sourceFields) && template.sourceFields.length > 0);
+  const planHasUnmappedWithNoMapped = !!(
+    Array.isArray(plan?.unmappedSourceFields) && plan.unmappedSourceFields.length > 0 && emptyFieldMappings
+  );
+  // Third path: if neither template nor plan signals mappings, scan original assignment text.
+  // Handles tasks where the plan was saved without fieldMappings/unmappedSourceFields
+  // even though the original assignment clearly describes source→target field work.
+  let textExtractedMappings = [];
+  let textExtractedValidation = [];
+  let textDetectedRequired = false;
+  let textDetectionSources = [];
+  if (emptyFieldMappings && !templateNeedsMapping && !planHasUnmappedWithNoMapped) {
+    const textResult = detectAndExtractFieldMappings(task);
+    textDetectedRequired = textResult.required;
+    textExtractedMappings = textResult.mappings;
+    textExtractedValidation = textResult.validationFields;
+    textDetectionSources = textResult.sources || [];
+  }
+  const requiresFieldMappings = templateNeedsMapping || planHasUnmappedWithNoMapped || textDetectedRequired;
+  // fieldMappingsMissing: requires mappings AND none available (text extraction also failed to resolve)
+  const fieldMappingsMissing = requiresFieldMappings && emptyFieldMappings && textExtractedMappings.length === 0;
+  // Use let so the consistency guard below can override if needed.
+  let canWriteCode = readiness.isImplementationReady && !planApprovalRequired && !fieldMappingsMissing;
 
   let decisionReason;
   let blockingUserAction = null;
@@ -1658,12 +1832,95 @@ function buildDeveloperWorkPacket(task, customerDevDefaults = null) {
   } else if (planApprovalRequired) {
     decisionReason = 'Technical plan approval is required in Task Workbench before code changes.';
     blockingUserAction = 'Review and approve the technical implementation plan in Task Workbench.';
+  } else if (fieldMappingsMissing) {
+    decisionReason = textDetectedRequired
+      ? 'Field mapping work is indicated in the original assignment but field mappings have not been defined in the technical plan. Complete the technical plan before implementation.'
+      : 'Field mappings are missing. Complete the technical plan before implementation.';
+    blockingUserAction = 'Run prepare_developer_task to regenerate the technical plan with field mappings.';
   } else {
-    decisionReason = readiness.recommendedNextStep || 'Task Workbench says implementation is not ready yet.';
+    // Use the first blocker as the primary reason so callers see the concrete issue, not just a generic step.
+    decisionReason = blockers[0] || readiness.recommendedNextStep || 'Task Workbench says implementation is not ready yet.';
     if (!plan) {
       blockingUserAction = 'Run prepare_developer_task to create/refresh setup and the technical plan.';
+    } else if (blockers[0]?.includes('has not been saved to task setup')) {
+      blockingUserAction = 'Run prepare_developer_task or call set_task_developer_target to save the target path.';
     } else if (blockers.length > 0) {
       blockingUserAction = 'Resolve the listed blockers in Task Workbench.';
+    }
+  }
+
+  // ── Guard 1: requiresFieldMappings consistency ───────────────────────────
+  // A packet with requiresFieldMappings=true and empty final fieldMappings MUST NOT
+  // have canWriteCode=true. Apply as a safety net regardless of how prior detection ran.
+  const finalFieldMappings = textExtractedMappings.length > 0 ? textExtractedMappings : (plan?.fieldMappings || []);
+  if (requiresFieldMappings && finalFieldMappings.length === 0 && canWriteCode) {
+    canWriteCode = false;
+    decisionReason =
+      'Required field mappings are missing. Packet consistency guard blocked code writing. ' +
+      'The task requires source→target field assignments that have not been defined.';
+    blockingUserAction =
+      'Define source→target field mappings in the technical plan using prepare_developer_task or save_technical_plan.';
+  }
+
+  // ── Guard 2: scaffold signal detection (diagnostic) ──────────────────────
+  // Scans plan steps and risks for TODO/scaffold/mapping-incomplete signals when
+  // canWriteCode is still true and fieldMappings is empty. DIAGNOSTIC ONLY: sets
+  // scaffoldSignalDetected and scaffoldSignalSources. Enforcement is by the final
+  // packet invariant below, which operates on the actually-assembled packet values.
+  let scaffoldSignalDetected = false;
+  let scaffoldSignalSources = [];
+  const matchScaffoldText = (t) =>
+    /\btodo\b|\bscaffold\b|\bplaceholder\b/i.test(t) ||
+    /field\s+mappings?\s+(?:are\s+)?not\s+defined/i.test(t) ||
+    /field\s+mappings?\s+nejsou\s+definov/i.test(t) ||
+    /mapov[aá]n[íi].*(?:doplnit|musí\s+b[ýy]t\s+dopl)/i.test(t) ||
+    /doplnění.*field\s+mappings?/i.test(t) ||
+    /připravit\s+todo/i.test(t);
+  if (canWriteCode && finalFieldMappings.length === 0) {
+    const scaffoldCheckTexts = [
+      ...(plan?.implementationSteps || []).map((s) => (typeof s === 'string' ? s : JSON.stringify(s))),
+      ...(plan?.risks || []).map((r) => (typeof r === 'string' ? r : JSON.stringify(r))),
+      typeof plan?.summary === 'string' ? plan.summary : '',
+    ];
+    scaffoldSignalSources = scaffoldCheckTexts.filter(matchScaffoldText);
+    if (scaffoldSignalSources.length > 0) {
+      scaffoldSignalDetected = true;
+    }
+  }
+
+  // ── Sanitize scaffold steps/risks when mappings are available ─────────────
+  // When canWriteCode=true and real fieldMappings were extracted, remove any scaffold-only
+  // steps/risks (e.g. "Připravit TODO komentáře") so the packet never instructs the AI
+  // to create TODO comments while also indicating code may be written.
+  const SCAFFOLD_ITEM_RE = /\btodo\b|\bscaffold\b|\bplaceholder\b|field\s+mappings?\s+(?:are\s+)?not\s+defined|field\s+mappings?\s+nejsou\s+definov|doplnění.*field\s+mapping|připravit\s+todo/i;
+  const sanitizedSteps = canWriteCode && finalFieldMappings.length > 0
+    ? (plan?.implementationSteps || []).filter((s) => !SCAFFOLD_ITEM_RE.test(typeof s === 'string' ? s : JSON.stringify(s)))
+    : (plan?.implementationSteps || []);
+  const sanitizedRisks = canWriteCode && finalFieldMappings.length > 0
+    ? (plan?.risks || []).filter((r) => !SCAFFOLD_ITEM_RE.test(typeof r === 'string' ? r : JSON.stringify(r)))
+    : (plan?.risks || []);
+
+  // ── Final packet invariant ────────────────────────────────────────────────
+  // Runs on the ACTUAL assembled packet values (sanitizedSteps, sanitizedRisks).
+  // canWriteCode=true with empty fieldMappings and scaffold/TODO text in the final
+  // steps or risks is an impossible state: enforce it here regardless of whether
+  // prior guards fired. This catches stale runtimes and any detection path gaps.
+  let finalConsistencyGuardApplied = false;
+  if (canWriteCode && finalFieldMappings.length === 0) {
+    const finalPacketTexts = [
+      ...sanitizedSteps.map((s) => (typeof s === 'string' ? s : JSON.stringify(s))),
+      ...sanitizedRisks.map((r) => (typeof r === 'string' ? r : JSON.stringify(r))),
+    ];
+    const packetHasScaffold = finalPacketTexts.some(matchScaffoldText);
+    if (packetHasScaffold) {
+      finalConsistencyGuardApplied = true;
+      canWriteCode = false;
+      decisionReason =
+        'Packet invariant violation: implementation steps or risks contain TODO/scaffold/placeholder ' +
+        'guidance while field mappings are empty. Required source→target field assignments must be ' +
+        'defined before code can be written.';
+      blockingUserAction =
+        'Define source→target field mappings in the technical plan using prepare_developer_task or save_technical_plan.';
     }
   }
 
@@ -1701,8 +1958,12 @@ function buildDeveloperWorkPacket(task, customerDevDefaults = null) {
     isScript ? customerDevDefaults?.conventionsSource || customerDevDefaults?.jsConventionsSource : customerDevDefaults?.pluginConventionsSource,
   ].filter(Boolean);
 
+  const fieldMappingsSource = textExtractedMappings.length > 0 ? 'text-extracted'
+    : (plan?.fieldMappings?.length > 0 ? 'plan' : 'none');
+
   return {
     taskId: task.id,
+    packetGeneratorVersion: DEVELOPER_WORK_PACKET_VERSION,
     status: canWriteCode ? 'ready_to_code' : 'not_ready',
     canWriteCode,
     decisionReason,
@@ -1714,10 +1975,40 @@ function buildDeveloperWorkPacket(task, customerDevDefaults = null) {
     implementation: {
       workKind,
       summary: plan?.summary || summarize(task.analysisResult?.summaryEn ?? task.analysisResult?.summary ?? task.title),
-      steps: plan?.implementationSteps || [],
-      fieldMappings: plan?.fieldMappings || [],
+      steps: sanitizedSteps,
+      requiresFieldMappings,
+      // Prefer text-extracted mappings when structured plan mappings are absent.
+      fieldMappings: finalFieldMappings,
       unmappedSourceFields: plan?.unmappedSourceFields || [],
-      risks: plan?.risks || [],
+      // Read-only context fields: from template additionalSourceFields or text extraction.
+      validationFields: [
+        ...(Array.isArray(template?.additionalSourceFields)
+          ? template.additionalSourceFields.map((f) => `${template.sourceEntity || 'source'}.${f}`)
+          : []),
+        ...textExtractedValidation,
+      ],
+      // When requiresFieldMappings is true and fieldMappings is empty, lists what must be defined.
+      missingRequiredMappings: fieldMappingsMissing
+        ? (templateNeedsMapping
+            ? templateFieldMapping(template, targetEntity).pairs.map((p) => `${p.source} -> ${p.target}`)
+            : textDetectedRequired
+              ? ['Field mapping work detected in original assignment but target field assignments could not be safely extracted. Define field mappings in the technical plan using prepare_developer_task.']
+              : (plan?.unmappedSourceFields || []).map((f) => `${f} (no target field defined in plan)`)
+          )
+        : [],
+      // true when canWriteCode is blocked because required mappings are absent.
+      scaffoldOnly: fieldMappingsMissing || (requiresFieldMappings && finalFieldMappings.length === 0) || scaffoldSignalDetected || finalConsistencyGuardApplied,
+      // Diagnostic fields — always present so callers can detect stale MCP runtimes and trace guard logic.
+      detectionSources: textDetectionSources,
+      scaffoldSignalDetected,
+      scaffoldSignalSources,
+      finalConsistencyGuardApplied,
+      fieldMappingsSource,
+      fieldMappingsCount: finalFieldMappings.length,
+      forbiddenAssumptions: (plan?.unmappedSourceFields || []).map(
+        (f) => `Do not map ${f} unless a target field is explicitly present in fieldMappings.`
+      ),
+      risks: sanitizedRisks,
     },
     conventions: {
       sources: conventionSources,
@@ -1733,6 +2024,22 @@ function buildDeveloperWorkPacket(task, customerDevDefaults = null) {
         ? 'Dataverse metadata verification for JS/TS is not available through MCP. Use the in-app Verify Implementation modal after implementation/upload.'
         : 'Use the stored Dataverse verification report. If missing or failing, resolve before implementation.',
     },
+    aiKit: {
+      available: false,
+      mustInspectBeforeWriting: true,
+      rulesFiles: [],
+      mandatoryRulesSummary: [
+        'No TODO comments, placeholder methods, or stub implementations in production code.',
+        'Do not create placeholder or stub handlers.',
+        'Do not add early returns unless existing scripts in the repository use them.',
+        'Implement only exact fields and entities from the work packet.',
+        'Do not invent fields, mappings, or web resource names.',
+      ],
+      reviewRequiredAfterImplementation: true,
+      reviewNote: isScript
+        ? 'Run AI Kit review for the created/updated script before upload or registration.'
+        : 'Run AI Kit review for the created/updated plugin before registration.',
+    },
     reviewTestCommit: {
       beforeCoding: [
         'Use this work packet as the source of truth.',
@@ -1740,8 +2047,9 @@ function buildDeveloperWorkPacket(task, customerDevDefaults = null) {
       ],
       localValidation: plan?.testChecklist || [],
       afterImplementation: [
-        'Record build/local test results back into Task Workbench.',
-        'Request/record consultant testing when the workflow requires it.',
+        'Record build/local test results back into Task Workbench using record_local_test.',
+        'After recording results, call continue_developer_workflow to get the next required workflow step.',
+        'Do not stop after creating files — follow continue_developer_workflow until it returns wait_for_user or mark_done.',
         'Do not perform Dataverse upload, plugin registration, GitHub/ADO writes, or deployment without explicit approval.',
       ],
       commit: [
@@ -2146,21 +2454,22 @@ function computeImplementationReadiness(task) {
   }
 
   if (isScript) {
-    const targetPath = setup.artifactPath || setup.scriptPath || planTarget.scriptPath || '';
-    if (!targetPath) {
-      blockers.push('Target script/artifact path is not set.');
+    // Only persisted setup fields count — derived naming-contract preview is not sufficient.
+    const persistedTargetPath = setup.artifactPath || setup.scriptPath || '';
+    if (!persistedTargetPath) {
+      blockers.push('Target script/artifact path has not been saved to task setup. Run prepare_developer_task or set_task_developer_target first.');
     } else {
       const actionType = setup.actionType ?? '';
       const isSpecificFile = (p) => p && /\.[jt]sx?$/.test(p);
 
       if (actionType === 'create-new-script') {
-        const hasDir      = !!(setup.scriptPath || planTarget.scriptPath);
-        const hasFileName = !!(setup.artifactPath) || isSpecificFile(setup.scriptPath) || isSpecificFile(planTarget.scriptPath) || !!(setup.desiredScriptFile);
+        const hasDir      = !!(setup.scriptPath || setup.artifactPath);
+        const hasFileName = isSpecificFile(setup.artifactPath) || isSpecificFile(setup.scriptPath) || !!(setup.desiredScriptFile);
         if (!hasDir || !hasFileName) {
           blockers.push('Script creation requires a known target directory and file name. Set script path and desired file name.');
         }
       } else if (actionType === 'update-existing-script') {
-        const hasSpecific = !!(setup.artifactPath) || isSpecificFile(setup.scriptPath) || isSpecificFile(planTarget.scriptPath);
+        const hasSpecific = isSpecificFile(setup.artifactPath) || isSpecificFile(setup.scriptPath);
         if (!hasSpecific) {
           blockers.push('Script update requires a specific existing file path. Set script path to an existing .js file.');
         }
@@ -2195,12 +2504,110 @@ function computeImplementationReadiness(task) {
     else if (first.includes('Plugin registration'))     recommendedNextStep = 'Specify message, stage, and execution mode in the technical plan.';
     else if (first.includes('Script creation requires')) recommendedNextStep = 'Set target directory and file name for script creation in Developer Target Setup.';
     else if (first.includes('Script update requires'))  recommendedNextStep = 'Set the existing script file path in Developer Target Setup.';
+    else if (first.includes('Target script/artifact path has not been saved')) recommendedNextStep = 'Run prepare_developer_task or call set_task_developer_target to persist the target path.';
     else if (first.includes('Target script'))           recommendedNextStep = 'Set the target script path via Developer Target Setup.';
     else if (first.includes('Form/event'))              recommendedNextStep = 'Add form/event details to the technical plan, or mark form registration as manual-later.';
     else                                                recommendedNextStep = 'Resolve all blockers before proceeding with implementation.';
   }
 
   return { isImplementationReady: isReady, blockers, warnings, recommendedNextStep };
+}
+
+function computeContinueWorkflowStep(task) {
+  // 0. Scaffold/TODO guard — block all workflow advancement if required field mappings are absent.
+  // This prevents AI from calling record_local_test or proceeding to verification on stub code.
+  if (isScaffoldOnlyTask(task)) {
+    return {
+      nextAction: 'define_field_mappings',
+      canProceed: false,
+      requiresUserApproval: false,
+      blockingUserAction: 'Define required field mappings in the technical plan. Run prepare_developer_task to regenerate the plan with mappings, or update the plan directly via save_technical_plan.',
+      recommendedTool: 'prepare_developer_task',
+      instructionForAI: 'This task requires field mappings that have not been defined. The current implementation is scaffold or TODO code — do not record test results, do not proceed to Dataverse verification or AI Kit review. Stop immediately. Report missingRequiredMappings to the user and wait for explicit guidance before any further action.',
+      allowedWrites: ['prepare_developer_task'],
+      forbiddenWrites: ['record_local_test', 'commit_task_changes', 'push_task_branch', 'commit_and_push_task_changes'],
+    };
+  }
+
+  const setup = asObject(task.workflowSetup);
+  const workflow = asObject(task.crmDeveloperWorkflow);
+  const workKind = workflow.detectedWorkKind || setup.devTargetKind || 'unknown';
+  const isScript = workKind === 'script' || workKind === 'ribbon' || setup.devTargetKind === 'script';
+
+  // 1. Local test must be recorded first.
+  const localTestRecord = asObject(task.localTestRecord);
+  const localTestDone = localTestRecord.status === 'passed' || localTestRecord.status === 'not-needed';
+  if (!localTestDone) {
+    return {
+      nextAction: 'record_results',
+      canProceed: false,
+      requiresUserApproval: false,
+      blockingUserAction: null,
+      recommendedTool: 'record_local_test',
+      instructionForAI: 'Record local build/test results before proceeding. Use record_local_test with status: passed, failed, or not-needed.',
+      allowedWrites: ['record_local_test'],
+      forbiddenWrites: ['commit_task_changes', 'push_task_branch', 'commit_and_push_task_changes'],
+    };
+  }
+
+  // 2. Dataverse verification.
+  const dvCheck = asObject(asObject(task.implementationVerification).dataverseCheck);
+  const crmReports = Array.isArray(task.crmVerificationReports) ? task.crmVerificationReports : [];
+  const dvDone = !!dvCheck.skippedAt || !!dvCheck.manuallyVerifiedAt
+    || dvCheck.status === 'skipped' || dvCheck.status === 'done' || dvCheck.status === 'manually-verified'
+    || READINESS_VERIFIED_VERDICTS.has(crmReports[0]?.verdict ?? '');
+  if (!dvDone) {
+    if (isScript) {
+      return {
+        nextAction: 'wait_for_user',
+        canProceed: false,
+        requiresUserApproval: true,
+        blockingUserAction: 'Run Verify Implementation modal in Task Workbench, then call continue_developer_workflow again.',
+        recommendedTool: null,
+        instructionForAI: 'Dataverse metadata verification for JS/TS requires the in-app Verify Implementation modal. Ask the user to run it and confirm, then call continue_developer_workflow again.',
+        allowedWrites: [],
+        forbiddenWrites: ['commit_task_changes', 'push_task_branch', 'commit_and_push_task_changes'],
+      };
+    }
+    return {
+      nextAction: 'verify_dataverse',
+      canProceed: true,
+      requiresUserApproval: false,
+      blockingUserAction: null,
+      recommendedTool: 'run_dataverse_check_for_task',
+      instructionForAI: 'Run Dataverse metadata verification using run_dataverse_check_for_task, then call continue_developer_workflow again.',
+      allowedWrites: ['run_dataverse_check_for_task'],
+      forbiddenWrites: ['commit_task_changes', 'push_task_branch', 'commit_and_push_task_changes'],
+    };
+  }
+
+  // 3. AI Kit review.
+  const aiKitReview = asObject(task.aiKitReview);
+  const aiKitDone = !!aiKitReview.completedAt || aiKitReview.status === 'passed' || aiKitReview.status === 'skipped';
+  if (!aiKitDone) {
+    return {
+      nextAction: 'wait_for_user',
+      canProceed: false,
+      requiresUserApproval: true,
+      blockingUserAction: 'Run AI Kit review in Task Workbench, then call continue_developer_workflow again.',
+      recommendedTool: null,
+      instructionForAI: 'AI Kit review is required before branch creation. Ask the user to run it and confirm, then call continue_developer_workflow again.',
+      allowedWrites: [],
+      forbiddenWrites: ['commit_task_changes', 'push_task_branch', 'commit_and_push_task_changes'],
+    };
+  }
+
+  // 4. Branch creation — requires explicit user approval.
+  return {
+    nextAction: 'propose_branch',
+    canProceed: true,
+    requiresUserApproval: true,
+    blockingUserAction: 'Ask the user to confirm the proposed branch name before creating the branch.',
+    recommendedTool: 'prepare_commit_for_task',
+    instructionForAI: 'Implementation, verification, and AI Kit review are complete. Propose a branch name and ask the user to confirm before creating the branch. Do not call commit_task_changes or push_task_branch without explicit user approval.',
+    allowedWrites: [],
+    forbiddenWrites: [],
+  };
 }
 
 async function callToolFallback(name, args = {}) {
@@ -2467,6 +2874,13 @@ async function callToolFallback(name, args = {}) {
         ...result,
         task: buildTaskFullContext(task, devDefaults),
       };
+    }
+    case 'continue_developer_workflow': {
+      const taskId = String(args.taskId ?? '').trim();
+      if (!taskId) return { ...common, error: 'Missing required argument: taskId' };
+      const task = getTaskById(tasks, taskId);
+      if (!task) return { ...common, error: `Task not found: ${taskId}` };
+      return { ...common, taskId, ...computeContinueWorkflowStep(task) };
     }
     default:
       throw new Error(`Tool '${name}' is not available in read-only fallback mode.`);

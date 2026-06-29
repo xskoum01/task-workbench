@@ -506,8 +506,8 @@ describe('buildAiWorkflowPrompt â€” script context block', () => {
     expect(buildAiWorkflowPrompt(makeReadyTask())).not.toContain('script tasks use only the target file shown in Script target context');
   });
 
-  it('rule 8 references conventionsSource', () => {
-    expect(buildAiWorkflowPrompt(makeReadyTask())).toContain('conventionsSource');
+  it('does not contain conventionsSource (removed from rule text, delegated to work packet)', () => {
+    expect(buildAiWorkflowPrompt(makeReadyTask())).not.toContain('conventionsSource');
   });
 });
 
@@ -520,8 +520,8 @@ describe('buildAiWorkflowPrompt â€” implementation prompt (ready task)', ()
     expect(buildAiWorkflowPrompt(makeReadyTask())).toContain('Implementation rules');
   });
 
-  it('rule 2: no files without confirmed context', () => {
-    expect(buildAiWorkflowPrompt(makeReadyTask())).toContain('Do not create or modify files unless canWriteCode is true');
+  it('does not contain old rule 2 (removed – canWriteCode gate now in rule 1)', () => {
+    expect(buildAiWorkflowPrompt(makeReadyTask())).not.toContain('Do not create or modify files unless canWriteCode is true');
   });
 
   it('rule 3: MCP unavailability stop', () => {
@@ -545,12 +545,12 @@ describe('buildAiWorkflowPrompt â€” implementation prompt (ready task)', ()
     expect(prompt).not.toContain('run run_dataverse_check_for_task');
   });
 
-  it('rule 8: script conventions', () => {
-    expect(buildAiWorkflowPrompt(makeReadyTask())).toContain('JavaScript/form script tasks');
+  it('does not contain old rule 8 (JS conventions merged into work-packet rule 4)', () => {
+    expect(buildAiWorkflowPrompt(makeReadyTask())).not.toContain('JavaScript/form script tasks');
   });
 
-  it('rule 9: plugin conventions', () => {
-    expect(buildAiWorkflowPrompt(makeReadyTask())).toContain('plugin conventions');
+  it('does not contain old rule 9 (plugin conventions merged into work-packet rule 4)', () => {
+    expect(buildAiWorkflowPrompt(makeReadyTask())).not.toContain('plugin conventions');
   });
 
   it('rule 10: no external writes without approval', () => {
@@ -561,8 +561,8 @@ describe('buildAiWorkflowPrompt â€” implementation prompt (ready task)', ()
     expect(buildAiWorkflowPrompt(makeReadyTask())).toContain('Record local test results');
   });
 
-  it('rule 12: summarize at end', () => {
-    expect(buildAiWorkflowPrompt(makeReadyTask())).toContain('summarize what was done');
+  it('rule 9: summarize what was changed at end', () => {
+    expect(buildAiWorkflowPrompt(makeReadyTask())).toContain('summarize what was changed');
   });
 
   it('shows warnings inline when present but does not block', () => {
@@ -591,8 +591,8 @@ describe('buildAiWorkflowPrompt - developer work packet opening instruction', ()
   it('uses get_developer_work_packet as the implementation-ready entrypoint', () => {
     const prompt = buildAiWorkflowPrompt(makeReadyTask());
     expect(prompt).toContain('First MCP call: `get_developer_work_packet`');
-    expect(prompt).toContain('Use `get_task_full_context` only as a fallback');
     expect(prompt).not.toContain('Start by loading the full current context');
+    expect(prompt).not.toContain('First MCP call: `get_task_full_context`');
   });
 
   it('does not contain contradictory full-context-first and prepare-first instructions', () => {
@@ -1160,9 +1160,9 @@ describe('buildAiWorkflowPrompt – implementation prompt AI-facing rules', () =
     expect(buildAiWorkflowPrompt(makeReadyTask())).toContain('If workPacket.canWriteCode is false, stop');
   });
 
-  it('contains "If workPacket.canWriteCode is true, implement only files listed"', () => {
+  it('contains "If workPacket.canWriteCode is true, implement only files listed in workPacket.writeTarget / targetFiles"', () => {
     expect(buildAiWorkflowPrompt(makeReadyTask())).toContain(
-      'If workPacket.canWriteCode is true, implement only files listed',
+      'If workPacket.canWriteCode is true, implement only files listed in workPacket.writeTarget / targetFiles',
     );
   });
 
@@ -1200,13 +1200,200 @@ describe('buildAiWorkflowPrompt – implementation prompt AI-facing rules', () =
     expect(prompt).not.toContain('run_dataverse_check_for_task');
   });
 
+  it('contains "Do not guess paths, entities, fields, mappings, handlers"', () => {
+    expect(buildAiWorkflowPrompt(makeReadyTask())).toContain(
+      'Do not guess paths, entities, fields, mappings, handlers',
+    );
+  });
+
+  it('contains "Inspect only conventions and similar files recommended by the work packet"', () => {
+    expect(buildAiWorkflowPrompt(makeReadyTask())).toContain(
+      'Inspect only conventions and similar files recommended by the work packet',
+    );
+  });
+
+  it('does not contain "Confirm canWriteCode from the already-returned developer work packet"', () => {
+    expect(buildAiWorkflowPrompt(makeReadyTask())).not.toContain(
+      'Confirm canWriteCode from the already-returned developer work packet',
+    );
+  });
+
+  it('does not contain "Use conventionsSource and related files listed in Script target context"', () => {
+    expect(buildAiWorkflowPrompt(makeReadyTask())).not.toContain(
+      'Use conventionsSource and related files listed in Script target context',
+    );
+  });
+
   it('does not contain mojibake markers', () => {
     const prompt = buildAiWorkflowPrompt(makeReadyTask());
     expect(prompt).not.toContain('Ă˘');
     expect(prompt).not.toContain('PĹ™');
     expect(prompt).not.toContain('PĹ');
   });
+
+  it('contains "Implement only exact field mappings returned"', () => {
+    expect(buildAiWorkflowPrompt(makeReadyTask())).toContain('Implement only exact field mappings returned');
+  });
+
+  it('contains "Do not add, infer, or substitute fields"', () => {
+    expect(buildAiWorkflowPrompt(makeReadyTask())).toContain('Do not add, infer, or substitute fields');
+  });
+
+  it('contains "Unmapped source fields are context only and must not be written"', () => {
+    expect(buildAiWorkflowPrompt(makeReadyTask())).toContain('Unmapped source fields are context only and must not be written');
+  });
+
+  it('contains "Follow AI Kit mandatory rules from workPacket.aiKit"', () => {
+    expect(buildAiWorkflowPrompt(makeReadyTask())).toContain('Follow AI Kit mandatory rules from workPacket.aiKit');
+  });
+
+  it('contains AI Kit review guidance after implementation', () => {
+    expect(buildAiWorkflowPrompt(makeReadyTask())).toContain('AI Kit review');
+  });
+
+  it('does not encourage stub or placeholder handlers', () => {
+    const prompt = buildAiWorkflowPrompt(makeReadyTask());
+    expect(prompt).not.toContain('create a stub');
+    expect(prompt).not.toContain('create a placeholder handler');
+    expect(prompt).not.toContain('add an empty');
+  });
 });
 
+describe('buildAiWorkflowPrompt – existing file acceptance guardrails', () => {
+  it('contains rule that existing file with TODO/scaffold is not acceptable as-is', () => {
+    const prompt = buildAiWorkflowPrompt(makeReadyTask());
+    expect(prompt).toContain('TODO comments');
+    expect(prompt).toContain('scaffold code');
+    expect(prompt).toContain('do not accept it as complete');
+  });
 
+  it('distinguishes fixable TODO (packet has info) from blocking TODO (packet lacks info)', () => {
+    const prompt = buildAiWorkflowPrompt(makeReadyTask());
+    // Branch (a): packet provides enough info → fix it
+    expect(prompt).toContain('fix the file by replacing every TODO with real implementation');
+    // Branch (b): packet lacks info → stop and report blocker
+    expect(prompt).toContain('stop immediately and report the blocker');
+  });
 
+  it('forbids leaving any TODO in output regardless of branch', () => {
+    const prompt = buildAiWorkflowPrompt(makeReadyTask());
+    expect(prompt).toContain('do not leave any TODO in output');
+  });
+
+  it('prohibits continue_developer_workflow and record_local_test while TODO remains', () => {
+    const prompt = buildAiWorkflowPrompt(makeReadyTask());
+    expect(prompt).toContain('Do not call continue_developer_workflow or record_local_test while any TODO');
+  });
+
+  it('prohibits accepting existing file outside fieldMappings as complete', () => {
+    const prompt = buildAiWorkflowPrompt(makeReadyTask());
+    expect(prompt).toContain('fields outside workPacket.implementation.fieldMappings');
+  });
+
+  it('contains AI Kit rule for accepting existing files', () => {
+    const prompt = buildAiWorkflowPrompt(makeReadyTask());
+    expect(prompt).toContain('aiKit.rulesFiles');
+    expect(prompt).toContain('Before writing changes or accepting an existing target file as complete');
+  });
+
+  it('existing file guardrails appear only in implementation-ready prompt', () => {
+    const setupPrompt = buildAiWorkflowPrompt(makeDevTask());
+    const readyPrompt = buildAiWorkflowPrompt(makeReadyTask());
+    expect(setupPrompt).not.toContain('If the target file contains TODO');
+    expect(readyPrompt).toContain('If the target file contains TODO');
+  });
+});
+
+describe('buildAiWorkflowPrompt – post-implementation workflow', () => {
+  it('contains post-implementation workflow section header', () => {
+    expect(buildAiWorkflowPrompt(makeReadyTask())).toContain('Post-implementation workflow');
+  });
+
+  it('instructs AI to call continue_developer_workflow after file writes', () => {
+    expect(buildAiWorkflowPrompt(makeReadyTask())).toContain('continue_developer_workflow');
+  });
+
+  it('instructs AI not to stop after creating files', () => {
+    expect(buildAiWorkflowPrompt(makeReadyTask())).toContain('Do not stop after creating files');
+  });
+
+  it('references requiresUserApproval as the gate for branch/push actions', () => {
+    expect(buildAiWorkflowPrompt(makeReadyTask())).toContain('requiresUserApproval');
+  });
+
+  it('prohibits TODO or scaffold code as substitute for missing mappings', () => {
+    const prompt = buildAiWorkflowPrompt(makeReadyTask());
+    expect(prompt).toContain('TODO');
+    expect(prompt).toContain('scaffold');
+  });
+
+  it('post-implementation section appears only in implementation-ready prompt, not setup prompt', () => {
+    const setupPrompt = buildAiWorkflowPrompt(makeDevTask());
+    const readyPrompt = buildAiWorkflowPrompt(makeReadyTask());
+    expect(setupPrompt).not.toContain('Post-implementation workflow');
+    expect(readyPrompt).toContain('Post-implementation workflow');
+  });
+});
+
+describe('buildAiWorkflowPrompt – requiresFieldMappings stop condition and validationFields rules', () => {
+  it('rule 10 references requiresFieldMappings and missingRequiredMappings in the prompt', () => {
+    const prompt = buildAiWorkflowPrompt(makeReadyTask());
+    expect(prompt).toContain('requiresFieldMappings');
+    expect(prompt).toContain('missingRequiredMappings');
+  });
+
+  it('rule 11 references validationFields in the prompt', () => {
+    const prompt = buildAiWorkflowPrompt(makeReadyTask());
+    expect(prompt).toContain('validationFields');
+  });
+
+  it('stop condition text is present for requiresFieldMappings guard', () => {
+    const prompt = buildAiWorkflowPrompt(makeReadyTask());
+    expect(prompt).toContain('stop immediately');
+  });
+
+  it('validationFields rule prohibits writing to target entity fields', () => {
+    const prompt = buildAiWorkflowPrompt(makeReadyTask());
+    // Rule 11 must say these fields must not be written to target entity fields
+    expect(prompt).toContain('never write them to target entity fields');
+  });
+
+  it('rule references get_developer_work_packet as source of truth', () => {
+    const prompt = buildAiWorkflowPrompt(makeReadyTask());
+    expect(prompt).toContain('get_developer_work_packet');
+  });
+});
+
+describe('buildAiWorkflowPrompt – TODO/scaffold hard stop rules', () => {
+  it('rule 13 blocks continue_developer_workflow while any TODO remains', () => {
+    const prompt = buildAiWorkflowPrompt(makeReadyTask());
+    expect(prompt).toContain('Do not call continue_developer_workflow or record_local_test while any TODO');
+  });
+
+  it('post-implementation rule 5 states TODO is never acceptable in final output', () => {
+    const prompt = buildAiWorkflowPrompt(makeReadyTask());
+    expect(prompt).toContain('TODO comments in final implementation output are never acceptable');
+  });
+
+  it('post-implementation rule 5 blocks continue_developer_workflow until every TODO is replaced', () => {
+    const prompt = buildAiWorkflowPrompt(makeReadyTask());
+    expect(prompt).toContain('Do not call continue_developer_workflow or record_local_test until every TODO, FIXME, and placeholder comment has been replaced');
+  });
+
+  it('post-implementation rule 5 allows fixing TODO when packet provides enough information', () => {
+    const prompt = buildAiWorkflowPrompt(makeReadyTask());
+    expect(prompt).toContain('If the packet provides enough information to replace a TODO, do so');
+  });
+
+  it('post-implementation rule 5 blocks when packet does not provide enough information', () => {
+    const prompt = buildAiWorkflowPrompt(makeReadyTask());
+    expect(prompt).toContain('If not, report the blocker');
+  });
+
+  it('TODO/scaffold hard stop rules only appear in implementation-ready prompt', () => {
+    const setupPrompt = buildAiWorkflowPrompt(makeDevTask());
+    const readyPrompt = buildAiWorkflowPrompt(makeReadyTask());
+    expect(setupPrompt).not.toContain('TODO comments in final implementation output are never acceptable');
+    expect(readyPrompt).toContain('TODO comments in final implementation output are never acceptable');
+  });
+});
