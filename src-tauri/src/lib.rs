@@ -6564,6 +6564,7 @@ fn task_mcp_local_write_tool_definitions() -> Vec<Value> {
         serde_json::json!({"name":"set_task_estimate",                   "description":"Set task effort estimate in hours with optional budget note. Validates positive numeric input.","readOnly":false}),
         serde_json::json!({"name":"save_technical_plan",                 "description":"Save local technical plan draft: summary, steps, entities, test plan, risks. Does not write code or register anything.","readOnly":false}),
         serde_json::json!({"name":"mark_technical_plan_ready_for_approval","description":"Mark saved technical plan as ready for user review. Requires save_technical_plan to have been called first.","readOnly":false}),
+        serde_json::json!({"name":"approve_technical_plan_if_safe","description":"Approve the technical plan automatically when all safety conditions are met: plan exists and is not invalidated, no TODO/scaffold/placeholder text in steps or risks, all required field mappings are present with a trusted source (template or plan), scaffoldOnly=false, finalConsistencyGuardApplied=false, no external actions in the plan. Returns canApprove=false with explicit reasons if any condition fails. Does not approve if external writes, deploys, uploads, or Dataverse actions are pending.","readOnly":false}),
         serde_json::json!({"name":"record_manual_pr",                    "description":"Record a pull request created manually outside task-workbench. Local tracking only â€” does not call GitHub or Azure DevOps.","readOnly":false}),
         serde_json::json!({"name":"save_pr_review_analysis",             "description":"Save local PR review analysis: summary, action items, warnings. Does not reply to or resolve PR comments.","readOnly":false}),
         serde_json::json!({"name":"save_pr_fix_proposal",                "description":"Save local PR fix proposal: summary and proposed changes. Does not edit files, commit, or push.","readOnly":false}),
@@ -6655,6 +6656,72 @@ fn task_mcp_approval_summary(gate: Option<&Value>) -> Value {
         "invalidatedAt": gate["invalidatedAt"].as_str(),
         "invalidationReason": gate["invalidationReason"].as_str(),
     })
+}
+
+fn task_mcp_plan_approval_safety_check(task: &Value, packet: &Value) -> Vec<String> {
+    let mut reasons: Vec<String> = Vec::new();
+    let workflow  = task.get("crmDeveloperWorkflow").unwrap_or(&Value::Null);
+    let impl_obj  = &packet["implementation"];
+    let plan      = &workflow["technicalPlan"];
+
+    if task["taskMode"].as_str() != Some("developer") {
+        reasons.push("Task mode is not 'developer'.".to_string());
+    }
+
+    let work_kind = workflow["detectedWorkKind"].as_str()
+        .or_else(|| task["workflowSetup"]["devTargetKind"].as_str())
+        .unwrap_or("unknown");
+    if matches!(work_kind, "unknown" | "") {
+        reasons.push("Work kind is not yet classified. Set work kind to plugin or script.".to_string());
+    }
+
+    if plan.is_null() {
+        reasons.push("No technical plan has been saved. Call save_technical_plan first.".to_string());
+    } else {
+        if !plan["invalidatedAt"].is_null() {
+            reasons.push("Technical plan has been invalidated and must be regenerated.".to_string());
+        }
+        if plan["externalActionPreview"].as_array().map(|a| !a.is_empty()).unwrap_or(false) {
+            reasons.push("Technical plan includes external actions (deploy/upload/Dataverse write). These require manual user approval and cannot be auto-approved.".to_string());
+        }
+        let has_todo = plan["implementationSteps"].as_array()
+            .map(|a| a.iter().any(|v| {
+                let s = v.as_str().unwrap_or("").to_lowercase();
+                s.contains("todo") || s.contains("scaffold") || s.contains("placeholder")
+            }))
+            .unwrap_or(false)
+            || plan["risks"].as_array()
+            .map(|a| a.iter().any(|v| {
+                let s = v.as_str().unwrap_or("").to_lowercase();
+                s.contains("todo") || s.contains("scaffold") || s.contains("placeholder")
+            }))
+            .unwrap_or(false);
+        if has_todo {
+            reasons.push("Technical plan steps or risks contain TODO/scaffold/placeholder text. Regenerate the plan with concrete implementation steps.".to_string());
+        }
+    }
+
+    if impl_obj["scaffoldOnly"].as_bool().unwrap_or(false) {
+        reasons.push("scaffoldOnly=true: required write targets or field mappings are not fully defined.".to_string());
+    }
+
+    if impl_obj["finalConsistencyGuardApplied"].as_bool().unwrap_or(false) {
+        reasons.push("finalConsistencyGuardApplied=true: plan still contains scaffold/TODO text alongside empty field mappings.".to_string());
+    }
+
+    let requires_fm = impl_obj["requiresFieldMappings"].as_bool().unwrap_or(false);
+    let fm_count    = impl_obj["fieldMappings"].as_array().map(|a| a.len()).unwrap_or(0);
+    let fm_source   = impl_obj["fieldMappingsSource"].as_str().unwrap_or("none");
+    if requires_fm {
+        if fm_count == 0 {
+            reasons.push("Field mappings are required but not defined. Define source\u{2192}target field mappings in the technical plan before approving.".to_string());
+        }
+        if !matches!(fm_source, "template" | "plan") {
+            reasons.push(format!("fieldMappingsSource='{fm_source}' is not a trusted source. Only 'template' or 'plan' field mapping sources can be auto-approved."));
+        }
+    }
+
+    reasons
 }
 
 fn task_mcp_safe_task_summary(task: &Value) -> Value {
@@ -6833,13 +6900,266 @@ fn task_mcp_safe_task_detail(task: &Value) -> Value {
     detail
 }
 
+// ── v4 packet helpers ────────────────────────────────────────────────────────
+
+/// Returns true when the text contains a TODO/scaffold/placeholder signal or Czech
+/// variants indicating field mappings have not been defined.
+fn task_mcp_matches_scaffold_text(text: &str) -> bool {
+    let lower = text.to_lowercase();
+    if lower.contains("todo") || lower.contains("scaffold") || lower.contains("placeholder") {
+        return true;
+    }
+    if lower.contains("field mappings are not defined")
+        || lower.contains("field mappings not defined")
+        || lower.contains("define field mappings")
+    {
+        return true;
+    }
+    // Czech variants
+    if lower.contains("field mappings nejsou definov") { return true; }
+    if lower.contains("mapov") && (lower.contains("doplnit") || lower.contains("mus") && lower.contains("dopl")) {
+        return true;
+    }
+    if lower.contains("doplnění") && lower.contains("field mapping") { return true; }
+    if lower.contains("připravit todo") || lower.contains("pripravi todo") { return true; }
+    false
+}
+
+/// Check whether a candidate string looks like `entity.field` where both parts are
+/// CRM-style logical names (underscore-separated lowercase alphanumeric).
+fn task_mcp_is_valid_crm_dotted(s: &str) -> bool {
+    let Some(dot) = s.find('.') else { return false; };
+    let entity = &s[..dot];
+    let field = &s[dot + 1..];
+    let valid_part = |p: &str| -> bool {
+        if p.len() < 2 { return false; }
+        p.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+            && p.chars().next().map(|c| c.is_ascii_lowercase()).unwrap_or(false)
+            && p.contains('_')
+    };
+    valid_part(entity) && valid_part(field)
+}
+
+/// Extract `entity.field` token ending just before `end_pos` in `text`.
+fn task_mcp_extract_left_dotted(text: &str) -> Option<String> {
+    let text = text.trim_end();
+    let bytes = text.as_bytes();
+    let mut i = bytes.len();
+    while i > 0 {
+        let c = bytes[i - 1];
+        if c.is_ascii_alphanumeric() || c == b'_' || c == b'.' {
+            i -= 1;
+        } else {
+            break;
+        }
+    }
+    let token = &text[i..];
+    if token.contains('.') { Some(token.to_lowercase()) } else { None }
+}
+
+/// Extract `entity.field` token starting at the beginning of `text`.
+fn task_mcp_extract_right_dotted(text: &str) -> Option<String> {
+    let text = text.trim_start();
+    let mut end = 0;
+    let bytes = text.as_bytes();
+    while end < bytes.len() {
+        let c = bytes[end];
+        if c.is_ascii_alphanumeric() || c == b'_' || c == b'.' {
+            end += 1;
+        } else {
+            break;
+        }
+    }
+    let token = &text[..end];
+    if token.contains('.') { Some(token.to_lowercase()) } else { None }
+}
+
+/// Count distinct CRM-style logical names (`prefix_suffix` pattern) in text.
+fn task_mcp_count_crm_names(text: &str) -> usize {
+    let mut names = std::collections::HashSet::new();
+    for word in text.split(|c: char| !c.is_ascii_alphanumeric() && c != '_') {
+        let word = word.to_lowercase();
+        if word.len() < 4 { continue; }
+        if !word.contains('_') { continue; }
+        let first = word.chars().next().unwrap_or(' ');
+        if !first.is_ascii_lowercase() { continue; }
+        // Must have at least one segment before and after the underscore
+        let underscore = word.find('_').unwrap_or(0);
+        if underscore == 0 || underscore == word.len() - 1 { continue; }
+        if word.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_') {
+            names.insert(word);
+        }
+    }
+    names.len()
+}
+
+/// Port of JS detectAndExtractFieldMappings.
+/// Returns (required, mappings, validation_fields, sources).
+fn task_mcp_detect_field_mappings(task: &Value) -> (bool, Vec<Value>, Vec<Value>, Vec<String>) {
+    let strip_html = |s: &str| -> String {
+        let mut out = String::with_capacity(s.len());
+        let mut in_tag = false;
+        for c in s.chars() {
+            if c == '<' { in_tag = true; out.push(' '); }
+            else if c == '>' { if !in_tag { out.push(c); } in_tag = false; }
+            else if !in_tag { out.push(c); }
+        }
+        out
+    };
+
+    let workflow = &task["crmDeveloperWorkflow"];
+    let plan = &workflow["technicalPlan"];
+
+    let join_array = |v: &Value| -> String {
+        v.as_array().map(|arr| arr.iter().map(|x| {
+            x.as_str().unwrap_or_else(|| x["description"].as_str()
+                .or_else(|| x["step"].as_str())
+                .or_else(|| x["risk"].as_str())
+                .unwrap_or(""))
+        }).collect::<Vec<_>>().join("\n")).unwrap_or_default()
+    };
+
+    let text_parts: Vec<(&str, String)> = vec![
+        ("originalMessage", strip_html(task["originalMessage"].as_str().unwrap_or(""))),
+        ("description",     strip_html(task["description"].as_str().unwrap_or(""))),
+        ("analysisEn",      strip_html(task["analysisResult"]["summaryEn"].as_str().unwrap_or(""))),
+        ("analysis",        strip_html(task["analysisResult"]["summary"].as_str().unwrap_or(""))),
+        ("requirements",    join_array(&task["analysisResult"]["requirements"])),
+        ("planSummary",     strip_html(plan["summary"].as_str().unwrap_or(""))),
+        ("planSteps",       join_array(&plan["implementationSteps"])),
+        ("planRisks",       join_array(&plan["risks"])),
+    ];
+
+    let sources: Vec<String> = text_parts.iter()
+        .filter(|(_, v)| !v.trim().is_empty())
+        .map(|(k, _)| k.to_string())
+        .collect();
+
+    let raw_text: String = text_parts.iter().map(|(_, v)| v.as_str()).collect::<Vec<_>>().join("\n");
+    let raw_text = raw_text.trim();
+    if raw_text.is_empty() {
+        return (false, vec![], vec![], sources);
+    }
+
+    // Detect source/target entity context
+    let lower = raw_text.to_lowercase();
+    let has_source_context = lower.contains("source entit") || lower.contains("src entit")
+        || (lower.contains("zdrojov") && lower.contains("entit"))
+        || lower.contains("zdroj:");
+    let has_target_context = lower.contains("target entit") || lower.contains("destination entit")
+        || (lower.contains("cílov") && lower.contains("entit"))
+        || (lower.contains("cilova") && lower.contains("entit"))
+        || lower.contains("cíl:") || lower.contains("cil:");
+
+    let crm_count = task_mcp_count_crm_names(&lower);
+
+    // Detect when plan text signals incomplete field mapping work
+    let plan_signals_incomplete = crm_count >= 2 && (
+        lower.contains("field mappings are not defined")
+        || lower.contains("define field mappings")
+        || lower.contains("field mappings not defined")
+        || lower.contains("field mappings nejsou definov")
+        || (lower.contains("mapov") && lower.contains("dopl") && crm_count >= 2)
+        || lower.contains("doplnění") && lower.contains("field mapping")
+        || lower.contains("připravit todo") || lower.contains("pripravi todo")
+        || (lower.contains("todo") && lower.contains("map") && lower.contains("field"))
+        || (lower.contains("field") && lower.contains("map") && lower.contains("todo"))
+    );
+
+    let detected = ((has_source_context || has_target_context) && crm_count >= 3) || plan_signals_incomplete;
+    if !detected {
+        return (false, vec![], vec![], sources);
+    }
+
+    // Extraction attempt 1: entity.field -> entity.field arrows
+    let mut arrow_mappings: Vec<Value> = Vec::new();
+    let mut arrow_seen = std::collections::HashSet::new();
+    for sep in &["->", "→", "=>"] {
+        let mut search_pos = 0usize;
+        while let Some(rel) = lower[search_pos..].find(sep) {
+            let abs_pos = search_pos + rel;
+            let left = task_mcp_extract_left_dotted(&lower[..abs_pos]);
+            let right = task_mcp_extract_right_dotted(&lower[abs_pos + sep.len()..]);
+            if let (Some(l), Some(r)) = (left, right) {
+                if task_mcp_is_valid_crm_dotted(&l) && task_mcp_is_valid_crm_dotted(&r) {
+                    let key = format!("{}=>{}", l, r);
+                    if !arrow_seen.contains(&key) {
+                        arrow_seen.insert(key);
+                        arrow_mappings.push(serde_json::json!({"source": l, "target": r}));
+                    }
+                }
+            }
+            search_pos = abs_pos + sep.len();
+        }
+    }
+    if arrow_mappings.len() >= 2 {
+        return (true, arrow_mappings, vec![], sources);
+    }
+
+    // Extraction attempt 2: Source entity/fields / Target entity/fields block
+    let src_entity = find_pattern_after(&lower, &[
+        "source entity:", "source entity :", "zdrojová entita:", "zdrojova entita:", "zdroj:",
+    ]);
+    let tgt_entity = find_pattern_after(&lower, &[
+        "target entity:", "target entity :", "cílová entita:", "cilova entita:", "cíl:", "cil:",
+    ]);
+    let src_fields_str = find_pattern_after(&lower, &[
+        "source fields:", "source field:", "zdrojová pole:", "zdrojova pole:", "pole zdroje:",
+        "copy fields:", "fields:",
+    ]);
+    let tgt_fields_str = find_pattern_after(&lower, &[
+        "target fields:", "target field:", "cílová pole:", "cilova pole:", "pole cíle:", "pole cile:",
+    ]);
+
+    if let (Some(se), Some(te), Some(sfs), Some(tfs)) = (src_entity, tgt_entity, src_fields_str, tgt_fields_str) {
+        let parse_fields = |s: &str| -> Vec<String> {
+            s.split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+                .map(str::trim)
+                .filter(|f| f.len() > 2 && f.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') && f.contains('_'))
+                .map(|f| f.to_lowercase())
+                .collect()
+        };
+        let sf: Vec<String> = parse_fields(sfs.split('\n').next().unwrap_or(""));
+        let tf: Vec<String> = parse_fields(tfs.split('\n').next().unwrap_or(""));
+        if sf.len() >= 2 && tf.len() >= 2 {
+            let pair_count = sf.len().min(tf.len());
+            let mappings: Vec<Value> = (0..pair_count)
+                .map(|i| serde_json::json!({"source": format!("{}.{}", se.trim(), sf[i]), "target": format!("{}.{}", te.trim(), tf[i])}))
+                .collect();
+            let validation_fields: Vec<Value> = sf[pair_count..].iter()
+                .map(|f| serde_json::json!(format!("{}.{}", se.trim(), f)))
+                .collect();
+            return (true, mappings, validation_fields, sources);
+        }
+    }
+
+    // Detected but could not safely extract pairs
+    (true, vec![], vec![], sources)
+}
+
+/// Find the first line of text after one of the given prefixes (case-insensitive, already lowercased input).
+fn find_pattern_after<'a>(lower: &'a str, prefixes: &[&str]) -> Option<&'a str> {
+    for prefix in prefixes {
+        if let Some(pos) = lower.find(prefix) {
+            let after = &lower[pos + prefix.len()..];
+            let trimmed = after.trim_start_matches(|c: char| c == ' ' || c == '\t');
+            if !trimmed.is_empty() {
+                return Some(trimmed);
+            }
+        }
+    }
+    None
+}
+
+const DEVELOPER_WORK_PACKET_VERSION: &str = "4";
+
 fn task_mcp_developer_work_packet(task: &Value, customer_dev_defaults: Option<&Value>, ai_kit_path: Option<&str>) -> Value {
     let setup = task.get("workflowSetup").unwrap_or(&Value::Null);
     let workflow = task.get("crmDeveloperWorkflow").unwrap_or(&Value::Null);
     let plan = &workflow["technicalPlan"];
     let plan_target = &plan["target"];
     let readiness = task_mcp_implementation_readiness(task);
-    let can_write = readiness["isImplementationReady"].as_bool().unwrap_or(false);
+    let template = task_mcp_match_template(task["title"].as_str().unwrap_or(""));
     let work_kind = workflow["detectedWorkKind"].as_str()
         .or_else(|| setup["devTargetKind"].as_str())
         .or_else(|| plan["workKind"].as_str())
@@ -6848,30 +7168,176 @@ fn task_mcp_developer_work_packet(task: &Value, customer_dev_defaults: Option<&V
     let script_naming = if is_script { task_mcp_compute_script_naming(task, customer_dev_defaults) } else { None };
     let verification = task_mcp_latest_verification(task);
     let approval = task_mcp_approval_summary(workflow.get("planApproval"));
+    let next = task_mcp_next_recommended_step(task);
 
-    let mut decision_reason = if can_write {
-        "Task Workbench says implementation is ready. Use this packet as the working contract.".to_string()
-    } else {
-        readiness["recommendedNextStep"].as_str()
-            .unwrap_or("Task Workbench says implementation is not ready yet.")
-            .to_string()
+    // ── Field mapping detection (four paths, matching JS v4 logic) ──────────
+    let plan_field_mappings = plan["fieldMappings"].as_array().cloned().unwrap_or_default();
+    let empty_field_mappings = plan_field_mappings.is_empty();
+
+    let template_needs_mapping = template.as_ref().map(|t| {
+        t["sourceFields"].as_array().map(|a| !a.is_empty()).unwrap_or(false)
+    }).unwrap_or(false);
+
+    let plan_has_unmapped_with_no_mapped = {
+        let unmapped = plan["unmappedSourceFields"].as_array().map(|a| !a.is_empty()).unwrap_or(false);
+        unmapped && empty_field_mappings
     };
+
+    // Template path: auto-derive fieldMappings from template sourceFields/targetFields when plan is empty
+    let template_field_mappings: Vec<Value> = if template_needs_mapping && plan_field_mappings.is_empty() {
+        template.as_ref().map(|tpl| {
+            let src_entity = tpl["sourceEntity"].as_str().unwrap_or("");
+            let tgt_entity = tpl["targetEntity"].as_str()
+                .or_else(|| setup["primaryEntityLogicalName"].as_str())
+                .or_else(|| plan_target["entityLogicalName"].as_str())
+                .unwrap_or("");
+            if src_entity.is_empty() || tgt_entity.is_empty() { return vec![]; }
+            let src_fields: Vec<&str> = tpl["sourceFields"].as_array()
+                .map(|a| a.iter().filter_map(|v| v.as_str()).collect())
+                .unwrap_or_default();
+            let tgt_fields: Vec<&str> = tpl["targetFields"].as_array()
+                .map(|a| a.iter().filter_map(|v| v.as_str()).collect())
+                .unwrap_or_default();
+            let pair_count = src_fields.len().min(tgt_fields.len());
+            (0..pair_count).map(|i| serde_json::json!({
+                "source": format!("{}.{}", src_entity, src_fields[i]),
+                "target": format!("{}.{}", tgt_entity, tgt_fields[i])
+            })).collect()
+        }).unwrap_or_default()
+    } else { vec![] };
+
+    // Text extraction path (only when template and plan don't already signal mapping work)
+    let (text_detected_required, text_extracted_mappings, text_extracted_validation, text_detection_sources) =
+        if empty_field_mappings && !template_needs_mapping && !plan_has_unmapped_with_no_mapped {
+            task_mcp_detect_field_mappings(task)
+        } else {
+            (false, vec![], vec![], vec![])
+        };
+
+    let requires_field_mappings = template_needs_mapping || plan_has_unmapped_with_no_mapped || text_detected_required;
+    let field_mappings_missing = requires_field_mappings
+        && empty_field_mappings
+        && text_extracted_mappings.is_empty()
+        && template_field_mappings.is_empty();
+
+    let plan_approval_required = plan.is_object() && !approval["approved"].as_bool().unwrap_or(false);
+    let readiness_ready = readiness["isImplementationReady"].as_bool().unwrap_or(false);
+
+    let mut can_write = readiness_ready && !plan_approval_required && !field_mappings_missing;
+
+    let blockers: Vec<Value> = readiness["blockers"].as_array().cloned().unwrap_or_default();
+
+    let mut decision_reason;
     let mut blocking_user_action = Value::Null;
-    if !can_write {
-        if plan.is_object() && !approval["approved"].as_bool().unwrap_or(false) {
-            decision_reason = "Technical plan approval is required in Task Workbench before code changes.".to_string();
-            blocking_user_action = serde_json::json!("Review and approve the technical implementation plan in Task Workbench.");
-        } else if !plan.is_object() {
+
+    if can_write {
+        decision_reason = "Task Workbench says implementation is ready. Use this packet as the working contract.".to_string();
+    } else if plan_approval_required {
+        decision_reason = "Technical plan approval is required in Task Workbench before code changes.".to_string();
+        blocking_user_action = serde_json::json!("Review and approve the technical implementation plan in Task Workbench.");
+    } else if field_mappings_missing {
+        decision_reason = if text_detected_required {
+            "Field mapping work is indicated in the original assignment but field mappings have not been defined in the technical plan. Complete the technical plan before implementation.".to_string()
+        } else {
+            "Field mappings are missing. Complete the technical plan before implementation.".to_string()
+        };
+        blocking_user_action = serde_json::json!("Run prepare_developer_task to regenerate the technical plan with field mappings.");
+    } else {
+        decision_reason = blockers.first()
+            .and_then(|b| b.as_str())
+            .or_else(|| readiness["recommendedNextStep"].as_str())
+            .unwrap_or("Task Workbench says implementation is not ready yet.")
+            .to_string();
+        if !plan.is_object() {
             blocking_user_action = serde_json::json!("Run prepare_developer_task to create/refresh setup and the technical plan.");
-        } else if readiness["blockers"].as_array().is_some_and(|a| !a.is_empty()) {
+        } else if blockers.first().and_then(|b| b.as_str()).map(|s| s.contains("has not been saved to task setup")).unwrap_or(false) {
+            blocking_user_action = serde_json::json!("Run prepare_developer_task or call set_task_developer_target to save the target path.");
+        } else if !blockers.is_empty() {
             blocking_user_action = serde_json::json!("Resolve the listed blockers in Task Workbench.");
         }
     }
 
+    // ── Guard 1: requiresFieldMappings consistency ───────────────────────────
+    // Priority: text-extracted > template-derived > plan
+    let final_field_mappings: Vec<Value> = if !text_extracted_mappings.is_empty() {
+        text_extracted_mappings.clone()
+    } else if !template_field_mappings.is_empty() {
+        template_field_mappings.clone()
+    } else {
+        plan_field_mappings.clone()
+    };
+    if requires_field_mappings && final_field_mappings.is_empty() && can_write {
+        can_write = false;
+        decision_reason = "Required field mappings are missing. Packet consistency guard blocked code writing. The task requires source\u{2192}target field assignments that have not been defined.".to_string();
+        blocking_user_action = serde_json::json!("Define source\u{2192}target field mappings in the technical plan using prepare_developer_task or save_technical_plan.");
+    }
+
+    // ── Guard 2: scaffold signal detection (diagnostic) ──────────────────────
+    let mut scaffold_signal_detected = false;
+    let mut scaffold_signal_sources: Vec<Value> = Vec::new();
+    let raw_steps: Vec<Value> = plan["implementationSteps"].as_array().cloned().unwrap_or_default();
+    let raw_risks: Vec<Value> = plan["risks"].as_array().cloned().unwrap_or_default();
+    if can_write && final_field_mappings.is_empty() {
+        let check_texts: Vec<String> = raw_steps.iter().chain(raw_risks.iter())
+            .map(|v| v.as_str().map(str::to_string).unwrap_or_else(|| v.to_string()))
+            .chain(std::iter::once(plan["summary"].as_str().unwrap_or("").to_string()))
+            .collect();
+        let signals: Vec<Value> = check_texts.into_iter()
+            .filter(|t| task_mcp_matches_scaffold_text(t))
+            .map(Value::String)
+            .collect();
+        if !signals.is_empty() {
+            scaffold_signal_detected = true;
+            scaffold_signal_sources = signals;
+        }
+    }
+
+    // ── Sanitize scaffold steps/risks when mappings are available ─────────────
+    let sanitized_steps: Vec<Value> = if can_write && !final_field_mappings.is_empty() {
+        raw_steps.iter()
+            .filter(|v| {
+                let text = v.as_str().map(str::to_string).unwrap_or_else(|| v.to_string());
+                !task_mcp_matches_scaffold_text(&text)
+            })
+            .cloned()
+            .collect()
+    } else {
+        raw_steps.clone()
+    };
+    let sanitized_risks: Vec<Value> = if can_write && !final_field_mappings.is_empty() {
+        raw_risks.iter()
+            .filter(|v| {
+                let text = v.as_str().map(str::to_string).unwrap_or_else(|| v.to_string());
+                !task_mcp_matches_scaffold_text(&text)
+            })
+            .cloned()
+            .collect()
+    } else {
+        raw_risks.clone()
+    };
+
+    // ── Final packet invariant ────────────────────────────────────────────────
+    let mut final_consistency_guard_applied = false;
+    if can_write && final_field_mappings.is_empty() {
+        let packet_has_scaffold = sanitized_steps.iter().chain(sanitized_risks.iter())
+            .any(|v| {
+                let text = v.as_str().map(str::to_string).unwrap_or_else(|| v.to_string());
+                task_mcp_matches_scaffold_text(&text)
+            });
+        if packet_has_scaffold {
+            final_consistency_guard_applied = true;
+            can_write = false;
+            decision_reason = "Packet invariant violation: implementation steps or risks contain TODO/scaffold/placeholder guidance while field mappings are empty. Required source\u{2192}target field assignments must be defined before code can be written.".to_string();
+            blocking_user_action = serde_json::json!("Define source\u{2192}target field mappings in the technical plan using prepare_developer_task or save_technical_plan.");
+        }
+    }
+
+    // ── Write target ──────────────────────────────────────────────────────────
+    let target_entity = setup["primaryEntityLogicalName"].as_str()
+        .or_else(|| plan_target["entityLogicalName"].as_str())
+        .or_else(|| template.as_ref().and_then(|t| t["targetEntity"].as_str()));
     let repository_root = setup["repositoryRoot"].as_str()
         .or_else(|| customer_dev_defaults.and_then(|d| d["repositoryRoot"].as_str()));
-    let target_entity = setup["primaryEntityLogicalName"].as_str()
-        .or_else(|| plan_target["entityLogicalName"].as_str());
 
     let write_target = if is_script {
         serde_json::json!({
@@ -6884,9 +7350,14 @@ fn task_mcp_developer_work_packet(task: &Value, customer_dev_defaults: Option<&V
             "absolutePath": setup["absoluteScriptPath"].as_str()
                 .or_else(|| script_naming.as_ref().and_then(|n| n["absoluteScriptPath"].as_str())),
             "targetEntity": target_entity,
-            "actionType": setup["actionType"].as_str(),
-            "eventName": setup["eventName"].as_str().or_else(|| plan_target["eventName"].as_str()),
-            "eventFieldName": setup["eventFieldName"].as_str().or_else(|| plan_target["eventFieldName"].as_str()),
+            "actionType": setup["actionType"].as_str()
+                .or_else(|| template.as_ref().and_then(|t| t["actionType"].as_str())),
+            "eventName": setup["eventName"].as_str()
+                .or_else(|| plan_target["eventName"].as_str())
+                .or_else(|| template.as_ref().and_then(|t| t["scriptTarget"]["eventName"].as_str())),
+            "eventFieldName": setup["eventFieldName"].as_str()
+                .or_else(|| plan_target["eventFieldName"].as_str())
+                .or_else(|| template.as_ref().and_then(|t| t["scriptTarget"]["eventFieldName"].as_str())),
             "handlers": {
                 "onLoad": setup["onLoadFunctionName"].as_str()
                     .or_else(|| script_naming.as_ref().and_then(|n| n["onLoadFunctionName"].as_str())),
@@ -6902,15 +7373,20 @@ fn task_mcp_developer_work_packet(task: &Value, customer_dev_defaults: Option<&V
             "repositoryRoot": repository_root,
             "artifactPath": setup["pluginProject"].as_str().or_else(|| plan_target["pluginProject"].as_str()),
             "targetEntity": target_entity,
-            "actionType": setup["actionType"].as_str(),
+            "actionType": setup["actionType"].as_str()
+                .or_else(|| template.as_ref().and_then(|t| t["actionType"].as_str())),
             "pluginProject": setup["pluginProject"].as_str().or_else(|| plan_target["pluginProject"].as_str()),
-            "message": plan_target["message"].as_str(),
-            "stage": plan_target["stage"].as_str(),
-            "mode": plan_target["mode"].as_str(),
+            "message": plan_target["message"].as_str()
+                .or_else(|| template.as_ref().and_then(|t| t["pluginTarget"]["messages"].as_array().and_then(|a| a.first()).and_then(|v| v.as_str()))),
+            "stage": plan_target["stage"].as_str()
+                .or_else(|| template.as_ref().and_then(|t| t["pluginTarget"]["stage"].as_str())),
+            "mode": plan_target["mode"].as_str()
+                .or_else(|| template.as_ref().and_then(|t| t["pluginTarget"]["mode"].as_str())),
             "filteringAttributes": plan_target["filteringAttributes"].as_array().cloned().unwrap_or_default(),
         })
     };
 
+    // ── Conventions ───────────────────────────────────────────────────────────
     let mut convention_sources: Vec<Value> = Vec::new();
     if let Some(v) = setup["conventionsSource"].as_str().filter(|s| !s.is_empty()) {
         convention_sources.push(serde_json::json!(v));
@@ -6921,7 +7397,6 @@ fn task_mcp_developer_work_packet(task: &Value, customer_dev_defaults: Option<&V
             convention_sources.push(serde_json::json!(v));
         }
     }
-
     let convention_rules: Vec<Value> = if is_script {
         vec![
             serde_json::json!("Inspect existing form scripts before editing."),
@@ -6936,27 +7411,74 @@ fn task_mcp_developer_work_packet(task: &Value, customer_dev_defaults: Option<&V
         ]
     };
 
+    // ── Forbidden assumptions + forbiddenAssumptions ──────────────────────────
     let forbidden_assumptions: Vec<String> = plan["unmappedSourceFields"].as_array()
         .map(|fields| fields.iter()
             .filter_map(|f| f.as_str().or_else(|| f["source"].as_str()))
-            .map(|f| format!("Do not map or write to target from source field '{f}' — it is unmapped context only."))
+            .map(|f| format!("Do not map {} unless a target field is explicitly present in fieldMappings.", f))
             .collect())
         .unwrap_or_default();
 
-    let ai_kit_available = ai_kit_path.is_some();
-    let ai_kit_rules_files: Vec<String> = if let Some(kit) = ai_kit_path.filter(|s| !s.is_empty()) {
-        let rules_rel = if work_kind == "plugin" {
-            "ai-rules/crm-plugin-rules.md"
-        } else if work_kind == "ribbon" {
-            "ai-rules/crm-ribbon-rules.md"
+    // ── validationFields: from template additionalSourceFields + text extraction ──
+    let validation_fields: Vec<Value> = {
+        let mut vf: Vec<Value> = Vec::new();
+        if let Some(tpl) = &template {
+            if let Some(add) = tpl["additionalSourceFields"].as_array() {
+                let src_entity = tpl["sourceEntity"].as_str().unwrap_or("source");
+                for f in add {
+                    if let Some(fname) = f.as_str() {
+                        vf.push(serde_json::json!(format!("{}.{}", src_entity, fname)));
+                    }
+                }
+            }
+        }
+        vf.extend(text_extracted_validation.iter().cloned());
+        vf
+    };
+
+    // ── missingRequiredMappings ───────────────────────────────────────────────
+    let missing_required_mappings: Vec<Value> = if field_mappings_missing {
+        if template_needs_mapping {
+            if let Some(tpl) = &template {
+                let source_entity = tpl["sourceEntity"].as_str().unwrap_or("source");
+                let target_ent = target_entity.unwrap_or("");
+                let src_fields: Vec<&str> = tpl["sourceFields"].as_array()
+                    .map(|a| a.iter().filter_map(|v| v.as_str()).collect())
+                    .unwrap_or_default();
+                let tgt_fields: Vec<&str> = tpl["targetFields"].as_array()
+                    .map(|a| a.iter().filter_map(|v| v.as_str()).collect())
+                    .unwrap_or_default();
+                let pair_count = src_fields.len().min(tgt_fields.len());
+                (0..pair_count)
+                    .map(|i| serde_json::json!(format!("{}.{} -> {}.{}", source_entity, src_fields[i], target_ent, tgt_fields[i])))
+                    .collect()
+            } else { vec![] }
+        } else if text_detected_required {
+            vec![serde_json::json!("Field mapping work detected in original assignment but target field assignments could not be safely extracted. Define field mappings in the technical plan using prepare_developer_task.")]
         } else {
-            "ai-rules/crm-javascript-rules.md"
-        };
-        let sep = if kit.ends_with('/') || kit.ends_with('\\') { "" } else { "/" };
-        vec![format!("{kit}{sep}{rules_rel}")]
+            plan["unmappedSourceFields"].as_array().cloned().unwrap_or_default().iter()
+                .filter_map(|f| f.as_str())
+                .map(|f| serde_json::json!(format!("{} (no target field defined in plan)", f)))
+                .collect()
+        }
     } else {
         vec![]
     };
+
+    let scaffold_only = field_mappings_missing
+        || (requires_field_mappings && final_field_mappings.is_empty())
+        || scaffold_signal_detected
+        || final_consistency_guard_applied;
+
+    // ── AI Kit ────────────────────────────────────────────────────────────────
+    let ai_kit_available = ai_kit_path.is_some();
+    let ai_kit_rules_files: Vec<String> = if let Some(kit) = ai_kit_path.filter(|s| !s.is_empty()) {
+        let rules_rel = if work_kind == "plugin" { "ai-rules/crm-plugin-rules.md" }
+            else if work_kind == "ribbon" { "ai-rules/crm-ribbon-rules.md" }
+            else { "ai-rules/crm-javascript-rules.md" };
+        let sep = if kit.ends_with('/') || kit.ends_with('\\') { "" } else { "/" };
+        vec![format!("{kit}{sep}{rules_rel}")]
+    } else { vec![] };
     let ai_kit_review_note = if is_script {
         "Run AI Kit review for the created/updated script before upload or registration."
     } else {
@@ -6972,13 +7494,19 @@ fn task_mcp_developer_work_packet(task: &Value, customer_dev_defaults: Option<&V
             .to_string()
     };
 
+    let field_mappings_source = if !text_extracted_mappings.is_empty() { "text-extracted" }
+        else if !template_field_mappings.is_empty() { "template" }
+        else if !plan_field_mappings.is_empty() { "plan" }
+        else { "none" };
+
     serde_json::json!({
         "taskId": task["id"].as_str().unwrap_or(""),
+        "packetGeneratorVersion": DEVELOPER_WORK_PACKET_VERSION,
         "status": if can_write { "ready_to_code" } else { "not_ready" },
         "canWriteCode": can_write,
         "decisionReason": decision_reason,
         "blockingUserAction": blocking_user_action,
-        "blockers": readiness["blockers"].as_array().cloned().unwrap_or_default(),
+        "blockers": blockers,
         "warnings": readiness["warnings"].as_array().cloned().unwrap_or_default(),
         "recommendedNextAction": recommended_next_action,
         "writeTarget": write_target,
@@ -6988,11 +7516,21 @@ fn task_mcp_developer_work_packet(task: &Value, customer_dev_defaults: Option<&V
                 .or_else(|| task["analysisResult"]["summaryEn"].as_str())
                 .or_else(|| task["analysisResult"]["summary"].as_str())
                 .or_else(|| task["title"].as_str()), TASK_MCP_MAX_SUMMARY_LENGTH),
-            "steps": plan["implementationSteps"].as_array().cloned().unwrap_or_default(),
-            "fieldMappings": plan["fieldMappings"].as_array().cloned().unwrap_or_default(),
+            "steps": sanitized_steps,
+            "requiresFieldMappings": requires_field_mappings,
+            "fieldMappings": final_field_mappings,
+            "fieldMappingsCount": final_field_mappings.len(),
+            "fieldMappingsSource": field_mappings_source,
             "unmappedSourceFields": plan["unmappedSourceFields"].as_array().cloned().unwrap_or_default(),
+            "validationFields": validation_fields,
+            "missingRequiredMappings": missing_required_mappings,
+            "scaffoldOnly": scaffold_only,
+            "scaffoldSignalDetected": scaffold_signal_detected,
+            "scaffoldSignalSources": scaffold_signal_sources,
+            "finalConsistencyGuardApplied": final_consistency_guard_applied,
+            "detectionSources": text_detection_sources,
             "forbiddenAssumptions": forbidden_assumptions,
-            "risks": plan["risks"].as_array().cloned().unwrap_or_default(),
+            "risks": sanitized_risks,
         },
         "conventions": {
             "sources": convention_sources,
@@ -7043,6 +7581,7 @@ fn task_mcp_developer_work_packet(task: &Value, customer_dev_defaults: Option<&V
         "internalStateSummary": {
             "currentStep": workflow["currentStep"].as_str(),
             "planApproved": approval["approved"].as_bool().unwrap_or(false),
+            "nextRecommendedStep": next["step"].as_str(),
         },
         "task": task_mcp_safe_task_summary(task),
     })
@@ -7600,8 +8139,8 @@ fn task_mcp_builtin_templates() -> Vec<Value> {
     vec![
         serde_json::json!({
             "id": "nvr-training-sh-script-prefill",
-            "name": "NVR Training Service Hub â€” Script: PĹ™edvyplnÄ›nĂ­ servisnĂ­ho poĹľadavku",
-            "titlePattern": "Script: PĹ™edvyplnÄ›nĂ­ servisnĂ­ho poĹľadavku",
+            "name": "NVR Training Service Hub – Script: Předvyplnění servisního požadavku",
+            "titlePattern": "Script: Předvyplnění servisního požadavku",
             "mode": "developer",
             "workKind": "script",
             "actionType": "create-new-script",
@@ -7627,8 +8166,8 @@ fn task_mcp_builtin_templates() -> Vec<Value> {
         }),
         serde_json::json!({
             "id": "nvr-training-sh-plugin-workorderline",
-            "name": "NVR Training Service Hub â€” Plugin: VĂ˝poÄŤet ÄŤĂˇstek na poloĹľce servisnĂ­ zakĂˇzky",
-            "titlePattern": "Plugin: VĂ˝poÄŤet ÄŤĂˇstek na poloĹľce servisnĂ­ zakĂˇzky",
+            "name": "NVR Training Service Hub – Plugin: Výpočet částek na položce servisní zakázky",
+            "titlePattern": "Plugin: Výpočet částek na položce servisní zakázky",
             "mode": "developer",
             "workKind": "plugin",
             "actionType": "create-new-plugin",
@@ -9044,6 +9583,53 @@ fn task_mcp_execute_tool(app: &tauri::AppHandle, tool_name: &str, args: &Value) 
             task_mcp_append_audit_note(task, "mark_technical_plan_ready_for_approval");
             updated = true;
             serde_json::json!({"task": task_mcp_safe_task_summary(task)})
+        }
+
+        "approve_technical_plan_if_safe" => {
+            let task_id = args["taskId"].as_str().unwrap_or("").trim();
+            if task_id.is_empty() { return Err("Missing required argument: taskId".to_string()); }
+            let index = task_mcp_find_task_index(&tasks, task_id)
+                .ok_or_else(|| format!("Task not found: {task_id}"))?;
+
+            // Compute packet pre-approval to evaluate safety conditions.
+            let task_snapshot = tasks[index].clone();
+            let customer_id = task_snapshot["customerId"].as_str()
+                .or_else(|| task_snapshot["workflowSetup"]["customerId"].as_str())
+                .unwrap_or("")
+                .to_string();
+            let dev_defaults = task_mcp_find_customer(&customers, &customer_id)
+                .and_then(|c| task_mcp_customer_dev_defaults(c, &crm_base_dir));
+            let ai_kit_path = settings["powerPlatformAiKitPath"].as_str()
+                .filter(|s| !s.trim().is_empty())
+                .map(str::to_string);
+            let packet = task_mcp_developer_work_packet(&task_snapshot, dev_defaults.as_ref(), ai_kit_path.as_deref());
+
+            let reasons = task_mcp_plan_approval_safety_check(&task_snapshot, &packet);
+            if !reasons.is_empty() {
+                return Ok(serde_json::json!({ "canApprove": false, "reasons": reasons }));
+            }
+
+            // All safety conditions met — set plan approval.
+            let now = chrono_now_iso();
+            let task = &mut tasks[index];
+            task["crmDeveloperWorkflow"]["planApproval"] = serde_json::json!({
+                "approved": true,
+                "approvedAt": now,
+            });
+            task["crmDeveloperWorkflow"]["updatedAt"] = serde_json::json!(now);
+            task_mcp_append_audit_note(task, "approve_technical_plan_if_safe [AI safe auto-approval]");
+            updated = true;
+
+            // Return a refreshed work packet so the AI can proceed without a second round-trip.
+            let refreshed_task = tasks[index].clone();
+            let dev_defaults2 = task_mcp_find_customer(&customers, &customer_id)
+                .and_then(|c| task_mcp_customer_dev_defaults(c, &crm_base_dir));
+            let refreshed_packet = task_mcp_developer_work_packet(&refreshed_task, dev_defaults2.as_ref(), ai_kit_path.as_deref());
+            serde_json::json!({
+                "canApprove": true,
+                "approvedAt": now,
+                "workPacket": refreshed_packet,
+            })
         }
 
         "record_manual_pr" => {
@@ -13597,6 +14183,729 @@ mod tests {
         assert!(first.contains("power-platform-ai-kit"), "must include kit path: {first}");
     }
 }
+// --- developer_work_packet v4 tests ----------------------------------------
+
+#[cfg(test)]
+mod developer_work_packet_tests {
+    use super::*;
+
+    // Build a fully ready developer task for script creation with the NVR template.
+    fn make_ready_script_task() -> Value {
+        serde_json::json!({
+            "id": "task-wp-test",
+            "title": "Script: Předvyplnění servisního požadavku",
+            "status": "in-progress",
+            "taskMode": "developer",
+            "customerId": "nvr-test",
+            "workflowSetup": {
+                "devTargetKind": "script",
+                "actionType": "create-new-script",
+                "primaryEntityLogicalName": "nvr_servicecase",
+                "repositoryRoot": "C:/repos/NVR",
+                "scriptPath": "Scripts",
+                "desiredScriptFile": "nvr_servicecase_events.js",
+                "artifactPath": "Scripts/nvr_servicecase_events.js",
+                "eventName": "onChange",
+                "eventFieldName": "nvr_assetid",
+                "onLoadFunctionName": "nvr_servicecase_OnLoad",
+                "onChangeFunctionName": "nvr_assetid_OnChange",
+                "confirmedAt": "2026-06-01T10:00:00Z",
+            },
+            "crmDeveloperWorkflow": {
+                "detectedWorkKind": "script",
+                "planApproval": { "approved": true, "approvedAt": "2026-06-01T11:00:00Z" },
+                "technicalPlan": {
+                    "workKind": "script",
+                    "summary": "Create onChange handler for nvr_assetid on nvr_servicecase.",
+                    "implementationSteps": [
+                        "Use script Scripts/nvr_servicecase_events.js",
+                        "Map template fields: nvr_customerasset.nvr_customerid -> nvr_servicecase.nvr_customerid; nvr_customerasset.nvr_contactid -> nvr_servicecase.nvr_contactid; nvr_customerasset.nvr_isunderwarranty -> nvr_servicecase.nvr_iswarrantycase."
+                    ],
+                    "fieldMappings": [
+                        { "source": "nvr_customerasset.nvr_customerid", "target": "nvr_servicecase.nvr_customerid" },
+                        { "source": "nvr_customerasset.nvr_contactid", "target": "nvr_servicecase.nvr_contactid" },
+                        { "source": "nvr_customerasset.nvr_isunderwarranty", "target": "nvr_servicecase.nvr_iswarrantycase" }
+                    ],
+                    "unmappedSourceFields": ["nvr_statuscustom"],
+                    "risks": ["Ensure event handler is wired correctly."],
+                    "testChecklist": ["Test onChange for nvr_assetid."],
+                    "target": {
+                        "entityLogicalName": "nvr_servicecase",
+                        "scriptPath": "Scripts/nvr_servicecase_events.js",
+                        "eventName": "onChange",
+                        "eventFieldName": "nvr_assetid",
+                        "functionName": "nvr_assetid_OnChange"
+                    }
+                }
+            },
+            "crmVerificationReports": [{ "verdict": "pass" }],
+        })
+    }
+
+    // ── packetGeneratorVersion ────────────────────────────────────────────────
+
+    #[test]
+    fn work_packet_includes_packet_generator_version_4() {
+        let task = make_ready_script_task();
+        let packet = task_mcp_developer_work_packet(&task, None, None);
+        assert_eq!(
+            packet["packetGeneratorVersion"].as_str(),
+            Some("4"),
+            "packetGeneratorVersion must be '4'; got: {:?}", packet["packetGeneratorVersion"]
+        );
+    }
+
+    // ── requiresFieldMappings ─────────────────────────────────────────────────
+
+    #[test]
+    fn work_packet_requires_field_mappings_true_when_template_has_source_fields() {
+        // Template "Script: Předvyplnění servisního požadavku" has sourceFields → requiresFieldMappings=true
+        let mut task = make_ready_script_task();
+        // Remove plan fieldMappings to trigger template-based detection
+        task["crmDeveloperWorkflow"]["technicalPlan"]["fieldMappings"] = serde_json::json!([]);
+        let packet = task_mcp_developer_work_packet(&task, None, None);
+        assert_eq!(
+            packet["implementation"]["requiresFieldMappings"].as_bool(),
+            Some(true),
+            "requiresFieldMappings must be true when template has sourceFields"
+        );
+    }
+
+    #[test]
+    fn work_packet_requires_field_mappings_false_when_no_template_no_unmapped() {
+        let task = serde_json::json!({
+            "id": "task-no-map",
+            "title": "Plugin: Custom calculation",
+            "status": "in-progress",
+            "taskMode": "developer",
+            "customerId": "cust-1",
+            "workflowSetup": {
+                "devTargetKind": "plugin",
+                "actionType": "create-new-plugin",
+                "primaryEntityLogicalName": "nvr_workorderline",
+                "repositoryRoot": "C:/repos/NVR",
+                "pluginProject": "NVR.Plugins/NVRPlugin.csproj",
+                "confirmedAt": "2026-06-01T10:00:00Z",
+            },
+            "crmDeveloperWorkflow": {
+                "detectedWorkKind": "plugin",
+                "planApproval": { "approved": true },
+                "technicalPlan": {
+                    "workKind": "plugin",
+                    "summary": "Plugin calculates amounts.",
+                    "implementationSteps": ["Implement IPlugin", "Compute amounts from input fields."],
+                    "fieldMappings": [],
+                    "unmappedSourceFields": [],
+                    "risks": [],
+                    "testChecklist": [],
+                    "target": {
+                        "entityLogicalName": "nvr_workorderline",
+                        "pluginProject": "NVR.Plugins/NVRPlugin.csproj",
+                        "message": "Create",
+                        "stage": "PreOperation",
+                        "mode": "Sync",
+                        "filteringAttributes": ["nvr_quantity", "nvr_unitprice"]
+                    }
+                }
+            },
+            "crmVerificationReports": [{ "verdict": "pass" }],
+        });
+        let packet = task_mcp_developer_work_packet(&task, None, None);
+        assert_eq!(
+            packet["implementation"]["requiresFieldMappings"].as_bool(),
+            Some(false),
+            "requiresFieldMappings must be false when no template, no unmapped fields"
+        );
+    }
+
+    // ── Guard 1: canWriteCode blocked when requiresFieldMappings=true and mappings empty ──
+
+    #[test]
+    fn work_packet_guard1_blocks_write_when_field_mappings_required_and_missing() {
+        // Use a non-template title so template auto-population doesn't kick in.
+        // unmappedSourceFields=["nvr_statuscustom"] + fieldMappings=[] → Guard 1 fires.
+        let task = serde_json::json!({
+            "id": "task-guard1",
+            "title": "Script: custom work without template",
+            "status": "in-progress",
+            "taskMode": "developer",
+            "customerId": "cust-1",
+            "workflowSetup": {
+                "devTargetKind": "script",
+                "actionType": "create-new-script",
+                "primaryEntityLogicalName": "nvr_servicecase",
+                "repositoryRoot": "C:/repos/NVR",
+                "scriptPath": "Scripts",
+                "desiredScriptFile": "nvr_servicecase_events.js",
+                "artifactPath": "Scripts/nvr_servicecase_events.js",
+                "confirmedAt": "2026-06-01T10:00:00Z",
+                "eventName": "onChange",
+                "eventFieldName": "nvr_assetid",
+            },
+            "crmDeveloperWorkflow": {
+                "detectedWorkKind": "script",
+                "planApproval": { "approved": true },
+                "technicalPlan": {
+                    "workKind": "script",
+                    "summary": "Create custom script.",
+                    "implementationSteps": ["Implement the handler."],
+                    "fieldMappings": [],
+                    "unmappedSourceFields": ["nvr_statuscustom"],
+                    "risks": [],
+                    "testChecklist": [],
+                    "target": {
+                        "entityLogicalName": "nvr_servicecase",
+                        "eventName": "onChange",
+                        "eventFieldName": "nvr_assetid",
+                        "functionName": "nvr_assetid_OnChange"
+                    }
+                }
+            },
+            "crmVerificationReports": [{ "verdict": "pass" }],
+        });
+        let packet = task_mcp_developer_work_packet(&task, None, None);
+        assert_eq!(
+            packet["canWriteCode"].as_bool(),
+            Some(false),
+            "canWriteCode must be false when field mappings are required (unmappedSourceFields set) but none defined"
+        );
+        assert_eq!(packet["implementation"]["requiresFieldMappings"].as_bool(), Some(true));
+        assert_eq!(packet["implementation"]["fieldMappingsCount"].as_u64(), Some(0));
+    }
+
+    // ── Final invariant: scaffold text in steps/risks blocks write ────────────
+
+    #[test]
+    fn work_packet_final_invariant_blocks_write_when_steps_contain_todo_and_no_mappings() {
+        let task = serde_json::json!({
+            "id": "task-scaffold",
+            "title": "Script: some script task",
+            "status": "in-progress",
+            "taskMode": "developer",
+            "customerId": "cust-1",
+            "workflowSetup": {
+                "devTargetKind": "script",
+                "actionType": "create-new-script",
+                "primaryEntityLogicalName": "nvr_servicecase",
+                "repositoryRoot": "C:/repos/NVR",
+                "artifactPath": "Scripts/nvr_servicecase_events.js",
+                "confirmedAt": "2026-06-01T10:00:00Z",
+                "eventName": "onChange",
+                "eventFieldName": "nvr_assetid",
+            },
+            "crmDeveloperWorkflow": {
+                "detectedWorkKind": "script",
+                "planApproval": { "approved": true },
+                "technicalPlan": {
+                    "workKind": "script",
+                    "summary": "Create script.",
+                    "implementationSteps": [
+                        "Use script target.",
+                        "TODO: map nvr_customerasset fields to nvr_servicecase"
+                    ],
+                    "fieldMappings": [],
+                    "unmappedSourceFields": [],
+                    "risks": [],
+                    "testChecklist": [],
+                    "target": {
+                        "entityLogicalName": "nvr_servicecase",
+                        "eventName": "onChange",
+                        "eventFieldName": "nvr_assetid",
+                        "functionName": "nvr_assetid_OnChange"
+                    }
+                }
+            },
+            "crmVerificationReports": [{ "verdict": "pass" }],
+        });
+        let packet = task_mcp_developer_work_packet(&task, None, None);
+        // Steps contain "TODO" + empty fieldMappings → final invariant must block write
+        assert_eq!(
+            packet["canWriteCode"].as_bool(),
+            Some(false),
+            "canWriteCode must be false when steps contain TODO and fieldMappings is empty"
+        );
+    }
+
+    // ── fieldMappingsSource ───────────────────────────────────────────────────
+
+    #[test]
+    fn work_packet_field_mappings_source_is_plan_when_plan_has_mappings() {
+        let task = make_ready_script_task();
+        let packet = task_mcp_developer_work_packet(&task, None, None);
+        assert_eq!(
+            packet["implementation"]["fieldMappingsSource"].as_str(),
+            Some("plan"),
+            "fieldMappingsSource must be 'plan' when plan contains fieldMappings"
+        );
+    }
+
+    // ── nvr_customerasset as source entity ────────────────────────────────────
+
+    #[test]
+    fn work_packet_field_mappings_use_nvr_customerasset_not_nvr_asset() {
+        let task = make_ready_script_task();
+        let packet = task_mcp_developer_work_packet(&task, None, None);
+        let mappings = packet["implementation"]["fieldMappings"].as_array().unwrap();
+        assert!(!mappings.is_empty(), "fieldMappings must not be empty");
+        for m in mappings {
+            let source = m["source"].as_str().unwrap_or("");
+            assert!(
+                source.starts_with("nvr_customerasset."),
+                "source entity must be nvr_customerasset, got: {source}"
+            );
+            assert!(
+                !source.starts_with("nvr_asset.") && !source.starts_with("nvr_assetid"),
+                "source must not use nvr_asset or nvr_assetid, got: {source}"
+            );
+        }
+    }
+
+    // ── direct unit test for task_mcp_detect_field_mappings ──────────────────
+
+    #[test]
+    fn detect_field_mappings_extracts_arrows_from_original_message() {
+        let task = serde_json::json!({
+            "id": "test-arrows",
+            "title": "Script: copy fields",
+            "originalMessage": "Source entity: nvr_customerasset\nTarget entity: nvr_servicecase\nnvr_customerasset.nvr_customerid -> nvr_servicecase.nvr_customerid\nnvr_customerasset.nvr_contactid -> nvr_servicecase.nvr_contactid",
+            "crmDeveloperWorkflow": { "technicalPlan": null }
+        });
+        let (required, mappings, _validation, _sources) = task_mcp_detect_field_mappings(&task);
+        assert!(required, "must detect field mapping work from source/target context + arrows");
+        assert!(
+            mappings.len() >= 2,
+            "must extract at least 2 arrow mappings; got: {:?}", mappings
+        );
+        let src0 = mappings[0]["source"].as_str().unwrap_or("");
+        assert!(
+            src0.starts_with("nvr_customerasset."),
+            "first source must be nvr_customerasset.*, got: {src0}"
+        );
+    }
+
+    // ── text-extracted field mappings (arrow notation) ────────────────────────
+
+    #[test]
+    fn work_packet_extracts_arrow_field_mappings_from_original_message() {
+        let task = serde_json::json!({
+            "id": "task-arrow",
+            "title": "Script: copy fields",
+            "status": "in-progress",
+            "taskMode": "developer",
+            "customerId": "cust-1",
+            "originalMessage": "Source entity: nvr_customerasset\nTarget entity: nvr_servicecase\nnvr_customerasset.nvr_customerid -> nvr_servicecase.nvr_customerid\nnvr_customerasset.nvr_contactid -> nvr_servicecase.nvr_contactid",
+            "workflowSetup": {
+                "devTargetKind": "script",
+                "actionType": "create-new-script",
+                "primaryEntityLogicalName": "nvr_servicecase",
+                "repositoryRoot": "C:/repos/NVR",
+                // scriptPath is required by create-new-script has_dir check
+                "scriptPath": "Scripts",
+                "desiredScriptFile": "nvr_servicecase_events.js",
+                "artifactPath": "Scripts/nvr_servicecase_events.js",
+                "confirmedAt": "2026-06-01T10:00:00Z",
+                "eventName": "onChange",
+                "eventFieldName": "nvr_assetid",
+            },
+            "crmDeveloperWorkflow": {
+                "detectedWorkKind": "script",
+                "planApproval": { "approved": true },
+                "technicalPlan": {
+                    "workKind": "script",
+                    "summary": "Script for nvr_servicecase.",
+                    "implementationSteps": ["Implement the handler."],
+                    "fieldMappings": [],
+                    "unmappedSourceFields": [],
+                    "risks": [],
+                    "testChecklist": [],
+                    "target": {
+                        "entityLogicalName": "nvr_servicecase",
+                        "eventName": "onChange",
+                        "eventFieldName": "nvr_assetid",
+                        "functionName": "nvr_assetid_OnChange"
+                    }
+                }
+            },
+            "crmVerificationReports": [{ "verdict": "pass" }],
+        });
+        let packet = task_mcp_developer_work_packet(&task, None, None);
+        let mappings = packet["implementation"]["fieldMappings"].as_array().unwrap();
+        assert!(
+            mappings.len() >= 2,
+            "should extract at least 2 arrow mappings from originalMessage; got: {:?}", mappings
+        );
+        assert_eq!(
+            packet["implementation"]["fieldMappingsSource"].as_str(),
+            Some("text-extracted"),
+            "fieldMappingsSource must be 'text-extracted'"
+        );
+        for m in mappings {
+            let source = m["source"].as_str().unwrap_or("");
+            assert!(
+                source.starts_with("nvr_customerasset."),
+                "text-extracted source must start with nvr_customerasset., got: {source}"
+            );
+        }
+    }
+
+    // ── plan approval blocks write ────────────────────────────────────────────
+
+    #[test]
+    fn work_packet_plan_approval_required_blocks_write() {
+        let mut task = make_ready_script_task();
+        // Remove plan approval
+        task["crmDeveloperWorkflow"]["planApproval"] = serde_json::json!({ "approved": false });
+        let packet = task_mcp_developer_work_packet(&task, None, None);
+        assert_eq!(
+            packet["canWriteCode"].as_bool(),
+            Some(false),
+            "canWriteCode must be false when plan approval is pending"
+        );
+        let reason = packet["decisionReason"].as_str().unwrap_or("");
+        assert!(
+            reason.contains("plan approval") || reason.contains("Technical plan"),
+            "decisionReason must mention plan approval; got: {reason}"
+        );
+    }
+
+    // ── diagnostic fields present ─────────────────────────────────────────────
+
+    #[test]
+    fn work_packet_includes_all_v4_diagnostic_fields() {
+        let task = make_ready_script_task();
+        let packet = task_mcp_developer_work_packet(&task, None, None);
+        let impl_obj = &packet["implementation"];
+        assert!(!impl_obj["requiresFieldMappings"].is_null(), "requiresFieldMappings must be present");
+        assert!(!impl_obj["fieldMappingsCount"].is_null(), "fieldMappingsCount must be present");
+        assert!(!impl_obj["fieldMappingsSource"].is_null(), "fieldMappingsSource must be present");
+        assert!(!impl_obj["scaffoldSignalDetected"].is_null(), "scaffoldSignalDetected must be present");
+        assert!(!impl_obj["scaffoldSignalSources"].is_null(), "scaffoldSignalSources must be present");
+        assert!(!impl_obj["finalConsistencyGuardApplied"].is_null(), "finalConsistencyGuardApplied must be present");
+        assert!(!impl_obj["validationFields"].is_null(), "validationFields must be present");
+    }
+
+    // ── template matching sanity ──────────────────────────────────────────────
+
+    #[test]
+    fn template_match_finds_nvr_training_script_title() {
+        let tpl = task_mcp_match_template("Script: \u{50}\u{159}edvyplnění servisn\u{ed}ho po\u{17e}adavku");
+        assert!(tpl.is_some(), "task_mcp_match_template must match Czech NVR training script title");
+        assert_eq!(
+            tpl.as_ref().and_then(|t| t["sourceEntity"].as_str()),
+            Some("nvr_customerasset"),
+            "matched template must have sourceEntity=nvr_customerasset"
+        );
+    }
+
+    // ── validationFields: additionalSourceFields from template ────────────────
+
+    #[test]
+    fn work_packet_validation_fields_include_template_additional_source_fields() {
+        let task = make_ready_script_task();
+        let packet = task_mcp_developer_work_packet(&task, None, None);
+        let vf = packet["implementation"]["validationFields"].as_array().unwrap();
+        // Template nvr-training-sh-script-prefill has additionalSourceFields: ["nvr_statuscustom"]
+        // with sourceEntity "nvr_customerasset".
+        let vf_strs: Vec<&str> = vf.iter().filter_map(|v| v.as_str()).collect();
+        assert!(
+            vf_strs.iter().any(|s| s.contains("nvr_statuscustom")),
+            "validationFields must contain nvr_statuscustom from template additionalSourceFields; got: {:?}", vf_strs
+        );
+        assert!(
+            vf_strs.iter().any(|s| s.starts_with("nvr_customerasset.")),
+            "validationFields must use nvr_customerasset. prefix (from template sourceEntity); got: {:?}", vf_strs
+        );
+    }
+
+    // ── template-derived fieldMappings (new path) ─────────────────────────────
+
+    fn make_template_task_no_plan_mappings() -> Value {
+        // Task matching nvr-training-sh-script-prefill template, but plan has no fieldMappings.
+        // Simulates the real task 1ad0cc9a state after prepare_developer_task sets up the plan.
+        serde_json::json!({
+            "id": "task-template-map",
+            "title": "Script: Předvyplnění servisního požadavku",
+            "status": "in-progress",
+            "taskMode": "developer",
+            "customerId": "nvr-test",
+            "workflowSetup": {
+                "devTargetKind": "script",
+                "actionType": "create-new-script",
+                "primaryEntityLogicalName": "nvr_servicecase",
+                "repositoryRoot": "C:/repos/NVR",
+                "scriptPath": "Scripts",
+                "desiredScriptFile": "nvr_servicecase_events.js",
+                "artifactPath": "Scripts/nvr_servicecase_events.js",
+                "confirmedAt": "2026-06-01T10:00:00Z",
+                "eventName": "onChange",
+                "eventFieldName": "nvr_assetid",
+                "onLoadFunctionName": "nvr_servicecase_OnLoad",
+                "onChangeFunctionName": "nvr_assetid_OnChange",
+            },
+            "crmDeveloperWorkflow": {
+                "detectedWorkKind": "script",
+                "planApproval": { "approved": true, "approvedAt": "2026-06-01T11:00:00Z" },
+                "technicalPlan": {
+                    "workKind": "script",
+                    "summary": "Create onChange handler for nvr_assetid on nvr_servicecase.",
+                    "implementationSteps": ["Implement the handler."],
+                    "fieldMappings": [],
+                    "unmappedSourceFields": [],
+                    "risks": [],
+                    "testChecklist": [],
+                    "target": {
+                        "entityLogicalName": "nvr_servicecase",
+                        "eventName": "onChange",
+                        "eventFieldName": "nvr_assetid",
+                        "functionName": "nvr_assetid_OnChange"
+                    }
+                }
+            },
+            "crmVerificationReports": [{ "verdict": "pass" }],
+        })
+    }
+
+    #[test]
+    fn work_packet_template_source_fields_populate_field_mappings() {
+        let task = make_template_task_no_plan_mappings();
+        let packet = task_mcp_developer_work_packet(&task, None, None);
+        let mappings = packet["implementation"]["fieldMappings"].as_array().unwrap();
+        assert_eq!(
+            mappings.len(), 3,
+            "template sourceFields/targetFields must produce 3 fieldMappings; got: {:?}", mappings
+        );
+        let sources: Vec<&str> = mappings.iter().filter_map(|m| m["source"].as_str()).collect();
+        let targets: Vec<&str> = mappings.iter().filter_map(|m| m["target"].as_str()).collect();
+        assert!(sources.iter().any(|s| s.contains("nvr_customerid")), "must include nvr_customerid mapping");
+        assert!(sources.iter().any(|s| s.contains("nvr_contactid")), "must include nvr_contactid mapping");
+        assert!(sources.iter().any(|s| s.contains("nvr_isunderwarranty")), "must include nvr_isunderwarranty mapping");
+        assert!(targets.iter().any(|t| t.contains("nvr_iswarrantycase")), "target must include nvr_iswarrantycase");
+    }
+
+    #[test]
+    fn work_packet_template_mappings_source_is_template() {
+        let task = make_template_task_no_plan_mappings();
+        let packet = task_mcp_developer_work_packet(&task, None, None);
+        assert_eq!(
+            packet["implementation"]["fieldMappingsSource"].as_str(),
+            Some("template"),
+            "fieldMappingsSource must be 'template' when mappings come from template"
+        );
+    }
+
+    #[test]
+    fn work_packet_template_mappings_enable_can_write() {
+        // Template-derived mappings satisfy the field mapping gate → canWriteCode=true
+        let task = make_template_task_no_plan_mappings();
+        let packet = task_mcp_developer_work_packet(&task, None, None);
+        assert_eq!(
+            packet["canWriteCode"].as_bool(),
+            Some(true),
+            "canWriteCode must be true when template provides field mappings and all gates pass"
+        );
+        assert_eq!(
+            packet["implementation"]["scaffoldOnly"].as_bool(),
+            Some(false),
+            "scaffoldOnly must be false when template mappings are present"
+        );
+    }
+
+    #[test]
+    fn work_packet_template_mappings_source_entity_is_nvr_customerasset() {
+        let task = make_template_task_no_plan_mappings();
+        let packet = task_mcp_developer_work_packet(&task, None, None);
+        let mappings = packet["implementation"]["fieldMappings"].as_array().unwrap();
+        for m in mappings {
+            let source = m["source"].as_str().unwrap_or("");
+            assert!(
+                source.starts_with("nvr_customerasset."),
+                "source entity in template-derived mapping must be nvr_customerasset, got: {source}"
+            );
+            assert!(
+                !source.starts_with("nvr_asset.") && !source.starts_with("nvr_assetid"),
+                "source must not use nvr_asset or nvr_assetid, got: {source}"
+            );
+        }
+    }
+
+    #[test]
+    fn work_packet_template_additional_source_fields_are_validation_only() {
+        // additionalSourceFields (nvr_statuscustom) must appear in validationFields but NOT in fieldMappings
+        let task = make_template_task_no_plan_mappings();
+        let packet = task_mcp_developer_work_packet(&task, None, None);
+        let mappings = packet["implementation"]["fieldMappings"].as_array().unwrap();
+        let vf = packet["implementation"]["validationFields"].as_array().unwrap();
+        // Must not be a mapping target or source
+        for m in mappings {
+            let source = m["source"].as_str().unwrap_or("");
+            let target = m["target"].as_str().unwrap_or("");
+            assert!(!source.contains("nvr_statuscustom"), "nvr_statuscustom must not appear in fieldMappings source; got: {source}");
+            assert!(!target.contains("nvr_statuscustom"), "nvr_statuscustom must not appear in fieldMappings target; got: {target}");
+        }
+        // Must be in validationFields
+        let vf_strs: Vec<&str> = vf.iter().filter_map(|v| v.as_str()).collect();
+        assert!(
+            vf_strs.iter().any(|s| s.contains("nvr_statuscustom")),
+            "nvr_statuscustom must be in validationFields; got: {:?}", vf_strs
+        );
+    }
+
+    // ── approve_technical_plan_if_safe safety check ───────────────────────────
+
+    fn make_template_task_awaiting_approval() -> Value {
+        let mut task = make_template_task_no_plan_mappings();
+        task["crmDeveloperWorkflow"]["planApproval"] = Value::Null;
+        task
+    }
+
+    fn make_non_template_task_with_unmapped_fields() -> Value {
+        serde_json::json!({
+            "id": "task-unmapped-no-tpl",
+            "title": "Script: custom work without template",
+            "status": "in-progress",
+            "taskMode": "developer",
+            "customerId": "cust-1",
+            "workflowSetup": {
+                "devTargetKind": "script",
+                "actionType": "create-new-script",
+                "primaryEntityLogicalName": "nvr_servicecase",
+                "repositoryRoot": "C:/repos/NVR",
+                "artifactPath": "Scripts/nvr_servicecase_events.js",
+                "confirmedAt": "2026-06-01T10:00:00Z",
+                "eventName": "onChange",
+                "eventFieldName": "nvr_assetid",
+            },
+            "crmDeveloperWorkflow": {
+                "detectedWorkKind": "script",
+                "planApproval": { "approved": true },
+                "technicalPlan": {
+                    "workKind": "script",
+                    "summary": "Custom handler without template.",
+                    "implementationSteps": ["Implement the handler."],
+                    "fieldMappings": [],
+                    "unmappedSourceFields": ["nvr_statuscustom"],
+                    "risks": [],
+                    "testChecklist": [],
+                    "target": {
+                        "entityLogicalName": "nvr_servicecase",
+                        "eventName": "onChange",
+                        "eventFieldName": "nvr_assetid",
+                    }
+                }
+            },
+            "crmVerificationReports": [{ "verdict": "pass" }],
+        })
+    }
+
+    #[test]
+    fn approval_safety_check_passes_for_valid_template_task() {
+        // Template task with template-derived mappings but no plan approval → safety check should pass
+        let task = make_template_task_awaiting_approval();
+        let packet = task_mcp_developer_work_packet(&task, None, None);
+        let reasons = task_mcp_plan_approval_safety_check(&task, &packet);
+        assert!(
+            reasons.is_empty(),
+            "Expected no safety blocks for a valid template task awaiting approval, got: {:?}", reasons
+        );
+    }
+
+    #[test]
+    fn approved_template_task_gets_can_write_code() {
+        // Setting planApproval.approved=true on a valid template task enables canWriteCode=true
+        let mut task = make_template_task_awaiting_approval();
+        task["crmDeveloperWorkflow"]["planApproval"] = serde_json::json!({
+            "approved": true,
+            "approvedAt": "2026-06-29T10:00:00Z",
+        });
+        let packet = task_mcp_developer_work_packet(&task, None, None);
+        assert_eq!(
+            packet["canWriteCode"].as_bool(),
+            Some(true),
+            "canWriteCode must be true after approval is set on a valid template task; got packet: {:?}", packet["decisionReason"]
+        );
+    }
+
+    #[test]
+    fn approval_safety_check_blocks_when_field_mappings_required_and_missing() {
+        // Non-template task: requiresFieldMappings=true but fieldMappings=[] → safety check blocks
+        let task = make_non_template_task_with_unmapped_fields();
+        let packet = task_mcp_developer_work_packet(&task, None, None);
+        let reasons = task_mcp_plan_approval_safety_check(&task, &packet);
+        assert!(
+            reasons.iter().any(|r| r.contains("required but not defined")),
+            "Should block when requiresFieldMappings=true but fieldMappings=[]; got: {:?}", reasons
+        );
+    }
+
+    #[test]
+    fn approval_safety_check_blocks_when_scaffold_only() {
+        // Non-template task with unmapped source fields produces scaffoldOnly=true → safety check blocks
+        let task = make_non_template_task_with_unmapped_fields();
+        let packet = task_mcp_developer_work_packet(&task, None, None);
+        let reasons = task_mcp_plan_approval_safety_check(&task, &packet);
+        assert!(
+            reasons.iter().any(|r| r.contains("scaffoldOnly=true")),
+            "Should block when packet.scaffoldOnly=true; got: {:?}", reasons
+        );
+    }
+
+    #[test]
+    fn approval_safety_check_blocks_when_plan_has_todo_in_steps() {
+        // Template task with TODO text in plan steps → safety check blocks
+        let mut task = make_template_task_awaiting_approval();
+        task["crmDeveloperWorkflow"]["technicalPlan"]["implementationSteps"] =
+            serde_json::json!(["TODO: implement the field copy logic", "validate result"]);
+        let packet = task_mcp_developer_work_packet(&task, None, None);
+        let reasons = task_mcp_plan_approval_safety_check(&task, &packet);
+        assert!(
+            reasons.iter().any(|r| r.contains("TODO") || r.contains("scaffold") || r.contains("placeholder")),
+            "Should block when plan steps contain TODO text; got: {:?}", reasons
+        );
+    }
+
+    #[test]
+    fn approval_safety_check_blocks_when_fm_source_is_not_trusted() {
+        // Non-template task: fieldMappingsSource="none" → safety check blocks (untrusted source)
+        let task = make_non_template_task_with_unmapped_fields();
+        let packet = task_mcp_developer_work_packet(&task, None, None);
+        assert_eq!(packet["implementation"]["fieldMappingsSource"].as_str(), Some("none"),
+            "Precondition: fieldMappingsSource must be 'none' for non-template task with no mappings");
+        let reasons = task_mcp_plan_approval_safety_check(&task, &packet);
+        assert!(
+            reasons.iter().any(|r| r.contains("fieldMappingsSource")),
+            "Should block when fieldMappingsSource is not trusted; got: {:?}", reasons
+        );
+    }
+
+    #[test]
+    fn approval_safety_check_blocks_when_external_actions_present() {
+        // Template task with external actions in plan → safety check blocks
+        let mut task = make_template_task_awaiting_approval();
+        task["crmDeveloperWorkflow"]["technicalPlan"]["externalActionPreview"] =
+            serde_json::json!(["Register plugin step in Dataverse."]);
+        let packet = task_mcp_developer_work_packet(&task, None, None);
+        let reasons = task_mcp_plan_approval_safety_check(&task, &packet);
+        assert!(
+            reasons.iter().any(|r| r.contains("external actions")),
+            "Should block when plan has externalActionPreview; got: {:?}", reasons
+        );
+    }
+
+    #[test]
+    fn approval_safety_check_audit_note_appended() {
+        // task_mcp_append_audit_note writes to task["notes"] as a string.
+        // Verify the action text appears in notes after append.
+        let mut task = make_template_task_awaiting_approval();
+        task_mcp_append_audit_note(&mut task, "approve_technical_plan_if_safe [AI safe auto-approval]");
+        let notes = task["notes"].as_str()
+            .expect("task.notes must be a string after task_mcp_append_audit_note");
+        assert!(
+            notes.contains("approve_technical_plan_if_safe"),
+            "notes must record the approve_technical_plan_if_safe action; got: {notes}"
+        );
+    }
+}
+
 // --- Entry point -----------------------------------------------------------
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]

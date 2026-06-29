@@ -613,6 +613,16 @@ const TOOL_DEFINITIONS = [
     },
   },
   {
+    name: 'approve_technical_plan_if_safe',
+    description: 'Approve the technical plan automatically when all safety conditions are met: plan exists and is not invalidated, no TODO/scaffold/placeholder text in steps or risks, all required field mappings are present with a trusted source (template or plan), scaffoldOnly=false, finalConsistencyGuardApplied=false, no external actions in the plan. Returns canApprove=false with explicit reasons if any condition fails. Does not approve if external writes, deploys, uploads, or Dataverse actions are pending.',
+    inputSchema: {
+      type: 'object',
+      properties: { taskId: { type: 'string' } },
+      required: ['taskId'],
+      additionalProperties: false,
+    },
+  },
+  {
     name: 'record_manual_pr',
     description: 'Record a pull request created manually outside task-workbench. Local tracking only â€” does not call GitHub or Azure DevOps.',
     inputSchema: {
@@ -1307,6 +1317,66 @@ function approvalSummary(gate) {
   };
 }
 
+function planApprovalSafetyCheck(task, packet) {
+  const reasons = [];
+  const workflow = asObject(task?.crmDeveloperWorkflow);
+  const impl = asObject(packet?.implementation);
+  const plan = asObject(workflow.technicalPlan);
+  const hasPlan = !!workflow.technicalPlan && typeof workflow.technicalPlan === 'object';
+
+  if (task.taskMode !== 'developer') {
+    reasons.push("Task mode is not 'developer'.");
+  }
+
+  const workKind = workflow.detectedWorkKind || task.workflowSetup?.devTargetKind || 'unknown';
+  if (!workKind || workKind === 'unknown') {
+    reasons.push('Work kind is not yet classified. Set work kind to plugin or script.');
+  }
+
+  if (!hasPlan) {
+    reasons.push('No technical plan has been saved. Call save_technical_plan first.');
+  } else {
+    if (plan.invalidatedAt) {
+      reasons.push('Technical plan has been invalidated and must be regenerated.');
+    }
+    if (Array.isArray(plan.externalActionPreview) && plan.externalActionPreview.length > 0) {
+      reasons.push('Technical plan includes external actions (deploy/upload/Dataverse write). These require manual user approval and cannot be auto-approved.');
+    }
+    const hasTodo = [
+      ...(Array.isArray(plan.implementationSteps) ? plan.implementationSteps : []),
+      ...(Array.isArray(plan.risks) ? plan.risks : []),
+    ].some((s) => {
+      const lower = String(s).toLowerCase();
+      return lower.includes('todo') || lower.includes('scaffold') || lower.includes('placeholder');
+    });
+    if (hasTodo) {
+      reasons.push('Technical plan steps or risks contain TODO/scaffold/placeholder text. Regenerate the plan with concrete implementation steps.');
+    }
+  }
+
+  if (impl.scaffoldOnly === true) {
+    reasons.push('scaffoldOnly=true: required write targets or field mappings are not fully defined.');
+  }
+
+  if (impl.finalConsistencyGuardApplied === true) {
+    reasons.push('finalConsistencyGuardApplied=true: plan still contains scaffold/TODO text alongside empty field mappings.');
+  }
+
+  const requiresFm = impl.requiresFieldMappings === true;
+  const fmCount = Array.isArray(impl.fieldMappings) ? impl.fieldMappings.length : 0;
+  const fmSource = impl.fieldMappingsSource ?? 'none';
+  if (requiresFm) {
+    if (fmCount === 0) {
+      reasons.push('Field mappings are required but not defined. Define source→target field mappings in the technical plan before approving.');
+    }
+    if (fmSource !== 'template' && fmSource !== 'plan') {
+      reasons.push(`fieldMappingsSource='${fmSource}' is not a trusted source. Only 'template' or 'plan' field mapping sources can be auto-approved.`);
+    }
+  }
+
+  return reasons;
+}
+
 function isDeveloperTask(task) {
   return task.taskMode === 'developer' || !!task.crmDeveloperWorkflow || !!task.workflowSetup || Array.isArray(task.crmVerificationReports);
 }
@@ -1820,8 +1890,20 @@ function buildDeveloperWorkPacket(task, customerDevDefaults = null) {
     textDetectionSources = textResult.sources || [];
   }
   const requiresFieldMappings = templateNeedsMapping || planHasUnmappedWithNoMapped || textDetectedRequired;
-  // fieldMappingsMissing: requires mappings AND none available (text extraction also failed to resolve)
-  const fieldMappingsMissing = requiresFieldMappings && emptyFieldMappings && textExtractedMappings.length === 0;
+  // Template path: auto-derive fieldMappings from template sourceFields/targetFields when plan is empty
+  const templateDerivedMappings = (templateNeedsMapping && emptyFieldMappings && template && template.sourceEntity && targetEntity)
+    ? (() => {
+        const sourceFields = Array.isArray(template.sourceFields) ? template.sourceFields : [];
+        const targetFields = Array.isArray(template.targetFields) ? template.targetFields : [];
+        const pairCount = Math.min(sourceFields.length, targetFields.length);
+        return Array.from({ length: pairCount }, (_, i) => ({
+          source: `${template.sourceEntity}.${sourceFields[i]}`,
+          target: `${targetEntity}.${targetFields[i]}`,
+        }));
+      })()
+    : [];
+  // fieldMappingsMissing: requires mappings AND none available from any path
+  const fieldMappingsMissing = requiresFieldMappings && emptyFieldMappings && textExtractedMappings.length === 0 && templateDerivedMappings.length === 0;
   // Use let so the consistency guard below can override if needed.
   let canWriteCode = readiness.isImplementationReady && !planApprovalRequired && !fieldMappingsMissing;
 
@@ -1852,7 +1934,10 @@ function buildDeveloperWorkPacket(task, customerDevDefaults = null) {
   // ── Guard 1: requiresFieldMappings consistency ───────────────────────────
   // A packet with requiresFieldMappings=true and empty final fieldMappings MUST NOT
   // have canWriteCode=true. Apply as a safety net regardless of how prior detection ran.
-  const finalFieldMappings = textExtractedMappings.length > 0 ? textExtractedMappings : (plan?.fieldMappings || []);
+  // Priority: text-extracted > template-derived > plan
+  const finalFieldMappings = textExtractedMappings.length > 0
+    ? textExtractedMappings
+    : (templateDerivedMappings.length > 0 ? templateDerivedMappings : (plan?.fieldMappings || []));
   if (requiresFieldMappings && finalFieldMappings.length === 0 && canWriteCode) {
     canWriteCode = false;
     decisionReason =
@@ -1959,7 +2044,8 @@ function buildDeveloperWorkPacket(task, customerDevDefaults = null) {
   ].filter(Boolean);
 
   const fieldMappingsSource = textExtractedMappings.length > 0 ? 'text-extracted'
-    : (plan?.fieldMappings?.length > 0 ? 'plan' : 'none');
+    : (templateDerivedMappings.length > 0 ? 'template'
+    : (plan?.fieldMappings?.length > 0 ? 'plan' : 'none'));
 
   return {
     taskId: task.id,
@@ -2881,6 +2967,37 @@ async function callToolFallback(name, args = {}) {
       const task = getTaskById(tasks, taskId);
       if (!task) return { ...common, error: `Task not found: ${taskId}` };
       return { ...common, taskId, ...computeContinueWorkflowStep(task) };
+    }
+    case 'approve_technical_plan_if_safe': {
+      const taskId = String(args.taskId ?? '').trim();
+      if (!taskId) return { ...common, error: 'Missing required argument: taskId' };
+      const index = tasks.findIndex((t) => t.id === taskId);
+      if (index < 0) return { ...common, error: `Task not found: ${taskId}` };
+
+      const task = tasks[index];
+      let devDefaults = null;
+      const customerId = task.customerId || task.workflowSetup?.customerId;
+      if (customerId) {
+        const [customers, settings] = await Promise.all([loadCustomers(), loadSettings()]);
+        const customer = customers.find((c) => c.id === customerId);
+        devDefaults = computeCustomerDevDefaults(customer, settings?.crmBaseDirectory ?? '');
+      }
+
+      const packet = buildDeveloperWorkPacket(task, devDefaults);
+      const reasons = planApprovalSafetyCheck(task, packet);
+      if (reasons.length > 0) {
+        return { ...common, canApprove: false, reasons };
+      }
+
+      const now = new Date().toISOString();
+      task.crmDeveloperWorkflow = asObject(task.crmDeveloperWorkflow);
+      task.crmDeveloperWorkflow.planApproval = { approved: true, approvedAt: now };
+      task.crmDeveloperWorkflow.updatedAt = now;
+      appendMcpAuditNote(task, 'approve_technical_plan_if_safe [AI safe auto-approval]');
+      await saveTasks(tasks);
+
+      const refreshedPacket = buildDeveloperWorkPacket(task, devDefaults);
+      return { ...common, canApprove: true, approvedAt: now, workPacket: refreshedPacket };
     }
     default:
       throw new Error(`Tool '${name}' is not available in read-only fallback mode.`);

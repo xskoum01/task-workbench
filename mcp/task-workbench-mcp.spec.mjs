@@ -653,7 +653,7 @@ describe('callToolFallback continue_developer_workflow', () => {
 // ---------------------------------------------------------------------------
 
 describe('callToolFallback get_developer_work_packet – fieldMappings guard', () => {
-  it('returns canWriteCode=false when template expects field mappings but plan has none', async () => {
+  it('auto-populates fieldMappings from template when plan has none, enabling canWriteCode=true', async () => {
     const os = await import('node:os');
     const fs = await import('node:fs/promises');
     const path = await import('node:path');
@@ -678,8 +678,8 @@ describe('callToolFallback get_developer_work_packet – fieldMappings guard', (
           workKind: 'script',
           summary: 'Create script.',
           target: { entityLogicalName: 'nvr_servicecase', scriptPath: 'Scripts\\nvr_servicecase_events.js', eventFieldName: 'nvr_assetid' },
-          implementationSteps: [],
-          fieldMappings: [],  // EMPTY — template requires mappings, so this should block
+          implementationSteps: ['Implement the handler.'],
+          fieldMappings: [],  // Empty — template should auto-populate
           risks: [],
           testChecklist: [],
         },
@@ -692,9 +692,74 @@ describe('callToolFallback get_developer_work_packet – fieldMappings guard', (
     process.argv = [...process.argv, '--data-dir', tmpDir, '--fallback-readonly'];
     try {
       const packet = await callToolFallback('get_developer_work_packet', { taskId: 'task-fmguard' });
+      // Template auto-populates fieldMappings → canWriteCode=true
+      expect(packet.canWriteCode).toBe(true);
+      expect(packet.implementation.fieldMappingsSource).toBe('template');
+      expect(packet.implementation.fieldMappings.length).toBe(3);
+      // Source entity must be nvr_customerasset, not nvr_asset or nvr_assetid
+      for (const m of packet.implementation.fieldMappings) {
+        expect(m.source).toMatch(/^nvr_customerasset\./);
+        expect(m.source).not.toMatch(/^nvr_asset\./);
+        expect(m.source).not.toMatch(/^nvr_assetid/);
+      }
+      // nvr_statuscustom must be in validationFields, not in fieldMappings
+      const mappingSources = packet.implementation.fieldMappings.map((m) => m.source);
+      const mappingTargets = packet.implementation.fieldMappings.map((m) => m.target);
+      expect(mappingSources.join(',')).not.toContain('nvr_statuscustom');
+      expect(mappingTargets.join(',')).not.toContain('nvr_statuscustom');
+      const vfStrs = (packet.implementation.validationFields || []).map((v) => String(v));
+      expect(vfStrs.some((s) => s.includes('nvr_statuscustom'))).toBe(true);
+    } finally {
+      process.argv = origArgv;
+      await fs.rm(tmpDir, { recursive: true });
+    }
+  });
+
+  it('returns canWriteCode=false when non-template task has unmappedSourceFields but empty fieldMappings', async () => {
+    // Guard 1 still fires when plan signals incomplete mappings and template cannot auto-populate
+    const os = await import('node:os');
+    const fs = await import('node:fs/promises');
+    const path = await import('node:path');
+
+    const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'tw-mcp-fmguard3-'));
+    await fs.writeFile(path.join(tmpDir, 'tasks.json'), JSON.stringify([makeTask({
+      id: 'task-fmguard3',
+      taskMode: 'developer',
+      title: 'Script: custom work without template',  // No template match
+      customerId: 'cust-test',
+      workflowSetup: {
+        devTargetKind: 'script',
+        repositoryRoot: 'C:\\Repo',
+        actionType: 'create-new-script',
+        primaryEntityLogicalName: 'nvr_servicecase',
+        artifactPath: 'Scripts\\nvr_servicecase_events.js',
+        confirmedAt: '2026-06-01T10:00:00.000Z',
+      },
+      crmDeveloperWorkflow: {
+        detectedWorkKind: 'script',
+        technicalPlan: {
+          workKind: 'script',
+          summary: 'Create script.',
+          target: { entityLogicalName: 'nvr_servicecase', scriptPath: 'Scripts\\nvr_servicecase_events.js' },
+          implementationSteps: ['Implement the handler.'],
+          fieldMappings: [],
+          unmappedSourceFields: ['nvr_statuscustom'],  // Plan signals mappings needed
+          risks: [],
+          testChecklist: [],
+        },
+        planApproval: { approved: true },
+      },
+      implementationVerification: { dataverseCheck: { status: 'skipped' } },
+    })]));
+
+    const origArgv = process.argv;
+    process.argv = [...process.argv, '--data-dir', tmpDir, '--fallback-readonly'];
+    try {
+      const packet = await callToolFallback('get_developer_work_packet', { taskId: 'task-fmguard3' });
+      // No template → no auto-population → Guard 1 fires
       expect(packet.canWriteCode).toBe(false);
-      expect(packet.decisionReason).toContain('Field mappings are missing');
-      expect(packet.blockingUserAction).toContain('prepare_developer_task');
+      expect(packet.implementation.requiresFieldMappings).toBe(true);
+      expect(packet.implementation.fieldMappings.length).toBe(0);
     } finally {
       process.argv = origArgv;
       await fs.rm(tmpDir, { recursive: true });
@@ -2511,6 +2576,238 @@ describe('callToolFallback get_developer_work_packet – Czech scaffold guard an
       expect(packet.implementation.scaffoldSignalDetected).toBe(true);
       expect(packet.implementation.fieldMappingsCount).toBe(0);
       expect(typeof packet.packetGeneratorVersion).toBe('string');
+    } finally {
+      process.argv = origArgv;
+      await fs.rm(tmpDir, { recursive: true });
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 17. approve_technical_plan_if_safe – safety conditions and audit note
+// ---------------------------------------------------------------------------
+
+describe('callToolFallback approve_technical_plan_if_safe', () => {
+  async function importHelpers() {
+    const os = await import('node:os');
+    const fs = await import('node:fs/promises');
+    const path = await import('node:path');
+    return { os, fs, path };
+  }
+
+  // Template task that matches the nvr-training-sh-script-prefill template.
+  // planApproval is NOT set — the tool is supposed to set it.
+  function makeTemplateTaskAwaitingApproval(id = 'task-approve-tpl') {
+    return makeTask({
+      id,
+      title: 'Script: Předvyplnění servisního požadavku',
+      customerId: 'nvr-test',
+      workflowSetup: {
+        devTargetKind: 'script',
+        repositoryRoot: 'C:\\Repos\\NVR',
+        actionType: 'create-new-script',
+        primaryEntityLogicalName: 'nvr_servicecase',
+        artifactPath: 'Scripts\\nvr_servicecase_events.js',
+        confirmedAt: '2026-06-01T10:00:00.000Z',
+        eventName: 'onChange',
+        eventFieldName: 'nvr_assetid',
+        onLoadFunctionName: 'nvr_servicecase_OnLoad',
+        onChangeFunctionName: 'nvr_assetid_OnChange',
+      },
+      crmDeveloperWorkflow: {
+        detectedWorkKind: 'script',
+        technicalPlan: {
+          workKind: 'script',
+          summary: 'Create onChange handler for nvr_assetid on nvr_servicecase.',
+          implementationSteps: ['Implement the onChange prefill handler.'],
+          fieldMappings: [],
+          unmappedSourceFields: [],
+          risks: [],
+          testChecklist: [],
+          target: { entityLogicalName: 'nvr_servicecase', scriptPath: 'Scripts\\nvr_servicecase_events.js', eventName: 'onChange', eventFieldName: 'nvr_assetid' },
+        },
+        // planApproval intentionally absent — tool must set it
+      },
+      implementationVerification: { dataverseCheck: { status: 'skipped' } },
+    });
+  }
+
+  function makeNonTemplateTaskWithUnmappedFields(id = 'task-approve-unmapped') {
+    return makeTask({
+      id,
+      title: 'Script: custom work without template',
+      customerId: 'cust-1',
+      workflowSetup: {
+        devTargetKind: 'script',
+        repositoryRoot: 'C:\\Repos\\NVR',
+        actionType: 'create-new-script',
+        primaryEntityLogicalName: 'nvr_servicecase',
+        artifactPath: 'Scripts\\nvr_servicecase_events.js',
+        confirmedAt: '2026-06-01T10:00:00.000Z',
+        eventName: 'onChange',
+        eventFieldName: 'nvr_assetid',
+      },
+      crmDeveloperWorkflow: {
+        detectedWorkKind: 'script',
+        planApproval: { approved: true },
+        technicalPlan: {
+          workKind: 'script',
+          summary: 'Custom handler without template.',
+          implementationSteps: ['Implement the handler.'],
+          fieldMappings: [],
+          unmappedSourceFields: ['nvr_statuscustom'],
+          risks: [],
+          testChecklist: [],
+          target: { entityLogicalName: 'nvr_servicecase', eventName: 'onChange', eventFieldName: 'nvr_assetid' },
+        },
+      },
+      implementationVerification: { dataverseCheck: { status: 'skipped' } },
+    });
+  }
+
+  it('scenario 1: template-derived plan with valid fieldMappings can be auto-approved', async () => {
+    const { os, fs, path } = await importHelpers();
+    const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'tw-mcp-approve1-'));
+    await fs.writeFile(path.join(tmpDir, 'tasks.json'), JSON.stringify([makeTemplateTaskAwaitingApproval()]));
+    const origArgv = process.argv;
+    process.argv = [...process.argv, '--data-dir', tmpDir, '--fallback-readonly'];
+    try {
+      const result = await callToolFallback('approve_technical_plan_if_safe', { taskId: 'task-approve-tpl' });
+      expect(result.canApprove).toBe(true);
+      expect(result.approvedAt).toBeDefined();
+      expect(Array.isArray(result.reasons)).not.toBe(true);
+    } finally {
+      process.argv = origArgv;
+      await fs.rm(tmpDir, { recursive: true });
+    }
+  });
+
+  it('scenario 2: auto-approval changes workPacket from canWriteCode=false to canWriteCode=true', async () => {
+    const { os, fs, path } = await importHelpers();
+    const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'tw-mcp-approve2-'));
+    await fs.writeFile(path.join(tmpDir, 'tasks.json'), JSON.stringify([makeTemplateTaskAwaitingApproval()]));
+    const origArgv = process.argv;
+    process.argv = [...process.argv, '--data-dir', tmpDir, '--fallback-readonly'];
+    try {
+      // Verify that before approval, canWriteCode=false
+      const before = await callToolFallback('get_developer_work_packet', { taskId: 'task-approve-tpl' });
+      expect(before.canWriteCode).toBe(false);
+
+      const result = await callToolFallback('approve_technical_plan_if_safe', { taskId: 'task-approve-tpl' });
+      expect(result.canApprove).toBe(true);
+      expect(result.workPacket.canWriteCode).toBe(true);
+      expect(result.workPacket.implementation.fieldMappings.length).toBe(3);
+    } finally {
+      process.argv = origArgv;
+      await fs.rm(tmpDir, { recursive: true });
+    }
+  });
+
+  it('scenario 3: missing fieldMappings blocks auto-approval', async () => {
+    const { os, fs, path } = await importHelpers();
+    const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'tw-mcp-approve3-'));
+    await fs.writeFile(path.join(tmpDir, 'tasks.json'), JSON.stringify([makeNonTemplateTaskWithUnmappedFields()]));
+    const origArgv = process.argv;
+    process.argv = [...process.argv, '--data-dir', tmpDir, '--fallback-readonly'];
+    try {
+      const result = await callToolFallback('approve_technical_plan_if_safe', { taskId: 'task-approve-unmapped' });
+      expect(result.canApprove).toBe(false);
+      expect(Array.isArray(result.reasons)).toBe(true);
+      expect(result.reasons.some((r) => r.includes('required but not defined'))).toBe(true);
+    } finally {
+      process.argv = origArgv;
+      await fs.rm(tmpDir, { recursive: true });
+    }
+  });
+
+  it('scenario 4: scaffoldOnly=true blocks auto-approval', async () => {
+    const { os, fs, path } = await importHelpers();
+    const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'tw-mcp-approve4-'));
+    await fs.writeFile(path.join(tmpDir, 'tasks.json'), JSON.stringify([makeNonTemplateTaskWithUnmappedFields('task-approve-scaffold')]));
+    const origArgv = process.argv;
+    process.argv = [...process.argv, '--data-dir', tmpDir, '--fallback-readonly'];
+    try {
+      const result = await callToolFallback('approve_technical_plan_if_safe', { taskId: 'task-approve-scaffold' });
+      expect(result.canApprove).toBe(false);
+      expect(result.reasons.some((r) => r.includes('scaffoldOnly=true'))).toBe(true);
+    } finally {
+      process.argv = origArgv;
+      await fs.rm(tmpDir, { recursive: true });
+    }
+  });
+
+  it('scenario 5: TODO/scaffold guidance in plan blocks auto-approval', async () => {
+    const { os, fs, path } = await importHelpers();
+    const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'tw-mcp-approve5-'));
+    const task = makeTemplateTaskAwaitingApproval('task-approve-todo');
+    task.crmDeveloperWorkflow.technicalPlan.implementationSteps = [
+      'TODO: implement the field copy logic',
+      'validate result',
+    ];
+    await fs.writeFile(path.join(tmpDir, 'tasks.json'), JSON.stringify([task]));
+    const origArgv = process.argv;
+    process.argv = [...process.argv, '--data-dir', tmpDir, '--fallback-readonly'];
+    try {
+      const result = await callToolFallback('approve_technical_plan_if_safe', { taskId: 'task-approve-todo' });
+      expect(result.canApprove).toBe(false);
+      expect(result.reasons.some((r) =>
+        r.toLowerCase().includes('todo') || r.toLowerCase().includes('scaffold') || r.toLowerCase().includes('placeholder')
+      )).toBe(true);
+    } finally {
+      process.argv = origArgv;
+      await fs.rm(tmpDir, { recursive: true });
+    }
+  });
+
+  it("scenario 6: untrusted fieldMappingsSource blocks auto-approval", async () => {
+    const { os, fs, path } = await importHelpers();
+    const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'tw-mcp-approve6-'));
+    await fs.writeFile(path.join(tmpDir, 'tasks.json'), JSON.stringify([makeNonTemplateTaskWithUnmappedFields('task-approve-src')]));
+    const origArgv = process.argv;
+    process.argv = [...process.argv, '--data-dir', tmpDir, '--fallback-readonly'];
+    try {
+      const result = await callToolFallback('approve_technical_plan_if_safe', { taskId: 'task-approve-src' });
+      expect(result.canApprove).toBe(false);
+      expect(result.reasons.some((r) => r.includes('fieldMappingsSource'))).toBe(true);
+    } finally {
+      process.argv = origArgv;
+      await fs.rm(tmpDir, { recursive: true });
+    }
+  });
+
+  it('scenario 7: external actions in plan block auto-approval', async () => {
+    const { os, fs, path } = await importHelpers();
+    const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'tw-mcp-approve7-'));
+    const task = makeTemplateTaskAwaitingApproval('task-approve-ext');
+    task.crmDeveloperWorkflow.technicalPlan.externalActionPreview = ['Register plugin step in Dataverse.'];
+    await fs.writeFile(path.join(tmpDir, 'tasks.json'), JSON.stringify([task]));
+    const origArgv = process.argv;
+    process.argv = [...process.argv, '--data-dir', tmpDir, '--fallback-readonly'];
+    try {
+      const result = await callToolFallback('approve_technical_plan_if_safe', { taskId: 'task-approve-ext' });
+      expect(result.canApprove).toBe(false);
+      expect(result.reasons.some((r) => r.includes('external actions'))).toBe(true);
+    } finally {
+      process.argv = origArgv;
+      await fs.rm(tmpDir, { recursive: true });
+    }
+  });
+
+  it('scenario 8: audit note is recorded after auto-approval', async () => {
+    const { os, fs, path } = await importHelpers();
+    const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'tw-mcp-approve8-'));
+    await fs.writeFile(path.join(tmpDir, 'tasks.json'), JSON.stringify([makeTemplateTaskAwaitingApproval('task-approve-audit')]));
+    const origArgv = process.argv;
+    process.argv = [...process.argv, '--data-dir', tmpDir, '--fallback-readonly'];
+    try {
+      const result = await callToolFallback('approve_technical_plan_if_safe', { taskId: 'task-approve-audit' });
+      expect(result.canApprove).toBe(true);
+      // appendMcpAuditNote writes to task.notes (a string). Verify it was persisted to disk.
+      const saved = JSON.parse(await fs.readFile(path.join(tmpDir, 'tasks.json'), 'utf8'));
+      const savedTask = saved.find((t) => t.id === 'task-approve-audit');
+      const notes = savedTask?.notes ?? '';
+      expect(typeof notes).toBe('string');
+      expect(notes.includes('approve_technical_plan_if_safe')).toBe(true);
     } finally {
       process.argv = origArgv;
       await fs.rm(tmpDir, { recursive: true });
