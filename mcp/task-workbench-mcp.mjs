@@ -3073,7 +3073,7 @@ async function callTool(name, args = {}) {
     };
   } catch (error) {
     const fallbackAllowed = isFallbackReadOnlyEnabled() || !!getCliDataDir();
-    const fallbackWriteAllowed = name === 'prepare_developer_task' && !!getCliDataDir();
+    const fallbackWriteAllowed = (name === 'prepare_developer_task' || name === 'approve_technical_plan_if_safe') && !!getCliDataDir();
     if (!fallbackAllowed || (!READ_ONLY_TOOL_NAMES.has(name) && !fallbackWriteAllowed)) {
       throw new Error(
         `task-workbench local bridge is not running at ${bridgeUrl}. Start task-workbench app first. `

@@ -14904,6 +14904,13 @@ mod developer_work_packet_tests {
             "notes must record the approve_technical_plan_if_safe action; got: {notes}"
         );
     }
+
+    #[test]
+    fn local_write_tool_definitions_includes_approve_technical_plan_if_safe() {
+        let defs = task_mcp_local_write_tool_definitions();
+        let found = defs.iter().any(|d| d["name"].as_str() == Some("approve_technical_plan_if_safe"));
+        assert!(found, "approve_technical_plan_if_safe must be in task_mcp_local_write_tool_definitions (tools/list write set)");
+    }
 }
 
 // --- Entry point -----------------------------------------------------------

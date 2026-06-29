@@ -74,6 +74,84 @@ describe('READ_ONLY_TOOL_NAMES', () => {
   it('does NOT contain record_external_action_completed (it is a write tool)', () => {
     expect(READ_ONLY_TOOL_NAMES.has('record_external_action_completed')).toBe(false);
   });
+
+  it('does NOT contain approve_technical_plan_if_safe (it is a write tool)', () => {
+    expect(READ_ONLY_TOOL_NAMES.has('approve_technical_plan_if_safe')).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Regression: approve_technical_plan_if_safe MCP exposure
+// ---------------------------------------------------------------------------
+
+describe('approve_technical_plan_if_safe MCP exposure', () => {
+  it('is present in TOOL_DEFINITIONS (tools/list)', () => {
+    const tool = TOOL_DEFINITIONS.find((t) => t.name === 'approve_technical_plan_if_safe');
+    expect(tool).toBeDefined();
+  });
+
+  it('has required inputSchema with taskId', () => {
+    const tool = TOOL_DEFINITIONS.find((t) => t.name === 'approve_technical_plan_if_safe');
+    expect(tool?.inputSchema?.properties?.taskId).toBeDefined();
+    expect(tool?.inputSchema?.required).toContain('taskId');
+  });
+
+  it('is NOT in READ_ONLY_TOOL_NAMES', () => {
+    expect(READ_ONLY_TOOL_NAMES.has('approve_technical_plan_if_safe')).toBe(false);
+  });
+
+  it('calling via MCP handler (callToolFallback) succeeds for safe template-derived task', async () => {
+    const os = await import('node:os');
+    const fs = await import('node:fs/promises');
+    const path = await import('node:path');
+
+    const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'tw-mcp-expose-'));
+    const task = makeTask({
+      id: 'task-expose-test',
+      title: 'Script: Předvyplnění servisního požadavku',
+      customerId: 'nvr-test',
+      workflowSetup: {
+        devTargetKind: 'script',
+        repositoryRoot: 'C:\\Repos\\NVR',
+        actionType: 'create-new-script',
+        primaryEntityLogicalName: 'nvr_servicecase',
+        artifactPath: 'Scripts\\nvr_servicecase_events.js',
+        confirmedAt: '2026-06-01T10:00:00.000Z',
+        eventName: 'onChange',
+        eventFieldName: 'nvr_assetid',
+        onLoadFunctionName: 'nvr_servicecase_OnLoad',
+        onChangeFunctionName: 'nvr_assetid_OnChange',
+      },
+      crmDeveloperWorkflow: {
+        detectedWorkKind: 'script',
+        technicalPlan: {
+          workKind: 'script',
+          summary: 'Create onChange handler for nvr_assetid on nvr_servicecase.',
+          implementationSteps: ['Implement the onChange prefill handler.'],
+          fieldMappings: [],
+          unmappedSourceFields: [],
+          risks: [],
+          testChecklist: [],
+          target: { entityLogicalName: 'nvr_servicecase', scriptPath: 'Scripts\\nvr_servicecase_events.js', eventName: 'onChange', eventFieldName: 'nvr_assetid' },
+        },
+        // No planApproval set — the tool must set it
+      },
+      implementationVerification: { dataverseCheck: { status: 'skipped' } },
+    });
+    await fs.writeFile(path.join(tmpDir, 'tasks.json'), JSON.stringify([task]));
+    const origArgv = process.argv;
+    process.argv = [...process.argv, '--data-dir', tmpDir, '--fallback-readonly'];
+    try {
+      const result = await callToolFallback('approve_technical_plan_if_safe', { taskId: 'task-expose-test' });
+      // Must return canApprove=true (not an error, not canApprove=false)
+      expect(result.canApprove).toBe(true);
+      expect(result.workPacket).toBeDefined();
+      expect(result.workPacket.canWriteCode).toBe(true);
+    } finally {
+      process.argv = origArgv;
+      await fs.rm(tmpDir, { recursive: true });
+    }
+  });
 });
 
 describe('callToolFallback get_developer_work_packet', () => {
