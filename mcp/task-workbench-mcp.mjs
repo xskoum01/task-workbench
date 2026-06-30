@@ -1377,6 +1377,182 @@ function planApprovalSafetyCheck(task, packet) {
   return reasons;
 }
 
+/**
+ * Returns true when the packet has the concrete trusted data needed to safely replace
+ * stale scaffold plan steps/risks with deterministic steps derived from the work packet.
+ *
+ * Called only when planApprovalSafetyCheck returned exactly one reason (the scaffold text
+ * reason). Belt-and-suspenders double-check of packet-level conditions.
+ */
+function canSafelyRefreshPlan(packet) {
+  const impl = asObject(packet?.implementation);
+  const wt   = asObject(packet?.writeTarget);
+
+  const fmCount  = Array.isArray(impl.fieldMappings) ? impl.fieldMappings.length : 0;
+  if (fmCount === 0) return false;
+
+  const fmSource = impl.fieldMappingsSource ?? 'none';
+  if (fmSource !== 'template' && fmSource !== 'plan') return false;
+
+  if (impl.scaffoldOnly === true)                return false;
+  if (impl.finalConsistencyGuardApplied === true) return false;
+
+  if (!wt.artifactPath) return false;
+  if (!wt.targetEntity)  return false;
+
+  return true;
+}
+
+/**
+ * Generates concrete, deterministic implementation steps from a trusted work packet.
+ * Used by the safe plan refresh path to replace stale scaffold/TODO steps.
+ */
+function generateConcreteStepsFromPacket(packet) {
+  const wt   = asObject(packet?.writeTarget);
+  const impl = asObject(packet?.implementation);
+  const fieldMappings    = Array.isArray(impl.fieldMappings)    ? impl.fieldMappings    : [];
+  const validationFields = Array.isArray(impl.validationFields) ? impl.validationFields : [];
+  const workKind = wt.kind ?? '';
+  const steps = [];
+
+  if (workKind === 'script' || workKind === 'ribbon') {
+    if (wt.artifactPath) {
+      steps.push(`Create or update ${wt.artifactPath}.`);
+    }
+    const onLoad   = wt.handlers?.onLoad   ?? '';
+    const onChange = wt.handlers?.onChange ?? '';
+    if (onLoad && onChange) {
+      steps.push(`Register/prepare handlers ${onLoad} and ${onChange}.`);
+    } else if (onLoad) {
+      steps.push(`Register/prepare handler ${onLoad}.`);
+    }
+    if (wt.eventFieldName) {
+      const sourceEntity = fieldMappings[0]?.source?.split('.')[0] ?? 'source';
+      steps.push(`On ${wt.eventFieldName} change, retrieve ${sourceEntity} using Xrm.WebApi.retrieveRecord.`);
+    }
+    for (const m of fieldMappings) {
+      if (m.source && m.target) {
+        steps.push(`Copy ${m.source} to ${m.target}.`);
+      }
+    }
+    for (const vf of validationFields) {
+      if (typeof vf === 'string') {
+        steps.push(`Use ${vf} only as validation source for conditional logic.`);
+      }
+    }
+    steps.push('Do not auto-save the form.');
+    steps.push('Do not upload/register the web resource automatically.');
+  } else {
+    // Plugin
+    const artifact = wt.artifactPath || wt.pluginProject || '';
+    if (artifact) {
+      steps.push(`Create or update the plugin class in ${artifact}.`);
+    }
+    if (wt.message && wt.stage && wt.targetEntity) {
+      steps.push(`Register handler for ${wt.message} ${wt.stage} on ${wt.targetEntity}.`);
+    }
+    for (const m of fieldMappings) {
+      if (m.source && m.target) {
+        steps.push(`Set ${m.target} from ${m.source}.`);
+      }
+    }
+  }
+
+  return steps;
+}
+
+const SCAFFOLD_TEXT_RE = /\btodo\b|\bscaffold\b|\bplaceholder\b|field\s+mappings?\s+(?:are\s+)?not\s+defined|field\s+mappings?\s+nejsou\s+definov|doplnění.*field\s+mapping|připravit\s+todo/i;
+
+/**
+ * Returns true if `word` (already lowercased) looks like a CRM logical entity/field name.
+ * Requires a 3–5 lowercase-letter publisher prefix, an underscore, and a ≥3-char suffix.
+ * The 3-char minimum on the prefix avoids common 2-letter English words (is_, on_, no_).
+ */
+function looksCrmLike(word) {
+  const us = word.indexOf('_');
+  if (us < 3 || us > 5 || us === word.length - 1) return false;
+  const prefix = word.slice(0, us);
+  const suffix = word.slice(us + 1);
+  if (!/^[a-z]{3,5}$/.test(prefix)) return false;
+  if (suffix.length < 3) return false;
+  if (!/^[a-z]/.test(suffix)) return false;
+  return /^[a-z0-9_]+$/.test(suffix);
+}
+
+/**
+ * Builds the set of logical names (entities and fields) that are trusted in the given packet.
+ * Includes: targetEntity, eventFieldName, entity/field parts from fieldMappings and validationFields.
+ */
+function buildAllowedLogicalNames(packet) {
+  const allowed = new Set();
+  const impl = asObject(packet?.implementation);
+  const wt   = asObject(packet?.writeTarget);
+
+  function addDotted(s) {
+    if (!s) return;
+    const lower = s.toLowerCase();
+    allowed.add(lower);
+    const dot = lower.indexOf('.');
+    if (dot > 0) {
+      allowed.add(lower.slice(0, dot));
+      allowed.add(lower.slice(dot + 1));
+    }
+  }
+
+  if (wt.targetEntity)   allowed.add(wt.targetEntity.toLowerCase());
+  // eventFieldName is a field name (e.g. nvr_assetid), not an entity — add so risks that mention
+  // the trigger field are not incorrectly removed.
+  if (wt.eventFieldName) allowed.add(wt.eventFieldName.toLowerCase());
+
+  (Array.isArray(impl.fieldMappings) ? impl.fieldMappings : []).forEach((m) => {
+    addDotted(m.source);
+    addDotted(m.target);
+  });
+  (Array.isArray(impl.validationFields) ? impl.validationFields : []).forEach(addDotted);
+
+  return allowed;
+}
+
+/**
+ * Returns true if riskText mentions a CRM-style logical name not present in allowed.
+ * Iterates over word tokens (ASCII alphanumeric + underscore runs) to avoid false positives
+ * from Czech or other multibyte characters.
+ */
+function riskMentionsUnknownEntity(riskText, allowed) {
+  const lower = riskText.toLowerCase();
+  const words = lower.match(/[a-z0-9_]+/g) ?? [];
+  return words.some((w) => looksCrmLike(w) && !allowed.has(w));
+}
+
+/**
+ * Returns cleaned risks: removes scaffold/TODO risks from existingRisks, also removes risks
+ * that mention CRM entity names not present in the trusted packet (to eliminate hallucinated
+ * or stale entity references), and appends standard guardrail risks if not already present.
+ */
+function generateCleanRisksFromPacket(existingRisks, packet) {
+  const workKind = asObject(packet?.writeTarget).kind ?? '';
+  const allowed  = buildAllowedLogicalNames(packet);
+  const risks = (Array.isArray(existingRisks) ? existingRisks : [])
+    .filter((r) => {
+      const text = typeof r === 'string' ? r : JSON.stringify(r);
+      return !SCAFFOLD_TEXT_RE.test(text) && !riskMentionsUnknownEntity(text, allowed);
+    });
+
+  const standard = (workKind === 'script' || workKind === 'ribbon')
+    ? [
+        'Dataverse metadata must be verified in-app for JS/TS.',
+        'Web resource upload and form registration are manual/approval-gated steps.',
+      ]
+    : ['Plugin registration is a manual approval-gated step.'];
+
+  for (const risk of standard) {
+    const alreadyPresent = risks.some((r) => typeof r === 'string' && r.includes(risk));
+    if (!alreadyPresent) risks.push(risk);
+  }
+
+  return risks;
+}
+
 function isDeveloperTask(task) {
   return task.taskMode === 'developer' || !!task.crmDeveloperWorkflow || !!task.workflowSetup || Array.isArray(task.crmVerificationReports);
 }
@@ -2047,7 +2223,7 @@ function buildDeveloperWorkPacket(task, customerDevDefaults = null) {
     : (templateDerivedMappings.length > 0 ? 'template'
     : (plan?.fieldMappings?.length > 0 ? 'plan' : 'none'));
 
-  return {
+  const packet = {
     taskId: task.id,
     packetGeneratorVersion: DEVELOPER_WORK_PACKET_VERSION,
     status: canWriteCode ? 'ready_to_code' : 'not_ready',
@@ -2151,6 +2327,16 @@ function buildDeveloperWorkPacket(task, customerDevDefaults = null) {
     },
     task: safeTaskSummary(task),
   };
+  // Post-packet filter: remove risks mentioning CRM entity names absent from the trusted packet.
+  // Applied after full assembly so writeTarget (targetEntity, eventFieldName) is available.
+  // Only runs when canWriteCode with concrete field mappings — the same condition as sanitizedRisks.
+  if (canWriteCode && finalFieldMappings.length > 0) {
+    const allowed = buildAllowedLogicalNames(packet);
+    packet.implementation.risks = (packet.implementation.risks ?? []).filter(
+      (r) => !riskMentionsUnknownEntity(typeof r === 'string' ? r : JSON.stringify(r), allowed)
+    );
+  }
+  return packet;
 }
 
 function deterministicPlanDraft(task, template) {
@@ -2985,19 +3171,39 @@ async function callToolFallback(name, args = {}) {
 
       const packet = buildDeveloperWorkPacket(task, devDefaults);
       const reasons = planApprovalSafetyCheck(task, packet);
-      if (reasons.length > 0) {
+
+      // Safe plan refresh path: if the ONLY blocker is stale scaffold/TODO text in the plan
+      // steps/risks, and the packet already has trusted concrete field mappings, replace the
+      // stale plan text with deterministic steps derived from the work packet — then approve.
+      const isOnlyScaffoldBlocker = reasons.length === 1
+        && (reasons[0].toLowerCase().includes('todo') || reasons[0].toLowerCase().includes('scaffold') || reasons[0].toLowerCase().includes('placeholder'));
+      const canRefresh = isOnlyScaffoldBlocker && canSafelyRefreshPlan(packet);
+
+      if (reasons.length > 0 && !canRefresh) {
         return { ...common, canApprove: false, reasons };
       }
 
       const now = new Date().toISOString();
       task.crmDeveloperWorkflow = asObject(task.crmDeveloperWorkflow);
+
+      if (canRefresh) {
+        const plan = asObject(task.crmDeveloperWorkflow.technicalPlan);
+        const existingRisks = Array.isArray(plan.risks) ? plan.risks : [];
+        task.crmDeveloperWorkflow.technicalPlan = {
+          ...plan,
+          implementationSteps: generateConcreteStepsFromPacket(packet),
+          risks: generateCleanRisksFromPacket(existingRisks, packet),
+        };
+        appendMcpAuditNote(task, 'approve_technical_plan_if_safe [safe plan refresh: stale scaffold steps/risks replaced from trusted work packet]');
+      }
+
       task.crmDeveloperWorkflow.planApproval = { approved: true, approvedAt: now };
       task.crmDeveloperWorkflow.updatedAt = now;
       appendMcpAuditNote(task, 'approve_technical_plan_if_safe [AI safe auto-approval]');
       await saveTasks(tasks);
 
       const refreshedPacket = buildDeveloperWorkPacket(task, devDefaults);
-      return { ...common, canApprove: true, approvedAt: now, workPacket: refreshedPacket };
+      return { ...common, canApprove: true, planRefreshed: canRefresh, approvedAt: now, workPacket: refreshedPacket };
     }
     default:
       throw new Error(`Tool '${name}' is not available in read-only fallback mode.`);

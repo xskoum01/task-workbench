@@ -1156,8 +1156,10 @@ describe('buildAiWorkflowPrompt – implementation prompt AI-facing rules', () =
     );
   });
 
-  it('contains "If workPacket.canWriteCode is false, stop"', () => {
-    expect(buildAiWorkflowPrompt(makeReadyTask())).toContain('If workPacket.canWriteCode is false, stop');
+  it('rule 1 contains canWriteCode false guard with plan-approval branch', () => {
+    const prompt = buildAiWorkflowPrompt(makeReadyTask());
+    expect(prompt).toContain('If workPacket.canWriteCode is false: (a)');
+    expect(prompt).toContain('approve_technical_plan_if_safe');
   });
 
   it('contains "If workPacket.canWriteCode is true, implement only files listed in workPacket.writeTarget / targetFiles"', () => {
@@ -1395,5 +1397,36 @@ describe('buildAiWorkflowPrompt – TODO/scaffold hard stop rules', () => {
     const readyPrompt = buildAiWorkflowPrompt(makeReadyTask());
     expect(setupPrompt).not.toContain('TODO comments in final implementation output are never acceptable');
     expect(readyPrompt).toContain('TODO comments in final implementation output are never acceptable');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// approve_technical_plan_if_safe — safe plan refresh guidance in prompt
+// ---------------------------------------------------------------------------
+
+describe('buildAiWorkflowPrompt – approve_technical_plan_if_safe safe refresh guidance', () => {
+  it('setup prompt mentions approve_technical_plan_if_safe when plan approval is blocking', () => {
+    const prompt = buildAiWorkflowPrompt(makeDevTask());
+    expect(prompt).toContain('approve_technical_plan_if_safe');
+  });
+
+  it('setup prompt mentions planRefreshed=true guidance', () => {
+    const prompt = buildAiWorkflowPrompt(makeDevTask());
+    expect(prompt).toContain('planRefreshed=true');
+  });
+
+  it('ready-task prompt mentions planRefreshed guidance in implementation rule 1', () => {
+    const prompt = buildAiWorkflowPrompt(makeReadyTask());
+    expect(prompt).toContain('planRefreshed');
+  });
+
+  it('ready-task rule 1 mentions internal refresh of stale scaffold plan', () => {
+    const prompt = buildAiWorkflowPrompt(makeReadyTask());
+    expect(prompt).toContain('stale scaffold plan steps/risks');
+  });
+
+  it('ready-task rule 1 states no manual plan regeneration needed when refresh fires', () => {
+    const prompt = buildAiWorkflowPrompt(makeReadyTask());
+    expect(prompt).toContain('no manual plan regeneration is needed in that case');
   });
 });

@@ -2814,23 +2814,28 @@ describe('callToolFallback approve_technical_plan_if_safe', () => {
     }
   });
 
-  it('scenario 5: TODO/scaffold guidance in plan blocks auto-approval', async () => {
+  it('scenario 5: TODO/scaffold in plan steps is safe-refreshed and approved when trusted template fieldMappings present', async () => {
+    // Stale scaffold steps + trusted template fieldMappings → safe refresh path fires:
+    // steps are replaced with concrete packet-derived steps, plan is approved, canApprove=true.
     const { os, fs, path } = await importHelpers();
     const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'tw-mcp-approve5-'));
     const task = makeTemplateTaskAwaitingApproval('task-approve-todo');
     task.crmDeveloperWorkflow.technicalPlan.implementationSteps = [
       'TODO: implement the field copy logic',
-      'validate result',
+      'TODO: fill in field mappings',
+    ];
+    task.crmDeveloperWorkflow.technicalPlan.risks = [
+      'field mappings are not defined',
+      'script contains TODO comments',
     ];
     await fs.writeFile(path.join(tmpDir, 'tasks.json'), JSON.stringify([task]));
     const origArgv = process.argv;
     process.argv = [...process.argv, '--data-dir', tmpDir, '--fallback-readonly'];
     try {
       const result = await callToolFallback('approve_technical_plan_if_safe', { taskId: 'task-approve-todo' });
-      expect(result.canApprove).toBe(false);
-      expect(result.reasons.some((r) =>
-        r.toLowerCase().includes('todo') || r.toLowerCase().includes('scaffold') || r.toLowerCase().includes('placeholder')
-      )).toBe(true);
+      expect(result.canApprove).toBe(true);
+      expect(result.planRefreshed).toBe(true);
+      expect(result.workPacket.canWriteCode).toBe(true);
     } finally {
       process.argv = origArgv;
       await fs.rm(tmpDir, { recursive: true });
@@ -2886,6 +2891,346 @@ describe('callToolFallback approve_technical_plan_if_safe', () => {
       const notes = savedTask?.notes ?? '';
       expect(typeof notes).toBe('string');
       expect(notes.includes('approve_technical_plan_if_safe')).toBe(true);
+    } finally {
+      process.argv = origArgv;
+      await fs.rm(tmpDir, { recursive: true });
+    }
+  });
+
+  it('scenario 9: refreshed plan contains concrete mapping steps (no TODO text)', async () => {
+    const { os, fs, path } = await importHelpers();
+    const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'tw-mcp-approve9-'));
+    const task = makeTemplateTaskAwaitingApproval('task-approve-refresh-steps');
+    task.crmDeveloperWorkflow.technicalPlan.implementationSteps = ['TODO: implement the field copy logic'];
+    task.crmDeveloperWorkflow.technicalPlan.risks = ['field mappings are not defined'];
+    await fs.writeFile(path.join(tmpDir, 'tasks.json'), JSON.stringify([task]));
+    const origArgv = process.argv;
+    process.argv = [...process.argv, '--data-dir', tmpDir, '--fallback-readonly'];
+    try {
+      const result = await callToolFallback('approve_technical_plan_if_safe', { taskId: 'task-approve-refresh-steps' });
+      expect(result.canApprove).toBe(true);
+      expect(result.planRefreshed).toBe(true);
+
+      // Verify the refreshed plan in persisted tasks.json
+      const saved = JSON.parse(await fs.readFile(path.join(tmpDir, 'tasks.json'), 'utf8'));
+      const savedTask = saved.find((t) => t.id === 'task-approve-refresh-steps');
+      const steps = savedTask?.crmDeveloperWorkflow?.technicalPlan?.implementationSteps ?? [];
+      expect(steps.some((s) => /Copy.*nvr_customerid/i.test(s))).toBe(true);
+      expect(steps.some((s) => /Copy.*nvr_contactid/i.test(s))).toBe(true);
+      expect(steps.some((s) => /Copy.*nvr_isunderwarranty/i.test(s))).toBe(true);
+      expect(steps.every((s) => !/todo|scaffold|placeholder/i.test(s))).toBe(true);
+    } finally {
+      process.argv = origArgv;
+      await fs.rm(tmpDir, { recursive: true });
+    }
+  });
+
+  it('scenario 10: refreshed plan removes scaffold risks and adds standard guardrail risks', async () => {
+    const { os, fs, path } = await importHelpers();
+    const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'tw-mcp-approve10-'));
+    const task = makeTemplateTaskAwaitingApproval('task-approve-refresh-risks');
+    task.crmDeveloperWorkflow.technicalPlan.implementationSteps = ['TODO: implement'];
+    task.crmDeveloperWorkflow.technicalPlan.risks = [
+      'field mappings are not defined',
+      'script contains TODO comments',
+      'Manual testing should be performed after deployment.',
+    ];
+    await fs.writeFile(path.join(tmpDir, 'tasks.json'), JSON.stringify([task]));
+    const origArgv = process.argv;
+    process.argv = [...process.argv, '--data-dir', tmpDir, '--fallback-readonly'];
+    try {
+      await callToolFallback('approve_technical_plan_if_safe', { taskId: 'task-approve-refresh-risks' });
+      const saved = JSON.parse(await fs.readFile(path.join(tmpDir, 'tasks.json'), 'utf8'));
+      const savedTask = saved.find((t) => t.id === 'task-approve-refresh-risks');
+      const risks = savedTask?.crmDeveloperWorkflow?.technicalPlan?.risks ?? [];
+      // Scaffold risks removed
+      expect(risks.every((r) => !/todo|scaffold|placeholder|field mappings are not defined/i.test(r))).toBe(true);
+      // Real risk preserved
+      expect(risks.some((r) => r.includes('Manual testing'))).toBe(true);
+      // Standard risks added
+      expect(risks.some((r) => r.includes('Dataverse'))).toBe(true);
+      expect(risks.some((r) => /web resource/i.test(r))).toBe(true);
+    } finally {
+      process.argv = origArgv;
+      await fs.rm(tmpDir, { recursive: true });
+    }
+  });
+
+  it('scenario 11: TODO in plan with empty fieldMappings still blocks (no refresh possible)', async () => {
+    // Non-template task: empty fieldMappings → canSafelyRefreshPlan=false → canApprove=false.
+    const { os, fs, path } = await importHelpers();
+    const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'tw-mcp-approve11-'));
+    const task = makeTask({
+      id: 'task-approve-todo-no-fm',
+      title: 'Script: custom work no mappings',
+      taskMode: 'developer',
+      workflowSetup: {
+        devTargetKind: 'script',
+        primaryEntityLogicalName: 'nvr_servicecase',
+        artifactPath: 'Scripts/nvr_servicecase_events.js',
+        confirmedAt: '2026-06-01T10:00:00.000Z',
+      },
+      crmDeveloperWorkflow: {
+        detectedWorkKind: 'script',
+        technicalPlan: {
+          workKind: 'script',
+          summary: 'Custom handler.',
+          implementationSteps: ['TODO: implement the handler'],
+          fieldMappings: [],
+          unmappedSourceFields: [],
+          risks: [],
+          testChecklist: [],
+          target: { entityLogicalName: 'nvr_servicecase' },
+        },
+      },
+    });
+    await fs.writeFile(path.join(tmpDir, 'tasks.json'), JSON.stringify([task]));
+    const origArgv = process.argv;
+    process.argv = [...process.argv, '--data-dir', tmpDir, '--fallback-readonly'];
+    try {
+      const result = await callToolFallback('approve_technical_plan_if_safe', { taskId: 'task-approve-todo-no-fm' });
+      // Cannot refresh because fieldMappings is empty → still blocks
+      expect(result.canApprove).toBe(false);
+      expect(Array.isArray(result.reasons)).toBe(true);
+    } finally {
+      process.argv = origArgv;
+      await fs.rm(tmpDir, { recursive: true });
+    }
+  });
+
+  it('scenario 12: plan refresh audit note contains safe plan refresh marker', async () => {
+    const { os, fs, path } = await importHelpers();
+    const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'tw-mcp-approve12-'));
+    const task = makeTemplateTaskAwaitingApproval('task-approve-refresh-audit');
+    task.crmDeveloperWorkflow.technicalPlan.implementationSteps = ['TODO: implement the field copy logic'];
+    task.crmDeveloperWorkflow.technicalPlan.risks = ['field mappings are not defined'];
+    await fs.writeFile(path.join(tmpDir, 'tasks.json'), JSON.stringify([task]));
+    const origArgv = process.argv;
+    process.argv = [...process.argv, '--data-dir', tmpDir, '--fallback-readonly'];
+    try {
+      const result = await callToolFallback('approve_technical_plan_if_safe', { taskId: 'task-approve-refresh-audit' });
+      expect(result.canApprove).toBe(true);
+      expect(result.planRefreshed).toBe(true);
+      // Audit note for the refresh must be persisted
+      const saved = JSON.parse(await fs.readFile(path.join(tmpDir, 'tasks.json'), 'utf8'));
+      const savedTask = saved.find((t) => t.id === 'task-approve-refresh-audit');
+      const notes = savedTask?.notes ?? '';
+      expect(notes.includes('safe plan refresh')).toBe(true);
+      expect(notes.includes('approve_technical_plan_if_safe')).toBe(true);
+    } finally {
+      process.argv = origArgv;
+      await fs.rm(tmpDir, { recursive: true });
+    }
+  });
+
+  it('scenario 13: normal approval (no scaffold steps) returns planRefreshed=false', async () => {
+    // Template task with clean steps → normal approval, planRefreshed must be false.
+    const { os, fs, path } = await importHelpers();
+    const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'tw-mcp-approve13-'));
+    await fs.writeFile(path.join(tmpDir, 'tasks.json'), JSON.stringify([makeTemplateTaskAwaitingApproval('task-approve-no-refresh')]));
+    const origArgv = process.argv;
+    process.argv = [...process.argv, '--data-dir', tmpDir, '--fallback-readonly'];
+    try {
+      const result = await callToolFallback('approve_technical_plan_if_safe', { taskId: 'task-approve-no-refresh' });
+      expect(result.canApprove).toBe(true);
+      expect(result.planRefreshed).toBe(false);
+    } finally {
+      process.argv = origArgv;
+      await fs.rm(tmpDir, { recursive: true });
+    }
+  });
+
+  it('scenario 14: plan refresh removes risks mentioning hallucinated entity nvr_asset not in packet', async () => {
+    // The stale plan risk mentions "nvr_asset" — an entity name hallucinated from the lookup
+    // field "nvr_assetid". The real source entity is nvr_customerasset (per fieldMappings/template).
+    // After safe plan refresh, no risk should mention nvr_asset.
+    const { os, fs, path } = await importHelpers();
+    const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'tw-mcp-approve14-'));
+    const task = makeTemplateTaskAwaitingApproval('task-approve-stale-entity');
+    task.crmDeveloperWorkflow.technicalPlan.implementationSteps = ['TODO: implement the field copy logic'];
+    task.crmDeveloperWorkflow.technicalPlan.risks = [
+      'TODO: verify fields',
+      'Logický název entity zařízení (nvr_asset) musí být ověřen v prostředí.',
+      'Manual testing should be performed after deployment.',
+    ];
+    await fs.writeFile(path.join(tmpDir, 'tasks.json'), JSON.stringify([task]));
+    const origArgv = process.argv;
+    process.argv = [...process.argv, '--data-dir', tmpDir, '--fallback-readonly'];
+    try {
+      const result = await callToolFallback('approve_technical_plan_if_safe', { taskId: 'task-approve-stale-entity' });
+      expect(result.canApprove).toBe(true);
+      expect(result.planRefreshed).toBe(true);
+
+      const saved = JSON.parse(await fs.readFile(path.join(tmpDir, 'tasks.json'), 'utf8'));
+      const savedTask = saved.find((t) => t.id === 'task-approve-stale-entity');
+      const risks = savedTask?.crmDeveloperWorkflow?.technicalPlan?.risks ?? [];
+
+      // No risk should mention the hallucinated nvr_asset entity (without also mentioning nvr_customerasset).
+      expect(risks.every((r) => !(r.includes('nvr_asset') && !r.includes('nvr_customerasset')))).toBe(true);
+      // The generic real risk must be preserved (it contains no CRM entity names).
+      expect(risks.some((r) => r.includes('Manual testing'))).toBe(true);
+    } finally {
+      process.argv = origArgv;
+      await fs.rm(tmpDir, { recursive: true });
+    }
+  });
+
+  it('scenario 15: plan refresh preserves risks mentioning the allowed entity nvr_customerasset', async () => {
+    // A risk that explicitly references the correct source entity nvr_customerasset must survive
+    // the unknown-entity filter, since nvr_customerasset IS in the packet's allowed name set.
+    const { os, fs, path } = await importHelpers();
+    const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'tw-mcp-approve15-'));
+    const task = makeTemplateTaskAwaitingApproval('task-approve-allowed-entity');
+    task.crmDeveloperWorkflow.technicalPlan.implementationSteps = ['TODO: implement'];
+    task.crmDeveloperWorkflow.technicalPlan.risks = [
+      'Logické názvy entity nvr_customerasset a polí podléhají ověření v prostředí.',
+    ];
+    await fs.writeFile(path.join(tmpDir, 'tasks.json'), JSON.stringify([task]));
+    const origArgv = process.argv;
+    process.argv = [...process.argv, '--data-dir', tmpDir, '--fallback-readonly'];
+    try {
+      const result = await callToolFallback('approve_technical_plan_if_safe', { taskId: 'task-approve-allowed-entity' });
+      expect(result.canApprove).toBe(true);
+      expect(result.planRefreshed).toBe(true);
+
+      const saved = JSON.parse(await fs.readFile(path.join(tmpDir, 'tasks.json'), 'utf8'));
+      const savedTask = saved.find((t) => t.id === 'task-approve-allowed-entity');
+      const risks = savedTask?.crmDeveloperWorkflow?.technicalPlan?.risks ?? [];
+
+      // The risk mentioning the legitimate entity nvr_customerasset must be preserved.
+      expect(risks.some((r) => r.includes('nvr_customerasset'))).toBe(true);
+    } finally {
+      process.argv = origArgv;
+      await fs.rm(tmpDir, { recursive: true });
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// get_developer_work_packet — post-packet stale entity risk filtering
+// Tests that already-approved plans with persisted stale CRM entity risks have those
+// risks filtered from the returned packet, even without going through the refresh path.
+// ---------------------------------------------------------------------------
+
+describe('get_developer_work_packet – stale entity risk filtering', () => {
+  async function importHelpers() {
+    const os = await import('node:os');
+    const fs = await import('node:fs/promises');
+    const path = await import('node:path');
+    return { os, fs, path };
+  }
+
+  // Task matching nvr-training-sh-script-prefill template; planApproval already set;
+  // persisted risks contain a hallucinated nvr_asset entity name.
+  function makeApprovedTaskWithStaleNvrAssetRisk(id = 'task-gdwp-stale') {
+    return makeTask({
+      id,
+      title: 'Script: Předvyplnění servisního požadavku',
+      customerId: 'nvr-test',
+      workflowSetup: {
+        devTargetKind: 'script',
+        repositoryRoot: 'C:\\Repos\\NVR',
+        actionType: 'create-new-script',
+        primaryEntityLogicalName: 'nvr_servicecase',
+        artifactPath: 'Scripts\\nvr_servicecase_events.js',
+        confirmedAt: '2026-06-01T10:00:00.000Z',
+        eventName: 'onChange',
+        eventFieldName: 'nvr_assetid',
+        onLoadFunctionName: 'nvr_servicecase_OnLoad',
+        onChangeFunctionName: 'nvr_assetid_OnChange',
+      },
+      crmDeveloperWorkflow: {
+        detectedWorkKind: 'script',
+        planApproval: { approved: true, approvedAt: '2026-06-01T11:00:00.000Z' },
+        technicalPlan: {
+          workKind: 'script',
+          summary: 'Create onChange handler for nvr_assetid on nvr_servicecase.',
+          implementationSteps: ['Implement the onChange prefill handler.'],
+          fieldMappings: [],
+          unmappedSourceFields: [],
+          risks: [
+            'Logický název entity zařízení (nvr_asset) musí být ověřen v prostředí.',
+            'Dataverse metadata must be verified in-app for JS/TS.',
+          ],
+          testChecklist: [],
+          target: { entityLogicalName: 'nvr_servicecase', scriptPath: 'Scripts\\nvr_servicecase_events.js', eventName: 'onChange', eventFieldName: 'nvr_assetid' },
+        },
+      },
+      implementationVerification: { dataverseCheck: { status: 'skipped' } },
+    });
+  }
+
+  it('already-approved task: returned packet risks exclude hallucinated nvr_asset entity', async () => {
+    const { os, fs, path } = await importHelpers();
+    const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'tw-mcp-gdwp1-'));
+    await fs.writeFile(path.join(tmpDir, 'tasks.json'), JSON.stringify([makeApprovedTaskWithStaleNvrAssetRisk()]));
+    const origArgv = process.argv;
+    process.argv = [...process.argv, '--data-dir', tmpDir, '--fallback-readonly'];
+    try {
+      const packet = await callToolFallback('get_developer_work_packet', { taskId: 'task-gdwp-stale' });
+      expect(packet.canWriteCode).toBe(true);
+      const risks = packet.implementation?.risks ?? [];
+      expect(risks.every((r) => !(r.includes('nvr_asset') && !r.includes('nvr_customerasset')))).toBe(true);
+    } finally {
+      process.argv = origArgv;
+      await fs.rm(tmpDir, { recursive: true });
+    }
+  });
+
+  it('already-approved task: canWriteCode remains true after stale risk is filtered', async () => {
+    const { os, fs, path } = await importHelpers();
+    const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'tw-mcp-gdwp2-'));
+    await fs.writeFile(path.join(tmpDir, 'tasks.json'), JSON.stringify([makeApprovedTaskWithStaleNvrAssetRisk()]));
+    const origArgv = process.argv;
+    process.argv = [...process.argv, '--data-dir', tmpDir, '--fallback-readonly'];
+    try {
+      const packet = await callToolFallback('get_developer_work_packet', { taskId: 'task-gdwp-stale' });
+      expect(packet.canWriteCode).toBe(true);
+    } finally {
+      process.argv = origArgv;
+      await fs.rm(tmpDir, { recursive: true });
+    }
+  });
+
+  it('already-approved task: nvr_assetid event field is allowed; nvr_asset is not inferred from it', async () => {
+    // The event field name nvr_assetid must not cause nvr_asset to be treated as an entity name.
+    // Only nvr_asset risks (not nvr_assetid risks) must be removed.
+    const { os, fs, path } = await importHelpers();
+    const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'tw-mcp-gdwp3-'));
+    const task = makeApprovedTaskWithStaleNvrAssetRisk('task-gdwp-fields');
+    task.crmDeveloperWorkflow.technicalPlan.risks = [
+      'Logický název entity zařízení (nvr_asset) musí být ověřen.',
+      'Dataverse metadata must be verified in-app for JS/TS.',
+    ];
+    await fs.writeFile(path.join(tmpDir, 'tasks.json'), JSON.stringify([task]));
+    const origArgv = process.argv;
+    process.argv = [...process.argv, '--data-dir', tmpDir, '--fallback-readonly'];
+    try {
+      const packet = await callToolFallback('get_developer_work_packet', { taskId: 'task-gdwp-fields' });
+      const risks = packet.implementation?.risks ?? [];
+      // Stale nvr_asset risk removed; standard Dataverse risk (no CRM entity names) preserved.
+      expect(risks.every((r) => !(r.includes('nvr_asset') && !r.includes('nvr_customerasset')))).toBe(true);
+      expect(risks.some((r) => r.includes('Dataverse'))).toBe(true);
+    } finally {
+      process.argv = origArgv;
+      await fs.rm(tmpDir, { recursive: true });
+    }
+  });
+
+  it('already-approved task: risk mentioning allowed entity nvr_customerasset is preserved', async () => {
+    const { os, fs, path } = await importHelpers();
+    const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'tw-mcp-gdwp4-'));
+    const task = makeApprovedTaskWithStaleNvrAssetRisk('task-gdwp-allowed');
+    task.crmDeveloperWorkflow.technicalPlan.risks = [
+      'Logické názvy entity nvr_customerasset a polí podléhají ověření v prostředí.',
+    ];
+    await fs.writeFile(path.join(tmpDir, 'tasks.json'), JSON.stringify([task]));
+    const origArgv = process.argv;
+    process.argv = [...process.argv, '--data-dir', tmpDir, '--fallback-readonly'];
+    try {
+      const packet = await callToolFallback('get_developer_work_packet', { taskId: 'task-gdwp-allowed' });
+      const risks = packet.implementation?.risks ?? [];
+      expect(risks.some((r) => r.includes('nvr_customerasset'))).toBe(true);
     } finally {
       process.argv = origArgv;
       await fs.rm(tmpDir, { recursive: true });

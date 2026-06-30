@@ -6925,6 +6925,229 @@ fn task_mcp_matches_scaffold_text(text: &str) -> bool {
     false
 }
 
+/// Returns true when the packet has the concrete trusted data needed to safely replace
+/// stale scaffold plan steps/risks with deterministic steps derived from the work packet.
+///
+/// Called only when the safety check returned exactly one reason (the TODO/scaffold text
+/// reason). All other safety conditions (external actions, trusted source, scaffoldOnly,
+/// etc.) were already verified by the safety check returning a single reason, but the
+/// packet-level conditions below are double-checked for belt-and-suspenders safety.
+fn task_mcp_can_safely_refresh_plan(packet: &Value) -> bool {
+    let impl_obj  = &packet["implementation"];
+    let write_tgt = &packet["writeTarget"];
+
+    // Field mappings must be non-empty and from a trusted source.
+    let fm_count  = impl_obj["fieldMappings"].as_array().map(|a| a.len()).unwrap_or(0);
+    if fm_count == 0 { return false; }
+    let fm_source = impl_obj["fieldMappingsSource"].as_str().unwrap_or("none");
+    if !matches!(fm_source, "template" | "plan") { return false; }
+
+    // Packet must not flag scaffoldOnly or finalConsistencyGuardApplied.
+    if impl_obj["scaffoldOnly"].as_bool().unwrap_or(true)                { return false; }
+    if impl_obj["finalConsistencyGuardApplied"].as_bool().unwrap_or(true) { return false; }
+
+    // writeTarget must have the concrete values required to generate steps.
+    if write_tgt["artifactPath"].as_str().filter(|s| !s.is_empty()).is_none() { return false; }
+    if write_tgt["targetEntity"].as_str().filter(|s| !s.is_empty()).is_none() { return false; }
+
+    true
+}
+
+/// Generates concrete, deterministic implementation steps from a trusted work packet.
+/// Used by the safe plan refresh path to replace stale scaffold/TODO steps.
+fn task_mcp_generate_concrete_steps_from_packet(packet: &Value) -> Vec<Value> {
+    let write_tgt = &packet["writeTarget"];
+    let impl_obj  = &packet["implementation"];
+    let field_mappings   = impl_obj["fieldMappings"].as_array().cloned().unwrap_or_default();
+    let validation_fields = impl_obj["validationFields"].as_array().cloned().unwrap_or_default();
+    let work_kind = write_tgt["kind"].as_str().unwrap_or("");
+    let mut steps: Vec<Value> = Vec::new();
+
+    if work_kind == "script" || work_kind == "ribbon" {
+        // 1. File action
+        if let Some(ap) = write_tgt["artifactPath"].as_str().filter(|s| !s.is_empty()) {
+            steps.push(serde_json::json!(format!("Create or update {}.", ap)));
+        }
+        // 2. Handler registration
+        let on_load   = write_tgt["handlers"]["onLoad"].as_str().unwrap_or("");
+        let on_change = write_tgt["handlers"]["onChange"].as_str().unwrap_or("");
+        match (!on_load.is_empty(), !on_change.is_empty()) {
+            (true, true)  => steps.push(serde_json::json!(format!("Register/prepare handlers {} and {}.", on_load, on_change))),
+            (true, false) => steps.push(serde_json::json!(format!("Register/prepare handler {}.", on_load))),
+            _             => {}
+        }
+        // 3. Retrieve source entity on event field change
+        let event_field = write_tgt["eventFieldName"].as_str().unwrap_or("");
+        if !event_field.is_empty() {
+            let source_entity = field_mappings.first()
+                .and_then(|m| m["source"].as_str())
+                .and_then(|s| s.split('.').next())
+                .unwrap_or("source");
+            steps.push(serde_json::json!(format!(
+                "On {} change, retrieve {} using Xrm.WebApi.retrieveRecord.",
+                event_field, source_entity
+            )));
+        }
+        // 4. Copy field mappings
+        for m in &field_mappings {
+            if let (Some(src), Some(tgt)) = (m["source"].as_str(), m["target"].as_str()) {
+                steps.push(serde_json::json!(format!("Copy {} to {}.", src, tgt)));
+            }
+        }
+        // 5. Validation-only fields
+        for vf in &validation_fields {
+            if let Some(s) = vf.as_str() {
+                steps.push(serde_json::json!(format!("Use {} only as validation source for conditional logic.", s)));
+            }
+        }
+        // 6. No-auto-save / no-upload guardrails
+        steps.push(serde_json::json!("Do not auto-save the form."));
+        steps.push(serde_json::json!("Do not upload/register the web resource automatically."));
+    } else {
+        // Plugin
+        let artifact = write_tgt["artifactPath"].as_str()
+            .or_else(|| write_tgt["pluginProject"].as_str())
+            .unwrap_or("");
+        if !artifact.is_empty() {
+            steps.push(serde_json::json!(format!("Create or update the plugin class in {}.", artifact)));
+        }
+        let message       = write_tgt["message"].as_str().unwrap_or("");
+        let stage         = write_tgt["stage"].as_str().unwrap_or("");
+        let target_entity = write_tgt["targetEntity"].as_str().unwrap_or("");
+        if !message.is_empty() && !stage.is_empty() && !target_entity.is_empty() {
+            steps.push(serde_json::json!(format!("Register handler for {} {} on {}.", message, stage, target_entity)));
+        }
+        for m in &field_mappings {
+            if let (Some(src), Some(tgt)) = (m["source"].as_str(), m["target"].as_str()) {
+                steps.push(serde_json::json!(format!("Set {} from {}.", tgt, src)));
+            }
+        }
+    }
+
+    steps
+}
+
+/// Returns true if `word` (expected already lowercased) looks like a CRM logical name.
+/// Pattern: 3–5 lowercase-letter publisher prefix + `_` + ≥3-char lowercase/digit/`_` suffix.
+/// The 3-char minimum on the prefix avoids false positives from common 2-letter English words
+/// like "is", "on", "no" that would otherwise match the publisher-prefix shape.
+fn task_mcp_looks_like_crm_name(word: &str) -> bool {
+    let Some(first_us) = word.find('_') else { return false; };
+    if first_us < 3 || first_us > 5 { return false; }
+    if first_us + 1 >= word.len() { return false; }
+    let prefix = &word[..first_us];
+    let suffix = &word[first_us + 1..];
+    if !prefix.chars().all(|c| c.is_ascii_lowercase()) { return false; }
+    if suffix.len() < 3 { return false; }
+    if !suffix.chars().next().map(|c| c.is_ascii_lowercase()).unwrap_or(false) { return false; }
+    suffix.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+}
+
+/// Builds the set of logical names (entities and fields) that are trusted in the given work packet.
+/// Includes: target entity, event field name, entity/field parts from fieldMappings and validationFields.
+fn task_mcp_build_allowed_logical_names(packet: &Value) -> std::collections::HashSet<String> {
+    let mut allowed = std::collections::HashSet::<String>::new();
+    let impl_obj  = &packet["implementation"];
+    let write_tgt = &packet["writeTarget"];
+
+    fn add_dotted(set: &mut std::collections::HashSet<String>, s: &str) {
+        let lower = s.to_lowercase();
+        set.insert(lower.clone());
+        if let Some(dot) = lower.find('.') {
+            set.insert(lower[..dot].to_string());
+            set.insert(lower[dot + 1..].to_string());
+        }
+    }
+
+    if let Some(s) = write_tgt["targetEntity"].as_str().filter(|s| !s.is_empty()) {
+        allowed.insert(s.to_lowercase());
+    }
+    // eventFieldName is a field name (e.g. nvr_assetid), not an entity name — still add it so
+    // risks that legitimately mention the trigger field are not incorrectly removed.
+    if let Some(s) = write_tgt["eventFieldName"].as_str().filter(|s| !s.is_empty()) {
+        allowed.insert(s.to_lowercase());
+    }
+    if let Some(mappings) = impl_obj["fieldMappings"].as_array() {
+        for m in mappings {
+            for key in ["source", "target"] {
+                if let Some(s) = m[key].as_str().filter(|s| !s.is_empty()) {
+                    add_dotted(&mut allowed, s);
+                }
+            }
+        }
+    }
+    if let Some(vfs) = impl_obj["validationFields"].as_array() {
+        for vf in vfs {
+            if let Some(s) = vf.as_str().filter(|s| !s.is_empty()) {
+                add_dotted(&mut allowed, s);
+            }
+        }
+    }
+    allowed
+}
+
+/// Returns `true` if `risk_text` contains a CRM-style logical name that is **not** in `allowed`.
+/// Used to filter risks that mention hallucinated or stale entity/field names not present in the
+/// trusted work packet.
+fn task_mcp_risk_mentions_unknown_entity(risk_text: &str, allowed: &std::collections::HashSet<String>) -> bool {
+    let lower = risk_text.to_lowercase();
+    let mut word_start: Option<usize> = None;
+    for (byte_pos, ch) in lower.char_indices() {
+        if ch.is_ascii_alphanumeric() || ch == '_' {
+            if word_start.is_none() { word_start = Some(byte_pos); }
+        } else if let Some(start) = word_start.take() {
+            let word = &lower[start..byte_pos];
+            if task_mcp_looks_like_crm_name(word) && !allowed.contains(word) {
+                return true;
+            }
+        }
+    }
+    // Handle a word that runs to the end of the string.
+    if let Some(start) = word_start {
+        let word = &lower[start..];
+        if task_mcp_looks_like_crm_name(word) && !allowed.contains(word) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Returns the cleaned risks for a refreshed plan: removes scaffold/TODO risks from
+/// `existing_risks`, also removes risks that mention CRM entity names not present in the
+/// trusted packet (to eliminate hallucinated/stale entity references), and appends standard
+/// guardrail risks for the work kind if not already present.
+fn task_mcp_generate_clean_risks_from_packet(existing_risks: &[Value], packet: &Value) -> Vec<Value> {
+    let work_kind = packet["writeTarget"]["kind"].as_str().unwrap_or("");
+    let allowed = task_mcp_build_allowed_logical_names(packet);
+
+    // Preserve risks that contain neither scaffold/TODO text nor unknown CRM entity names.
+    let mut risks: Vec<Value> = existing_risks.iter()
+        .filter(|v| {
+            let t = v.as_str().map(str::to_string).unwrap_or_else(|| v.to_string());
+            !task_mcp_matches_scaffold_text(&t) && !task_mcp_risk_mentions_unknown_entity(&t, &allowed)
+        })
+        .cloned()
+        .collect();
+
+    // Append standard guardrail risks if not already present.
+    let standard: &[&str] = if work_kind == "script" || work_kind == "ribbon" {
+        &[
+            "Dataverse metadata must be verified in-app for JS/TS.",
+            "Web resource upload and form registration are manual/approval-gated steps.",
+        ]
+    } else {
+        &["Plugin registration is a manual approval-gated step."]
+    };
+    for &risk in standard {
+        let already = risks.iter().any(|r| r.as_str().map(|s| s.contains(risk)).unwrap_or(false));
+        if !already {
+            risks.push(serde_json::json!(risk));
+        }
+    }
+
+    risks
+}
+
 /// Check whether a candidate string looks like `entity.field` where both parts are
 /// CRM-style logical names (underscore-separated lowercase alphanumeric).
 fn task_mcp_is_valid_crm_dotted(s: &str) -> bool {
@@ -7499,7 +7722,7 @@ fn task_mcp_developer_work_packet(task: &Value, customer_dev_defaults: Option<&V
         else if !plan_field_mappings.is_empty() { "plan" }
         else { "none" };
 
-    serde_json::json!({
+    let mut packet = serde_json::json!({
         "taskId": task["id"].as_str().unwrap_or(""),
         "packetGeneratorVersion": DEVELOPER_WORK_PACKET_VERSION,
         "status": if can_write { "ready_to_code" } else { "not_ready" },
@@ -7584,7 +7807,24 @@ fn task_mcp_developer_work_packet(task: &Value, customer_dev_defaults: Option<&V
             "nextRecommendedStep": next["step"].as_str(),
         },
         "task": task_mcp_safe_task_summary(task),
-    })
+    });
+    // Post-packet filter: remove risks that mention CRM entity names absent from the trusted packet.
+    // Applied after full assembly so writeTarget (targetEntity, eventFieldName) is available.
+    // Only runs when the packet is ready-to-code with concrete field mappings — the same condition
+    // used by sanitized_risks — to avoid silently dropping risks on unapproved/incomplete plans.
+    if can_write && !final_field_mappings.is_empty() {
+        let allowed = task_mcp_build_allowed_logical_names(&packet);
+        if let Some(risks) = packet["implementation"]["risks"].as_array().cloned() {
+            let filtered: Vec<Value> = risks.into_iter()
+                .filter(|v| {
+                    let t = v.as_str().map(str::to_string).unwrap_or_else(|| v.to_string());
+                    !task_mcp_risk_mentions_unknown_entity(&t, &allowed)
+                })
+                .collect();
+            packet["implementation"]["risks"] = Value::Array(filtered);
+        }
+    }
+    packet
 }
 
 fn task_mcp_allowed_statuses() -> &'static [&'static str] {
@@ -9605,13 +9845,35 @@ fn task_mcp_execute_tool(app: &tauri::AppHandle, tool_name: &str, args: &Value) 
             let packet = task_mcp_developer_work_packet(&task_snapshot, dev_defaults.as_ref(), ai_kit_path.as_deref());
 
             let reasons = task_mcp_plan_approval_safety_check(&task_snapshot, &packet);
-            if !reasons.is_empty() {
+
+            // Safe plan refresh path: if the ONLY blocker is stale scaffold/TODO text in
+            // the plan steps/risks, and the packet already has trusted concrete field mappings,
+            // replace the stale plan text with deterministic steps derived from the work
+            // packet — then approve. This avoids requiring a full plan regeneration when the
+            // implementation data in the packet is already complete and trustworthy.
+            let is_only_scaffold_blocker = reasons.len() == 1
+                && reasons[0].contains("TODO/scaffold/placeholder");
+            let can_refresh = is_only_scaffold_blocker && task_mcp_can_safely_refresh_plan(&packet);
+
+            if !reasons.is_empty() && !can_refresh {
                 return Ok(serde_json::json!({ "canApprove": false, "reasons": reasons }));
             }
 
-            // All safety conditions met — set plan approval.
             let now = chrono_now_iso();
             let task = &mut tasks[index];
+
+            if can_refresh {
+                // Replace stale scaffold steps/risks with concrete packet-derived content.
+                let existing_risks: Vec<Value> = task["crmDeveloperWorkflow"]["technicalPlan"]["risks"]
+                    .as_array().cloned().unwrap_or_default();
+                let new_steps = task_mcp_generate_concrete_steps_from_packet(&packet);
+                let new_risks = task_mcp_generate_clean_risks_from_packet(&existing_risks, &packet);
+                task["crmDeveloperWorkflow"]["technicalPlan"]["implementationSteps"] = serde_json::json!(new_steps);
+                task["crmDeveloperWorkflow"]["technicalPlan"]["risks"] = serde_json::json!(new_risks);
+                task_mcp_append_audit_note(task, "approve_technical_plan_if_safe [safe plan refresh: stale scaffold steps/risks replaced from trusted work packet]");
+            }
+
+            // All safety conditions met (or safe refresh applied) — set plan approval.
             task["crmDeveloperWorkflow"]["planApproval"] = serde_json::json!({
                 "approved": true,
                 "approvedAt": now,
@@ -9627,6 +9889,7 @@ fn task_mcp_execute_tool(app: &tauri::AppHandle, tool_name: &str, args: &Value) 
             let refreshed_packet = task_mcp_developer_work_packet(&refreshed_task, dev_defaults2.as_ref(), ai_kit_path.as_deref());
             serde_json::json!({
                 "canApprove": true,
+                "planRefreshed": can_refresh,
                 "approvedAt": now,
                 "workPacket": refreshed_packet,
             })
@@ -14910,6 +15173,389 @@ mod developer_work_packet_tests {
         let defs = task_mcp_local_write_tool_definitions();
         let found = defs.iter().any(|d| d["name"].as_str() == Some("approve_technical_plan_if_safe"));
         assert!(found, "approve_technical_plan_if_safe must be in task_mcp_local_write_tool_definitions (tools/list write set)");
+    }
+
+    // ── developer work packet risk filtering for already-approved plans ────────
+
+    /// Template task with planApproval already set AND a persisted risk that mentions the
+    /// hallucinated entity name "nvr_asset". Simulates task 1ad0cc9a after the plan was
+    /// approved before the stale-risk cleanup was implemented.
+    fn make_approved_task_with_stale_nvr_asset_risk() -> Value {
+        let mut task = make_template_task_no_plan_mappings();
+        task["crmDeveloperWorkflow"]["technicalPlan"]["risks"] = serde_json::json!([
+            "Logický název entity zařízení (nvr_asset) musí být ověřen v prostředí.",
+            "Dataverse metadata must be verified in-app for JS/TS.",
+        ]);
+        task
+    }
+
+    #[test]
+    fn developer_work_packet_filters_stale_nvr_asset_risk_from_approved_plan() {
+        // Task was approved before cleanup — persisted risks contain a stale nvr_asset reference.
+        // The work packet must filter it out even though the plan is already approved.
+        let task = make_approved_task_with_stale_nvr_asset_risk();
+        let packet = task_mcp_developer_work_packet(&task, None, None);
+
+        assert_eq!(packet["canWriteCode"].as_bool(), Some(true),
+            "canWriteCode must remain true; got: {:?}", packet["decisionReason"]);
+
+        let risks: Vec<&str> = packet["implementation"]["risks"]
+            .as_array().into_iter().flatten().filter_map(|v| v.as_str()).collect();
+
+        assert!(
+            !risks.iter().any(|s| s.contains("nvr_asset") && !s.contains("nvr_customerasset")),
+            "Packet risks must not contain hallucinated entity nvr_asset; got: {:?}", risks
+        );
+    }
+
+    #[test]
+    fn developer_work_packet_can_write_code_true_after_stale_risk_filtered() {
+        // Filtering stale risks must not affect canWriteCode.
+        let task = make_approved_task_with_stale_nvr_asset_risk();
+        let packet = task_mcp_developer_work_packet(&task, None, None);
+        assert_eq!(packet["canWriteCode"].as_bool(), Some(true),
+            "canWriteCode must stay true after stale-risk filter; got: {:?}", packet["decisionReason"]);
+    }
+
+    #[test]
+    fn developer_work_packet_preserves_standard_guardrail_risk_in_approved_plan() {
+        // The standard Dataverse guardrail risk must survive the entity-name filter (no CRM names).
+        let task = make_approved_task_with_stale_nvr_asset_risk();
+        let packet = task_mcp_developer_work_packet(&task, None, None);
+        let risks: Vec<&str> = packet["implementation"]["risks"]
+            .as_array().into_iter().flatten().filter_map(|v| v.as_str()).collect();
+        assert!(
+            risks.iter().any(|s| s.contains("Dataverse")),
+            "Standard Dataverse risk must be preserved; got: {:?}", risks
+        );
+    }
+
+    #[test]
+    fn developer_work_packet_nvr_assetid_allowed_nvr_asset_not_allowed() {
+        // eventFieldName nvr_assetid must be in the allowed set; nvr_asset must not be.
+        let task = make_approved_task_with_stale_nvr_asset_risk();
+        let packet = task_mcp_developer_work_packet(&task, None, None);
+        let allowed = task_mcp_build_allowed_logical_names(&packet);
+        assert!(allowed.contains("nvr_assetid"),
+            "nvr_assetid (event field name) must be in allowed set");
+        assert!(!allowed.contains("nvr_asset"),
+            "nvr_asset must NOT be in allowed set — it is inferred from the field name, not from mappings");
+    }
+
+    #[test]
+    fn developer_work_packet_preserves_nvr_customerasset_risk_in_approved_plan() {
+        // A risk that mentions the correct source entity nvr_customerasset must be preserved.
+        let mut task = make_approved_task_with_stale_nvr_asset_risk();
+        task["crmDeveloperWorkflow"]["technicalPlan"]["risks"] = serde_json::json!([
+            "Logické názvy entity nvr_customerasset a polí podléhají ověření v prostředí.",
+        ]);
+        let packet = task_mcp_developer_work_packet(&task, None, None);
+        let risks: Vec<&str> = packet["implementation"]["risks"]
+            .as_array().into_iter().flatten().filter_map(|v| v.as_str()).collect();
+        assert!(
+            risks.iter().any(|s| s.contains("nvr_customerasset")),
+            "Risk mentioning the allowed entity nvr_customerasset must be preserved; got: {:?}", risks
+        );
+    }
+
+    // ── safe plan refresh path ────────────────────────────────────────────────
+
+    fn make_template_task_with_stale_scaffold_steps() -> Value {
+        let mut task = make_template_task_awaiting_approval();
+        task["crmDeveloperWorkflow"]["technicalPlan"]["implementationSteps"] =
+            serde_json::json!(["TODO: implement the field copy logic", "TODO: fill in field mappings"]);
+        task["crmDeveloperWorkflow"]["technicalPlan"]["risks"] =
+            serde_json::json!(["field mappings are not defined", "script contains TODO comments"]);
+        task
+    }
+
+    #[test]
+    fn can_safely_refresh_plan_when_only_todo_and_trusted_template_mappings() {
+        // Template task: only TODO/scaffold blocker, packet has 3 trusted template mappings.
+        let task = make_template_task_with_stale_scaffold_steps();
+        let packet = task_mcp_developer_work_packet(&task, None, None);
+        let reasons = task_mcp_plan_approval_safety_check(&task, &packet);
+        assert_eq!(reasons.len(), 1, "Precondition: exactly one blocker (scaffold text); got: {:?}", reasons);
+        assert!(reasons[0].contains("TODO/scaffold/placeholder"),
+            "Precondition: blocker must be scaffold text; got: {}", reasons[0]);
+        assert!(task_mcp_can_safely_refresh_plan(&packet),
+            "Should be able to safely refresh when only scaffold blocker and trusted template mappings");
+    }
+
+    #[test]
+    fn cannot_safely_refresh_plan_when_field_mappings_empty() {
+        // Non-template task with empty fieldMappings: packet has no mappings → cannot refresh.
+        let task = serde_json::json!({
+            "id": "task-no-fm",
+            "title": "Script: custom no mappings",
+            "status": "in-progress",
+            "taskMode": "developer",
+            "workflowSetup": {
+                "devTargetKind": "script",
+                "primaryEntityLogicalName": "nvr_servicecase",
+                "artifactPath": "Scripts/nvr_servicecase_events.js",
+                "confirmedAt": "2026-06-01T10:00:00Z",
+            },
+            "crmDeveloperWorkflow": {
+                "detectedWorkKind": "script",
+                "technicalPlan": {
+                    "workKind": "script",
+                    "summary": "Custom handler.",
+                    "implementationSteps": ["TODO: implement the handler"],
+                    "fieldMappings": [],
+                    "unmappedSourceFields": [],
+                    "risks": [],
+                    "testChecklist": [],
+                    "target": { "entityLogicalName": "nvr_servicecase" }
+                }
+            }
+        });
+        let packet = task_mcp_developer_work_packet(&task, None, None);
+        let fm_count = packet["implementation"]["fieldMappings"].as_array().map(|a| a.len()).unwrap_or(0);
+        assert_eq!(fm_count, 0, "Precondition: empty field mappings");
+        assert!(!task_mcp_can_safely_refresh_plan(&packet),
+            "Must NOT refresh when field mappings are empty");
+    }
+
+    #[test]
+    fn cannot_safely_refresh_plan_when_scaffold_only() {
+        // Non-template task with unmapped source fields: scaffoldOnly=true → cannot refresh.
+        let task = make_non_template_task_with_unmapped_fields();
+        let packet = task_mcp_developer_work_packet(&task, None, None);
+        assert_eq!(packet["implementation"]["scaffoldOnly"].as_bool(), Some(true),
+            "Precondition: scaffoldOnly=true");
+        assert!(!task_mcp_can_safely_refresh_plan(&packet),
+            "Must NOT refresh when scaffoldOnly=true");
+    }
+
+    #[test]
+    fn cannot_safely_refresh_plan_when_external_actions_present() {
+        // Template task with externalActionPreview → safety check has external-actions reason
+        // AND can_safely_refresh_plan would block on external actions directly via task check.
+        // Here we verify the full flow: reasons.len() > 1, so can_refresh is false regardless.
+        let mut task = make_template_task_with_stale_scaffold_steps();
+        task["crmDeveloperWorkflow"]["technicalPlan"]["externalActionPreview"] =
+            serde_json::json!(["Register plugin step in Dataverse."]);
+        let packet = task_mcp_developer_work_packet(&task, None, None);
+        let reasons = task_mcp_plan_approval_safety_check(&task, &packet);
+        // Two reasons: external actions + scaffold text → is_only_scaffold_blocker=false
+        assert!(
+            reasons.len() >= 2 || reasons.iter().any(|r| r.contains("external actions")),
+            "Must block with external actions reason; got: {:?}", reasons
+        );
+        let is_only_scaffold = reasons.len() == 1 && reasons[0].contains("TODO/scaffold/placeholder");
+        assert!(!is_only_scaffold, "Should not be only-scaffold when external actions also present");
+    }
+
+    #[test]
+    fn generate_concrete_steps_includes_copy_steps_from_template_mappings() {
+        // For the template task, concrete steps must include "Copy source to target" for each mapping.
+        let task = make_template_task_with_stale_scaffold_steps();
+        let packet = task_mcp_developer_work_packet(&task, None, None);
+        let steps = task_mcp_generate_concrete_steps_from_packet(&packet);
+        let step_texts: Vec<&str> = steps.iter().filter_map(|v| v.as_str()).collect();
+        assert!(step_texts.iter().any(|s| s.contains("Copy") && s.contains("nvr_customerid")),
+            "Must include Copy step for nvr_customerid; got: {:?}", step_texts);
+        assert!(step_texts.iter().any(|s| s.contains("Copy") && s.contains("nvr_contactid")),
+            "Must include Copy step for nvr_contactid; got: {:?}", step_texts);
+        assert!(step_texts.iter().any(|s| s.contains("Copy") && s.contains("nvr_isunderwarranty")),
+            "Must include Copy step for nvr_isunderwarranty; got: {:?}", step_texts);
+    }
+
+    #[test]
+    fn generate_concrete_steps_includes_artifact_path_and_handlers() {
+        let task = make_template_task_with_stale_scaffold_steps();
+        let packet = task_mcp_developer_work_packet(&task, None, None);
+        let steps = task_mcp_generate_concrete_steps_from_packet(&packet);
+        let step_texts: Vec<&str> = steps.iter().filter_map(|v| v.as_str()).collect();
+        assert!(step_texts.iter().any(|s| s.contains("nvr_servicecase_events.js")),
+            "Must mention the artifact path; got: {:?}", step_texts);
+        assert!(step_texts.iter().any(|s| s.contains("nvr_servicecase_OnLoad")),
+            "Must mention onLoad handler; got: {:?}", step_texts);
+        assert!(step_texts.iter().any(|s| s.contains("nvr_assetid_OnChange")),
+            "Must mention onChange handler; got: {:?}", step_texts);
+    }
+
+    #[test]
+    fn generate_concrete_steps_no_todo_or_scaffold_text() {
+        let task = make_template_task_with_stale_scaffold_steps();
+        let packet = task_mcp_developer_work_packet(&task, None, None);
+        let steps = task_mcp_generate_concrete_steps_from_packet(&packet);
+        for step in &steps {
+            let text = step.as_str().unwrap_or("");
+            assert!(
+                !task_mcp_matches_scaffold_text(text),
+                "Generated step must not contain TODO/scaffold text; got: {text}"
+            );
+        }
+    }
+
+    #[test]
+    fn generate_concrete_steps_includes_no_autosave_and_no_upload() {
+        let task = make_template_task_with_stale_scaffold_steps();
+        let packet = task_mcp_developer_work_packet(&task, None, None);
+        let steps = task_mcp_generate_concrete_steps_from_packet(&packet);
+        let step_texts: Vec<&str> = steps.iter().filter_map(|v| v.as_str()).collect();
+        assert!(step_texts.iter().any(|s| s.contains("auto-save")),
+            "Must include no-auto-save guardrail; got: {:?}", step_texts);
+        assert!(step_texts.iter().any(|s| s.contains("upload") || s.contains("web resource")),
+            "Must include no-upload guardrail; got: {:?}", step_texts);
+    }
+
+    #[test]
+    fn generate_clean_risks_removes_scaffold_and_adds_standard() {
+        let existing_risks = vec![
+            serde_json::json!("field mappings are not defined"),
+            serde_json::json!("script contains TODO comments"),
+            serde_json::json!("Manual testing should be performed after deployment."),
+        ];
+        let task = make_template_task_with_stale_scaffold_steps();
+        let packet = task_mcp_developer_work_packet(&task, None, None);
+        let new_risks = task_mcp_generate_clean_risks_from_packet(&existing_risks, &packet);
+        let risks_text: Vec<&str> = new_risks.iter().filter_map(|v| v.as_str()).collect();
+
+        // Scaffold risks removed
+        assert!(!risks_text.iter().any(|s| task_mcp_matches_scaffold_text(s)),
+            "No scaffold/TODO risks should remain; got: {:?}", risks_text);
+        // Real risk preserved
+        assert!(risks_text.iter().any(|s| s.contains("Manual testing")),
+            "Real risks must be preserved; got: {:?}", risks_text);
+        // Standard risks added
+        assert!(risks_text.iter().any(|s| s.contains("Dataverse")),
+            "Must add Dataverse metadata risk; got: {:?}", risks_text);
+        assert!(risks_text.iter().any(|s| s.contains("Web resource") || s.contains("web resource")),
+            "Must add web resource risk; got: {:?}", risks_text);
+    }
+
+    #[test]
+    fn generate_clean_risks_does_not_duplicate_standard_risks() {
+        let existing_risks = vec![
+            serde_json::json!("Dataverse metadata must be verified in-app for JS/TS."),
+        ];
+        let task = make_template_task_with_stale_scaffold_steps();
+        let packet = task_mcp_developer_work_packet(&task, None, None);
+        let new_risks = task_mcp_generate_clean_risks_from_packet(&existing_risks, &packet);
+        let dataverse_count = new_risks.iter()
+            .filter(|v| v.as_str().map(|s| s.contains("Dataverse")).unwrap_or(false))
+            .count();
+        assert_eq!(dataverse_count, 1, "Standard risk must not be duplicated; got: {:?}", new_risks);
+    }
+
+    #[test]
+    fn plan_refresh_then_approval_enables_can_write_code() {
+        // Simulate the full refresh+approval flow and verify canWriteCode=true.
+        let mut task = make_template_task_with_stale_scaffold_steps();
+        let packet = task_mcp_developer_work_packet(&task, None, None);
+
+        // Verify preconditions
+        let reasons = task_mcp_plan_approval_safety_check(&task, &packet);
+        assert!(task_mcp_can_safely_refresh_plan(&packet), "Precondition: can refresh");
+        assert_eq!(reasons.len(), 1, "Precondition: only scaffold blocker");
+
+        // Apply the refresh
+        let existing_risks: Vec<Value> = task["crmDeveloperWorkflow"]["technicalPlan"]["risks"]
+            .as_array().cloned().unwrap_or_default();
+        let new_steps = task_mcp_generate_concrete_steps_from_packet(&packet);
+        let new_risks = task_mcp_generate_clean_risks_from_packet(&existing_risks, &packet);
+        task["crmDeveloperWorkflow"]["technicalPlan"]["implementationSteps"] = serde_json::json!(new_steps);
+        task["crmDeveloperWorkflow"]["technicalPlan"]["risks"] = serde_json::json!(new_risks);
+
+        // Apply approval
+        task["crmDeveloperWorkflow"]["planApproval"] = serde_json::json!({
+            "approved": true,
+            "approvedAt": "2026-06-30T12:00:00Z",
+        });
+
+        let refreshed_packet = task_mcp_developer_work_packet(&task, None, None);
+        assert_eq!(
+            refreshed_packet["canWriteCode"].as_bool(), Some(true),
+            "canWriteCode must be true after plan refresh and approval; reason: {:?}",
+            refreshed_packet["decisionReason"]
+        );
+    }
+
+    #[test]
+    fn plan_refresh_audit_note_contains_safe_plan_refresh_marker() {
+        let mut task = make_template_task_awaiting_approval();
+        task_mcp_append_audit_note(&mut task, "approve_technical_plan_if_safe [safe plan refresh: stale scaffold steps/risks replaced from trusted work packet]");
+        let notes = task["notes"].as_str().expect("notes must be a string");
+        assert!(
+            notes.contains("safe plan refresh"),
+            "Audit note must record safe plan refresh; got: {notes}"
+        );
+    }
+
+    // ── unknown-entity risk filtering ─────────────────────────────────────────
+
+    #[test]
+    fn looks_like_crm_name_accepts_typical_crm_names() {
+        assert!(task_mcp_looks_like_crm_name("nvr_asset"),         "nvr_asset should be CRM-like");
+        assert!(task_mcp_looks_like_crm_name("nvr_customerasset"), "nvr_customerasset should be CRM-like");
+        assert!(task_mcp_looks_like_crm_name("nvr_servicecase"),   "nvr_servicecase should be CRM-like");
+        assert!(task_mcp_looks_like_crm_name("msdyn_something"),   "msdyn_ prefix (5 chars) should be accepted");
+    }
+
+    #[test]
+    fn looks_like_crm_name_rejects_short_prefix_and_common_words() {
+        assert!(!task_mcp_looks_like_crm_name("is_valid"),  "is_ (2 chars) must be rejected – too short prefix");
+        assert!(!task_mcp_looks_like_crm_name("on_change"), "on_ (2 chars) must be rejected – too short prefix");
+        assert!(!task_mcp_looks_like_crm_name("no_data"),   "no_ (2 chars) must be rejected – too short prefix");
+        assert!(!task_mcp_looks_like_crm_name("logick"),    "no underscore – not a CRM name");
+        assert!(!task_mcp_looks_like_crm_name("nvr"),       "no underscore – not a CRM name");
+        assert!(!task_mcp_looks_like_crm_name("nvr_id"),    "suffix 'id' is only 2 chars – too short");
+    }
+
+    #[test]
+    fn build_allowed_logical_names_includes_packet_entities_but_not_nvr_asset() {
+        let task = make_template_task_with_stale_scaffold_steps();
+        let packet = task_mcp_developer_work_packet(&task, None, None);
+        let allowed = task_mcp_build_allowed_logical_names(&packet);
+        assert!(allowed.contains("nvr_servicecase"),   "target entity must be in allowed set");
+        assert!(allowed.contains("nvr_customerasset"), "source entity from mappings must be in allowed set");
+        assert!(allowed.contains("nvr_customerid"),    "field name from mappings must be in allowed set");
+        assert!(allowed.contains("nvr_assetid"),       "event field name must be in allowed set");
+        assert!(!allowed.contains("nvr_asset"),
+            "nvr_asset must NOT be in allowed set – it is a hallucinated entity name, not present in the packet");
+    }
+
+    #[test]
+    fn generate_clean_risks_removes_risk_mentioning_stale_nvr_asset_entity() {
+        let existing_risks = vec![
+            serde_json::json!("TODO: verify fields"),
+            serde_json::json!("Logický název entity zařízení (nvr_asset) musí být ověřen v prostředí."),
+            serde_json::json!("Manual testing should be performed after deployment."),
+        ];
+        let task = make_template_task_with_stale_scaffold_steps();
+        let packet = task_mcp_developer_work_packet(&task, None, None);
+        let new_risks = task_mcp_generate_clean_risks_from_packet(&existing_risks, &packet);
+        let risks_text: Vec<&str> = new_risks.iter().filter_map(|v| v.as_str()).collect();
+
+        // The stale risk mentioning the hallucinated nvr_asset entity must be removed.
+        assert!(
+            !risks_text.iter().any(|s| s.contains("nvr_asset") && !s.contains("nvr_customerasset")),
+            "Stale risk with hallucinated entity nvr_asset must be removed; got: {:?}", risks_text
+        );
+        // A generic real risk that mentions no CRM entity names must be preserved.
+        assert!(
+            risks_text.iter().any(|s| s.contains("Manual testing")),
+            "Generic real risk must be preserved; got: {:?}", risks_text
+        );
+    }
+
+    #[test]
+    fn generate_clean_risks_preserves_risk_mentioning_allowed_entity_nvr_customerasset() {
+        let existing_risks = vec![
+            serde_json::json!("Logické názvy entity nvr_customerasset a polí podléhají ověření."),
+        ];
+        let task = make_template_task_with_stale_scaffold_steps();
+        let packet = task_mcp_developer_work_packet(&task, None, None);
+        let new_risks = task_mcp_generate_clean_risks_from_packet(&existing_risks, &packet);
+        let risks_text: Vec<&str> = new_risks.iter().filter_map(|v| v.as_str()).collect();
+
+        assert!(
+            risks_text.iter().any(|s| s.contains("nvr_customerasset")),
+            "Risk mentioning the allowed entity nvr_customerasset must be preserved; got: {:?}", risks_text
+        );
     }
 }
 
