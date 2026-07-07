@@ -6613,6 +6613,25 @@ fn task_mcp_capabilities_from(defined_names: &std::collections::HashSet<String>)
     })
 }
 
+/// Fail-fast guard for run_implementation_verification: if `next_action` is "run_ai_kit_review"
+/// (i.e. the agent would be told to call record_ai_kit_review_result next) but that tool is
+/// listed in `missing_tools`, override to a tooling_error / reload_mcp_or_start_app result instead
+/// of a misleading instruction the agent cannot actually follow. Pure — no I/O — so tests can
+/// simulate a toolset missing the tool without touching the real tool definitions or an AppHandle.
+/// run_implementation_verification must never report status=pending_ai_kit_review /
+/// nextAction=run_ai_kit_review when record_ai_kit_review_result is unavailable.
+fn task_mcp_apply_tooling_availability_guard(
+    status: &'static str,
+    next_action: &'static str,
+    missing_tools: &[String],
+) -> (&'static str, &'static str, Vec<String>) {
+    if next_action == "run_ai_kit_review" && missing_tools.iter().any(|m| m == "record_ai_kit_review_result") {
+        ("tooling_error", "reload_mcp_or_start_app", vec!["record_ai_kit_review_result".to_string()])
+    } else {
+        (status, next_action, Vec::new())
+    }
+}
+
 /// Builds the get_task_workbench_mcp_capabilities result for the live Rust bridge. Reaching this
 /// code at all means the bridge is live (bridgeMode is always "live-rust" here) — the JS fallback
 /// mirror in mcp/task-workbench-mcp.mjs handles the js-fallback/offline cases.
@@ -10376,20 +10395,13 @@ fn task_mcp_execute_tool(app: &tauri::AppHandle, tool_name: &str, args: &Value) 
                 checks.push(serde_json::json!({ "name": "Local Test", "status": status, "findings": [finding] }));
             }
 
-            let (mut status, mut next_action) = task_mcp_rollup_verification_status(&checks, fixable_findings.len());
-
+            let (status, next_action) = task_mcp_rollup_verification_status(&checks, fixable_findings.len());
             // Fail-fast: never tell the agent to call record_ai_kit_review_result if this
             // toolset does not actually expose it — that produces a confusing "tool not
             // found"/"bridge not running" error after the fact instead of one clear instruction now.
-            let mut missing_required_tools: Vec<String> = Vec::new();
-            if next_action == "run_ai_kit_review" {
-                let missing = task_mcp_missing_required_tools();
-                if missing.iter().any(|m| m == "record_ai_kit_review_result") {
-                    status = "tooling_error";
-                    next_action = "reload_mcp_or_start_app";
-                    missing_required_tools = vec!["record_ai_kit_review_result".to_string()];
-                }
-            }
+            let (status, next_action, missing_required_tools) = task_mcp_apply_tooling_availability_guard(
+                status, next_action, &task_mcp_missing_required_tools(),
+            );
 
             let now = chrono_now_iso();
             let task = &mut tasks[index];
@@ -17103,6 +17115,86 @@ mod developer_work_packet_tests {
         assert_ne!(continue_step["nextAction"].as_str(), Some("needs_manual_action"));
         assert!(continue_step["blockingUserAction"].as_str().unwrap_or("").contains("CRM metadata assistant is not enabled"));
         assert_eq!(continue_step["requiresUserApproval"].as_bool(), Some(true));
+    }
+
+    // ── get_task_workbench_mcp_capabilities + tooling-availability fail-fast guard ──────────────
+
+    #[test]
+    fn tool_definitions_include_record_ai_kit_review_result_and_capabilities_tool() {
+        let definitions = task_mcp_tool_definitions();
+        let names: Vec<&str> = definitions.iter().filter_map(|t| t["name"].as_str()).collect();
+        assert!(names.contains(&"record_ai_kit_review_result"), "tools/list must include record_ai_kit_review_result: {names:?}");
+        assert!(names.contains(&"get_task_workbench_mcp_capabilities"), "tools/list must include get_task_workbench_mcp_capabilities: {names:?}");
+        // Exact name match — no near-miss like recordAiKitReviewResult / record_ai_kit_review.
+        assert_eq!(names.iter().filter(|n| n.contains("ai_kit_review")).count(), 1);
+    }
+
+    #[test]
+    fn capabilities_reports_can_record_ai_kit_review_true_when_tool_is_exposed() {
+        let defined: std::collections::HashSet<String> = task_mcp_tool_definitions().iter()
+            .filter_map(|t| t["name"].as_str().map(str::to_string))
+            .collect();
+        let capabilities = task_mcp_capabilities_from(&defined);
+        assert_eq!(capabilities["bridgeMode"].as_str(), Some("live-rust"));
+        assert_eq!(capabilities["canRecordAiKitReview"].as_bool(), Some(true));
+        assert_eq!(capabilities["canRunImplementationVerification"].as_bool(), Some(true));
+        assert_eq!(capabilities["canRunDeveloperWorkflow"].as_bool(), Some(true));
+        assert!(capabilities["missingRequiredTools"].as_array().unwrap().is_empty());
+        assert!(capabilities["recommendedAction"].is_null());
+        let required = capabilities["requiredDeveloperWorkflowTools"].as_array().unwrap();
+        assert!(required.iter().any(|v| v == "record_ai_kit_review_result"));
+    }
+
+    #[test]
+    fn capabilities_reports_missing_record_ai_kit_review_result_when_absent_from_toolset() {
+        // Simulates a stale/older running process whose tool list predates this tool.
+        let mut defined: std::collections::HashSet<String> = task_mcp_tool_definitions().iter()
+            .filter_map(|t| t["name"].as_str().map(str::to_string))
+            .collect();
+        defined.remove("record_ai_kit_review_result");
+
+        let capabilities = task_mcp_capabilities_from(&defined);
+        let missing: Vec<&str> = capabilities["missingRequiredTools"].as_array().unwrap()
+            .iter().filter_map(|v| v.as_str()).collect();
+        assert_eq!(missing, vec!["record_ai_kit_review_result"]);
+        assert_eq!(capabilities["canRecordAiKitReview"].as_bool(), Some(false));
+        assert_eq!(capabilities["canRunDeveloperWorkflow"].as_bool(), Some(false));
+        // run_implementation_verification itself is unaffected — only the AI Kit review path is.
+        assert_eq!(capabilities["canRunImplementationVerification"].as_bool(), Some(true));
+        assert!(capabilities["recommendedAction"].as_str().unwrap().contains("record_ai_kit_review_result"));
+    }
+
+    #[test]
+    fn tooling_availability_guard_passes_through_when_record_ai_kit_review_result_is_available() {
+        let (status, next_action, missing) = task_mcp_apply_tooling_availability_guard(
+            "pending_ai_kit_review", "run_ai_kit_review", &[],
+        );
+        assert_eq!((status, next_action), ("pending_ai_kit_review", "run_ai_kit_review"));
+        assert!(missing.is_empty());
+    }
+
+    #[test]
+    fn tooling_availability_guard_overrides_to_tooling_error_when_record_tool_is_missing() {
+        // run_implementation_verification must never report status=pending_ai_kit_review /
+        // nextAction=run_ai_kit_review when record_ai_kit_review_result is unavailable — the agent
+        // would be told to call a tool that does not exist in its current environment.
+        let (status, next_action, missing) = task_mcp_apply_tooling_availability_guard(
+            "pending_ai_kit_review", "run_ai_kit_review", &["record_ai_kit_review_result".to_string()],
+        );
+        assert_eq!(status, "tooling_error");
+        assert_eq!(next_action, "reload_mcp_or_start_app");
+        assert_eq!(missing, vec!["record_ai_kit_review_result".to_string()]);
+    }
+
+    #[test]
+    fn tooling_availability_guard_ignores_missing_tools_unrelated_to_ai_kit_review_path() {
+        // Only the run_ai_kit_review path is guarded here — an unrelated missing tool (e.g. one
+        // never even reached this run) must not spuriously flip an unrelated nextAction.
+        let (status, next_action, missing) = task_mcp_apply_tooling_availability_guard(
+            "passed", "continue_workflow", &["record_ai_kit_review_result".to_string()],
+        );
+        assert_eq!((status, next_action), ("passed", "continue_workflow"));
+        assert!(missing.is_empty());
     }
 
     // ── Modal-visible implementationVerification summary + nextRecommendedStep composer ─────

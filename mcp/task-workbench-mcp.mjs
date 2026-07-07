@@ -1215,6 +1215,23 @@ function computeMcpCapabilities() {
   });
 }
 
+/**
+ * Fail-fast guard for run_implementation_verification: if `nextAction` is 'run_ai_kit_review'
+ * (i.e. the agent would be told to call record_ai_kit_review_result next) but `capabilities`
+ * reports it as unavailable, override to a tooling_error / reload_mcp_or_start_app result instead
+ * of a misleading instruction the agent cannot actually follow. Pure — no I/O — takes an already-
+ * computed capabilities object (see computeMcpCapabilities/computeMcpCapabilitiesFromToolNames) so
+ * tests can simulate a toolset missing the tool. run_implementation_verification must never report
+ * status=pending_ai_kit_review / nextAction=run_ai_kit_review when record_ai_kit_review_result is
+ * unavailable.
+ */
+function applyToolingAvailabilityGuard(status, nextAction, capabilities) {
+  if (nextAction === 'run_ai_kit_review' && !capabilities.canRecordAiKitReview) {
+    return { status: 'tooling_error', nextAction: 'reload_mcp_or_start_app', missingRequiredTools: ['record_ai_kit_review_result'] };
+  }
+  return { status, nextAction, missingRequiredTools: [] };
+}
+
 async function fetchBridgeToken(baseUrl) {
   try {
     const status = await bridgeRequestJson(baseUrl, '/mcp/status', null);
@@ -4040,12 +4057,10 @@ async function callToolFallback(name, args = {}) {
       // Fail-fast: never tell the agent to call record_ai_kit_review_result if this MCP session
       // cannot actually reach it — that produces a confusing "tool not found"/"bridge not running"
       // error after the fact instead of one clear, actionable instruction now.
-      let missingRequiredTools = [];
-      if (nextAction === 'run_ai_kit_review' && !computeMcpCapabilities().canRecordAiKitReview) {
-        status = 'tooling_error';
-        nextAction = 'reload_mcp_or_start_app';
-        missingRequiredTools = ['record_ai_kit_review_result'];
-      }
+      const guarded = applyToolingAvailabilityGuard(status, nextAction, computeMcpCapabilities());
+      status = guarded.status;
+      nextAction = guarded.nextAction;
+      const missingRequiredTools = guarded.missingRequiredTools;
 
       const now = new Date().toISOString();
       task.implementationVerification = asObject(task.implementationVerification);
@@ -4353,5 +4368,6 @@ if (!process.env.VITEST) {
 export {
   READ_ONLY_TOOL_NAMES, TOOL_DEFINITIONS, TASK_TEMPLATES, matchTaskTemplate, callToolFallback, applyDeveloperWorkflowTransition,
   REQUIRED_DEVELOPER_WORKFLOW_TOOLS, FALLBACK_WRITE_ALLOWED_TOOL_NAMES, computeMcpCapabilitiesFromToolNames,
+  applyToolingAvailabilityGuard,
 };
 

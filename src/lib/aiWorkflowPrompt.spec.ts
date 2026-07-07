@@ -1431,6 +1431,32 @@ describe('buildAiWorkflowPrompt – TODO/scaffold hard stop rules', () => {
     const prompt = buildAiWorkflowPrompt(makeReadyTask());
     expect(prompt).toContain('Stop only when continue_developer_workflow returns wait_for_user');
   });
+
+  it('instructs AI to call get_task_workbench_mcp_capabilities before relying on automated verification', () => {
+    const prompt = buildAiWorkflowPrompt(makeReadyTask());
+    expect(prompt).toContain('get_task_workbench_mcp_capabilities');
+    expect(prompt).toContain('canRunImplementationVerification');
+    expect(prompt).toContain('canRecordAiKitReview');
+  });
+
+  it('instructs AI not to fall back to manual-modal instructions or fabricate record_ai_kit_review_result when tooling is unavailable', () => {
+    const prompt = buildAiWorkflowPrompt(makeReadyTask());
+    expect(prompt).toContain('do not fall back to old manual-modal instructions');
+    expect(prompt).toContain('do not fabricate calling record_ai_kit_review_result');
+  });
+
+  it('instructs AI to ask the user to start Task Workbench and reload the MCP server, then retry', () => {
+    const prompt = buildAiWorkflowPrompt(makeReadyTask());
+    expect(prompt).toContain('start Task Workbench and reload the MCP server');
+    expect(prompt).toContain('Retry from this step only after the user confirms');
+  });
+
+  it('instructs AI to stop on status=tooling_error / nextAction=reload_mcp_or_start_app without claiming manual review is required', () => {
+    const prompt = buildAiWorkflowPrompt(makeReadyTask());
+    expect(prompt).toContain('reload_mcp_or_start_app');
+    expect(prompt).toContain('missingRequiredTools');
+    expect(prompt).toContain('tooling availability problem, not a workflow requirement');
+  });
 });
 
 // ---------------------------------------------------------------------------

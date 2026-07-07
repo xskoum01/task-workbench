@@ -35,7 +35,8 @@ node mcp/task-workbench-mcp.mjs --fallback-readonly --data-dir "/path/to/task-wo
 ### Read-only
 
 These tools never write to Dataverse, GitHub, Azure DevOps, or the local filesystem
-(except `run_dataverse_check_for_task`, which persists a report to local task state).
+(except `run_dataverse_check_for_task` and `run_implementation_verification`, which persist a
+report/check result to local task state only).
 
 | Tool | Purpose |
 |------|---------|
@@ -61,6 +62,9 @@ These tools never write to Dataverse, GitHub, Azure DevOps, or the local filesys
 | `get_developer_work_packet` | AI-facing work packet: canWriteCode, why, target path, implementation instructions, conventions, verification, review/test/commit guidance |
 | `continue_developer_workflow` | Next required post-implementation step: record results, Dataverse verification, AI Kit review, or branch creation. Call after every file write. |
 | `get_task_templates` | Built-in setup templates and matched template for a task title |
+| `run_implementation_verification` | Orchestrates Script File Readiness, Local Static/Business-Rule Verification, and (when configured) automated Dataverse Metadata Check for script/ribbon tasks; reports whether AI Kit review still needs the calling agent to run it via `record_ai_kit_review_result` |
+| `get_implementation_verification_summary` | Same modal-truth Implementation Verification summary as `run_implementation_verification`, from currently persisted state only (does not re-run any check) |
+| `get_task_workbench_mcp_capabilities` | Health/capability check for the current MCP session: bridge mode (live-rust/js-fallback/offline), which developer-workflow tools are actually available, missing required tools, recommended action. Call this after a "tool not found"/"bridge is not running" error, or before relying on automated Dataverse/AI Kit verification |
 
 AI clients should use `get_developer_work_packet` as the default first read for
 developer work. It hides Task Workbench internal workflow state and returns a
@@ -103,6 +107,7 @@ These tools update only local task-workbench state. No external system is called
 | `save_technical_plan` | Save plan: summary, steps, entities, test plan, risks, pluginTarget, scriptTarget |
 | `mark_technical_plan_ready_for_approval` | Mark plan ready for in-app user review |
 | `record_external_action_completed` | Record that the developer manually completed an external action (plugin registration, web resource upload, etc.) |
+| `record_ai_kit_review_result` | Record the result of an AI Kit / Client-API code review performed by the calling AI agent itself (`reviewSource: "claude-ai-kit"`). Persists to `implementationVerification.aiCodeReview` and `task.aiKitReview`. Calls no external LLM/API. |
 | `record_local_test` | Record local test result |
 | `record_consultant_testing` | Record consultant testing status |
 | `mark_testing_confirmed_prepare_commit` | Mark consultant testing confirmed; set next step to prepare commit |

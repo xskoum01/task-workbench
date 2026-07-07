@@ -6,7 +6,11 @@
  * the script's process.exit handler from firing during tests.
  */
 import { describe, it, expect } from 'vitest';
-import { READ_ONLY_TOOL_NAMES, TOOL_DEFINITIONS, TASK_TEMPLATES, matchTaskTemplate, callToolFallback, applyDeveloperWorkflowTransition } from './task-workbench-mcp.mjs';
+import {
+  READ_ONLY_TOOL_NAMES, TOOL_DEFINITIONS, TASK_TEMPLATES, matchTaskTemplate, callToolFallback, applyDeveloperWorkflowTransition,
+  REQUIRED_DEVELOPER_WORKFLOW_TOOLS, FALLBACK_WRITE_ALLOWED_TOOL_NAMES, computeMcpCapabilitiesFromToolNames,
+  applyToolingAvailabilityGuard,
+} from './task-workbench-mcp.mjs';
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -4230,6 +4234,144 @@ describe('record_ai_kit_review_result tool', () => {
       const after = await callToolFallback('continue_developer_workflow', { taskId: 'task-aikit-cdw' });
       expect(after.nextAction).not.toBe('run_ai_kit_review');
       expect(after.nextAction).toBe('propose_branch');
+    } finally {
+      process.argv = origArgv;
+      await fs.rm(tmpDir, { recursive: true });
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// get_task_workbench_mcp_capabilities tool + tooling-availability fail-fast guard
+// ---------------------------------------------------------------------------
+
+describe('get_task_workbench_mcp_capabilities tool', () => {
+  async function importHelpers() {
+    const { default: os } = await import('node:os');
+    const { default: fs } = await import('node:fs/promises');
+    const { default: path } = await import('node:path');
+    return { os, fs, path };
+  }
+
+  it('tool definition is present and read-only, with no required arguments', () => {
+    const tool = TOOL_DEFINITIONS.find((t) => t.name === 'get_task_workbench_mcp_capabilities');
+    expect(tool).toBeDefined();
+    expect(READ_ONLY_TOOL_NAMES.has('get_task_workbench_mcp_capabilities')).toBe(true);
+    expect(tool.inputSchema.required ?? []).toEqual([]);
+  });
+
+  it('is answerable even with no bridge and no --data-dir/--fallback-readonly flags (bridgeMode=offline)', async () => {
+    // This is the exact scenario that must never throw "bridge is not running" — the whole point
+    // of this tool is to diagnose that condition, not fail with the same opaque error as everything else.
+    const origArgv = process.argv;
+    process.argv = process.argv.filter((a) => a !== '--data-dir' && a !== '--fallback-readonly');
+    try {
+      const result = await callToolFallback('get_task_workbench_mcp_capabilities', {});
+      expect(result.bridgeMode).toBe('offline');
+      expect(result.canRunDeveloperWorkflow).toBe(false);
+      expect(result.recommendedAction).toContain('Start the Task Workbench app');
+    } finally {
+      process.argv = origArgv;
+    }
+  });
+
+  it('reports canRecordAiKitReview=true and no missing tools when running with --data-dir (js-fallback mode)', async () => {
+    const { os, fs, path } = await importHelpers();
+    const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'tw-mcp-capabilities-'));
+    const origArgv = process.argv;
+    process.argv = [...process.argv, '--data-dir', tmpDir];
+    try {
+      const result = await callToolFallback('get_task_workbench_mcp_capabilities', {});
+      expect(result.bridgeMode).toBe('js-fallback');
+      expect(result.canRecordAiKitReview).toBe(true);
+      expect(result.canRunImplementationVerification).toBe(true);
+      expect(result.canRunDeveloperWorkflow).toBe(true);
+      expect(result.missingRequiredTools).toEqual([]);
+      expect(result.requiredDeveloperWorkflowTools).toEqual(REQUIRED_DEVELOPER_WORKFLOW_TOOLS);
+      expect(result.recommendedAction).toBeNull();
+    } finally {
+      process.argv = origArgv;
+      await fs.rm(tmpDir, { recursive: true });
+    }
+  });
+
+  it('reports record_ai_kit_review_result as missingRequiredTools when absent from the toolset', () => {
+    // Simulates a stale/older running process whose tool list predates this tool — exactly the
+    // live failure this feature exists to diagnose.
+    const definedNames = new Set(TOOL_DEFINITIONS.map((t) => t.name));
+    definedNames.delete('record_ai_kit_review_result');
+
+    const capabilities = computeMcpCapabilitiesFromToolNames(definedNames, { dataDir: '/tmp/x', fallbackReadOnly: false });
+    expect(capabilities.missingRequiredTools).toEqual(['record_ai_kit_review_result']);
+    expect(capabilities.canRecordAiKitReview).toBe(false);
+    expect(capabilities.canRunDeveloperWorkflow).toBe(false);
+    // run_implementation_verification itself is unaffected — only the AI Kit review path is.
+    expect(capabilities.canRunImplementationVerification).toBe(true);
+    expect(capabilities.recommendedAction).toContain('record_ai_kit_review_result');
+  });
+
+  it('allows record_ai_kit_review_result in the fallback write allowlist only when --data-dir is set', () => {
+    expect(FALLBACK_WRITE_ALLOWED_TOOL_NAMES.has('record_ai_kit_review_result')).toBe(true);
+    const withDataDir = computeMcpCapabilitiesFromToolNames(new Set(TOOL_DEFINITIONS.map((t) => t.name)), { dataDir: '/tmp/x', fallbackReadOnly: false });
+    expect(withDataDir.canRecordAiKitReview).toBe(true);
+    const withoutDataDir = computeMcpCapabilitiesFromToolNames(new Set(TOOL_DEFINITIONS.map((t) => t.name)), { dataDir: undefined, fallbackReadOnly: true });
+    expect(withoutDataDir.canRecordAiKitReview).toBe(false);
+  });
+});
+
+describe('applyToolingAvailabilityGuard — run_implementation_verification fail-fast', () => {
+  async function importHelpers() {
+    const { default: os } = await import('node:os');
+    const { default: fs } = await import('node:fs/promises');
+    const { default: path } = await import('node:path');
+    return { os, fs, path };
+  }
+
+  it('passes nextAction=run_ai_kit_review through unchanged when record_ai_kit_review_result is available', () => {
+    const result = applyToolingAvailabilityGuard('pending_ai_kit_review', 'run_ai_kit_review', { canRecordAiKitReview: true });
+    expect(result).toEqual({ status: 'pending_ai_kit_review', nextAction: 'run_ai_kit_review', missingRequiredTools: [] });
+  });
+
+  it('overrides to tooling_error/reload_mcp_or_start_app when record_ai_kit_review_result is unavailable', () => {
+    // run_implementation_verification must never report status=pending_ai_kit_review /
+    // nextAction=run_ai_kit_review when record_ai_kit_review_result is unavailable — the agent
+    // would be told to call a tool that does not exist in its current environment.
+    const result = applyToolingAvailabilityGuard('pending_ai_kit_review', 'run_ai_kit_review', { canRecordAiKitReview: false });
+    expect(result.status).toBe('tooling_error');
+    expect(result.nextAction).toBe('reload_mcp_or_start_app');
+    expect(result.missingRequiredTools).toEqual(['record_ai_kit_review_result']);
+  });
+
+  it('does not touch unrelated nextAction values even when record_ai_kit_review_result is unavailable', () => {
+    const result = applyToolingAvailabilityGuard('passed', 'continue_workflow', { canRecordAiKitReview: false });
+    expect(result).toEqual({ status: 'passed', nextAction: 'continue_workflow', missingRequiredTools: [] });
+  });
+
+  it('run_implementation_verification actually applies the guard end-to-end when the tool is available', async () => {
+    const { os, fs, path } = await importHelpers();
+    const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'tw-mcp-riv-tooling-ok-'));
+    const scriptsDir = path.join(tmpDir, 'Scripts');
+    await fs.mkdir(scriptsDir, { recursive: true });
+    await fs.writeFile(path.join(scriptsDir, 'nvr_servicecase_events.js'), 'function noop() {}');
+    const task = {
+      id: 'task-riv-tooling-ok',
+      title: 'Script: Předvyplnění servisního požadavku',
+      status: 'in-progress',
+      taskMode: 'developer',
+      workflowSetup: { devTargetKind: 'script', repositoryRoot: tmpDir, artifactPath: 'Scripts/nvr_servicecase_events.js' },
+      crmDeveloperWorkflow: { detectedWorkKind: 'script' },
+    };
+    await fs.writeFile(path.join(tmpDir, 'tasks.json'), JSON.stringify([task]));
+
+    const origArgv = process.argv;
+    process.argv = [...process.argv, '--data-dir', tmpDir];
+    try {
+      const result = await callToolFallback('run_implementation_verification', { taskId: 'task-riv-tooling-ok' });
+      // record_ai_kit_review_result is available in this toolset, so the AI Kit review step must
+      // never be silently downgraded to tooling_error.
+      expect(result.status).not.toBe('tooling_error');
+      expect(result.nextAction).not.toBe('reload_mcp_or_start_app');
+      expect(result.missingRequiredTools).toEqual([]);
     } finally {
       process.argv = origArgv;
       await fs.rm(tmpDir, { recursive: true });
