@@ -6539,7 +6539,88 @@ fn task_mcp_read_only_tool_definitions() -> Vec<Value> {
         serde_json::json!({"name":"get_developer_work_packet",              "description":"Return a simplified AI-facing developer work packet: canWriteCode, reason, target, implementation, conventions, Dataverse verification, and review/test/commit guidance.","readOnly":true}),
         serde_json::json!({"name":"continue_developer_workflow",           "description":"Return the next required post-implementation workflow step: record results, Dataverse verification, AI Kit review, or branch creation. Call after every file write until it returns wait_for_user or mark_done.","readOnly":true}),
         serde_json::json!({"name":"get_task_templates",                    "description":"Return built-in task setup templates and the matched template for a task title, when any.","readOnly":true}),
+        serde_json::json!({"name":"run_implementation_verification",       "description":"Orchestrates the same Verify Implementation checks/state as ImplementationVerificationModal for a script/ribbon task: runs Script File Readiness and Local Static/Business-Rule Verification directly; runs Dataverse Metadata Check for real (Primarch, read-only) when configured; reports AI Internal Code Review as needs_ai_kit_review (call record_ai_kit_review_result) until a result is recorded; Local Test remains a read-only passthrough (genuinely manual/browser step). Never reports status=passed while a required row is still unresolved. No external writes. Returns status, checks, fixableFindings, nextAction (continue_workflow/fix_code/run_ai_kit_review/needs_configuration/wait_for_user), implementationVerification (modal-truth summary), unresolvedRequiredRows, nextRecommendedStep.","readOnly":true}),
+        serde_json::json!({"name":"get_implementation_verification_summary","description":"Read-only. Returns the same normalized, modal-truth Implementation Verification summary as run_implementation_verification and get_task_workflow_overview, from currently persisted state only (does not re-run any check).","readOnly":true}),
+        serde_json::json!({"name":"get_task_workbench_mcp_capabilities", "description":"Read-only health/capability check for the current MCP session. Call this before relying on automated Dataverse Metadata Check / AI Kit review, or after a \"tool not found\"/\"bridge is not running\" error. Returns bridgeMode (live-rust/js-fallback/offline), which developer-workflow tools are actually available right now, missingRequiredTools, and a recommendedAction. Does NOT write anything.","readOnly":true}),
     ]
+}
+
+/// Tool names the developer workflow (post-plan-approval through Implementation Verification)
+/// depends on being available in the current MCP toolset. Used by
+/// get_task_workbench_mcp_capabilities and the pending_ai_kit_review fail-fast guard in
+/// run_implementation_verification. Keep in sync with the JS REQUIRED_DEVELOPER_WORKFLOW_TOOLS
+/// list in mcp/task-workbench-mcp.mjs.
+fn task_mcp_required_developer_workflow_tools() -> &'static [&'static str] {
+    &[
+        "get_developer_work_packet",
+        "approve_technical_plan_if_safe",
+        "record_ai_implementation_completed",
+        "run_implementation_verification",
+        "record_ai_kit_review_result",
+        "get_implementation_verification_summary",
+        "continue_developer_workflow",
+        "get_task_workflow_overview",
+    ]
+}
+
+/// Required developer-workflow tool names absent from `defined_names`. Pure — no I/O — so tests
+/// can simulate a toolset that is missing a required tool without touching the real tool list.
+fn task_mcp_missing_required_tools_from(defined_names: &std::collections::HashSet<String>) -> Vec<String> {
+    task_mcp_required_developer_workflow_tools().iter()
+        .filter(|name| !defined_names.contains(**name))
+        .map(|name| name.to_string())
+        .collect()
+}
+
+/// Required developer-workflow tool names absent from the live Rust tool definitions. Always
+/// empty in a correctly built app — this is a real, dynamic check (not a hardcoded assumption) so
+/// it catches accidental removal/renaming of a required tool as a regression, not just in theory.
+fn task_mcp_missing_required_tools() -> Vec<String> {
+    let defined: std::collections::HashSet<String> = task_mcp_tool_definitions().iter()
+        .filter_map(|t| t["name"].as_str().map(str::to_string))
+        .collect();
+    task_mcp_missing_required_tools_from(&defined)
+}
+
+/// Pure core of get_task_workbench_mcp_capabilities' live-rust result — takes the set of tool
+/// names actually defined (normally task_mcp_tool_definitions()'s names) with no other I/O, so
+/// tests can simulate a toolset that is missing a required tool.
+fn task_mcp_capabilities_from(defined_names: &std::collections::HashSet<String>) -> Value {
+    let missing = task_mcp_missing_required_tools_from(defined_names);
+    let can_run_implementation_verification = !missing.iter().any(|m| m == "run_implementation_verification");
+    let can_record_ai_kit_review = !missing.iter().any(|m| m == "record_ai_kit_review_result");
+    let can_run_developer_workflow = missing.is_empty();
+    let recommended_action = if missing.is_empty() {
+        None
+    } else {
+        Some(format!(
+            "Reload the MCP server/app — this running instance does not expose: {}. Restart Task Workbench.",
+            missing.join(", "),
+        ))
+    };
+    serde_json::json!({
+        "bridgeMode": "live-rust",
+        "bridgeUrl": format!("http://{TASK_MCP_BRIDGE_HOST}:{TASK_MCP_BRIDGE_PORT}"),
+        "appVersion": env!("CARGO_PKG_VERSION"),
+        "serverVersion": env!("CARGO_PKG_VERSION"),
+        "toolsetVersion": env!("CARGO_PKG_VERSION"),
+        "requiredDeveloperWorkflowTools": task_mcp_required_developer_workflow_tools(),
+        "missingRequiredTools": missing,
+        "canRunDeveloperWorkflow": can_run_developer_workflow,
+        "canRunImplementationVerification": can_run_implementation_verification,
+        "canRecordAiKitReview": can_record_ai_kit_review,
+        "recommendedAction": recommended_action,
+    })
+}
+
+/// Builds the get_task_workbench_mcp_capabilities result for the live Rust bridge. Reaching this
+/// code at all means the bridge is live (bridgeMode is always "live-rust" here) — the JS fallback
+/// mirror in mcp/task-workbench-mcp.mjs handles the js-fallback/offline cases.
+fn task_mcp_capabilities() -> Value {
+    let defined: std::collections::HashSet<String> = task_mcp_tool_definitions().iter()
+        .filter_map(|t| t["name"].as_str().map(str::to_string))
+        .collect();
+    task_mcp_capabilities_from(&defined)
 }
 
 fn task_mcp_local_write_tool_definitions() -> Vec<Value> {
@@ -6559,6 +6640,7 @@ fn task_mcp_local_write_tool_definitions() -> Vec<Value> {
         serde_json::json!({"name":"prepare_developer_task",              "description":"Safe high-level orchestration: apply templates/defaults, derive developer target, draft a technical plan, and stop at the first approval gate or hard blocker. No code, repo, or external writes.","readOnly":false}),
         serde_json::json!({"name":"confirm_task_setup",                  "description":"Record local setup confirmation timestamp. Advances status from new to analyzed.","readOnly":false}),
         serde_json::json!({"name":"set_task_phase",                      "description":"Set task phase: new/analyzed/development/testing/review/done. Maps to internal status+waitingState model.","readOnly":false}),
+        serde_json::json!({"name":"record_ai_implementation_completed",   "description":"Record that AI has finished writing implementation files. Sets implementation-done and advances past local-test to wait_for_user (manual Dataverse upload/verify). Use instead of record_local_test for script/ribbon tasks after AI file write.","readOnly":false}),
         serde_json::json!({"name":"record_local_test",                   "description":"Record local test result: not-started/passed/failed/not-needed. Updates checklist only.","readOnly":false}),
         serde_json::json!({"name":"record_consultant_testing",           "description":"Record consultant testing status: requested/confirmed/failed/not-needed. Updates local workflow state only.","readOnly":false}),
         serde_json::json!({"name":"set_task_estimate",                   "description":"Set task effort estimate in hours with optional budget note. Validates positive numeric input.","readOnly":false}),
@@ -6576,6 +6658,7 @@ fn task_mcp_local_write_tool_definitions() -> Vec<Value> {
         serde_json::json!({"name":"commit_and_push_task_changes",        "description":"WRITE â€” stages files, creates a Git commit, and pushes the current branch in one step. No PR creation. Set moveToReviewAfterPush=true to also move the task to Code Review / Waiting for code review.","readOnly":false}),
         serde_json::json!({"name":"mark_testing_confirmed_prepare_commit","description":"WRITE (local task state only) â€” marks consultant testing as confirmed and sets the next step to Prepare commit and push. Does NOT commit, push, or move the task to Code Review.","readOnly":false}),
         serde_json::json!({"name":"record_external_action_completed",     "description":"WRITE (local task state only) â€” records that the developer manually completed an external action (plugin registration, web resource upload, etc.). Does not call any external system.","readOnly":false}),
+        serde_json::json!({"name":"record_ai_kit_review_result",          "description":"WRITE (local task state only) â€” records the result of an AI Kit / Client-API code review performed by the calling AI agent itself (reviewSource=claude-ai-kit). Persists to implementationVerification.aiCodeReview (the same field the modal reads) and task.aiKitReview. Does not call any external LLM, API, or system â€” the caller supplies its own verdict after reading the AI Kit rules and target file directly.","readOnly":false}),
     ]
 }
 
@@ -7754,6 +7837,8 @@ fn task_mcp_developer_work_packet(task: &Value, customer_dev_defaults: Option<&V
             "detectionSources": text_detection_sources,
             "forbiddenAssumptions": forbidden_assumptions,
             "risks": sanitized_risks,
+            "businessRules": template.as_ref().and_then(|t| t["businessRules"].as_array()).cloned().unwrap_or_default(),
+            "acceptanceCriteria": template.as_ref().and_then(|t| t["acceptanceCriteria"].as_array()).cloned().unwrap_or_default(),
         },
         "conventions": {
             "sources": convention_sources,
@@ -7761,10 +7846,10 @@ fn task_mcp_developer_work_packet(task: &Value, customer_dev_defaults: Option<&V
             "rules": convention_rules,
         },
         "dataverse": {
-            "verificationStatus": if is_script { "not_available_for_js_ts_mcp" } else { verification["verdict"].as_str().unwrap_or("unknown") },
+            "verificationStatus": verification["verdict"].as_str().unwrap_or("unknown"),
             "report": verification,
             "instruction": if is_script {
-                "Dataverse metadata verification for JS/TS is not available through MCP. Use the in-app Verify Implementation modal after implementation/upload."
+                "Dataverse Metadata Check for script/ribbon files runs automatically via run_implementation_verification (Primarch, when configured) after implementation. Use the stored report here if already present."
             } else {
                 "Use the stored Dataverse verification report. If missing or failing, resolve before implementation."
             },
@@ -7790,9 +7875,12 @@ fn task_mcp_developer_work_packet(task: &Value, customer_dev_defaults: Option<&V
             ],
             "localValidation": plan["testChecklist"].as_array().cloned().unwrap_or_default(),
             "afterImplementation": [
-                "Record build/local test results back into Task Workbench using record_local_test.",
-                "After recording results, call continue_developer_workflow to get the next required workflow step.",
-                "Do not stop after creating files — follow continue_developer_workflow until it returns wait_for_user or mark_done.",
+                "After writing implementation files: re-read the file and verify every businessRule and acceptanceCriteria in the packet is satisfied.",
+                "Call record_ai_implementation_completed with taskId, filesChanged, and a short summary. This records the implementation and advances the workflow.",
+                "Call continue_developer_workflow after record_ai_implementation_completed. If it returns nextAction=run_implementation_verification, call run_implementation_verification.",
+                "If run_implementation_verification returns fixableFindings, fix the code and repeat: record_ai_implementation_completed, continue_developer_workflow, run_implementation_verification.",
+                "Stop only when continue_developer_workflow returns wait_for_user — report the required manual action and wait.",
+                "Do not call record_local_test for script tasks — use record_ai_implementation_completed instead.",
                 "Do not perform Dataverse upload, plugin registration, GitHub/ADO writes, or deployment without explicit approval."
             ],
             "commit": [
@@ -8082,12 +8170,418 @@ fn task_mcp_next_recommended_step(task: &Value) -> Value {
         });
     }
 
-    let current = workflow["currentStep"].as_str().unwrap_or("diagnosis");
+    let plan_approved = workflow["planApproval"]["approved"].as_bool().unwrap_or(false)
+        && workflow["planApproval"]["invalidatedAt"].is_null();
+    if !plan_approved {
+        return serde_json::json!({
+            "step": "technical-plan",
+            "attentionRequired": true,
+            "reason": "Review and approve the technical implementation plan.",
+        });
+    }
+
+    // Plan is approved — delegate to the same post-implementation computation used by
+    // continue_developer_workflow, so the UI-visible next step always matches the AI-facing one.
+    let continue_step = task_mcp_compute_continue_workflow_step(task);
     serde_json::json!({
-        "step": current,
-        "attentionRequired": true,
-        "reason": "Continue the current local CRM workflow step.",
+        "step": continue_step["nextAction"].as_str().unwrap_or("diagnosis"),
+        "attentionRequired": continue_step["requiresUserApproval"].as_bool().unwrap_or(true),
+        "reason": continue_step["blockingUserAction"].as_str()
+            .or_else(|| continue_step["instructionForAI"].as_str())
+            .unwrap_or("Continue the current local CRM workflow step.")
+            .to_string(),
     })
+}
+
+/// Sets the canonical UI-visible status/waitingState/attentionState fields for a workflow phase.
+/// This is the single place that maps a phase name to the fields TaskDetail / workflowPlan.ts /
+/// CrmDeveloperWorkflowPanel read to render the top-level workflow phase (NEW/ANALYZED/
+/// DEVELOPMENT/TESTING/CODE REVIEW/DONE). Used by both the `set_task_phase` tool and
+/// `task_mcp_apply_developer_workflow_transition` so UI actions and MCP writes never diverge.
+fn task_mcp_set_status_phase(task: &mut Value, phase: &str) {
+    match phase {
+        "new" => {
+            task["status"]       = serde_json::json!("new");
+            task["waitingState"] = Value::Null;
+            task["attentionState"] = Value::Null;
+        }
+        "analyzed" => {
+            task["status"]       = serde_json::json!("analyzed");
+            task["waitingState"] = Value::Null;
+            task["attentionState"] = Value::Null;
+        }
+        "development" => {
+            task["status"]       = serde_json::json!("in-progress");
+            task["waitingState"] = Value::Null;
+            task["attentionState"] = Value::Null;
+        }
+        "testing" => {
+            task["status"]       = serde_json::json!("in-progress");
+            task["waitingState"] = serde_json::json!("consultant-testing");
+            task["attentionState"] = Value::Null;
+        }
+        "review" => {
+            task["status"]       = serde_json::json!("ready-for-review");
+            task["waitingState"] = serde_json::json!("code-review");
+            task["attentionState"] = Value::Null;
+        }
+        "done" => {
+            task["status"]       = serde_json::json!("done");
+            task["waitingState"] = Value::Null;
+            task["attentionState"] = Value::Null;
+            task["completedAt"]  = serde_json::json!(chrono_now_iso());
+        }
+        _ => {}
+    }
+}
+
+/// Canonical developer workflow transition service. Both MCP write tools and (in future) UI
+/// actions must call this instead of writing `status`/`waitingState`/helper fields ad hoc, so
+/// the app-visible phase never drifts from what MCP tools recorded.
+///
+/// `payload` carries transition-specific inputs as a JSON object (e.g. `{"canWriteCode": true}`
+/// for `technical_plan_approved`). Unknown transitions are a no-op.
+fn task_mcp_apply_developer_workflow_transition(task: &mut Value, transition: &str, payload: &Value) {
+    match transition {
+        "technical_plan_approved" => {
+            // Leaving NEW/Analyze: a plan can only be approved once the task has been analyzed.
+            if task["status"].as_str() == Some("new") {
+                task_mcp_set_status_phase(task, "analyzed");
+            }
+            // If code can now be written (all other gates satisfied), move straight into
+            // DEVELOPMENT so the UI does not show a stale NEW/Analyze or Analyzed phase.
+            let can_write_code = payload["canWriteCode"].as_bool().unwrap_or(false);
+            if can_write_code && task["status"].as_str() != Some("in-progress") {
+                task_mcp_set_status_phase(task, "development");
+            }
+        }
+        "ai_implementation_completed" => {
+            // Implementation files were written by AI. This is DEVELOPMENT / Verify
+            // Implementation — do not set a testing waitingState here; the manual CRM
+            // upload + in-app Verify Implementation step still has to happen first.
+            if task["status"].as_str() != Some("in-progress") {
+                task_mcp_set_status_phase(task, "development");
+            }
+        }
+        "manual_crm_verification_completed" => {
+            // Manual CRM upload/registration + Verify Implementation is done — hand off to
+            // consultant testing.
+            task_mcp_set_status_phase(task, "testing");
+        }
+        _ => {}
+    }
+    if task["crmDeveloperWorkflow"].is_null() {
+        task["crmDeveloperWorkflow"] = serde_json::json!({});
+    }
+    task["crmDeveloperWorkflow"]["updatedAt"] = serde_json::json!(chrono_now_iso());
+}
+
+/// Builds the same simplified workflow state returned by `get_task_workflow_overview`, for
+/// embedding into write-tool responses so callers can verify the UI-visible phase moved
+/// without a second round-trip.
+fn task_mcp_workflow_overview(task: &Value) -> Value {
+    // Modal-truth Verify Implementation summary — the same shape run_implementation_verification
+    // and get_implementation_verification_summary return, so MCP callers never have to guess
+    // modal-visible statuses from a separate call, and never have to re-derive unresolved rows
+    // from prose.
+    let implementation_verification = task_mcp_build_modal_verification_summary(task);
+    let unresolved_required_rows = task_mcp_unresolved_modal_rows(&implementation_verification);
+
+    serde_json::json!({
+        "displayPhase":          task_mcp_display_phase(task),
+        "status":                task["status"].as_str(),
+        "waitingState":          task["waitingState"].as_str(),
+        "attentionState":        task["attentionState"].as_str(),
+        "checklist":             task_mcp_workflow_checklist(task),
+        // task.localTestRecord is the continue_developer_workflow step-1 gate / AI implementation-
+        // completion helper — NOT the modal's Local Test row (implementationVerification.localTest).
+        // Exposed separately and clearly labeled so it can never be read as verification truth.
+        "legacyLocalTestRecord": {
+            "status": task["localTestRecord"]["status"].as_str(),
+            "ignoredForImplementationVerification": true,
+        },
+        "consultantTestRecord":  task.get("consultantTestRecord").cloned().unwrap_or(Value::Null),
+        "mcpNextStep":           task.get("mcpNextStep").cloned().unwrap_or(Value::Null),
+        "implementationVerification": implementation_verification,
+        "unresolvedRequiredRows": unresolved_required_rows,
+        "nextRecommendedStep":   task_mcp_next_recommended_step(task),
+    })
+}
+
+/// True for script/ribbon (JS/TS form) developer tasks. Mirrors the JS `isScriptWorkflowTask`
+/// helper in mcp/task-workbench-mcp.mjs — keep both in sync.
+fn task_mcp_is_script_workflow_task(task: &Value) -> bool {
+    let setup = task.get("workflowSetup").unwrap_or(&Value::Null);
+    let workflow = task.get("crmDeveloperWorkflow").unwrap_or(&Value::Null);
+    let work_kind = workflow["detectedWorkKind"].as_str()
+        .or_else(|| setup["devTargetKind"].as_str())
+        .unwrap_or("unknown");
+    work_kind == "script" || work_kind == "ribbon" || setup["devTargetKind"].as_str() == Some("script")
+}
+
+/// Picks the file from filesChanged that best matches the task's known script artifact/name.
+/// Mirrors the JS `resolveImplementedScriptArtifact` helper.
+fn task_mcp_resolve_implemented_script_artifact(task: &Value, files_changed: &[&str]) -> Option<String> {
+    let normalize = |p: &str| p.replace('\\', "/").to_lowercase();
+    let script_candidates: Vec<&str> = files_changed.iter().copied()
+        .filter(|f| {
+            let lower = f.to_lowercase();
+            lower.ends_with(".js") || lower.ends_with(".ts") || lower.ends_with(".jsx") || lower.ends_with(".tsx")
+        })
+        .collect();
+    if script_candidates.is_empty() { return None; }
+
+    let setup = task.get("workflowSetup").unwrap_or(&Value::Null);
+    let desired = setup["desiredScriptFile"].as_str().map(normalize).filter(|s| !s.is_empty());
+    let existing = setup["artifactPath"].as_str().or_else(|| setup["scriptPath"].as_str())
+        .map(normalize).filter(|s| !s.is_empty());
+
+    if let Some(desired) = &desired {
+        if let Some(m) = script_candidates.iter().find(|f| normalize(f).ends_with(desired.as_str())) {
+            return Some((*m).to_string());
+        }
+    }
+    if let Some(existing) = &existing {
+        if let Some(m) = script_candidates.iter().find(|f| {
+            let nf = normalize(f);
+            nf == *existing || existing.ends_with(nf.as_str())
+        }) {
+            return Some((*m).to_string());
+        }
+    }
+    Some(script_candidates[0].to_string())
+}
+
+/// Persists the file AI just implemented into the UI-visible script selection fields, so
+/// TaskDevModePanel / ImplementationVerificationModal / repositoryContext.ts resolve to the
+/// actual implemented artifact instead of a stale or empty workflowSetup.artifactPath.
+fn task_mcp_apply_implemented_script_artifact(task: &mut Value, implemented_path: &str) {
+    if task["workflowSetup"].is_null() { task["workflowSetup"] = serde_json::json!({}); }
+    let normalized = implemented_path.replace('\\', "/");
+    let file_name = normalized.rsplit('/').next().unwrap_or(&normalized).to_string();
+    task["workflowSetup"]["artifactPath"] = serde_json::json!(implemented_path);
+    task["workflowSetup"]["desiredScriptFile"] = serde_json::json!(file_name);
+    let is_absolute = std::path::Path::new(implemented_path).is_absolute();
+    if is_absolute {
+        task["workflowSetup"]["absoluteScriptPath"] = serde_json::json!(implemented_path);
+    } else if let Some(repo_root) = task["workflowSetup"]["repositoryRoot"].as_str().filter(|s| !s.is_empty()) {
+        let joined = std::path::Path::new(repo_root).join(implemented_path);
+        task["workflowSetup"]["absoluteScriptPath"] = serde_json::json!(joined.to_string_lossy().to_string());
+    }
+}
+
+/// Resolves an absolute filesystem path for the task's current script artifact, if known.
+fn task_mcp_resolve_script_absolute_path(task: &Value) -> Option<String> {
+    let setup = task.get("workflowSetup").unwrap_or(&Value::Null);
+    if let Some(p) = setup["absoluteScriptPath"].as_str().filter(|s| !s.is_empty()) {
+        return Some(p.to_string());
+    }
+    let artifact = setup["artifactPath"].as_str().or_else(|| setup["scriptPath"].as_str())?;
+    if artifact.is_empty() { return None; }
+    if std::path::Path::new(artifact).is_absolute() {
+        return Some(artifact.to_string());
+    }
+    let repo_root = setup["repositoryRoot"].as_str().filter(|s| !s.is_empty())?;
+    Some(std::path::Path::new(repo_root).join(artifact).to_string_lossy().to_string())
+}
+
+/// Deterministic regex-free business-rule check for one static rule id. Keep in sync with the
+/// `pattern`/`type` entries of the matching template's staticRules in mcp/task-workbench-mcp.mjs
+/// and task_mcp_builtin_templates() below — Rust has no regex dependency, so rules are
+/// hand-implemented substring/proximity checks instead of compiled patterns.
+fn task_mcp_static_rule_matches(rule_id: &str, content: &str, content_lower: &str) -> bool {
+    match rule_id {
+        "retrieve-source-entity" => content_lower.contains("retrieverecord") && content_lower.contains("nvr_customerasset"),
+        "no-xrm-page" => content.contains("Xrm.Page"),
+        "no-autosave" => content_lower.contains(".data.save("),
+        "no-webresource-upload" => content_lower.contains("uploadwebresource")
+            || content_lower.contains("registerevent")
+            || content_lower.contains("updatewebresourceset"),
+        "no-todo-fixme-placeholder" => content_lower.contains("todo")
+            || content_lower.contains("fixme")
+            || content_lower.contains("placeholder"),
+        "no-empty-lookup-entitytype" => ["entitytype: \"\"", "entitytype:\"\"", "entitytype: ''", "entitytype:''"]
+            .iter().any(|p| content_lower.contains(p)),
+        "no-write-validationfields" => task_mcp_call_contains_arg(content_lower, "setvalue(", "nvr_statuscustom"),
+        "status-custom-checks-inactive-values" => content_lower.contains("inactive")
+            || content_lower.contains("retired")
+            || content_lower.contains("lost"),
+        "notification-on-inactive-status" => content_lower.contains("notification"),
+        _ => false,
+    }
+}
+
+/// Scans for `call_prefix` occurrences and checks whether `arg` appears before the call's
+/// closing parenthesis (a lightweight stand-in for `setValue\(([^)]*arg)\)`-style regex).
+fn task_mcp_call_contains_arg(content_lower: &str, call_prefix: &str, arg: &str) -> bool {
+    let mut search_from = 0usize;
+    while let Some(idx) = content_lower[search_from..].find(call_prefix) {
+        let start = search_from + idx + call_prefix.len();
+        if start >= content_lower.len() { break; }
+        if let Some(end_rel) = content_lower[start..].find(')') {
+            if content_lower[start..start + end_rel].contains(arg) {
+                return true;
+            }
+        }
+        search_from = start;
+    }
+    false
+}
+
+/// Runs the matched template's staticRules against implemented file content. No LLM call.
+/// Returns (status, findings, fixable_findings).
+fn task_mcp_run_static_business_rule_checks(template: Option<&Value>, file_content: &str) -> (String, Vec<String>, Vec<Value>) {
+    let rules = template.and_then(|t| t["staticRules"].as_array()).cloned().unwrap_or_default();
+    if rules.is_empty() {
+        return (
+            "skipped".to_string(),
+            vec!["No static rules are defined for this task template.".to_string()],
+            vec![],
+        );
+    }
+    let content_lower = file_content.to_lowercase();
+    let mut findings = Vec::new();
+    let mut fixable = Vec::new();
+    for rule in &rules {
+        let id = rule["id"].as_str().unwrap_or("").to_string();
+        let description = rule["description"].as_str().unwrap_or("").to_string();
+        let rule_type = rule["type"].as_str().unwrap_or("must-match");
+        let matched = task_mcp_static_rule_matches(&id, file_content, &content_lower);
+        let pass = if rule_type == "must-not-match" { !matched } else { matched };
+        findings.push(format!("{}|{}", if pass { "pass" } else { "fail" }, description));
+        if !pass {
+            fixable.push(serde_json::json!({ "id": id, "description": description }));
+        }
+    }
+    let status = if fixable.is_empty() { "passed" } else { "failed" };
+    (status.to_string(), findings, fixable)
+}
+
+/// Statuses that count as "resolved" for a modal check row without MCP re-running it.
+fn task_mcp_impl_check_resolved(status: &str) -> bool {
+    matches!(status, "passed" | "warnings" | "skipped" | "manually-verified" | "failed")
+}
+
+/// Mirrors ImplementationVerificationModal's deriveDataverseCheckStatus (src/components/
+/// ImplementationVerificationModal.tsx). Read-only — run_dataverse_check_for_task rejects
+/// .js/.ts artifacts, so MCP cannot run this check for script tasks; it can only report the
+/// same status the modal would show.
+fn task_mcp_derive_dataverse_check_status(task: &Value) -> String {
+    let override_status = task["implementationVerification"]["dataverseCheck"]["status"].as_str().unwrap_or("");
+    if override_status == "skipped" || override_status == "manually-verified" {
+        return override_status.to_string();
+    }
+    let verdict = task["crmVerificationReports"].as_array()
+        .and_then(|a| a.first())
+        .and_then(|r| r["verdict"].as_str())
+        .unwrap_or("");
+    match verdict {
+        "pass" => "passed".to_string(),
+        "warnings" => "warnings".to_string(),
+        "fail" => "failed".to_string(),
+        "not_configured" => "warnings".to_string(),
+        _ => "not-run".to_string(),
+    }
+}
+
+/// Read-only passthrough for the "Dataverse Metadata Check" modal row. Never writes
+/// task.implementationVerification.dataverseCheck — MCP is not the source of truth for this
+/// check for script tasks.
+fn task_mcp_dataverse_metadata_check_passthrough(task: &Value) -> (String, String) {
+    let status = task_mcp_derive_dataverse_check_status(task);
+    if task_mcp_impl_check_resolved(&status) {
+        (status.clone(), format!("Existing Dataverse Metadata Check status: {status}."))
+    } else {
+        ("needs_manual_action".to_string(), "Run Dataverse Metadata Check in the Implementation Verification modal.".to_string())
+    }
+}
+
+/// Read-only passthrough for the "AI Internal Code Review" modal row (task.
+/// implementationVerification.aiCodeReview — the LLM-backed AI Kit/Settings Reviewer, distinct
+/// from the deterministic staticRules check). MCP cannot invoke a live LLM reviewer headlessly.
+fn task_mcp_ai_internal_code_review_passthrough(task: &Value) -> (String, String) {
+    let status = task["implementationVerification"]["aiCodeReview"]["status"].as_str().unwrap_or("");
+    if task_mcp_impl_check_resolved(status) {
+        (status.to_string(), format!("Existing AI Kit review status: {status}."))
+    } else {
+        ("needs_manual_action".to_string(), "Run AI Kit Review or Settings Reviewer in the Implementation Verification modal.".to_string())
+    }
+}
+
+/// Read-only passthrough for the "Local Test" modal row (task.implementationVerification.
+/// localTest — distinct from the top-level task.localTestRecord used by continue_developer_
+/// workflow's step 1 gate). MCP must never write this field for scripts.
+fn task_mcp_local_test_impl_passthrough(task: &Value) -> (String, String) {
+    let status = task["implementationVerification"]["localTest"]["status"].as_str().unwrap_or("");
+    if status == "passed" || status == "not-needed" || status == "failed" {
+        (status.to_string(), format!("Existing Local Test status: {status}."))
+    } else {
+        ("needs_manual_action".to_string(), "Record Local Test in the Implementation Verification modal after manual/browser CRM testing (or mark it not-needed there).".to_string())
+    }
+}
+
+/// Normalized, modal-truth verification summary — the same shape regardless of which MCP tool
+/// returns it (run_implementation_verification, get_implementation_verification_summary, or
+/// get_task_workflow_overview). Built ONLY from the canonical fields ImplementationVerification
+/// Modal reads. Never a side-channel-only MCP result. Mirrors JS buildModalVerificationSummary.
+fn task_mcp_build_modal_verification_summary(task: &Value) -> Value {
+    let build_status = task["implementationVerification"]["buildCheck"]["status"].as_str().unwrap_or("not-run");
+    let build_summary = task["implementationVerification"]["buildCheck"]["summary"].as_str();
+    let mut build_check = serde_json::json!({ "status": build_status, "label": "Script File Readiness" });
+    if let Some(summary) = build_summary { build_check["message"] = serde_json::json!(summary); }
+
+    let (dv_status, dv_message) = task_mcp_dataverse_metadata_check_passthrough(task);
+    let (ai_status, ai_message) = task_mcp_ai_internal_code_review_passthrough(task);
+    let (lt_status, lt_message) = task_mcp_local_test_impl_passthrough(task);
+
+    serde_json::json!({
+        "buildCheck": build_check,
+        "dataverseCheck": { "status": dv_status, "label": "Dataverse Metadata Check", "message": dv_message },
+        "aiCodeReview": { "status": ai_status, "label": "AI Internal Code Review", "message": ai_message },
+        "localTest": { "status": lt_status, "label": "Local Test", "message": lt_message },
+    })
+}
+
+/// Keys of the modal-required rows still unresolved (needs_manual_action or genuinely not-run).
+fn task_mcp_unresolved_modal_rows(summary: &Value) -> Vec<String> {
+    let unresolved = |row: &Value| matches!(row["status"].as_str(), Some("needs_manual_action") | Some("not-run"));
+    let mut rows = Vec::new();
+    if unresolved(&summary["dataverseCheck"]) { rows.push("dataverseCheck".to_string()); }
+    if unresolved(&summary["aiCodeReview"]) { rows.push("aiCodeReview".to_string()); }
+    if unresolved(&summary["localTest"]) { rows.push("localTest".to_string()); }
+    rows
+}
+
+/// Composes the single, complete manual-action message used by continue_developer_workflow,
+/// get_task_workflow_overview.nextRecommendedStep, run_implementation_verification, and (in JS)
+/// the Implementation Verification modal footer — so all four always say the same thing. Only
+/// mentions the checks that are actually still unresolved.
+fn task_mcp_compose_manual_verification_step(summary: &Value) -> String {
+    let needs = |row: &Value| matches!(row["status"].as_str(), Some("needs_manual_action") | Some("not-run"));
+    let dv_needs = needs(&summary["dataverseCheck"]);
+    let ai_needs = needs(&summary["aiCodeReview"]);
+    let local_needs = needs(&summary["localTest"]);
+
+    let mut modal_names: Vec<&str> = Vec::new();
+    if dv_needs { modal_names.push("Dataverse Metadata Check"); }
+    if ai_needs { modal_names.push("AI Kit/Settings Review"); }
+
+    let mut parts: Vec<String> = Vec::new();
+    if !modal_names.is_empty() {
+        parts.push(format!("Run {} in the Implementation Verification modal.", modal_names.join(" and ")));
+    }
+    if local_needs {
+        parts.push(if parts.is_empty() {
+            "Upload/register the web resource manually and record Local Test/browser validation.".to_string()
+        } else {
+            "Then upload/register the web resource manually and record Local Test/browser validation.".to_string()
+        });
+    }
+    if parts.is_empty() {
+        "All Implementation Verification checks are resolved.".to_string()
+    } else {
+        parts.join(" ")
+    }
 }
 
 fn task_mcp_compute_continue_workflow_step(task: &Value) -> Value {
@@ -8127,14 +8621,88 @@ fn task_mcp_compute_continue_workflow_step(task: &Value) -> Value {
         || matches!(first_verdict, "pass" | "warnings" | "fail");
     if !dv_done {
         if is_script {
+            let mcp_verification = &task["implementationVerification"]["mcpVerification"];
+            if mcp_verification["ranAt"].is_null() {
+                return serde_json::json!({
+                    "nextAction": "run_implementation_verification",
+                    "canProceed": true,
+                    "requiresUserApproval": false,
+                    "blockingUserAction": null,
+                    "recommendedTool": "run_implementation_verification",
+                    "instructionForAI": "Run run_implementation_verification. It automatically runs Dataverse Metadata Check (when Primarch is configured) and reports whether AI Kit review is still needed — only the final manual upload/register/browser Local Test step requires waiting for the user.",
+                    "allowedWrites": ["run_implementation_verification"],
+                    "forbiddenWrites": ["commit_task_changes", "push_task_branch", "commit_and_push_task_changes"],
+                });
+            }
+            let mcp_verification_failed_with_fixes = mcp_verification["status"].as_str() == Some("failed")
+                && mcp_verification["fixableFindings"].as_array().map(|a| !a.is_empty()).unwrap_or(false);
+            if mcp_verification_failed_with_fixes {
+                return serde_json::json!({
+                    "nextAction": "fix_code",
+                    "canProceed": true,
+                    "requiresUserApproval": false,
+                    "blockingUserAction": null,
+                    "recommendedTool": "record_ai_implementation_completed",
+                    "instructionForAI": "Fix the fixable findings from run_implementation_verification, then call record_ai_implementation_completed and run_implementation_verification again.",
+                    "allowedWrites": ["record_ai_implementation_completed", "run_implementation_verification"],
+                    "forbiddenWrites": ["commit_task_changes", "push_task_branch", "commit_and_push_task_changes"],
+                });
+            }
+            if mcp_verification["status"].as_str() == Some("pending_ai_kit_review") {
+                return serde_json::json!({
+                    "nextAction": "run_ai_kit_review",
+                    "canProceed": true,
+                    "requiresUserApproval": false,
+                    "blockingUserAction": null,
+                    "recommendedTool": "record_ai_kit_review_result",
+                    "instructionForAI": "Dataverse Metadata Check is resolved. Read the applicable AI Kit rules and the target file yourself, then call record_ai_kit_review_result with your verdict, then call run_implementation_verification again.",
+                    "allowedWrites": ["record_ai_kit_review_result", "run_implementation_verification"],
+                    "forbiddenWrites": ["commit_task_changes", "push_task_branch", "commit_and_push_task_changes"],
+                });
+            }
+            if mcp_verification["status"].as_str() == Some("needs_configuration") {
+                let reason = mcp_verification["checks"].as_array()
+                    .and_then(|checks| checks.iter().find(|c| c["status"].as_str() == Some("needs_configuration")))
+                    .and_then(|c| c["findings"][0].as_str())
+                    .unwrap_or("Dataverse Metadata Check is not configured.")
+                    .to_string();
+                return serde_json::json!({
+                    "nextAction": "needs_configuration",
+                    "canProceed": false,
+                    "requiresUserApproval": true,
+                    "blockingUserAction": reason,
+                    "recommendedTool": null,
+                    "instructionForAI": format!("{reason} This cannot be resolved by the AI agent — ask the user to configure it, then call continue_developer_workflow again."),
+                    "allowedWrites": [],
+                    "forbiddenWrites": ["commit_task_changes", "push_task_branch", "commit_and_push_task_changes"],
+                });
+            }
+            if mcp_verification["status"].as_str() == Some("needs_manual_action") {
+                let manual_step = task_mcp_compose_manual_verification_step(&task_mcp_build_modal_verification_summary(task));
+                return serde_json::json!({
+                    "nextAction": "wait_for_user",
+                    "canProceed": false,
+                    "requiresUserApproval": true,
+                    "blockingUserAction": manual_step,
+                    "recommendedTool": null,
+                    "instructionForAI": format!(
+                        "Script File Readiness and local static/business-rule verification are complete, but some Implementation Verification modal rows are still not-run. {manual_step} Call continue_developer_workflow again after the user completes it."
+                    ),
+                    "allowedWrites": [],
+                    "forbiddenWrites": ["commit_task_changes", "push_task_branch", "commit_and_push_task_changes"],
+                });
+            }
+            // Fallback (should be rare): Dataverse Metadata Check ran but did not resolve.
+            // Re-run run_implementation_verification rather than pointing at the in-app modal —
+            // the automated check can be retried directly.
             return serde_json::json!({
-                "nextAction": "wait_for_user",
-                "canProceed": false,
-                "requiresUserApproval": true,
-                "blockingUserAction": "Run Verify Implementation modal in Task Workbench, then call continue_developer_workflow again.",
-                "recommendedTool": null,
-                "instructionForAI": "Dataverse metadata verification for JS/TS requires the in-app Verify Implementation modal. Call continue_developer_workflow again after the user confirms verification in Task Workbench.",
-                "allowedWrites": [],
+                "nextAction": "run_implementation_verification",
+                "canProceed": true,
+                "requiresUserApproval": false,
+                "blockingUserAction": null,
+                "recommendedTool": "run_implementation_verification",
+                "instructionForAI": "Dataverse Metadata Check has not resolved yet. Call run_implementation_verification again.",
+                "allowedWrites": ["run_implementation_verification"],
                 "forbiddenWrites": ["commit_task_changes", "push_task_branch", "commit_and_push_task_changes"],
             });
         }
@@ -8156,13 +8724,13 @@ fn task_mcp_compute_continue_workflow_step(task: &Value) -> Value {
         || matches!(ai_kit_review["status"].as_str().unwrap_or(""), "passed" | "skipped");
     if !ai_kit_done {
         return serde_json::json!({
-            "nextAction": "wait_for_user",
-            "canProceed": false,
-            "requiresUserApproval": true,
-            "blockingUserAction": "Run AI Kit review in Task Workbench, then call continue_developer_workflow again.",
-            "recommendedTool": null,
-            "instructionForAI": "AI Kit review is required before branch creation. Call continue_developer_workflow again after the user completes AI Kit review in Task Workbench.",
-            "allowedWrites": [],
+            "nextAction": "run_ai_kit_review",
+            "canProceed": true,
+            "requiresUserApproval": false,
+            "blockingUserAction": null,
+            "recommendedTool": "record_ai_kit_review_result",
+            "instructionForAI": "AI Kit review is required before branch creation. Read the applicable AI Kit rules and the target file yourself, then call record_ai_kit_review_result with your verdict, then call continue_developer_workflow again.",
+            "allowedWrites": ["record_ai_kit_review_result"],
             "forbiddenWrites": ["commit_task_changes", "push_task_branch", "commit_and_push_task_changes"],
         });
     }
@@ -8259,7 +8827,7 @@ fn task_mcp_implementation_readiness(task: &Value) -> Value {
 
     if !dv_satisfied {
         if is_script {
-            warnings.push("Dataverse metadata verification for JS/TS is not available through MCP. Use the in-app Verify Implementation modal after implementation/upload.".into());
+            warnings.push("Dataverse metadata verification for JS/TS runs automatically after implementation via run_implementation_verification (Primarch, when configured) — not before.".into());
         } else {
             blockers.push("Dataverse metadata verification has not been completed or explicitly skipped.".into());
         }
@@ -8402,7 +8970,38 @@ fn task_mcp_builtin_templates() -> Vec<Value> {
             "sourceFields": ["nvr_customerid", "nvr_contactid", "nvr_isunderwarranty"],
             "targetFields": ["nvr_customerid", "nvr_contactid", "nvr_iswarrantycase"],
             "additionalSourceFields": ["nvr_statuscustom"],
-            "notes": "onChange on nvr_assetid. Source entity: nvr_customerasset. Copy nvr_customerid, nvr_contactid, nvr_isunderwarranty to nvr_servicecase fields nvr_customerid, nvr_contactid, nvr_iswarrantycase. Additional source field available: nvr_statuscustom. Solution: NVRTrainingServiceHubCore. App: nvr_trainingservicehub."
+            "notes": "onChange on nvr_assetid. Source entity: nvr_customerasset. Copy nvr_customerid, nvr_contactid, nvr_isunderwarranty to nvr_servicecase fields nvr_customerid, nvr_contactid, nvr_iswarrantycase. Additional source field available: nvr_statuscustom. Solution: NVRTrainingServiceHubCore. App: nvr_trainingservicehub.",
+            "businessRules": [
+                "Empty nvr_assetid means no-op: do not clear or modify any form fields.",
+                "Retrieve source record from nvr_customerasset using Xrm.WebApi.retrieveRecord before copying fields.",
+                "Check nvr_statuscustom on the retrieved asset: if inactive, retired, or lost, show a form notification and skip prefill.",
+                "Never write validationFields (nvr_statuscustom) to the target entity — read-only source context only.",
+                "Never set a lookup field entityType to an empty string.",
+                "Guard attribute access: check that getFormContext().getAttribute returns non-null before calling setValue.",
+                "Do not use Xrm.Page — use the execution context passed to the event handler.",
+                "Do not trigger autosave and do not upload or register the web resource."
+            ],
+            "acceptanceCriteria": [
+                "onChange fires on nvr_assetid: if the field is empty, the handler exits without modifying any other field.",
+                "onChange fires on nvr_assetid: if the field has a value, retrieveRecord is called on nvr_customerasset with the selected ID.",
+                "If nvr_statuscustom indicates inactive/retired/lost: a form notification is shown and no field values are written.",
+                "nvr_customerasset.nvr_customerid is copied to nvr_servicecase.nvr_customerid.",
+                "nvr_customerasset.nvr_contactid is copied to nvr_servicecase.nvr_contactid.",
+                "nvr_customerasset.nvr_isunderwarranty is copied to nvr_servicecase.nvr_iswarrantycase.",
+                "No Xrm.Page reference appears in the output code.",
+                "No autosave call appears in the output code."
+            ],
+            "staticRules": [
+                { "id": "retrieve-source-entity", "description": "retrieveRecord must target nvr_customerasset.", "type": "must-match" },
+                { "id": "no-xrm-page", "description": "Must not reference Xrm.Page.", "type": "must-not-match" },
+                { "id": "no-autosave", "description": "Must not trigger autosave (formContext.data.save()).", "type": "must-not-match" },
+                { "id": "no-webresource-upload", "description": "Must not upload or register web resources.", "type": "must-not-match" },
+                { "id": "no-todo-fixme-placeholder", "description": "Must not contain TODO/FIXME/placeholder markers.", "type": "must-not-match" },
+                { "id": "no-empty-lookup-entitytype", "description": "Lookup entityType must never be an empty string.", "type": "must-not-match" },
+                { "id": "no-write-validationfields", "description": "nvr_statuscustom (validation field) must not be written to a target with setValue.", "type": "must-not-match" },
+                { "id": "status-custom-checks-inactive-values", "description": "nvr_statuscustom must be checked against inactive/retired/lost values, not merely non-null.", "type": "must-match" },
+                { "id": "notification-on-inactive-status", "description": "Must show a form notification when status is inactive/retired/lost.", "type": "must-match" }
+            ]
         }),
         serde_json::json!({
             "id": "nvr-training-sh-plugin-workorderline",
@@ -9087,7 +9686,7 @@ fn task_mcp_execute_tool(app: &tauri::AppHandle, tool_name: &str, args: &Value) 
             let mut applied: Vec<&str> = Vec::new();
             let skipped = vec![serde_json::json!({
                 "action": "run_dataverse_check_for_task",
-                "reason": "Dataverse metadata verification for JS/TS is not available through MCP. Use the in-app Verify Implementation modal after implementation/upload."
+                "reason": "Dataverse Metadata Check for JS/TS runs automatically after implementation via run_implementation_verification (Primarch, when configured) — not during setup, since no artifact exists yet."
             })];
             let mut hard_blockers: Vec<String> = Vec::new();
             let mut warnings: Vec<String> = Vec::new();
@@ -9191,7 +9790,7 @@ fn task_mcp_execute_tool(app: &tauri::AppHandle, tool_name: &str, args: &Value) 
                     .to_string();
                 let confirmed_missing = task["workflowSetup"]["confirmedAt"].as_str().unwrap_or("").is_empty();
                 if dev_target_kind == "script" || work_kind == "script" || work_kind == "ribbon" {
-                    warnings.push("Dataverse metadata verification for JS/TS is not available through MCP. Use the in-app Verify Implementation modal after implementation/upload.".into());
+                    warnings.push("Dataverse metadata verification for JS/TS runs automatically after implementation via run_implementation_verification (Primarch, when configured) — not before.".into());
                 }
                 if task["workflowSetup"]["repositoryRoot"].as_str().unwrap_or("").is_empty() { missing.push("repositoryRoot".into()); }
                 if work_kind.is_empty() || work_kind == "unknown" { missing.push("workKind".into()); }
@@ -9285,18 +9884,9 @@ fn task_mcp_execute_tool(app: &tauri::AppHandle, tool_name: &str, args: &Value) 
             if task_id.is_empty() { return Err("Missing required argument: id".to_string()); }
             let task = task_mcp_get_task(&tasks, task_id)
                 .ok_or_else(|| format!("Task not found: {task_id}"))?;
-            serde_json::json!({
-                "taskId":                task_id,
-                "displayPhase":          task_mcp_display_phase(task),
-                "status":                task["status"].as_str(),
-                "waitingState":          task["waitingState"].as_str(),
-                "attentionState":        task["attentionState"].as_str(),
-                "checklist":             task_mcp_workflow_checklist(task),
-                "localTestRecord":       task.get("localTestRecord").cloned().unwrap_or(Value::Null),
-                "consultantTestRecord":  task.get("consultantTestRecord").cloned().unwrap_or(Value::Null),
-                "mcpNextStep":           task.get("mcpNextStep").cloned().unwrap_or(Value::Null),
-                "nextRecommendedStep":   task_mcp_next_recommended_step(task),
-            })
+            let mut overview = task_mcp_workflow_overview(task);
+            overview["taskId"] = serde_json::json!(task_id);
+            overview
         }
 
         "get_task_original_message" => {
@@ -9566,44 +10156,356 @@ fn task_mcp_execute_tool(app: &tauri::AppHandle, tool_name: &str, args: &Value) 
             let index = task_mcp_find_task_index(&tasks, task_id)
                 .ok_or_else(|| format!("Task not found: {task_id}"))?;
             let task = &mut tasks[index];
-            match phase {
-                "new" => {
-                    task["status"]       = serde_json::json!("new");
-                    task["waitingState"] = Value::Null;
-                    task["attentionState"] = Value::Null;
-                }
-                "analyzed" => {
-                    task["status"]       = serde_json::json!("analyzed");
-                    task["waitingState"] = Value::Null;
-                    task["attentionState"] = Value::Null;
-                }
-                "development" => {
-                    task["status"]       = serde_json::json!("in-progress");
-                    task["waitingState"] = Value::Null;
-                    task["attentionState"] = Value::Null;
-                }
-                "testing" => {
-                    task["status"]       = serde_json::json!("in-progress");
-                    task["waitingState"] = serde_json::json!("consultant-testing");
-                    task["attentionState"] = Value::Null;
-                }
-                "review" => {
-                    task["status"]       = serde_json::json!("ready-for-review");
-                    task["waitingState"] = serde_json::json!("code-review");
-                    task["attentionState"] = Value::Null;
-                }
-                "done" => {
-                    task["status"]       = serde_json::json!("done");
-                    task["waitingState"] = Value::Null;
-                    task["attentionState"] = Value::Null;
-                    task["completedAt"]  = serde_json::json!(chrono_now_iso());
-                }
-                _ => {}
-            }
+            task_mcp_set_status_phase(task, phase);
             task_mcp_append_audit_note(task, &format!("set_task_phase -> {phase}"));
             updated = true;
             serde_json::json!({"task": task_mcp_safe_task_summary(task)})
         }
+
+        "record_ai_implementation_completed" => {
+            let task_id = args["taskId"].as_str().unwrap_or("").trim();
+            if task_id.is_empty() { return Err("Missing required argument: taskId".to_string()); }
+
+            let files_changed: Vec<&str> = args["filesChanged"].as_array()
+                .map(|a| a.iter().filter_map(|v| v.as_str()).collect())
+                .unwrap_or_default();
+            if files_changed.is_empty() { return Err("filesChanged must be a non-empty array".to_string()); }
+
+            let summary = args["summary"].as_str().unwrap_or("").trim();
+            if summary.is_empty() { return Err("Missing required argument: summary".to_string()); }
+
+            let index = task_mcp_find_task_index(&tasks, task_id)
+                .ok_or_else(|| format!("Task not found: {task_id}"))?;
+            let task = &mut tasks[index];
+
+            if task["taskMode"].as_str() != Some("developer") {
+                return Err("Task is not in developer mode.".to_string());
+            }
+            let plan_approved = task["crmDeveloperWorkflow"]["planApproval"]["approved"].as_bool().unwrap_or(false);
+            let plan_invalidated = !task["crmDeveloperWorkflow"]["planApproval"]["invalidatedAt"].is_null();
+            if !plan_approved || plan_invalidated {
+                return Err("Technical plan is not approved. Approve the plan before recording implementation.".to_string());
+            }
+
+            let now = chrono_now_iso();
+            let implementation_checks = args["implementationChecks"].as_array().cloned().unwrap_or_default();
+            task["crmDeveloperWorkflow"]["lastAiImplementation"] = serde_json::json!({
+                "filesChanged": files_changed,
+                "summary": summary,
+                "implementationChecks": implementation_checks,
+                "completedAt": now,
+            });
+            if task["mcpChecklistOverrides"].is_null() { task["mcpChecklistOverrides"] = serde_json::json!({}); }
+            task["mcpChecklistOverrides"]["implementation-done"] = serde_json::json!("done");
+            task["localTestRecord"] = serde_json::json!({
+                "status":    "not-needed",
+                "updatedAt": now,
+                "note":      "Script implementation completed by AI — no local test required before Dataverse upload.",
+            });
+            task["mcpChecklistOverrides"]["local-test-done"] = serde_json::json!("optional");
+
+            let implemented_artifact_path = if task_mcp_is_script_workflow_task(task) {
+                let resolved = task_mcp_resolve_implemented_script_artifact(task, &files_changed);
+                if let Some(path) = &resolved {
+                    task_mcp_apply_implemented_script_artifact(task, path);
+                }
+                resolved
+            } else {
+                None
+            };
+            // The implementation changed — any previous run_implementation_verification result is stale.
+            if task["implementationVerification"]["mcpVerification"].is_object() {
+                task["implementationVerification"].as_object_mut().unwrap().remove("mcpVerification");
+            }
+
+            task_mcp_append_audit_note(task, &format!("record_ai_implementation_completed: {}", files_changed.join(", ")));
+            task_mcp_apply_developer_workflow_transition(task, "ai_implementation_completed", &Value::Null);
+            updated = true;
+            serde_json::json!({
+                "recorded": true,
+                "implementedArtifactPath": implemented_artifact_path,
+                "nextStep": "Call continue_developer_workflow, then run_implementation_verification before the manual Dataverse Upload / Verify Implementation step.",
+                "requiresManualCrmAction": true,
+                "workflowOverview": task_mcp_workflow_overview(task),
+            })
+        }
+
+        "run_implementation_verification" => {
+            let task_id = args["taskId"].as_str().unwrap_or("").trim();
+            if task_id.is_empty() { return Err("Missing required argument: taskId".to_string()); }
+            let index = task_mcp_find_task_index(&tasks, task_id)
+                .ok_or_else(|| format!("Task not found: {task_id}"))?;
+
+            if tasks[index]["taskMode"].as_str() != Some("developer") {
+                return Err("Task is not in developer mode.".to_string());
+            }
+            if !task_mcp_is_script_workflow_task(&tasks[index]) {
+                return Err("run_implementation_verification currently supports script/ribbon tasks only. Use run_dataverse_check_for_task for plugin tasks.".to_string());
+            }
+
+            let requested_checks: Option<std::collections::HashSet<String>> = args["checks"].as_array()
+                .filter(|a| !a.is_empty())
+                .map(|a| a.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect());
+            let run_check = |key: &str| requested_checks.as_ref().map(|set| set.contains(key)).unwrap_or(true);
+
+            let mut checks: Vec<Value> = Vec::new();
+            let mut fixable_findings: Vec<Value> = Vec::new();
+            let mut readiness_status: Option<String> = None;
+            let mut readiness_finding: Option<String> = None;
+            let mut file_content: Option<String> = None;
+            let mut absolute_script_path: Option<String> = None;
+
+            if run_check("scriptFileReadiness") {
+                let absolute_path = task_mcp_resolve_script_absolute_path(&tasks[index]);
+                absolute_script_path = absolute_path.clone();
+                let (status, finding, fixable) = match &absolute_path {
+                    None => (
+                        "failed".to_string(),
+                        "No script artifact path is set on the task. Call record_ai_implementation_completed with filesChanged first.".to_string(),
+                        Some("Persist the implemented file path via record_ai_implementation_completed before verifying.".to_string()),
+                    ),
+                    Some(p) => match fs::read_to_string(p) {
+                        Err(e) => (
+                            "failed".to_string(),
+                            format!("Script file not found or unreadable at {p}: {e}"),
+                            Some("Verify the implemented file was written to the expected path and call record_ai_implementation_completed again.".to_string()),
+                        ),
+                        Ok(content) => {
+                            let is_empty = content.trim().is_empty();
+                            let line_count = content.lines().count();
+                            let file_name = std::path::Path::new(p).file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| p.clone());
+                            let finding = if is_empty {
+                                format!("Script file exists but is empty: {file_name}.")
+                            } else {
+                                format!("Script file found: {file_name} ({line_count} lines).")
+                            };
+                            if !is_empty { file_content = Some(content); }
+                            (
+                                if is_empty { "failed".to_string() } else { "passed".to_string() },
+                                finding,
+                                if is_empty { Some("Write the actual implementation to the script file.".to_string()) } else { None },
+                            )
+                        }
+                    },
+                };
+                checks.push(serde_json::json!({ "name": "Script File Readiness", "status": status, "findings": [finding] }));
+                if let Some(fix_description) = fixable {
+                    fixable_findings.push(serde_json::json!({ "id": "script-file-readiness", "description": fix_description }));
+                }
+                readiness_status = Some(status);
+                readiness_finding = Some(finding);
+            }
+
+            if run_check("localStaticVerification") {
+                if let Some(content) = &file_content {
+                    let template = task_mcp_builtin_templates().into_iter()
+                        .find(|t| tasks[index]["title"].as_str().unwrap_or("").to_lowercase()
+                            .contains(&t["titlePattern"].as_str().unwrap_or("__none__").to_lowercase()));
+                    let (status, findings, fixable) = task_mcp_run_static_business_rule_checks(template.as_ref(), content);
+                    checks.push(serde_json::json!({ "name": "Local Static/Business-Rule Verification", "status": status, "findings": findings }));
+                    fixable_findings.extend(fixable);
+                } else {
+                    checks.push(serde_json::json!({ "name": "Local Static/Business-Rule Verification", "status": "skipped", "findings": ["Skipped — script file is not readable."] }));
+                }
+            }
+
+            // Dataverse Metadata Check: actually run it (Rust JS/TS + C# scanners against
+            // Primarch), same as run_dataverse_check_for_task, instead of the old read-only
+            // passthrough. Persists to task.crmVerificationReports — the modal's canonical field.
+            if run_check("dataverseMetadataCheck") {
+                match &absolute_script_path {
+                    None => {
+                        checks.push(serde_json::json!({
+                            "name": "Dataverse Metadata Check",
+                            "status": "skipped",
+                            "findings": ["Skipped — script file path is not resolved yet."],
+                        }));
+                    }
+                    Some(path) => {
+                        let settings = load_settings(app.clone())?;
+                        match get_mcp_config(&settings) {
+                            Err(msg) => {
+                                checks.push(serde_json::json!({
+                                    "name": "Dataverse Metadata Check",
+                                    "status": "needs_configuration",
+                                    "findings": [format!("Dataverse Metadata Check is not configured: {msg}")],
+                                }));
+                            }
+                            Ok(_) => {
+                                let scan_hint = tasks[index]["workflowSetup"]["primaryEntityLogicalName"].as_str()
+                                    .map(str::to_string)
+                                    .or_else(|| tasks[index]["crmDeveloperWorkflow"]["technicalPlan"]["target"]["entityLogicalName"].as_str().map(str::to_string));
+                                match task_mcp_run_dataverse_metadata_check(app, &mut tasks, index, path, scan_hint.as_deref(), None) {
+                                    Ok(report) => {
+                                        let (dv_status, finding, dv_fixable) = task_mcp_dataverse_check_from_report(&report);
+                                        fixable_findings.extend(dv_fixable);
+                                        checks.push(serde_json::json!({ "name": "Dataverse Metadata Check", "status": dv_status, "findings": [finding] }));
+                                    }
+                                    Err(e) => {
+                                        checks.push(serde_json::json!({
+                                            "name": "Dataverse Metadata Check",
+                                            "status": "failed",
+                                            "findings": [format!("Dataverse Metadata Check failed: {e}")],
+                                        }));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // AI Internal Code Review: Claude (the calling MCP agent) performs this review itself
+            // — read the AI Kit rules and target file, then call record_ai_kit_review_result. Only
+            // a passthrough when a result has already been recorded.
+            if run_check("aiInternalCodeReview") {
+                let ai_status = tasks[index]["implementationVerification"]["aiCodeReview"]["status"].as_str().unwrap_or("").to_string();
+                if task_mcp_impl_check_resolved(&ai_status) {
+                    checks.push(serde_json::json!({ "name": "AI Internal Code Review", "status": ai_status, "findings": [format!("Existing AI Kit review status: {ai_status}.")] }));
+                } else {
+                    checks.push(serde_json::json!({
+                        "name": "AI Internal Code Review",
+                        "status": "needs_ai_kit_review",
+                        "findings": ["Read the applicable AI Kit rules and the target file yourself (use get_power_platform_ai_kit_status and get_developer_work_packet for context), then call record_ai_kit_review_result with your verdict."],
+                    }));
+                }
+            }
+
+            if run_check("localTest") {
+                let (status, finding) = task_mcp_local_test_impl_passthrough(&tasks[index]);
+                checks.push(serde_json::json!({ "name": "Local Test", "status": status, "findings": [finding] }));
+            }
+
+            let (mut status, mut next_action) = task_mcp_rollup_verification_status(&checks, fixable_findings.len());
+
+            // Fail-fast: never tell the agent to call record_ai_kit_review_result if this
+            // toolset does not actually expose it — that produces a confusing "tool not
+            // found"/"bridge not running" error after the fact instead of one clear instruction now.
+            let mut missing_required_tools: Vec<String> = Vec::new();
+            if next_action == "run_ai_kit_review" {
+                let missing = task_mcp_missing_required_tools();
+                if missing.iter().any(|m| m == "record_ai_kit_review_result") {
+                    status = "tooling_error";
+                    next_action = "reload_mcp_or_start_app";
+                    missing_required_tools = vec!["record_ai_kit_review_result".to_string()];
+                }
+            }
+
+            let now = chrono_now_iso();
+            let task = &mut tasks[index];
+            if task["implementationVerification"].is_null() { task["implementationVerification"] = serde_json::json!({}); }
+            task["implementationVerification"]["mcpVerification"] = serde_json::json!({
+                "status": status,
+                "checks": checks,
+                "fixableFindings": fixable_findings,
+                "nextAction": next_action,
+                "ranAt": now,
+            });
+            if let (Some(rstatus), Some(rfinding)) = (&readiness_status, &readiness_finding) {
+                task["implementationVerification"]["buildCheck"] = serde_json::json!({
+                    "status": rstatus,
+                    "runAt": now,
+                    "summary": rfinding,
+                    "findings": [format!("{}|{}", if rstatus == "passed" { "pass" } else { "fail" }, rfinding)],
+                });
+            }
+            task_mcp_append_audit_note(task, &format!("run_implementation_verification -> {status}/{next_action}"));
+            updated = true;
+
+            // Modal-truth summary, built from the SAME canonical fields ImplementationVerification
+            // Modal reads (now including the buildCheck we just wrote above, and the real
+            // crmVerificationReports/aiCodeReview state the checks above may have just written).
+            let mut implementation_verification = task_mcp_build_modal_verification_summary(task);
+            if let Some(static_check) = checks.iter().find(|c| c["name"] == "Local Static/Business-Rule Verification") {
+                implementation_verification["staticBusinessRules"] = serde_json::json!({
+                    "status": static_check["status"],
+                    "label": static_check["name"],
+                    "findings": static_check["findings"],
+                });
+            }
+            let unresolved_required_rows = task_mcp_unresolved_modal_rows(&implementation_verification);
+            let next_recommended_step = match next_action {
+                "reload_mcp_or_start_app" => "Stop. Ask the user to start Task Workbench and reload the MCP server. Do not claim AI Kit review must be done manually unless the tool capability check says AI review cannot be automated.".to_string(),
+                "needs_configuration" => checks.iter()
+                    .find(|c| c["status"].as_str() == Some("needs_configuration"))
+                    .and_then(|c| c["findings"][0].as_str())
+                    .unwrap_or("Resolve the required configuration, then call run_implementation_verification again.")
+                    .to_string(),
+                "fix_code" => "Fix the fixable findings, then call record_ai_implementation_completed and run_implementation_verification again.".to_string(),
+                "run_ai_kit_review" => "Read the applicable AI Kit rules and the target file, then call record_ai_kit_review_result with your verdict, then call run_implementation_verification again.".to_string(),
+                "wait_for_user" => task_mcp_compose_manual_verification_step(&implementation_verification),
+                _ => "All Implementation Verification checks are resolved. Call continue_developer_workflow to proceed.".to_string(),
+            };
+
+            serde_json::json!({
+                "taskId": task_id,
+                "status": status,
+                "checks": checks,
+                "fixableFindings": fixable_findings,
+                "nextAction": next_action,
+                "implementationVerification": implementation_verification,
+                "unresolvedRequiredRows": unresolved_required_rows,
+                "nextRecommendedStep": next_recommended_step,
+                "missingRequiredTools": missing_required_tools,
+                "instructionForAI": next_recommended_step,
+            })
+        }
+
+        "get_implementation_verification_summary" => {
+            let task_id = args["taskId"].as_str().unwrap_or("").trim();
+            if task_id.is_empty() { return Err("Missing required argument: taskId".to_string()); }
+            let task = task_mcp_get_task(&tasks, task_id)
+                .ok_or_else(|| format!("Task not found: {task_id}"))?;
+
+            let mut implementation_verification = task_mcp_build_modal_verification_summary(task);
+            let persisted_checks = task["implementationVerification"]["mcpVerification"]["checks"].as_array().cloned().unwrap_or_default();
+            if let Some(static_check) = persisted_checks.iter().find(|c| c["name"] == "Local Static/Business-Rule Verification") {
+                implementation_verification["staticBusinessRules"] = serde_json::json!({
+                    "status": static_check["status"],
+                    "label": static_check["name"],
+                    "findings": static_check["findings"],
+                });
+            }
+
+            let unresolved_required_rows = task_mcp_unresolved_modal_rows(&implementation_verification);
+            let fixable_findings = task["implementationVerification"]["mcpVerification"]["fixableFindings"].as_array().cloned().unwrap_or_default();
+            // Reuse the nextAction persisted by run_implementation_verification when available, so
+            // this read-only summary never diverges from the actual last run (needs_configuration/
+            // run_ai_kit_review/etc.) — only fall back to the simple derivation when nothing ran yet.
+            let persisted_next_action = task["implementationVerification"]["mcpVerification"]["nextAction"].as_str().map(str::to_string);
+            let next_action = persisted_next_action.unwrap_or_else(|| {
+                if !fixable_findings.is_empty() {
+                    "fix_code".to_string()
+                } else if !unresolved_required_rows.is_empty() {
+                    "wait_for_user".to_string()
+                } else {
+                    "continue_workflow".to_string()
+                }
+            });
+            let next_recommended_step = match next_action.as_str() {
+                "needs_configuration" => persisted_checks.iter()
+                    .find(|c| c["status"].as_str() == Some("needs_configuration"))
+                    .and_then(|c| c["findings"][0].as_str())
+                    .unwrap_or("Resolve the required configuration, then call run_implementation_verification again.")
+                    .to_string(),
+                "fix_code" => "Fix the fixable findings, then call record_ai_implementation_completed and run_implementation_verification again.".to_string(),
+                "run_ai_kit_review" => "Read the applicable AI Kit rules and the target file, then call record_ai_kit_review_result with your verdict, then call run_implementation_verification again.".to_string(),
+                "wait_for_user" => task_mcp_compose_manual_verification_step(&implementation_verification),
+                _ => "All Implementation Verification checks are resolved. Call continue_developer_workflow to proceed.".to_string(),
+            };
+
+            serde_json::json!({
+                "taskId": task_id,
+                "implementationVerification": implementation_verification,
+                "checks": persisted_checks,
+                "unresolvedRequiredRows": unresolved_required_rows,
+                "fixableFindings": fixable_findings,
+                "nextAction": next_action,
+                "nextRecommendedStep": next_recommended_step,
+            })
+        }
+
+        "get_task_workbench_mcp_capabilities" => task_mcp_capabilities(),
 
         "record_local_test" => {
             let task_id = args["taskId"].as_str().unwrap_or("").trim();
@@ -9882,6 +10784,20 @@ fn task_mcp_execute_tool(app: &tauri::AppHandle, tool_name: &str, args: &Value) 
             task_mcp_append_audit_note(task, "approve_technical_plan_if_safe [AI safe auto-approval]");
             updated = true;
 
+            // Determine whether code can now be written and advance the app-visible phase
+            // through the canonical transition, so the UI never stays on NEW/Analyze once
+            // get_developer_work_packet would return canWriteCode=true.
+            let post_approval_snapshot = tasks[index].clone();
+            let dev_defaults_post = task_mcp_find_customer(&customers, &customer_id)
+                .and_then(|c| task_mcp_customer_dev_defaults(c, &crm_base_dir));
+            let can_write_now = task_mcp_developer_work_packet(&post_approval_snapshot, dev_defaults_post.as_ref(), ai_kit_path.as_deref())
+                ["canWriteCode"].as_bool().unwrap_or(false);
+            task_mcp_apply_developer_workflow_transition(
+                &mut tasks[index],
+                "technical_plan_approved",
+                &serde_json::json!({ "canWriteCode": can_write_now }),
+            );
+
             // Return a refreshed work packet so the AI can proceed without a second round-trip.
             let refreshed_task = tasks[index].clone();
             let dev_defaults2 = task_mcp_find_customer(&customers, &customer_id)
@@ -9892,6 +10808,7 @@ fn task_mcp_execute_tool(app: &tauri::AppHandle, tool_name: &str, args: &Value) 
                 "planRefreshed": can_refresh,
                 "approvedAt": now,
                 "workPacket": refreshed_packet,
+                "workflowOverview": task_mcp_workflow_overview(&tasks[index]),
             })
         }
 
@@ -10065,56 +10982,8 @@ fn task_mcp_execute_tool(app: &tauri::AppHandle, tool_name: &str, args: &Value) 
                 app, &task_snapshot, persist_inferred, &mut tasks, task_index
             )?;
 
-            // Detect script tasks â€” JS/TS files are not handled by the C# scanner.
-            let lower_path = artifact_path.to_lowercase();
-            if lower_path.ends_with(".js") || lower_path.ends_with(".ts") {
-                let now = chrono_now_iso();
-                let file_name: String = artifact_path.replace('\\', "/")
-                    .split('/').last().unwrap_or(artifact_path.as_str()).to_string();
-                let msg = format!(
-                    "Dataverse check is not supported for script files ({file_name}). \
-                     Use the in-app Verify Implementation modal, which handles JavaScript/TypeScript directly."
-                );
-                let report_id = format!("mcp-{}", now.replace(':', "-"));
-                {
-                    let task = &mut tasks[task_index];
-                    let existing: Vec<Value> = task["crmVerificationReports"]
-                        .as_array().cloned().unwrap_or_default();
-                    let report_entry = serde_json::json!({
-                        "id": report_id,
-                        "createdAt": now,
-                        "verdict": "unknown",
-                        "summary": msg,
-                        "answer": msg,
-                        "filePath": artifact_path,
-                    });
-                    let mut reports = vec![report_entry];
-                    reports.extend(existing.into_iter().take(4));
-                    task["crmVerificationReports"] = Value::Array(reports);
-                    task["mcpNextStep"] = serde_json::json!({
-                        "action": "Use the in-app Verify Implementation modal for JavaScript/TypeScript Dataverse checks",
-                        "reason": "MCP Dataverse check does not support JS/TS files.",
-                        "updatedAt": now,
-                    });
-                    task_mcp_append_audit_note(task, "run_dataverse_check_for_task -> unknown (script file, not supported by MCP scanner)");
-                }
-                task_mcp_save_tasks(app, &tasks)?;
-                return Ok(serde_json::json!({
-                    "ok": true,
-                    "verdict": "unknown",
-                    "status": "not-supported",
-                    "message": msg,
-                    "taskId": task_id,
-                    "artifactPath": artifact_path,
-                    "artifactInferred": artifact_inferred,
-                }));
-            }
-
-            // Read the source file.
-            let content = fs::read_to_string(&artifact_path)
-                .map_err(|e| format!("Cannot read artifact '{artifact_path}': {e}"))?;
-
-            // Scan C# logical names.
+            // Scan logical names â€” C# via scan_cs_logical_names_for_mcp, JS/TS via
+            // scan_js_logical_names_for_mcp (chosen by extension inside the shared helper).
             let primary_entity_for_scan = primary_override.clone()
                 .or_else(|| task_snapshot["workflowSetup"]["primaryEntityLogicalName"].as_str().map(str::to_string))
                 .or_else(|| {
@@ -10122,53 +10991,15 @@ fn task_mcp_execute_tool(app: &tauri::AppHandle, tool_name: &str, args: &Value) 
                     task_snapshot["crmDeveloperWorkflow"]["technicalPlan"]["target"]["entityLogicalName"]
                         .as_str().map(str::to_string)
                 });
-            let raw_scan = scan_cs_logical_names_for_mcp(&content, primary_entity_for_scan.as_deref());
-            let scan: CrmScanResult = serde_json::from_value(raw_scan.clone()).unwrap_or_default();
 
-            // Run Primarch verification.  This is async; create a one-shot Tokio runtime.
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .map_err(|e| format!("Failed to create Tokio runtime: {e}"))?;
-            let report = rt.block_on(run_crm_verification_for_scan(
-                app,
-                scan,
-                raw_scan.clone(),
-                Some(artifact_path.clone()),
-                primary_override,
-            ))?;
-
-            let verdict      = report["verdict"].as_str().unwrap_or("unknown").to_string();
-            let report_id    = format!("mcp-{}", chrono_now_iso().replace(':', "-"));
-            let now          = chrono_now_iso();
-
-            // Persist report to task.crmVerificationReports (newest first, cap 5).
-            {
-                let task = &mut tasks[task_index];
-                let existing: Vec<Value> = task["crmVerificationReports"]
-                    .as_array().cloned().unwrap_or_default();
-                let mut enriched = report.clone();
-                enriched["id"]        = Value::String(report_id);
-                enriched["createdAt"] = Value::String(now.clone());
-                let mut reports = vec![enriched];
-                reports.extend(existing.into_iter().take(4));
-                task["crmVerificationReports"] = Value::Array(reports);
-
-                // Set next-step hint.
-                let next_action = match verdict.as_str() {
-                    "pass"     => "Run AI code review or local test",
-                    "warnings" => "Review Dataverse warnings before proceeding",
-                    "fail"     => "Fix Dataverse metadata issues before development continues",
-                    _          => "Confirm setup or entity binding and rerun Dataverse check",
-                };
-                task["mcpNextStep"] = serde_json::json!({
-                    "action":    next_action,
-                    "reason":    format!("Dataverse check verdict: {}.", verdict),
-                    "updatedAt": now,
-                });
-                task_mcp_append_audit_note(task, &format!("run_dataverse_check_for_task -> {verdict}"));
-            }
+            let report = task_mcp_run_dataverse_metadata_check(
+                app, &mut tasks, task_index, &artifact_path,
+                primary_entity_for_scan.as_deref(), primary_override,
+            )?;
             updated = true;
+
+            let verdict = report["verdict"].as_str().unwrap_or("unknown").to_string();
+            let raw_scan = report["rawExtractedReferences"].clone();
 
             // Build compact result for MCP caller.
             let confirmed = report["confirmedReferences"].as_array().map(|a| a.len()).unwrap_or(0);
@@ -10506,10 +11337,58 @@ fn task_mcp_execute_tool(app: &tauri::AppHandle, tool_name: &str, args: &Value) 
             });
             task["crmDeveloperWorkflow"]["updatedAt"] = serde_json::json!(now);
             task_mcp_append_audit_note(task, &format!("record_external_action_completed -> {action_type}"));
+            // Web resource upload / plugin registration is the manual CRM step that unblocks
+            // DEVELOPMENT / Verify Implementation. Once recorded, hand the task off to testing
+            // instead of leaving it stuck on Development indefinitely.
+            let unblocks_testing = matches!(action_type, "web-resource-upload" | "plugin-registration")
+                && task["taskMode"].as_str() == Some("developer")
+                && task["status"].as_str() == Some("in-progress")
+                && task["waitingState"].as_str() != Some("consultant-testing");
+            if unblocks_testing {
+                task_mcp_apply_developer_workflow_transition(task, "manual_crm_verification_completed", &Value::Null);
+            }
             updated = true;
             serde_json::json!({
                 "task": task_mcp_safe_task_summary(task),
                 "message": format!("External action '{action_type}' recorded as completed."),
+                "workflowOverview": task_mcp_workflow_overview(task),
+            })
+        }
+
+        // â”€â”€ record_ai_kit_review_result â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        // Records an AI Kit / Client-API code review performed by the calling AI agent itself
+        // (Claude, in the current MCP session) â€” no external LLM/API call is made here. Persists
+        // to implementationVerification.aiCodeReview, the same canonical field the Implementation
+        // Verification modal reads, and to task.aiKitReview so continue_developer_workflow's
+        // separate pre-branch AI Kit gate resolves too. Local task state only.
+        "record_ai_kit_review_result" => {
+            let task_id = args["taskId"].as_str().unwrap_or("").trim();
+            if task_id.is_empty() { return Err("Missing required argument: taskId".to_string()); }
+            let status = args["status"].as_str().unwrap_or("").trim();
+            if !matches!(status, "passed" | "failed" | "warnings") {
+                return Err(format!("Invalid status '{status}'. Allowed: passed, failed, warnings"));
+            }
+            let reviewed_files: Vec<Value> = args["reviewedFiles"].as_array().cloned().unwrap_or_default();
+            let findings: Vec<Value> = args["findings"].as_array().cloned().unwrap_or_default();
+            let fixable_findings: Vec<Value> = args["fixableFindings"].as_array().cloned().unwrap_or_default();
+
+            let index = task_mcp_find_task_index(&tasks, task_id)
+                .ok_or_else(|| format!("Task not found: {task_id}"))?;
+            let task = &mut tasks[index];
+            let now = chrono_now_iso();
+
+            task_mcp_apply_ai_kit_review_result(task, status, reviewed_files, findings, fixable_findings, &now);
+            task_mcp_append_audit_note(task, &format!("record_ai_kit_review_result -> {status}"));
+            updated = true;
+
+            let implementation_verification = task_mcp_build_modal_verification_summary(task);
+            let unresolved_required_rows = task_mcp_unresolved_modal_rows(&implementation_verification);
+            serde_json::json!({
+                "taskId": task_id,
+                "recorded": true,
+                "implementationVerification": implementation_verification,
+                "unresolvedRequiredRows": unresolved_required_rows,
+                "nextRecommendedStep": "Call run_implementation_verification again to confirm all automated checks are resolved.",
             })
         }
 
@@ -12794,6 +13673,160 @@ async fn run_crm_verification_for_scan(
     }
 }
 
+/// Maps a Primarch verification report (as returned by `run_crm_verification_for_scan` /
+/// `task_mcp_run_dataverse_metadata_check`) to a "Dataverse Metadata Check" check-row status,
+/// finding message, and any fixable findings for missing references. Pure — no I/O — so the
+/// verdict-to-status mapping can be unit tested without a live Primarch process.
+fn task_mcp_dataverse_check_from_report(report: &Value) -> (String, String, Vec<Value>) {
+    let verdict = report["verdict"].as_str().unwrap_or("unknown");
+    let mut fixable = Vec::new();
+    let (status, finding) = match verdict {
+        "pass" => ("passed", report["summary"].as_str().unwrap_or("Dataverse Metadata Check passed.").to_string()),
+        "warnings" => ("warnings", report["summary"].as_str().unwrap_or("Dataverse Metadata Check completed with warnings.").to_string()),
+        "fail" => {
+            for missing in report["missingReferences"].as_array().unwrap_or(&vec![]) {
+                let label = missing["displayName"].as_str().unwrap_or("unknown").to_string();
+                let entity = missing["entityLogicalName"].as_str().unwrap_or("").to_string();
+                fixable.push(serde_json::json!({
+                    "id": format!("dataverse-missing-{label}"),
+                    "description": if entity.is_empty() {
+                        format!("Dataverse Metadata Check: '{label}' was not found in Dataverse. Fix the logical name or field mapping.")
+                    } else {
+                        format!("Dataverse Metadata Check: '{label}' was not found on entity '{entity}' in Dataverse. Fix the logical name or field mapping.")
+                    },
+                }));
+            }
+            ("failed", report["summary"].as_str().unwrap_or("Dataverse Metadata Check found missing references.").to_string())
+        }
+        "not_configured" => ("needs_configuration", "Dataverse metadata assistant is not configured. Enable CRM Metadata and set the Primarch MCP command/args in Settings.".to_string()),
+        _ => ("warnings", report["summary"].as_str().unwrap_or("Dataverse Metadata Check could not be completed.").to_string()),
+    };
+    (status.to_string(), finding, fixable)
+}
+
+/// Rolls up the top-level run_implementation_verification status/nextAction from the per-check
+/// statuses and accumulated fixable findings. Pure — no I/O.
+///
+/// Priority: agent-actionable outcomes (fix code, run the AI Kit review) come before
+/// needs_configuration — that requires the user to act, so it must not block work the agent can
+/// already do right now. needs_configuration only wins once there is nothing left for the agent
+/// itself to act on. needs_manual_action/wait_for_user is reserved for the genuinely manual rows
+/// (Local Test) — never for Dataverse Check or AI Review merely because this is a JS/TS task.
+fn task_mcp_rollup_verification_status(checks: &[Value], fixable_findings_count: usize) -> (&'static str, &'static str) {
+    let has_needs_configuration = checks.iter().any(|c| c["status"].as_str() == Some("needs_configuration"));
+    let has_needs_ai_review = checks.iter().any(|c| c["status"].as_str() == Some("needs_ai_kit_review"));
+    if fixable_findings_count > 0 {
+        ("failed", "fix_code")
+    } else if has_needs_ai_review {
+        ("pending_ai_kit_review", "run_ai_kit_review")
+    } else if has_needs_configuration {
+        ("needs_configuration", "needs_configuration")
+    } else if checks.iter().any(|c| matches!(c["status"].as_str(), Some("needs_manual_action") | Some("failed") | Some("skipped"))) {
+        ("needs_manual_action", "wait_for_user")
+    } else {
+        ("passed", "continue_workflow")
+    }
+}
+
+/// Applies an AI Kit / Client-API review result (performed by the calling AI agent itself) to a
+/// task: writes implementationVerification.aiCodeReview (the canonical field the modal reads) and
+/// task.aiKitReview (the separate continue_developer_workflow pre-branch gate). Pure mutation — no
+/// I/O — so this is unit testable without a Tauri AppHandle.
+fn task_mcp_apply_ai_kit_review_result(
+    task: &mut Value,
+    status: &str,
+    reviewed_files: Vec<Value>,
+    findings: Vec<Value>,
+    fixable_findings: Vec<Value>,
+    now: &str,
+) {
+    if task["implementationVerification"].is_null() { task["implementationVerification"] = serde_json::json!({}); }
+    task["implementationVerification"]["aiCodeReview"] = serde_json::json!({
+        "status":          status,
+        "reviewSource":    "claude-ai-kit",
+        "reviewedFiles":   reviewed_files,
+        "findings":        findings,
+        "fixableFindings": fixable_findings,
+        "runAt":           now,
+    });
+    task["implementationVerification"]["updatedAt"] = serde_json::json!(now);
+    task["aiKitReview"] = serde_json::json!({
+        "completedAt":  now,
+        "status":       status,
+        "reviewSource": "claude-ai-kit",
+    });
+}
+
+/// Reads `artifact_path`, scans it for Dataverse logical-name references (C# via
+/// `scan_cs_logical_names_for_mcp`, JS/TS via `scan_js_logical_names_for_mcp` — chosen by
+/// extension), verifies the references against Dataverse via `run_crm_verification_for_scan`
+/// (Primarch), and persists the resulting report to `task.crmVerificationReports` (newest first,
+/// capped at 5) — the same field the Implementation Verification modal derives its Dataverse
+/// Metadata Check status from. Shared by `run_dataverse_check_for_task` (plugin + script) and
+/// `run_implementation_verification`'s Dataverse Metadata Check step, so both paths run the exact
+/// same verification. Never writes to Dataverse.
+fn task_mcp_run_dataverse_metadata_check(
+    app: &tauri::AppHandle,
+    tasks: &mut [Value],
+    task_index: usize,
+    artifact_path: &str,
+    scan_hint: Option<&str>,
+    explicit_override: Option<String>,
+) -> Result<Value, String> {
+    let content = fs::read_to_string(artifact_path)
+        .map_err(|e| format!("Cannot read artifact '{artifact_path}': {e}"))?;
+
+    let lower_path = artifact_path.to_lowercase();
+    let raw_scan = if lower_path.ends_with(".js") || lower_path.ends_with(".ts") {
+        scan_js_logical_names_for_mcp(&content, scan_hint)
+    } else {
+        scan_cs_logical_names_for_mcp(&content, scan_hint)
+    };
+    let scan: CrmScanResult = serde_json::from_value(raw_scan.clone()).unwrap_or_default();
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| format!("Failed to create Tokio runtime: {e}"))?;
+    let report = rt.block_on(run_crm_verification_for_scan(
+        app,
+        scan,
+        raw_scan.clone(),
+        Some(artifact_path.to_string()),
+        explicit_override,
+    ))?;
+
+    let verdict = report["verdict"].as_str().unwrap_or("unknown").to_string();
+    let report_id = format!("mcp-{}", chrono_now_iso().replace(':', "-"));
+    let now = chrono_now_iso();
+
+    {
+        let task = &mut tasks[task_index];
+        let existing: Vec<Value> = task["crmVerificationReports"].as_array().cloned().unwrap_or_default();
+        let mut enriched = report.clone();
+        enriched["id"] = Value::String(report_id);
+        enriched["createdAt"] = Value::String(now.clone());
+        let mut reports = vec![enriched];
+        reports.extend(existing.into_iter().take(4));
+        task["crmVerificationReports"] = Value::Array(reports);
+
+        let next_action = match verdict.as_str() {
+            "pass"     => "Run AI code review or local test",
+            "warnings" => "Review Dataverse warnings before proceeding",
+            "fail"     => "Fix Dataverse metadata issues before development continues",
+            _          => "Confirm setup or entity binding and rerun Dataverse check",
+        };
+        task["mcpNextStep"] = serde_json::json!({
+            "action":    next_action,
+            "reason":    format!("Dataverse check verdict: {}.", verdict),
+            "updatedAt": now,
+        });
+        task_mcp_append_audit_note(task, &format!("dataverse_metadata_check -> {verdict}"));
+    }
+
+    Ok(report)
+}
+
 /// Thin Tauri command wrapper â€” delegates to run_crm_verification_for_scan.
 /// The verdict is deterministic (based on local scan + metadata lookup results).
 /// Never writes to Dataverse.
@@ -13607,6 +14640,379 @@ fn scan_cs_logical_names_for_mcp(content: &str, primary_entity_hint: Option<&str
     })
 }
 
+/// Extracts the quoted string (single or double) immediately following optional whitespace at the
+/// start of `s`. Mirrors the `["']...["']` capture used throughout the JS/TS reference scanner.
+fn js_extract_leading_quoted(s: &str) -> Option<String> {
+    let trimmed = s.trim_start();
+    let quote = trimmed.chars().next().filter(|c| *c == '"' || *c == '\'')?;
+    let rest = &trimmed[quote.len_utf8()..];
+    let end = rest.find(quote)?;
+    Some(rest[..end].to_string())
+}
+
+/// Returns the remainder of `s` after skipping optional leading whitespace and one quoted string.
+fn js_skip_past_quoted(s: &str) -> Option<&str> {
+    let trimmed = s.trim_start();
+    let quote = trimmed.chars().next().filter(|c| *c == '"' || *c == '\'')?;
+    let rest = &trimmed[quote.len_utf8()..];
+    let end = rest.find(quote)?;
+    Some(&rest[end + quote.len_utf8()..])
+}
+
+/// Returns the identifier (letters/digits/_/$, not starting with a digit) immediately preceding
+/// the end of `s`, or `None` if the trailing characters do not form a valid identifier.
+fn js_trailing_ident(s: &str) -> Option<String> {
+    let ident: String = s.chars().rev()
+        .take_while(|c| c.is_alphanumeric() || *c == '_' || *c == '$')
+        .collect::<Vec<char>>().into_iter().rev().collect();
+    if ident.is_empty() || ident.chars().next().is_some_and(|c| c.is_ascii_digit()) { return None; }
+    Some(ident)
+}
+
+/// Returns the identifier (letters/digits/_/$) at the start of `s` (after optional leading
+/// whitespace), or `None` if `s` does not start with an identifier character.
+fn js_leading_ident(s: &str) -> Option<String> {
+    let trimmed = s.trim_start();
+    let ident: String = trimmed.chars().take_while(|c| c.is_alphanumeric() || *c == '_' || *c == '$').collect();
+    if ident.is_empty() { return None; }
+    Some(ident)
+}
+
+/// Finds the variable name assigned via `(const|let|var) X = ` immediately before `before_call`
+/// (the text preceding an `await Xrm.WebApi.retrieve...` call), bounded to the current statement.
+fn js_lhs_var_before(before_call: &str) -> Option<String> {
+    let stmt_start = before_call.rfind(|c| c == '\n' || c == ';' || c == '{').map(|i| i + 1).unwrap_or(0);
+    let stmt = &before_call[stmt_start..];
+    let eq_pos = stmt.rfind("= ")?;
+    js_trailing_ident(stmt[..eq_pos].trim_end())
+}
+
+/// Deduplicates and adds an entity reference (JS/TS scanner).
+fn js_add_entity_ref(entity: &str, source: &str, context_type: &str, refs: &mut Vec<Value>) {
+    if !refs.iter().any(|r| r["logicalName"].as_str() == Some(entity) && r["contextType"].as_str() == Some(context_type)) {
+        refs.push(serde_json::json!({
+            "logicalName": entity,
+            "sourceReason": source,
+            "contextType": context_type,
+        }));
+    }
+}
+
+/// Deduplicates and adds an attribute reference (JS/TS scanner). When `entity` is `None`, the
+/// attribute is still recorded (without `entityLogicalName`) and tracked in `ambiguous`, mirroring
+/// the C# scanner's `cs_add_attr_ref` convention.
+fn js_add_attr_ref(
+    entity: &Option<String>,
+    attr: &str,
+    source: &str,
+    context_type: &str,
+    attr_refs: &mut Vec<Value>,
+    ambiguous: &mut Vec<String>,
+    related_entity: Option<&str>,
+) {
+    if attr_refs.iter().any(|r| {
+        r["logicalName"].as_str() == Some(attr)
+            && r["entityLogicalName"].as_str() == entity.as_deref()
+            && r["contextType"].as_str() == Some(context_type)
+    }) {
+        return;
+    }
+    if let Some(e) = entity {
+        let mut v = serde_json::json!({
+            "logicalName": attr,
+            "entityLogicalName": e,
+            "sourceReason": source,
+            "contextType": context_type,
+        });
+        if let Some(re) = related_entity {
+            v["relatedEntityLogicalName"] = serde_json::json!(re);
+        }
+        attr_refs.push(v);
+    } else {
+        if !ambiguous.contains(&attr.to_string()) { ambiguous.push(attr.to_string()); }
+        attr_refs.push(serde_json::json!({
+            "logicalName": attr,
+            "sourceReason": source,
+            "contextType": context_type,
+        }));
+    }
+}
+
+/// Finds the value of OData query parameter `name` in a decoded query string (`decoded`), matching
+/// it only at a parameter boundary (start of string or right after `&`). Returns the raw value up
+/// to the next `&` (or end of string).
+fn js_find_query_param<'a>(decoded: &'a str, name: &str) -> Option<&'a str> {
+    let lower = decoded.to_lowercase();
+    let needle = format!("{}=", name.to_lowercase());
+    let mut start = 0usize;
+    while start < lower.len() {
+        let idx = lower[start..].find(&needle)?;
+        let abs = start + idx;
+        let boundary_ok = abs == 0 || decoded.as_bytes().get(abs - 1) == Some(&b'&');
+        if boundary_ok {
+            let value_start = abs + needle.len();
+            let rest = &decoded[value_start..];
+            let end = rest.find('&').unwrap_or(rest.len());
+            return Some(&rest[..end]);
+        }
+        start = abs + needle.len();
+    }
+    None
+}
+
+/// Extracts attribute logical names used in `$filter eq/ne/.../contains/...` comparisons.
+fn js_extract_filter_attrs(filter: &str) -> Vec<String> {
+    const OPS: &[&str] = &["eq", "ne", "gt", "ge", "lt", "le", "contains", "startswith", "endswith"];
+    let tokens: Vec<&str> = filter.split(|c: char| c.is_whitespace() || c == '(' || c == ')')
+        .filter(|s| !s.is_empty()).collect();
+    let mut out = Vec::new();
+    for i in 1..tokens.len() {
+        if OPS.contains(&tokens[i].to_lowercase().as_str()) {
+            if let Some(name) = normalize_logical_name(tokens[i - 1]) {
+                if !out.contains(&name) { out.push(name); }
+            }
+        }
+    }
+    out
+}
+
+/// Extracts a `$expand=entity(...)` block from a decoded OData query string: the expand entity
+/// name and its inner content (up to the first closing paren).
+fn js_extract_expand(decoded: &str) -> Option<(String, String)> {
+    let lower = decoded.to_lowercase();
+    let idx = lower.find("$expand=")?;
+    let after = &decoded[idx + "$expand=".len()..];
+    let name_end = after.find('(')?;
+    let name = normalize_logical_name(&after[..name_end])?;
+    let rest = &after[name_end + 1..];
+    let close = rest.find(')')?;
+    Some((name, rest[..close].to_string()))
+}
+
+/// Parses `$select`/`$filter`/`$expand` out of a raw (URL-encoded) OData query string and records
+/// attribute/entity references against `entity` (or as ambiguous when the entity is unknown).
+fn js_push_query_attributes(
+    raw_query: &str,
+    entity: Option<&str>,
+    source_prefix: &str,
+    attr_refs: &mut Vec<Value>,
+    entity_refs: &mut Vec<Value>,
+    ambiguous: &mut Vec<String>,
+) {
+    let stripped = raw_query.strip_prefix('?').unwrap_or(raw_query);
+    let decoded = urlencoding::decode(stripped).map(|c| c.into_owned()).unwrap_or_else(|_| stripped.to_string());
+    let entity_opt = entity.map(str::to_string);
+
+    if let Some(select) = js_find_query_param(&decoded, "$select") {
+        for field in select.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+            if let Some(f) = normalize_logical_name(field) {
+                js_add_attr_ref(&entity_opt, &f, &format!("{source_prefix} $select"), "$select", attr_refs, ambiguous, None);
+            }
+        }
+    }
+
+    if let Some(filter) = js_find_query_param(&decoded, "$filter") {
+        for f in js_extract_filter_attrs(filter) {
+            js_add_attr_ref(&entity_opt, &f, &format!("{source_prefix} $filter"), "$filter", attr_refs, ambiguous, None);
+        }
+    }
+
+    if let Some((expand_entity, inner)) = js_extract_expand(&decoded) {
+        js_add_entity_ref(&expand_entity, &format!("{source_prefix} $expand"), "$expand", entity_refs);
+        if let Some(inner_select_pos) = inner.to_lowercase().find("$select=") {
+            let after = &inner[inner_select_pos + "$select=".len()..];
+            let value = after.split(';').next().unwrap_or(after);
+            for field in value.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+                if let Some(f) = normalize_logical_name(field) {
+                    js_add_attr_ref(&Some(expand_entity.clone()), &f, &format!("{source_prefix} $expand $select"), "$expand",
+                        attr_refs, ambiguous, entity);
+                }
+            }
+        }
+    }
+}
+
+/// Scans a JavaScript/TypeScript Dataverse form/web-resource script for Dataverse entity/attribute
+/// logical-name references. Rust port of `scanJavaScriptCrmReferences`
+/// (`src/lib/crmReferenceScanner.ts`), producing the same JSON shape as `scan_cs_logical_names_for_mcp`
+/// (`CrmScanResult`-compatible, camelCase keys) for use with `run_crm_verification_for_scan`.
+/// The primary form entity is taken only from `primary_entity_hint` (workflowSetup's
+/// primaryEntityLogicalName) — unlike the TypeScript original, file-path-based entity inference is
+/// intentionally not ported, since the MCP/bridge path always has a hint from workflow setup.
+fn scan_js_logical_names_for_mcp(content: &str, primary_entity_hint: Option<&str>) -> Value {
+    let mut entity_refs: Vec<Value> = Vec::new();
+    let mut attr_refs: Vec<Value> = Vec::new();
+    let mut ambiguous_attrs: Vec<String> = Vec::new();
+    let mut notes: Vec<String> = Vec::new();
+    let mut webapi_entity_by_var: std::collections::HashMap<String, String> = Default::default();
+
+    let primary_form_entity: Option<String> = primary_entity_hint.and_then(normalize_logical_name);
+    if let Some(ref e) = primary_form_entity {
+        js_add_entity_ref(e, "from primary form entity inference", "primary_form_entity", &mut entity_refs);
+        notes.push(format!("Primary form entity: {e}."));
+    }
+
+    // ── Xrm.WebApi.retrieveRecord/retrieveMultipleRecords entity references ────────────────────
+    for (keyword, context_type, source) in [
+        ("Xrm.WebApi.retrieveRecord(", "retrieveRecord", "from Xrm.WebApi.retrieveRecord"),
+        ("Xrm.WebApi.retrieveMultipleRecords(", "retrieveMultipleRecords", "from Xrm.WebApi.retrieveMultipleRecords"),
+    ] {
+        let mut search = content;
+        while let Some(pos) = search.find(keyword) {
+            let after = &search[pos + keyword.len()..];
+            if let Some(entity_raw) = js_extract_leading_quoted(after) {
+                if let Some(entity) = normalize_logical_name(&entity_raw) {
+                    js_add_entity_ref(&entity, source, context_type, &mut entity_refs);
+                }
+            }
+            search = &search[pos + keyword.len()..];
+        }
+    }
+
+    // ── Track `const X = await Xrm.WebApi.retrieve...(` result variables → entity ───────────────
+    for keyword in ["await Xrm.WebApi.retrieveRecord(", "await Xrm.WebApi.retrieveMultipleRecords("] {
+        let mut search = content;
+        while let Some(pos) = search.find(keyword) {
+            let before = &search[..pos];
+            let after = &search[pos + keyword.len()..];
+            if let (Some(var), Some(entity_raw)) = (js_lhs_var_before(before), js_extract_leading_quoted(after)) {
+                if let Some(entity) = normalize_logical_name(&entity_raw) {
+                    webapi_entity_by_var.insert(var, entity);
+                }
+            }
+            search = &search[pos + keyword.len()..];
+        }
+    }
+
+    // ── $select/$filter/$expand parsing from the retrieveRecord/retrieveMultipleRecords query arg ─
+    {
+        let keyword = "Xrm.WebApi.retrieveRecord(";
+        let mut search = content;
+        while let Some(pos) = search.find(keyword) {
+            let after = &search[pos + keyword.len()..];
+            if let Some(entity_raw) = js_extract_leading_quoted(after) {
+                if let Some(rest) = js_skip_past_quoted(after) {
+                    if let Some(rest) = rest.trim_start().strip_prefix(',') {
+                        if let Some(comma_pos) = rest.find(',') {
+                            let after_second = rest[comma_pos + 1..].trim_start();
+                            if let Some(query_raw) = js_extract_leading_quoted(after_second) {
+                                js_push_query_attributes(
+                                    &query_raw, Some(&entity_raw),
+                                    &format!("from Xrm.WebApi.retrieveRecord {entity_raw}"),
+                                    &mut attr_refs, &mut entity_refs, &mut ambiguous_attrs,
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+            search = &search[pos + keyword.len()..];
+        }
+    }
+    {
+        let keyword = "Xrm.WebApi.retrieveMultipleRecords(";
+        let mut search = content;
+        while let Some(pos) = search.find(keyword) {
+            let after = &search[pos + keyword.len()..];
+            if let Some(entity_raw) = js_extract_leading_quoted(after) {
+                if let Some(rest) = js_skip_past_quoted(after) {
+                    if let Some(rest) = rest.trim_start().strip_prefix(',') {
+                        if let Some(query_raw) = js_extract_leading_quoted(rest.trim_start()) {
+                            js_push_query_attributes(
+                                &query_raw, Some(&entity_raw),
+                                &format!("from Xrm.WebApi.retrieveMultipleRecords {entity_raw}"),
+                                &mut attr_refs, &mut entity_refs, &mut ambiguous_attrs,
+                            );
+                        }
+                    }
+                }
+            }
+            search = &search[pos + keyword.len()..];
+        }
+    }
+
+    // ── formContext.getAttribute/getControl on the primary form entity ─────────────────────────
+    for keyword in ["formContext.getAttribute(", "formContext.getControl("] {
+        let mut search = content;
+        while let Some(pos) = search.find(keyword) {
+            let after = &search[pos + keyword.len()..];
+            if let Some(attr_raw) = js_extract_leading_quoted(after) {
+                if let Some(attr) = normalize_logical_name(&attr_raw) {
+                    js_add_attr_ref(
+                        &primary_form_entity, &attr,
+                        "from formContext.getAttribute/getControl on primary form entity", "formContext",
+                        &mut attr_refs, &mut ambiguous_attrs, None,
+                    );
+                }
+            }
+            search = &search[pos + keyword.len()..];
+        }
+    }
+
+    // ── `collectionVar?.entities?.map((itemVar` → propagate entity to the loop item variable ────
+    {
+        let keyword = "?.entities?.map(";
+        let mut search = content;
+        while let Some(pos) = search.find(keyword) {
+            let before = &search[..pos];
+            let after = &search[pos + keyword.len()..];
+            let collection_var = js_trailing_ident(before);
+            let item_var = js_leading_ident(after.trim_start().trim_start_matches('('));
+            if let (Some(cv), Some(iv)) = (collection_var, item_var) {
+                if let Some(entity) = webapi_entity_by_var.get(&cv).cloned() {
+                    webapi_entity_by_var.insert(iv, entity);
+                }
+            }
+            search = &search[pos + keyword.len()..];
+        }
+    }
+
+    // ── `ownerVar?.attr` member access on a tracked WebApi result variable ──────────────────────
+    {
+        let mut search = content;
+        while let Some(pos) = search.find("?.") {
+            let before = &search[..pos];
+            let after = &search[pos + 2..];
+            if let (Some(owner), Some(attr)) = (js_trailing_ident(before), js_leading_ident(after)) {
+                if let Some(entity) = webapi_entity_by_var.get(&owner).cloned() {
+                    if let Some(a) = normalize_logical_name(&attr) {
+                        js_add_attr_ref(
+                            &Some(entity), &a, &format!("from {owner}?.{attr} (WebApi result)"), "webapi_result",
+                            &mut attr_refs, &mut ambiguous_attrs, None,
+                        );
+                    }
+                }
+            }
+            search = &search[pos + 2..];
+        }
+    }
+
+    if entity_refs.is_empty() {
+        if let Some(ref e) = primary_form_entity {
+            js_add_entity_ref(e, "from workflow setup fallback", "fallback", &mut entity_refs);
+            notes.push("No explicit WebApi entity found; used fallback entity from workflow setup.".to_string());
+        }
+    }
+
+    let attrs_map = cs_build_attrs_map(&attr_refs);
+    let mut entities: Vec<String> = entity_refs.iter().filter_map(|r| r["logicalName"].as_str().map(str::to_string)).collect();
+    if let Some(obj) = attrs_map.as_object() {
+        entities.extend(obj.keys().cloned());
+    }
+    entities.sort(); entities.dedup();
+
+    serde_json::json!({
+        "entities": entities,
+        "attributes": attrs_map,
+        "ambiguousAttributes": ambiguous_attrs,
+        "notes": notes,
+        "entityReferences": entity_refs,
+        "attributeReferences": attr_refs,
+        "relationshipReferences": [],
+        "ambiguousReferences": [],
+    })
+}
+
 /// Extracts (entity, attr) from the LHS of a bracket assignment: `entity[attr]` or `entity.Attributes[attr]`.
 /// Handles both string literals and const variable names.
 fn cs_extract_bracket_lhs(
@@ -14118,6 +15524,104 @@ mod tests {
     fn no_entity_reference_and_no_attrs_produces_unknown_confidence() {
         let scan = CrmScanResult::default();
         assert_eq!(compute_static_inference_confidence(&scan), "unknown");
+    }
+
+    // ── scan_js_logical_names_for_mcp — Rust port of scanJavaScriptCrmReferences ────────────────
+
+    #[test]
+    fn js_scanner_binds_form_context_attributes_to_primary_entity_hint() {
+        let content = r#"
+            function nvr_assetid_OnChange(executionContext) {
+                var formContext = executionContext.getFormContext();
+                var assetId = formContext.getAttribute("nvr_assetid").getValue();
+                formContext.getControl("nvr_iswarrantycase");
+            }
+        "#;
+        let scan = scan_js_logical_names_for_mcp(content, Some("nvr_servicecase"));
+        assert!(scan["entities"].as_array().unwrap().iter().any(|v| v == "nvr_servicecase"));
+        let attrs = scan["attributes"]["nvr_servicecase"].as_array().expect("attrs for nvr_servicecase");
+        let attr_names: Vec<&str> = attrs.iter().filter_map(|v| v.as_str()).collect();
+        assert!(attr_names.contains(&"nvr_assetid"));
+        assert!(attr_names.contains(&"nvr_iswarrantycase"));
+        assert!(scan["ambiguousAttributes"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn js_scanner_without_primary_entity_hint_marks_form_context_attributes_ambiguous() {
+        let content = r#"formContext.getAttribute("nvr_assetid");"#;
+        let scan = scan_js_logical_names_for_mcp(content, None);
+        let ambiguous: Vec<&str> = scan["ambiguousAttributes"].as_array().unwrap().iter().filter_map(|v| v.as_str()).collect();
+        assert!(ambiguous.contains(&"nvr_assetid"));
+    }
+
+    #[test]
+    fn js_scanner_extracts_entity_and_select_attributes_from_retrieve_record() {
+        let content = r#"
+            var asset = await Xrm.WebApi.retrieveRecord(
+                "nvr_customerasset",
+                assetId,
+                "?$select=nvr_customerid,nvr_contactid,nvr_isunderwarranty,nvr_statuscustom"
+            );
+        "#;
+        let scan = scan_js_logical_names_for_mcp(content, Some("nvr_servicecase"));
+        assert!(scan["entities"].as_array().unwrap().iter().any(|v| v == "nvr_customerasset"));
+        let attrs = scan["attributes"]["nvr_customerasset"].as_array().expect("attrs for nvr_customerasset");
+        let attr_names: Vec<&str> = attrs.iter().filter_map(|v| v.as_str()).collect();
+        for expected in ["nvr_customerid", "nvr_contactid", "nvr_isunderwarranty", "nvr_statuscustom"] {
+            assert!(attr_names.contains(&expected), "expected {expected} in {attr_names:?}");
+        }
+    }
+
+    #[test]
+    fn js_scanner_extracts_filter_attributes_from_retrieve_multiple_records() {
+        let content = r#"
+            var results = await Xrm.WebApi.retrieveMultipleRecords(
+                "nvr_customerasset",
+                "?$filter=nvr_statuscustom eq 1"
+            );
+        "#;
+        let scan = scan_js_logical_names_for_mcp(content, None);
+        let attrs = scan["attributes"]["nvr_customerasset"].as_array().expect("attrs for nvr_customerasset");
+        let attr_names: Vec<&str> = attrs.iter().filter_map(|v| v.as_str()).collect();
+        assert!(attr_names.contains(&"nvr_statuscustom"));
+    }
+
+    #[test]
+    fn js_scanner_binds_webapi_result_member_access_to_retrieved_entity() {
+        let content = r#"
+            var asset = await Xrm.WebApi.retrieveRecord("nvr_customerasset", assetId, "?$select=nvr_customerid");
+            var customerId = asset?.nvr_customerid;
+        "#;
+        let scan = scan_js_logical_names_for_mcp(content, None);
+        let attrs = scan["attributes"]["nvr_customerasset"].as_array().expect("attrs for nvr_customerasset");
+        let attr_names: Vec<&str> = attrs.iter().filter_map(|v| v.as_str()).collect();
+        assert!(attr_names.contains(&"nvr_customerid"));
+    }
+
+    #[test]
+    fn js_scanner_uses_primary_entity_hint_when_no_webapi_calls_found() {
+        let content = "function noop() {}";
+        let scan = scan_js_logical_names_for_mcp(content, Some("nvr_servicecase"));
+        assert_eq!(scan["entities"].as_array().unwrap(), &vec![Value::String("nvr_servicecase".to_string())]);
+        let notes: Vec<&str> = scan["notes"].as_array().unwrap().iter().filter_map(|v| v.as_str()).collect();
+        assert!(notes.iter().any(|n| n.contains("Primary form entity: nvr_servicecase")));
+    }
+
+    #[test]
+    fn js_scanner_with_no_hint_and_no_webapi_calls_finds_nothing() {
+        let content = "function noop() {}";
+        let scan = scan_js_logical_names_for_mcp(content, None);
+        assert!(scan["entities"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn js_scanner_never_produces_relationship_or_ambiguous_reference_entries() {
+        // Mirrors the C# scanner's convention: relationshipReferences/ambiguousReferences stay
+        // empty arrays; ambiguity is tracked via ambiguousAttributes + entity-less attribute refs.
+        let content = r#"formContext.getAttribute("nvr_assetid");"#;
+        let scan = scan_js_logical_names_for_mcp(content, None);
+        assert!(scan["relationshipReferences"].as_array().unwrap().is_empty());
+        assert!(scan["ambiguousReferences"].as_array().unwrap().is_empty());
     }
 
     #[test]
@@ -15086,6 +16590,628 @@ mod developer_work_packet_tests {
             Some(true),
             "canWriteCode must be true after approval is set on a valid template task; got packet: {:?}", packet["decisionReason"]
         );
+    }
+
+    // ── task_mcp_apply_developer_workflow_transition: canonical workflow phase ───────────────
+    //
+    // Regression coverage for the bug where record_ai_implementation_completed and
+    // approve_technical_plan_if_safe wrote helper fields (mcpChecklistOverrides,
+    // localTestRecord, lastAiImplementation) but never updated task.status/waitingState — the
+    // canonical fields TaskDetail / CrmDeveloperWorkflowPanel / workflowPlan.ts read to render
+    // the top-level phase (NEW/ANALYZED/DEVELOPMENT/TESTING/CODE REVIEW/DONE).
+
+    #[test]
+    fn workflow_transition_technical_plan_approved_moves_to_development_when_can_write_code() {
+        let mut task = make_template_task_awaiting_approval();
+        task["status"] = serde_json::json!("new");
+        task_mcp_apply_developer_workflow_transition(&mut task, "technical_plan_approved", &serde_json::json!({"canWriteCode": true}));
+        assert_eq!(task["status"].as_str(), Some("in-progress"));
+        assert!(task["waitingState"].is_null());
+    }
+
+    #[test]
+    fn workflow_transition_technical_plan_approved_only_reaches_analyzed_when_cannot_write_code() {
+        let mut task = make_template_task_awaiting_approval();
+        task["status"] = serde_json::json!("new");
+        task_mcp_apply_developer_workflow_transition(&mut task, "technical_plan_approved", &serde_json::json!({"canWriteCode": false}));
+        assert_eq!(task["status"].as_str(), Some("analyzed"));
+    }
+
+    #[test]
+    fn workflow_transition_ai_implementation_completed_does_not_set_testing_waiting_state() {
+        let mut task = make_template_task_no_plan_mappings();
+        task["status"] = serde_json::json!("analyzed");
+        task_mcp_apply_developer_workflow_transition(&mut task, "ai_implementation_completed", &Value::Null);
+        assert_eq!(task["status"].as_str(), Some("in-progress"));
+        assert_ne!(task["waitingState"].as_str(), Some("consultant-testing"));
+    }
+
+    #[test]
+    fn workflow_transition_manual_crm_verification_completed_moves_to_testing() {
+        let mut task = make_template_task_no_plan_mappings(); // status: in-progress
+        task_mcp_apply_developer_workflow_transition(&mut task, "manual_crm_verification_completed", &Value::Null);
+        assert_eq!(task["status"].as_str(), Some("in-progress"));
+        assert_eq!(task["waitingState"].as_str(), Some("consultant-testing"));
+    }
+
+    #[test]
+    fn workflow_overview_display_phase_is_development_after_ai_implementation_completed() {
+        let mut task = make_template_task_no_plan_mappings();
+        task["status"] = serde_json::json!("analyzed");
+        task_mcp_apply_developer_workflow_transition(&mut task, "ai_implementation_completed", &Value::Null);
+        let overview = task_mcp_workflow_overview(&task);
+        assert_eq!(overview["displayPhase"].as_str(), Some("development"));
+    }
+
+    #[test]
+    fn approve_technical_plan_if_safe_transition_does_not_leave_task_on_new_or_analyzed_when_can_write_code() {
+        // Guard: get_developer_work_packet canWriteCode=true must never coexist with
+        // get_task_workflow_overview showing NEW/Analyze.
+        let mut task = make_template_task_awaiting_approval();
+        task["status"] = serde_json::json!("new");
+        task["crmDeveloperWorkflow"]["planApproval"] = serde_json::json!({
+            "approved": true,
+            "approvedAt": "2026-06-29T10:00:00Z",
+        });
+        let packet = task_mcp_developer_work_packet(&task, None, None);
+        let can_write = packet["canWriteCode"].as_bool().unwrap_or(false);
+        assert!(can_write, "test fixture must produce canWriteCode=true; packet: {:?}", packet["decisionReason"]);
+
+        task_mcp_apply_developer_workflow_transition(&mut task, "technical_plan_approved", &serde_json::json!({"canWriteCode": can_write}));
+
+        let overview = task_mcp_workflow_overview(&task);
+        assert_ne!(overview["displayPhase"].as_str(), Some("new"));
+        assert_ne!(overview["displayPhase"].as_str(), Some("analyzed"));
+        assert_eq!(overview["displayPhase"].as_str(), Some("development"));
+    }
+
+    #[test]
+    fn next_recommended_step_matches_continue_developer_workflow_after_implementation_completed() {
+        // Consistency guard: get_task_workflow_overview's nextRecommendedStep must always mirror
+        // continue_developer_workflow's nextAction/instructionForAI, whatever it currently is.
+        let mut task = make_template_task_no_plan_mappings();
+        task["status"] = serde_json::json!("analyzed");
+        // No Dataverse verification recorded yet, and run_implementation_verification has not run
+        // either — continue_developer_workflow must recommend running it before wait_for_user.
+        task["crmVerificationReports"] = serde_json::json!([]);
+        task_mcp_apply_developer_workflow_transition(&mut task, "ai_implementation_completed", &Value::Null);
+        task["localTestRecord"] = serde_json::json!({"status": "not-needed"});
+
+        let continue_step = task_mcp_compute_continue_workflow_step(&task);
+        assert_eq!(continue_step["nextAction"].as_str(), Some("run_implementation_verification"));
+
+        let next_step = task_mcp_next_recommended_step(&task);
+        assert_eq!(next_step["step"].as_str(), continue_step["nextAction"].as_str());
+        assert_eq!(
+            next_step["reason"].as_str().unwrap_or(""),
+            continue_step["instructionForAI"].as_str().unwrap_or(""),
+        );
+    }
+
+    #[test]
+    fn next_recommended_step_matches_continue_developer_workflow_when_verification_needs_manual_action() {
+        // Same consistency guard, once run_implementation_verification ran but Dataverse/AI
+        // review/Local Test rows are still not-run in the modal — both must report the exact
+        // modal-check message, not silently move on.
+        let mut task = make_template_task_no_plan_mappings();
+        task["status"] = serde_json::json!("analyzed");
+        task["crmVerificationReports"] = serde_json::json!([]);
+        task_mcp_apply_developer_workflow_transition(&mut task, "ai_implementation_completed", &Value::Null);
+        task["localTestRecord"] = serde_json::json!({"status": "not-needed"});
+        task["implementationVerification"]["mcpVerification"] = serde_json::json!({
+            "status": "needs_manual_action",
+            "checks": [],
+            "fixableFindings": [],
+            "nextAction": "wait_for_user",
+            "ranAt": "2026-06-29T10:00:00Z",
+        });
+
+        let continue_step = task_mcp_compute_continue_workflow_step(&task);
+        assert_eq!(continue_step["nextAction"].as_str(), Some("wait_for_user"));
+        assert_eq!(
+            continue_step["blockingUserAction"].as_str(),
+            Some(
+                "Run Dataverse Metadata Check and AI Kit/Settings Review in the Implementation Verification modal. \
+                 Then upload/register the web resource manually and record Local Test/browser validation."
+            ),
+        );
+        // Blocked from reaching commit/push while verification rows are unresolved.
+        assert!(continue_step["forbiddenWrites"].as_array().unwrap().iter().any(|v| v == "commit_task_changes"));
+
+        let next_step = task_mcp_next_recommended_step(&task);
+        assert_eq!(next_step["step"].as_str(), continue_step["nextAction"].as_str());
+        assert_eq!(
+            next_step["reason"].as_str().unwrap_or(""),
+            continue_step["blockingUserAction"].as_str().unwrap_or(""),
+        );
+    }
+
+    #[test]
+    fn next_recommended_step_matches_continue_developer_workflow_when_verification_passed() {
+        // mcpVerification.status='passed' with no crmVerificationReports/dataverseCheck override is
+        // an inconsistent/synthetic state a real run_implementation_verification call would never
+        // produce (a real "passed" always means Dataverse Metadata Check resolved for real). This is
+        // a rare-case backstop: retry the automated check rather than pointing at the old modal-only flow.
+        let mut task = make_template_task_no_plan_mappings();
+        task["status"] = serde_json::json!("analyzed");
+        task["crmVerificationReports"] = serde_json::json!([]);
+        task_mcp_apply_developer_workflow_transition(&mut task, "ai_implementation_completed", &Value::Null);
+        task["localTestRecord"] = serde_json::json!({"status": "not-needed"});
+        task["implementationVerification"]["mcpVerification"] = serde_json::json!({
+            "status": "passed",
+            "checks": [],
+            "fixableFindings": [],
+            "nextAction": "continue_workflow",
+            "ranAt": "2026-06-29T10:00:00Z",
+        });
+
+        let continue_step = task_mcp_compute_continue_workflow_step(&task);
+        assert_eq!(continue_step["nextAction"].as_str(), Some("run_implementation_verification"));
+        assert_eq!(continue_step["canProceed"].as_bool(), Some(true));
+        assert_eq!(continue_step["recommendedTool"].as_str(), Some("run_implementation_verification"));
+
+        let next_step = task_mcp_next_recommended_step(&task);
+        assert_eq!(next_step["step"].as_str(), continue_step["nextAction"].as_str());
+        assert_eq!(
+            next_step["reason"].as_str().unwrap_or(""),
+            continue_step["instructionForAI"].as_str().unwrap_or(""),
+        );
+    }
+
+    #[test]
+    fn continue_workflow_returns_fix_code_when_verification_failed_with_fixable_findings() {
+        let mut task = make_template_task_no_plan_mappings();
+        task["status"] = serde_json::json!("analyzed");
+        task["crmVerificationReports"] = serde_json::json!([]);
+        task_mcp_apply_developer_workflow_transition(&mut task, "ai_implementation_completed", &Value::Null);
+        task["localTestRecord"] = serde_json::json!({"status": "not-needed"});
+        task["implementationVerification"]["mcpVerification"] = serde_json::json!({
+            "status": "failed",
+            "checks": [],
+            "fixableFindings": [{"id": "no-xrm-page", "description": "Must not reference Xrm.Page."}],
+            "nextAction": "fix_code",
+            "ranAt": "2026-06-29T10:00:00Z",
+        });
+
+        let continue_step = task_mcp_compute_continue_workflow_step(&task);
+        assert_eq!(continue_step["nextAction"].as_str(), Some("fix_code"));
+        assert_eq!(continue_step["canProceed"].as_bool(), Some(true));
+    }
+
+    // ── Static rule engine + implemented-artifact persistence helpers ────────────────────────
+
+    #[test]
+    fn is_script_workflow_task_true_for_script_and_ribbon_work_kinds() {
+        let mut task = make_template_task_no_plan_mappings();
+        task["crmDeveloperWorkflow"]["detectedWorkKind"] = serde_json::json!("script");
+        assert!(task_mcp_is_script_workflow_task(&task));
+        task["crmDeveloperWorkflow"]["detectedWorkKind"] = serde_json::json!("ribbon");
+        assert!(task_mcp_is_script_workflow_task(&task));
+        task["crmDeveloperWorkflow"]["detectedWorkKind"] = serde_json::json!("plugin");
+        task["workflowSetup"]["devTargetKind"] = serde_json::json!("plugin");
+        assert!(!task_mcp_is_script_workflow_task(&task));
+    }
+
+    #[test]
+    fn resolve_implemented_script_artifact_prefers_desired_script_file_match() {
+        let mut task = make_template_task_no_plan_mappings();
+        task["workflowSetup"]["desiredScriptFile"] = serde_json::json!("nvr_servicecase_events.js");
+        let files = vec!["Scripts/other.js", "Scripts/nvr_servicecase_events.js"];
+        let resolved = task_mcp_resolve_implemented_script_artifact(&task, &files);
+        assert_eq!(resolved.as_deref(), Some("Scripts/nvr_servicecase_events.js"));
+    }
+
+    #[test]
+    fn resolve_implemented_script_artifact_falls_back_to_only_candidate() {
+        // Neither desiredScriptFile nor artifactPath on the fixture match this file name —
+        // resolution must still fall back to the single script candidate rather than returning None.
+        let task = make_template_task_no_plan_mappings();
+        let files = vec!["Scripts/renamed_events.js"];
+        let resolved = task_mcp_resolve_implemented_script_artifact(&task, &files);
+        assert_eq!(resolved.as_deref(), Some("Scripts/renamed_events.js"));
+    }
+
+    #[test]
+    fn resolve_implemented_script_artifact_ignores_non_script_files() {
+        let task = make_template_task_no_plan_mappings();
+        let files = vec!["README.md"];
+        assert_eq!(task_mcp_resolve_implemented_script_artifact(&task, &files), None);
+    }
+
+    #[test]
+    fn apply_implemented_script_artifact_sets_workflow_setup_fields() {
+        let mut task = make_template_task_no_plan_mappings();
+        task["workflowSetup"]["repositoryRoot"] = serde_json::json!("C:\\Repos\\NVR");
+        task_mcp_apply_implemented_script_artifact(&mut task, "Scripts/nvr_servicecase_events.js");
+        assert_eq!(task["workflowSetup"]["artifactPath"].as_str(), Some("Scripts/nvr_servicecase_events.js"));
+        assert_eq!(task["workflowSetup"]["desiredScriptFile"].as_str(), Some("nvr_servicecase_events.js"));
+        assert_eq!(
+            task["workflowSetup"]["absoluteScriptPath"].as_str(),
+            Some("C:\\Repos\\NVR\\Scripts/nvr_servicecase_events.js"),
+        );
+    }
+
+    #[test]
+    fn static_rule_checks_pass_for_compliant_script_and_fail_for_violations() {
+        let template = serde_json::json!({
+            "staticRules": [
+                { "id": "no-xrm-page", "description": "Must not reference Xrm.Page.", "type": "must-not-match" },
+                { "id": "retrieve-source-entity", "description": "retrieveRecord must target nvr_customerasset.", "type": "must-match" },
+            ]
+        });
+        let good = "Xrm.WebApi.retrieveRecord(\"nvr_customerasset\", id, \"?$select=nvr_customerid\")";
+        let (status, _findings, fixable) = task_mcp_run_static_business_rule_checks(Some(&template), good);
+        assert_eq!(status, "passed");
+        assert!(fixable.is_empty());
+
+        let bad = "var formContext = Xrm.Page;";
+        let (status2, _findings2, fixable2) = task_mcp_run_static_business_rule_checks(Some(&template), bad);
+        assert_eq!(status2, "failed");
+        let ids: Vec<&str> = fixable2.iter().filter_map(|f| f["id"].as_str()).collect();
+        assert!(ids.contains(&"no-xrm-page"));
+        assert!(ids.contains(&"retrieve-source-entity"));
+    }
+
+    #[test]
+    fn static_rule_checks_skip_when_template_has_no_rules() {
+        let (status, findings, fixable) = task_mcp_run_static_business_rule_checks(None, "anything");
+        assert_eq!(status, "skipped");
+        assert!(fixable.is_empty());
+        assert_eq!(findings.len(), 1);
+    }
+
+    // ── Split-brain regression coverage: MCP verification passthroughs must read the SAME
+    // canonical fields ImplementationVerificationModal uses, and never fabricate a result. ────
+
+    #[test]
+    fn dataverse_metadata_check_passthrough_needs_manual_action_when_not_run() {
+        let mut task = make_template_task_no_plan_mappings();
+        // Fixture defaults to a resolved verdict — clear it to test the genuinely not-run case.
+        task["crmVerificationReports"] = serde_json::json!([]);
+        let (status, finding) = task_mcp_dataverse_metadata_check_passthrough(&task);
+        assert_eq!(status, "needs_manual_action");
+        assert_eq!(finding, "Run Dataverse Metadata Check in the Implementation Verification modal.");
+    }
+
+    #[test]
+    fn dataverse_metadata_check_passthrough_reports_existing_verdict() {
+        let mut task = make_template_task_no_plan_mappings();
+        task["crmVerificationReports"] = serde_json::json!([{"verdict": "pass"}]);
+        let (status, _finding) = task_mcp_dataverse_metadata_check_passthrough(&task);
+        assert_eq!(status, "passed");
+    }
+
+    #[test]
+    fn ai_internal_code_review_passthrough_needs_manual_action_when_not_run() {
+        let task = make_template_task_no_plan_mappings();
+        let (status, finding) = task_mcp_ai_internal_code_review_passthrough(&task);
+        assert_eq!(status, "needs_manual_action");
+        assert_eq!(finding, "Run AI Kit Review or Settings Reviewer in the Implementation Verification modal.");
+    }
+
+    #[test]
+    fn ai_internal_code_review_passthrough_reports_existing_status() {
+        let mut task = make_template_task_no_plan_mappings();
+        task["implementationVerification"]["aiCodeReview"] = serde_json::json!({"status": "skipped"});
+        let (status, _finding) = task_mcp_ai_internal_code_review_passthrough(&task);
+        assert_eq!(status, "skipped");
+    }
+
+    #[test]
+    fn local_test_impl_passthrough_needs_manual_action_when_not_run() {
+        let task = make_template_task_no_plan_mappings();
+        let (status, _finding) = task_mcp_local_test_impl_passthrough(&task);
+        assert_eq!(status, "needs_manual_action");
+    }
+
+    #[test]
+    fn local_test_impl_passthrough_does_not_read_top_level_local_test_record() {
+        // task.localTestRecord ('not-needed', the continue_developer_workflow gate) must not
+        // leak into implementationVerification.localTest (the modal row) as an auto-pass.
+        let mut task = make_template_task_no_plan_mappings();
+        task["localTestRecord"] = serde_json::json!({"status": "not-needed"});
+        let (status, _finding) = task_mcp_local_test_impl_passthrough(&task);
+        assert_eq!(status, "needs_manual_action");
+    }
+
+    #[test]
+    fn local_test_impl_passthrough_reports_existing_status() {
+        let mut task = make_template_task_no_plan_mappings();
+        task["implementationVerification"]["localTest"] = serde_json::json!({"status": "not-needed"});
+        let (status, _finding) = task_mcp_local_test_impl_passthrough(&task);
+        assert_eq!(status, "not-needed");
+    }
+
+    // ── Automated Dataverse Metadata Check + AI Kit review (run_implementation_verification) ────
+
+    #[test]
+    fn dataverse_check_from_report_maps_pass_verdict_to_passed_status() {
+        let report = serde_json::json!({"verdict": "pass", "summary": "All references confirmed."});
+        let (status, finding, fixable) = task_mcp_dataverse_check_from_report(&report);
+        assert_eq!(status, "passed");
+        assert_eq!(finding, "All references confirmed.");
+        assert!(fixable.is_empty());
+    }
+
+    #[test]
+    fn dataverse_check_from_report_maps_fail_verdict_to_failed_with_fixable_findings() {
+        let report = serde_json::json!({
+            "verdict": "fail",
+            "summary": "Missing references found.",
+            "missingReferences": [
+                {"displayName": "nvr_iswarrantycase", "entityLogicalName": "nvr_servicecase"},
+                {"displayName": "nvr_bogusfield", "entityLogicalName": "nvr_customerasset"},
+            ],
+        });
+        let (status, _finding, fixable) = task_mcp_dataverse_check_from_report(&report);
+        assert_eq!(status, "failed");
+        assert_eq!(fixable.len(), 2);
+        let descriptions: Vec<&str> = fixable.iter().filter_map(|f| f["description"].as_str()).collect();
+        assert!(descriptions.iter().any(|d| d.contains("nvr_iswarrantycase") && d.contains("nvr_servicecase")));
+    }
+
+    #[test]
+    fn dataverse_check_from_report_maps_not_configured_verdict_to_needs_configuration() {
+        let report = serde_json::json!({"verdict": "not_configured"});
+        let (status, finding, fixable) = task_mcp_dataverse_check_from_report(&report);
+        assert_eq!(status, "needs_configuration");
+        assert!(finding.contains("Settings"));
+        assert!(fixable.is_empty());
+    }
+
+    #[test]
+    fn dataverse_check_from_report_maps_warnings_and_unknown_verdicts() {
+        let (status, ..) = task_mcp_dataverse_check_from_report(&serde_json::json!({"verdict": "warnings"}));
+        assert_eq!(status, "warnings");
+        let (status, ..) = task_mcp_dataverse_check_from_report(&serde_json::json!({"verdict": "error"}));
+        assert_eq!(status, "warnings");
+    }
+
+    #[test]
+    fn rollup_verification_status_prioritizes_fixable_findings_over_everything_else() {
+        let checks = vec![
+            serde_json::json!({"status": "needs_configuration"}),
+            serde_json::json!({"status": "needs_ai_kit_review"}),
+        ];
+        let (status, next_action) = task_mcp_rollup_verification_status(&checks, 1);
+        assert_eq!((status, next_action), ("failed", "fix_code"));
+    }
+
+    #[test]
+    fn rollup_verification_status_prioritizes_ai_kit_review_over_needs_configuration() {
+        // The agent can perform the AI Kit review right now; it should not be blocked by an
+        // unrelated configuration issue the agent cannot resolve itself.
+        let checks = vec![
+            serde_json::json!({"status": "needs_configuration"}),
+            serde_json::json!({"status": "needs_ai_kit_review"}),
+        ];
+        let (status, next_action) = task_mcp_rollup_verification_status(&checks, 0);
+        assert_eq!((status, next_action), ("pending_ai_kit_review", "run_ai_kit_review"));
+    }
+
+    #[test]
+    fn rollup_verification_status_reports_needs_configuration_when_nothing_else_is_actionable() {
+        let checks = vec![
+            serde_json::json!({"status": "passed"}),
+            serde_json::json!({"status": "needs_configuration"}),
+        ];
+        let (status, next_action) = task_mcp_rollup_verification_status(&checks, 0);
+        assert_eq!((status, next_action), ("needs_configuration", "needs_configuration"));
+    }
+
+    #[test]
+    fn rollup_verification_status_reports_needs_manual_action_only_for_genuinely_manual_rows() {
+        let checks = vec![
+            serde_json::json!({"status": "passed"}),
+            serde_json::json!({"status": "passed"}),
+            serde_json::json!({"status": "needs_manual_action"}),
+        ];
+        let (status, next_action) = task_mcp_rollup_verification_status(&checks, 0);
+        assert_eq!((status, next_action), ("needs_manual_action", "wait_for_user"));
+    }
+
+    #[test]
+    fn rollup_verification_status_reports_passed_when_all_checks_resolved() {
+        let checks = vec![
+            serde_json::json!({"status": "passed"}),
+            serde_json::json!({"status": "warnings"}),
+            serde_json::json!({"status": "not-needed"}),
+        ];
+        let (status, next_action) = task_mcp_rollup_verification_status(&checks, 0);
+        assert_eq!((status, next_action), ("passed", "continue_workflow"));
+    }
+
+    #[test]
+    fn apply_ai_kit_review_result_persists_to_canonical_field_and_ai_kit_review_gate() {
+        let mut task = make_template_task_no_plan_mappings();
+        task_mcp_apply_ai_kit_review_result(
+            &mut task,
+            "passed",
+            vec![Value::String("Scripts/nvr_servicecase_events.js".to_string())],
+            vec![Value::String("No TODOs; correct Client API usage.".to_string())],
+            vec![],
+            "2026-07-01T00:00:00Z",
+        );
+        assert_eq!(task["implementationVerification"]["aiCodeReview"]["status"].as_str(), Some("passed"));
+        assert_eq!(task["implementationVerification"]["aiCodeReview"]["reviewSource"].as_str(), Some("claude-ai-kit"));
+        // Keeps continue_developer_workflow's separate pre-branch AI Kit gate from dead-ending.
+        assert_eq!(task["aiKitReview"]["completedAt"].as_str(), Some("2026-07-01T00:00:00Z"));
+        assert_eq!(task["aiKitReview"]["status"].as_str(), Some("passed"));
+
+        let (status, _finding) = task_mcp_ai_internal_code_review_passthrough(&task);
+        assert_eq!(status, "passed");
+    }
+
+    #[test]
+    fn continue_workflow_reports_run_ai_kit_review_not_wait_for_user_when_dataverse_resolved_but_ai_review_pending() {
+        let mut task = make_template_task_no_plan_mappings();
+        task["status"] = serde_json::json!("analyzed");
+        task["crmVerificationReports"] = serde_json::json!([{"verdict": "pass"}]);
+        task_mcp_apply_developer_workflow_transition(&mut task, "ai_implementation_completed", &Value::Null);
+        task["localTestRecord"] = serde_json::json!({"status": "not-needed"});
+        // No aiKitReview recorded — AI Kit review is the only remaining step.
+
+        let continue_step = task_mcp_compute_continue_workflow_step(&task);
+        assert_eq!(continue_step["nextAction"].as_str(), Some("run_ai_kit_review"));
+        assert_eq!(continue_step["canProceed"].as_bool(), Some(true));
+        assert_eq!(continue_step["requiresUserApproval"].as_bool(), Some(false));
+        assert_eq!(continue_step["recommendedTool"].as_str(), Some("record_ai_kit_review_result"));
+    }
+
+    #[test]
+    fn continue_workflow_reports_run_ai_kit_review_when_mcp_verification_is_pending_ai_kit_review() {
+        let mut task = make_template_task_no_plan_mappings();
+        task["status"] = serde_json::json!("analyzed");
+        task["crmVerificationReports"] = serde_json::json!([]);
+        task_mcp_apply_developer_workflow_transition(&mut task, "ai_implementation_completed", &Value::Null);
+        task["localTestRecord"] = serde_json::json!({"status": "not-needed"});
+        task["implementationVerification"]["mcpVerification"] = serde_json::json!({
+            "status": "pending_ai_kit_review",
+            "checks": [],
+            "fixableFindings": [],
+            "nextAction": "run_ai_kit_review",
+            "ranAt": "2026-06-29T10:00:00Z",
+        });
+
+        let continue_step = task_mcp_compute_continue_workflow_step(&task);
+        assert_eq!(continue_step["nextAction"].as_str(), Some("run_ai_kit_review"));
+        assert_eq!(continue_step["canProceed"].as_bool(), Some(true));
+        assert_eq!(continue_step["requiresUserApproval"].as_bool(), Some(false));
+    }
+
+    #[test]
+    fn continue_workflow_reports_needs_configuration_not_needs_manual_action_when_dataverse_not_configured() {
+        let mut task = make_template_task_no_plan_mappings();
+        task["status"] = serde_json::json!("analyzed");
+        task["crmVerificationReports"] = serde_json::json!([]);
+        task_mcp_apply_developer_workflow_transition(&mut task, "ai_implementation_completed", &Value::Null);
+        task["localTestRecord"] = serde_json::json!({"status": "not-needed"});
+        task["implementationVerification"]["mcpVerification"] = serde_json::json!({
+            "status": "needs_configuration",
+            "checks": [{
+                "name": "Dataverse Metadata Check",
+                "status": "needs_configuration",
+                "findings": ["Dataverse Metadata Check is not configured: CRM metadata assistant is not enabled."],
+            }],
+            "fixableFindings": [],
+            "nextAction": "needs_configuration",
+            "ranAt": "2026-06-29T10:00:00Z",
+        });
+
+        let continue_step = task_mcp_compute_continue_workflow_step(&task);
+        assert_eq!(continue_step["nextAction"].as_str(), Some("needs_configuration"));
+        assert_ne!(continue_step["nextAction"].as_str(), Some("needs_manual_action"));
+        assert!(continue_step["blockingUserAction"].as_str().unwrap_or("").contains("CRM metadata assistant is not enabled"));
+        assert_eq!(continue_step["requiresUserApproval"].as_bool(), Some(true));
+    }
+
+    // ── Modal-visible implementationVerification summary + nextRecommendedStep composer ─────
+
+    #[test]
+    fn build_modal_verification_summary_matches_live_reported_example() {
+        // Live state from the bug report: Script File Readiness passed, Dataverse/AI/Local Test
+        // all needs_manual_action, no crmVerificationReports / aiCodeReview / localTest set yet.
+        let mut task = make_template_task_no_plan_mappings();
+        task["crmVerificationReports"] = serde_json::json!([]);
+        task["implementationVerification"]["buildCheck"] = serde_json::json!({
+            "status": "passed", "summary": "Script file found: nvr_servicecase_events.js (42 lines).",
+        });
+        let summary = task_mcp_build_modal_verification_summary(&task);
+        assert_eq!(summary["buildCheck"]["status"].as_str(), Some("passed"));
+        assert_eq!(summary["buildCheck"]["label"].as_str(), Some("Script File Readiness"));
+        assert_eq!(summary["dataverseCheck"]["status"].as_str(), Some("needs_manual_action"));
+        assert_eq!(summary["aiCodeReview"]["status"].as_str(), Some("needs_manual_action"));
+        assert_eq!(summary["localTest"]["status"].as_str(), Some("needs_manual_action"));
+
+        let rows = task_mcp_unresolved_modal_rows(&summary);
+        assert_eq!(rows, vec!["dataverseCheck", "aiCodeReview", "localTest"]);
+
+        let message = task_mcp_compose_manual_verification_step(&summary);
+        assert_eq!(
+            message,
+            "Run Dataverse Metadata Check and AI Kit/Settings Review in the Implementation Verification modal. \
+             Then upload/register the web resource manually and record Local Test/browser validation.",
+        );
+    }
+
+    #[test]
+    fn compose_manual_verification_step_mentions_only_unresolved_rows() {
+        let mut task = make_template_task_no_plan_mappings();
+        task["crmVerificationReports"] = serde_json::json!([{"verdict": "pass"}]);
+        task["implementationVerification"]["aiCodeReview"] = serde_json::json!({"status": "skipped"});
+        // Local Test remains unresolved — the only row still requiring manual action.
+        let summary = task_mcp_build_modal_verification_summary(&task);
+        assert_eq!(task_mcp_unresolved_modal_rows(&summary), vec!["localTest"]);
+        assert_eq!(
+            task_mcp_compose_manual_verification_step(&summary),
+            "Upload/register the web resource manually and record Local Test/browser validation.",
+        );
+    }
+
+    #[test]
+    fn compose_manual_verification_step_reports_all_resolved() {
+        let mut task = make_template_task_no_plan_mappings();
+        task["crmVerificationReports"] = serde_json::json!([{"verdict": "pass"}]);
+        task["implementationVerification"]["aiCodeReview"] = serde_json::json!({"status": "passed"});
+        task["implementationVerification"]["localTest"] = serde_json::json!({"status": "not-needed"});
+        let summary = task_mcp_build_modal_verification_summary(&task);
+        assert!(task_mcp_unresolved_modal_rows(&summary).is_empty());
+        assert_eq!(task_mcp_compose_manual_verification_step(&summary), "All Implementation Verification checks are resolved.");
+    }
+
+    #[test]
+    fn workflow_overview_includes_implementation_verification_summary() {
+        let mut task = make_template_task_no_plan_mappings();
+        task["crmVerificationReports"] = serde_json::json!([]);
+        let overview = task_mcp_workflow_overview(&task);
+        assert!(overview["implementationVerification"].is_object());
+        assert_eq!(overview["implementationVerification"]["dataverseCheck"]["status"].as_str(), Some("needs_manual_action"));
+    }
+
+    #[test]
+    fn workflow_overview_includes_unresolved_required_rows_matching_the_live_example() {
+        let mut task = make_template_task_no_plan_mappings();
+        task["crmVerificationReports"] = serde_json::json!([]);
+        task["implementationVerification"]["buildCheck"] = serde_json::json!({ "status": "passed" });
+        let overview = task_mcp_workflow_overview(&task);
+        let rows: Vec<&str> = overview["unresolvedRequiredRows"].as_array().unwrap()
+            .iter().filter_map(|v| v.as_str()).collect();
+        assert_eq!(rows, vec!["dataverseCheck", "aiCodeReview", "localTest"]);
+
+        // Must match exactly what run_implementation_verification / get_implementation_verification_summary
+        // compute from the same task via the same helper.
+        let summary = task_mcp_build_modal_verification_summary(&task);
+        assert_eq!(task_mcp_unresolved_modal_rows(&summary), rows);
+    }
+
+    #[test]
+    fn workflow_overview_local_test_row_never_mentions_legacy_local_test_record() {
+        // Regression: task.localTestRecord ('not-needed', set by record_ai_implementation_completed)
+        // must never leak a contradictory note into the modal-visible localTest row.
+        let mut task = make_template_task_no_plan_mappings();
+        task["crmVerificationReports"] = serde_json::json!([]);
+        task["localTestRecord"] = serde_json::json!({
+            "status": "not-needed",
+            "note": "Script implementation completed by AI — no local test required before Dataverse upload.",
+        });
+        let overview = task_mcp_workflow_overview(&task);
+        let local_test = &overview["implementationVerification"]["localTest"];
+        assert_eq!(local_test["status"].as_str(), Some("needs_manual_action"));
+        assert_eq!(
+            local_test["message"].as_str(),
+            Some("Record Local Test in the Implementation Verification modal after manual/browser CRM testing (or mark it not-needed there)."),
+        );
+        assert!(!local_test["message"].as_str().unwrap_or("").to_lowercase().contains("localtestrecord"));
+        assert!(!local_test.as_object().unwrap().contains_key("note"));
+    }
+
+    #[test]
+    fn workflow_overview_exposes_legacy_local_test_record_separately_and_clearly_labeled() {
+        let mut task = make_template_task_no_plan_mappings();
+        task["localTestRecord"] = serde_json::json!({"status": "not-needed"});
+        let overview = task_mcp_workflow_overview(&task);
+        assert_eq!(overview["legacyLocalTestRecord"]["status"].as_str(), Some("not-needed"));
+        assert_eq!(overview["legacyLocalTestRecord"]["ignoredForImplementationVerification"].as_bool(), Some(true));
     }
 
     #[test]

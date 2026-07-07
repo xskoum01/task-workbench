@@ -40,6 +40,37 @@ const READ_ONLY_TOOL_NAMES = new Set([
   'get_developer_work_packet',
   'get_task_templates',
   'continue_developer_workflow',
+  // run_implementation_verification performs no external/Dataverse/Git writes. Like
+  // run_dataverse_check_for_task, its local report persistence is expected behavior.
+  'run_implementation_verification',
+  'get_implementation_verification_summary',
+  'get_task_workbench_mcp_capabilities',
+]);
+
+/** Tool names the developer workflow (post-plan-approval through Implementation Verification)
+ *  depends on being available in the current MCP toolset. Used by
+ *  get_task_workbench_mcp_capabilities and the pending_ai_kit_review fail-fast guard in
+ *  run_implementation_verification. Keep in sync with the Rust REQUIRED_DEVELOPER_WORKFLOW_TOOLS
+ *  list in src-tauri/src/lib.rs. */
+const REQUIRED_DEVELOPER_WORKFLOW_TOOLS = [
+  'get_developer_work_packet',
+  'approve_technical_plan_if_safe',
+  'record_ai_implementation_completed',
+  'run_implementation_verification',
+  'record_ai_kit_review_result',
+  'get_implementation_verification_summary',
+  'continue_developer_workflow',
+  'get_task_workflow_overview',
+];
+
+/** Write tool names the standalone MCP fallback (no live app bridge) may execute, and only when
+ *  --data-dir is set. Mirrors the fallbackWriteAllowed check inside callTool() — kept as a single
+ *  named set so get_task_workbench_mcp_capabilities and callTool() cannot drift apart. */
+const FALLBACK_WRITE_ALLOWED_TOOL_NAMES = new Set([
+  'prepare_developer_task',
+  'approve_technical_plan_if_safe',
+  'record_ai_implementation_completed',
+  'record_ai_kit_review_result',
 ]);
 
 /**
@@ -73,6 +104,39 @@ const TASK_TEMPLATES = [
     targetFields: ['nvr_customerid', 'nvr_contactid', 'nvr_iswarrantycase'],
     additionalSourceFields: ['nvr_statuscustom'],
     notes: 'onChange on nvr_assetid. Source entity: nvr_customerasset. Copy nvr_customerid, nvr_contactid, nvr_isunderwarranty to nvr_servicecase fields nvr_customerid, nvr_contactid, nvr_iswarrantycase. Additional source field available: nvr_statuscustom. Solution: NVRTrainingServiceHubCore. App: nvr_trainingservicehub.',
+    businessRules: [
+      'Empty nvr_assetid means no-op: do not clear or modify any form fields.',
+      'Retrieve source record from nvr_customerasset using Xrm.WebApi.retrieveRecord before copying fields.',
+      'Check nvr_statuscustom on the retrieved asset: if inactive, retired, or lost, show a form notification and skip prefill.',
+      'Never write validationFields (nvr_statuscustom) to the target entity — read-only source context only.',
+      'Never set a lookup field entityType to an empty string.',
+      'Guard attribute access: check that getFormContext().getAttribute returns non-null before calling setValue.',
+      'Do not use Xrm.Page — use the execution context passed to the event handler.',
+      'Do not trigger autosave and do not upload or register the web resource.',
+    ],
+    acceptanceCriteria: [
+      'onChange fires on nvr_assetid: if the field is empty, the handler exits without modifying any other field.',
+      'onChange fires on nvr_assetid: if the field has a value, retrieveRecord is called on nvr_customerasset with the selected ID.',
+      'If nvr_statuscustom indicates inactive/retired/lost: a form notification is shown and no field values are written.',
+      'nvr_customerasset.nvr_customerid is copied to nvr_servicecase.nvr_customerid.',
+      'nvr_customerasset.nvr_contactid is copied to nvr_servicecase.nvr_contactid.',
+      'nvr_customerasset.nvr_isunderwarranty is copied to nvr_servicecase.nvr_iswarrantycase.',
+      'No Xrm.Page reference appears in the output code.',
+      'No autosave call appears in the output code.',
+    ],
+    // Deterministic regex checks run by run_implementation_verification. No LLM call —
+    // catches the concrete, checkable failure modes called out for this script task.
+    staticRules: [
+      { id: 'retrieve-source-entity', description: 'retrieveRecord must target nvr_customerasset.', type: 'must-match', pattern: 'retrieveRecord\\s*\\(\\s*["\']nvr_customerasset["\']' },
+      { id: 'no-xrm-page', description: 'Must not reference Xrm.Page.', type: 'must-not-match', pattern: 'Xrm\\.Page' },
+      { id: 'no-autosave', description: 'Must not trigger autosave (formContext.data.save()).', type: 'must-not-match', pattern: '\\.data\\.save\\s*\\(' },
+      { id: 'no-webresource-upload', description: 'Must not upload or register web resources.', type: 'must-not-match', pattern: 'uploadWebResource|RegisterEvent|updatewebresourceset' },
+      { id: 'no-todo-fixme-placeholder', description: 'Must not contain TODO/FIXME/placeholder markers.', type: 'must-not-match', pattern: '\\b(TODO|FIXME|placeholder)\\b' },
+      { id: 'no-empty-lookup-entitytype', description: 'Lookup entityType must never be an empty string.', type: 'must-not-match', pattern: 'entityType\\s*:\\s*["\']\\s*["\']' },
+      { id: 'no-write-validationfields', description: 'nvr_statuscustom (validation field) must not be written to a target with setValue.', type: 'must-not-match', pattern: 'setValue\\s*\\([^)]*nvr_statuscustom' },
+      { id: 'status-custom-checks-inactive-values', description: 'nvr_statuscustom must be checked against inactive/retired/lost values, not merely non-null.', type: 'must-match', pattern: 'inactive|retired|lost' },
+      { id: 'notification-on-inactive-status', description: 'Must show a form notification when status is inactive/retired/lost.', type: 'must-match', pattern: 'notification' },
+    ],
   },
   {
     id: 'nvr-training-sh-plugin-workorderline',
@@ -513,6 +577,47 @@ const TOOL_DEFINITIONS = [
     },
   },
   {
+    name: 'record_ai_implementation_completed',
+    description: 'Record that AI has finished writing implementation files. Sets implementation-done, persists the implemented script artifact into workflowSetup for the UI, and advances past local-test. Call continue_developer_workflow next — it will recommend run_implementation_verification before wait_for_user. Use this instead of record_local_test for script/ribbon tasks after AI file write.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        taskId:              { type: 'string' },
+        filesChanged:        { type: 'array', items: { type: 'string' } },
+        summary:             { type: 'string' },
+        implementationChecks: { type: 'array', items: { type: 'string' } },
+      },
+      required: ['taskId', 'filesChanged', 'summary'],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: 'run_implementation_verification',
+    description: 'Orchestrates the same Verify Implementation checks/state as ImplementationVerificationModal for a script/ribbon task: runs Script File Readiness and Local Static/Business-Rule Verification directly; when running via the Task Workbench app (bridge mode), also runs Dataverse Metadata Check for real via Primarch (read-only, no Dataverse writes) and reports whether AI Internal Code Review still needs to be performed by the calling AI agent (call record_ai_kit_review_result). Local Test remains a read-only passthrough — it is the one genuinely manual/browser step. Never reports status=passed while a required row is still unresolved. No external writes, no web resource upload, no form event registration, no commit/push. Returns status (needs_configuration/failed/pending_ai_kit_review/needs_manual_action/passed), checks, fixableFindings, and nextAction (needs_configuration/fix_code/run_ai_kit_review/wait_for_user/continue_workflow).',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        taskId:                    { type: 'string' },
+        checks:                    { type: 'array', items: { type: 'string', enum: ['scriptFileReadiness', 'localStaticVerification', 'dataverseMetadataCheck', 'aiInternalCodeReview', 'localTest'] } },
+        allowReadOnlyDataverseCheck: { type: 'boolean' },
+      },
+      required: ['taskId'],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: 'get_implementation_verification_summary',
+    description: 'Read-only. Returns the same normalized, modal-truth Implementation Verification summary as run_implementation_verification and get_task_workflow_overview, from currently persisted state only (does not re-run any check). Use this to check current verification status without re-running Script File Readiness / static rules.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        taskId: { type: 'string' },
+      },
+      required: ['taskId'],
+      additionalProperties: false,
+    },
+  },
+  {
     name: 'record_local_test',
     description: 'Record local test result: not-started/passed/failed/not-needed. Updates checklist only.',
     inputSchema: {
@@ -910,6 +1015,38 @@ const TOOL_DEFINITIONS = [
     },
   },
   {
+    name: 'record_ai_kit_review_result',
+    description:
+      'WRITE (local task state only) â€” records the result of an AI Kit / Client-API code review performed ' +
+      'by the calling AI agent itself (reviewSource is always recorded as "claude-ai-kit"). ' +
+      'Before calling this, read the applicable AI Kit rules (see get_power_platform_ai_kit_status / ' +
+      'workPacket.aiKit.rulesFiles) and the target file(s) yourself, and review against ' +
+      'workPacket.implementation.fieldMappings, validationFields, businessRules, acceptanceCriteria, and ' +
+      'the AI Kit rules (no TODO/FIXME/placeholders, no Xrm.Page/autosave, correct Client API usage). ' +
+      'Persists to task.implementationVerification.aiCodeReview (the same field the Implementation ' +
+      'Verification modal reads) and task.aiKitReview. Does NOT call any external LLM, API, or system.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        taskId: { type: 'string', description: 'ID of the task.' },
+        status: { type: 'string', enum: ['passed', 'failed', 'warnings'], description: 'Overall review verdict.' },
+        reviewedFiles: { type: 'array', items: { type: 'string' }, description: 'Files that were reviewed.' },
+        findings: { type: 'array', items: { type: 'string' }, description: 'Review findings/comments.' },
+        fixableFindings: {
+          type: 'array',
+          items: {
+            type: 'object',
+            properties: { id: { type: 'string' }, description: { type: 'string' } },
+            required: ['id', 'description'],
+          },
+          description: 'Findings that should be fixed before the task can proceed.',
+        },
+      },
+      required: ['taskId', 'status'],
+      additionalProperties: false,
+    },
+  },
+  {
     name: 'get_implementation_verification_state',
     description:
       'Read-only. Returns the implementation verification state for a task: ' +
@@ -987,6 +1124,22 @@ const TOOL_DEFINITIONS = [
       additionalProperties: false,
     },
   },
+  {
+    name: 'get_task_workbench_mcp_capabilities',
+    description:
+      'Read-only health/capability check for the current MCP session. Call this before relying on automated ' +
+      'Dataverse Metadata Check / AI Kit review (e.g. after get_developer_work_packet, or before ' +
+      'run_implementation_verification / record_ai_kit_review_result) whenever there is any doubt the live ' +
+      'Task Workbench app + MCP bridge is reachable, or after a "tool not found" / "bridge is not running" ' +
+      'error. Returns bridgeMode (live-rust/js-fallback/offline), which developer-workflow tools are actually ' +
+      'available right now, missingRequiredTools, and a recommendedAction. Does NOT write anything, and never ' +
+      'throws even when the bridge is unreachable and no --data-dir/--fallback-readonly flags are set.',
+    inputSchema: {
+      type: 'object',
+      properties: {},
+      additionalProperties: false,
+    },
+  },
 ];
 
 function getCliDataDir() {
@@ -1003,6 +1156,63 @@ function getCliBridgeUrl() {
 
 function isFallbackReadOnlyEnabled() {
   return process.argv.includes('--fallback-readonly');
+}
+
+/**
+ * Pure core of get_task_workbench_mcp_capabilities' standalone-fallback result — takes the set of
+ * tool names actually defined (normally TOOL_DEFINITIONS.map(t => t.name)) plus the resolved CLI
+ * flags, with no reference to process.argv/module-level state, so tests can simulate a toolset
+ * that is missing a required tool. bridgeMode is 'js-fallback' when local-file access is at least
+ * attempted (--data-dir or --fallback-readonly given), else 'offline' (nothing beyond this health
+ * check itself will work). A tool only counts as usable if it is both in `definedNames` AND
+ * actually callable in the current mode — read-only tools need fallbackAllowed, write tools
+ * additionally need FALLBACK_WRITE_ALLOWED_TOOL_NAMES + dataDir, mirroring callTool() exactly.
+ */
+function computeMcpCapabilitiesFromToolNames(definedNames, { dataDir, fallbackReadOnly }) {
+  const fallbackAllowed = fallbackReadOnly || !!dataDir;
+  const bridgeMode = fallbackAllowed ? 'js-fallback' : 'offline';
+
+  const isToolUsable = (toolName) => {
+    if (!definedNames.has(toolName)) return false;
+    if (READ_ONLY_TOOL_NAMES.has(toolName)) return fallbackAllowed;
+    return FALLBACK_WRITE_ALLOWED_TOOL_NAMES.has(toolName) && !!dataDir;
+  };
+
+  const missingRequiredTools = REQUIRED_DEVELOPER_WORKFLOW_TOOLS.filter((t) => !isToolUsable(t));
+  const canRunImplementationVerification = isToolUsable('run_implementation_verification');
+  const canRecordAiKitReview = isToolUsable('record_ai_kit_review_result');
+  const canRunDeveloperWorkflow = missingRequiredTools.length === 0;
+
+  let recommendedAction = null;
+  if (bridgeMode === 'offline') {
+    recommendedAction = 'Start the Task Workbench app so the local MCP bridge is reachable, then reload/reconnect the MCP server. No developer-workflow tools are available until then.';
+  } else if (missingRequiredTools.length > 0) {
+    recommendedAction = `Start the Task Workbench app for full functionality — this standalone MCP fallback cannot run: ${missingRequiredTools.join(', ')}.`;
+  }
+
+  return {
+    bridgeMode,
+    bridgeUrl: getCliBridgeUrl(),
+    appVersion: null,
+    serverVersion: SERVER_VERSION,
+    toolsetVersion: SERVER_VERSION,
+    requiredDeveloperWorkflowTools: REQUIRED_DEVELOPER_WORKFLOW_TOOLS,
+    missingRequiredTools,
+    canRunDeveloperWorkflow,
+    canRunImplementationVerification,
+    canRecordAiKitReview,
+    recommendedAction,
+  };
+}
+
+/** Computes get_task_workbench_mcp_capabilities' result for the standalone MCP fallback, from the
+ *  live TOOL_DEFINITIONS list and current CLI flags. See computeMcpCapabilitiesFromToolNames. */
+function computeMcpCapabilities() {
+  const definedNames = new Set(TOOL_DEFINITIONS.map((t) => t.name));
+  return computeMcpCapabilitiesFromToolNames(definedNames, {
+    dataDir: getCliDataDir(),
+    fallbackReadOnly: isFallbackReadOnlyEnabled(),
+  });
 }
 
 async function fetchBridgeToken(baseUrl) {
@@ -1848,6 +2058,268 @@ function appendMcpAuditNote(task, action) {
   task.notes = existing ? `${existing}\n${line}` : line;
 }
 
+/** True for script/ribbon (JS/TS form) developer tasks, matching the branch used throughout the workflow gates. */
+function isScriptWorkflowTask(task) {
+  const setup = asObject(task.workflowSetup);
+  const workflow = asObject(task.crmDeveloperWorkflow);
+  const workKind = workflow.detectedWorkKind || setup.devTargetKind || 'unknown';
+  return workKind === 'script' || workKind === 'ribbon' || setup.devTargetKind === 'script';
+}
+
+/** Picks the file from filesChanged that best matches the task's known script artifact/name. */
+function resolveImplementedScriptArtifact(task, filesChanged) {
+  const scriptCandidates = filesChanged.filter((f) => /\.[jt]sx?$/i.test(String(f)));
+  if (scriptCandidates.length === 0) return null;
+  const setup = asObject(task.workflowSetup);
+  const normalize = (p) => String(p ?? '').replace(/\\/g, '/').toLowerCase();
+  const desired = normalize(setup.desiredScriptFile);
+  const existing = normalize(setup.artifactPath || setup.scriptPath);
+  let match = desired ? scriptCandidates.find((f) => normalize(f).endsWith(desired)) : null;
+  if (!match && existing) {
+    match = scriptCandidates.find((f) => normalize(f) === existing || (existing && existing.endsWith(normalize(f))));
+  }
+  return match || scriptCandidates[0];
+}
+
+/**
+ * Persists the file AI just implemented into the UI-visible script selection fields, so
+ * TaskDevModePanel / ImplementationVerificationModal / repositoryContext.ts resolve to the
+ * actual implemented artifact instead of a stale or empty workflowSetup.artifactPath.
+ */
+function applyImplementedScriptArtifactToWorkflowSetup(task, implementedPath) {
+  if (!implementedPath) return;
+  const setup = asObject(task.workflowSetup);
+  task.workflowSetup = setup;
+  const normalizedPath = String(implementedPath).replace(/\\/g, '/');
+  setup.artifactPath = implementedPath;
+  setup.desiredScriptFile = normalizedPath.split('/').pop();
+  if (path.isAbsolute(implementedPath)) {
+    setup.absoluteScriptPath = implementedPath;
+  } else if (setup.repositoryRoot) {
+    setup.absoluteScriptPath = path.join(setup.repositoryRoot, implementedPath);
+  }
+}
+
+/** Resolves an absolute filesystem path for the task's current script artifact, if known. */
+function resolveScriptAbsolutePath(task) {
+  const setup = asObject(task.workflowSetup);
+  if (setup.absoluteScriptPath) return setup.absoluteScriptPath;
+  const artifact = setup.artifactPath || setup.scriptPath || '';
+  if (!artifact) return null;
+  if (path.isAbsolute(artifact)) return artifact;
+  if (setup.repositoryRoot) return path.join(setup.repositoryRoot, artifact);
+  return null;
+}
+
+/** Script File Readiness check for run_implementation_verification: real filesystem read. */
+async function checkScriptFileReadinessForVerification(task) {
+  const absolutePath = resolveScriptAbsolutePath(task);
+  if (!absolutePath) {
+    return {
+      name: 'Script File Readiness',
+      status: 'failed',
+      findings: ['No script artifact path is set on the task. Call record_ai_implementation_completed with filesChanged first.'],
+      fixable: true,
+      fixDescription: 'Persist the implemented file path via record_ai_implementation_completed before verifying.',
+      fileContent: null,
+    };
+  }
+  try {
+    const content = await fs.readFile(absolutePath, 'utf8');
+    const lineCount = content.split('\n').length;
+    const isEmpty = content.trim().length === 0;
+    return {
+      name: 'Script File Readiness',
+      status: isEmpty ? 'failed' : 'passed',
+      findings: [
+        isEmpty
+          ? `Script file exists but is empty: ${path.basename(absolutePath)}.`
+          : `Script file found: ${path.basename(absolutePath)} (${lineCount} lines).`,
+      ],
+      fixable: isEmpty,
+      fixDescription: isEmpty ? 'Write the actual implementation to the script file.' : null,
+      fileContent: isEmpty ? null : content,
+    };
+  } catch (e) {
+    return {
+      name: 'Script File Readiness',
+      status: 'failed',
+      findings: [`Script file not found or unreadable at ${absolutePath}: ${String(e?.message || e)}`],
+      fixable: true,
+      fixDescription: 'Verify the implemented file was written to the expected path and call record_ai_implementation_completed again.',
+      fileContent: null,
+    };
+  }
+}
+
+/** Deterministic regex-based business-rule checks, driven by template.staticRules. No LLM call. */
+function runStaticBusinessRuleChecks(template, fileContent) {
+  const rules = Array.isArray(template?.staticRules) ? template.staticRules : [];
+  if (rules.length === 0) {
+    return {
+      name: 'Local Static/Business-Rule Verification',
+      status: 'skipped',
+      findings: ['No static rules are defined for this task template.'],
+      fixableFindings: [],
+    };
+  }
+  const results = rules.map((rule) => {
+    let matched = false;
+    try {
+      matched = new RegExp(rule.pattern, 'i').test(fileContent);
+    } catch {
+      matched = false;
+    }
+    const pass = rule.type === 'must-not-match' ? !matched : matched;
+    return { id: rule.id, description: rule.description, pass };
+  });
+  const failed = results.filter((r) => !r.pass);
+  return {
+    name: 'Local Static/Business-Rule Verification',
+    status: failed.length === 0 ? 'passed' : 'failed',
+    findings: results.map((r) => `${r.pass ? 'pass' : 'fail'}|${r.description}`),
+    fixableFindings: failed.map((r) => ({ id: r.id, description: r.description })),
+  };
+}
+
+/**
+ * AI Internal Code Review is the in-app LLM-backed review (Implementation Verification modal /
+ * AI Kit). MCP cannot trigger that from a headless tool call, so this only reports back whatever
+ * has already been recorded — it does not duplicate a separate MCP-only AI review path.
+ */
+// Statuses that count as "resolved" for a modal check row without MCP re-running it.
+const IMPL_CHECK_RESOLVED_STATUSES = new Set(['passed', 'warnings', 'skipped', 'manually-verified', 'failed']);
+
+/**
+ * Mirrors ImplementationVerificationModal's deriveDataverseCheckStatus (src/components/
+ * ImplementationVerificationModal.tsx). Read-only — MCP cannot run the Dataverse metadata
+ * check for JS/TS files (Rust's run_dataverse_check_for_task rejects .js/.ts artifacts and
+ * tells the caller to use the modal, which uses a browser-side scanner + live Primarch call
+ * unavailable to a headless tool). This only reports the same status the modal would show.
+ */
+function deriveDataverseCheckStatusForVerification(task) {
+  const override = asObject(asObject(task.implementationVerification).dataverseCheck);
+  if (override.status === 'skipped' || override.status === 'manually-verified') return override.status;
+  const verdict = (Array.isArray(task.crmVerificationReports) ? task.crmVerificationReports : [])[0]?.verdict;
+  if (verdict === 'pass') return 'passed';
+  if (verdict === 'warnings') return 'warnings';
+  if (verdict === 'fail') return 'failed';
+  if (verdict === 'not_configured') return 'warnings';
+  return 'not-run';
+}
+
+/**
+ * Read-only passthrough for the "Dataverse Metadata Check" modal row. Never writes
+ * task.implementationVerification.dataverseCheck — MCP is not the source of truth for this
+ * check for script tasks, it only reports back what the modal already recorded (or hasn't).
+ */
+function dataverseMetadataCheckPassthrough(task) {
+  const status = deriveDataverseCheckStatusForVerification(task);
+  if (IMPL_CHECK_RESOLVED_STATUSES.has(status)) {
+    return { name: 'Dataverse Metadata Check', status, findings: [`Existing Dataverse Metadata Check status: ${status}.`] };
+  }
+  return {
+    name: 'Dataverse Metadata Check',
+    status: 'needs_manual_action',
+    findings: ['Run Dataverse Metadata Check in the Implementation Verification modal.'],
+  };
+}
+
+/**
+ * Read-only passthrough for the "AI Internal Code Review" modal row (task.
+ * implementationVerification.aiCodeReview — the LLM-backed AI Kit/Settings Reviewer, distinct
+ * from the deterministic staticRules check below). MCP cannot invoke a live LLM reviewer from
+ * a headless tool call, so this only reports back what the modal already recorded.
+ */
+function aiInternalCodeReviewPassthrough(task) {
+  const status = asObject(asObject(task.implementationVerification).aiCodeReview).status;
+  if (IMPL_CHECK_RESOLVED_STATUSES.has(status)) {
+    return { name: 'AI Internal Code Review', status, findings: [`Existing AI Kit review status: ${status}.`] };
+  }
+  return {
+    name: 'AI Internal Code Review',
+    status: 'needs_manual_action',
+    findings: ['Run AI Kit Review or Settings Reviewer in the Implementation Verification modal.'],
+  };
+}
+
+/**
+ * Read-only passthrough for the "Local Test" modal row (task.implementationVerification.
+ * localTest — distinct from the top-level task.localTestRecord used by continue_developer_
+ * workflow's step 1 gate). MCP must never write this field for scripts: it can only be
+ * genuinely satisfied by a manual/browser CRM test after upload.
+ */
+function localTestImplPassthrough(task) {
+  const status = asObject(asObject(task.implementationVerification).localTest).status;
+  if (status === 'passed' || status === 'not-needed' || status === 'failed') {
+    return { name: 'Local Test', status, findings: [`Existing Local Test status: ${status}.`] };
+  }
+  return {
+    name: 'Local Test',
+    status: 'needs_manual_action',
+    findings: ['Record Local Test in the Implementation Verification modal after manual/browser CRM testing (or mark it not-needed there).'],
+  };
+}
+
+/**
+ * Normalized, modal-truth verification summary — the same shape regardless of which MCP tool
+ * returns it (run_implementation_verification, get_implementation_verification_summary, or the
+ * Rust get_task_workflow_overview). Built ONLY from the canonical fields ImplementationVerification
+ * Modal reads (task.implementationVerification.buildCheck/dataverseCheck/aiCodeReview/localTest,
+ * task.crmVerificationReports). Never a side-channel-only MCP result.
+ */
+function buildModalVerificationSummary(task) {
+  const buildCheck = asObject(asObject(task.implementationVerification).buildCheck);
+  const dv = dataverseMetadataCheckPassthrough(task);
+  const ai = aiInternalCodeReviewPassthrough(task);
+  const lt = localTestImplPassthrough(task);
+  return {
+    buildCheck: {
+      status: buildCheck.status || 'not-run',
+      label: 'Script File Readiness',
+      ...(buildCheck.summary ? { message: buildCheck.summary } : {}),
+    },
+    dataverseCheck: { status: dv.status, label: 'Dataverse Metadata Check', message: dv.findings[0] },
+    aiCodeReview: { status: ai.status, label: 'AI Internal Code Review', message: ai.findings[0] },
+    localTest: { status: lt.status, label: 'Local Test', message: lt.findings[0] },
+  };
+}
+
+/** Keys of the modal-required rows still unresolved (needs_manual_action or genuinely not-run). */
+function unresolvedModalRows(summary) {
+  const unresolved = (row) => row.status === 'needs_manual_action' || row.status === 'not-run';
+  const rows = [];
+  if (unresolved(summary.dataverseCheck)) rows.push('dataverseCheck');
+  if (unresolved(summary.aiCodeReview)) rows.push('aiCodeReview');
+  if (unresolved(summary.localTest)) rows.push('localTest');
+  return rows;
+}
+
+/**
+ * Composes the single, complete manual-action message used by continue_developer_workflow,
+ * get_task_workflow_overview.nextRecommendedStep, run_implementation_verification, and the
+ * Implementation Verification modal footer — so all four always say the same thing. Only
+ * mentions the checks that are actually still unresolved.
+ */
+function composeManualVerificationStep(summary) {
+  const dvNeeds = summary.dataverseCheck.status === 'needs_manual_action' || summary.dataverseCheck.status === 'not-run';
+  const aiNeeds = summary.aiCodeReview.status === 'needs_manual_action' || summary.aiCodeReview.status === 'not-run';
+  const localNeeds = summary.localTest.status === 'needs_manual_action' || summary.localTest.status === 'not-run';
+
+  const modalNames = [];
+  if (dvNeeds) modalNames.push('Dataverse Metadata Check');
+  if (aiNeeds) modalNames.push('AI Kit/Settings Review');
+
+  const parts = [];
+  if (modalNames.length > 0) parts.push(`Run ${modalNames.join(' and ')} in the Implementation Verification modal.`);
+  if (localNeeds) {
+    parts.push(parts.length > 0
+      ? 'Then upload/register the web resource manually and record Local Test/browser validation.'
+      : 'Upload/register the web resource manually and record Local Test/browser validation.');
+  }
+  return parts.length > 0 ? parts.join(' ') : 'All Implementation Verification checks are resolved.';
+}
+
 function safeString(value) {
   const text = String(value ?? '').trim();
   if (!text || text.length > 500) return '';
@@ -2271,6 +2743,8 @@ function buildDeveloperWorkPacket(task, customerDevDefaults = null) {
         (f) => `Do not map ${f} unless a target field is explicitly present in fieldMappings.`
       ),
       risks: sanitizedRisks,
+      businessRules: Array.isArray(template?.businessRules) ? template.businessRules : [],
+      acceptanceCriteria: Array.isArray(template?.acceptanceCriteria) ? template.acceptanceCriteria : [],
     },
     conventions: {
       sources: conventionSources,
@@ -2280,10 +2754,10 @@ function buildDeveloperWorkPacket(task, customerDevDefaults = null) {
         : ['Inspect the existing plugin project conventions before editing.', 'Respect message/stage/filtering attributes from writeTarget.', 'Do not register plugins from MCP.'],
     },
     dataverse: {
-      verificationStatus: isScript ? 'not_available_for_js_ts_mcp' : verification.verdict,
+      verificationStatus: verification.verdict,
       report: verification,
       instruction: isScript
-        ? 'Dataverse metadata verification for JS/TS is not available through MCP. Use the in-app Verify Implementation modal after implementation/upload.'
+        ? 'Dataverse Metadata Check for script/ribbon files runs automatically via run_implementation_verification (Primarch, when configured) after implementation. Use the stored report here if already present.'
         : 'Use the stored Dataverse verification report. If missing or failing, resolve before implementation.',
     },
     aiKit: {
@@ -2309,9 +2783,12 @@ function buildDeveloperWorkPacket(task, customerDevDefaults = null) {
       ],
       localValidation: plan?.testChecklist || [],
       afterImplementation: [
-        'Record build/local test results back into Task Workbench using record_local_test.',
-        'After recording results, call continue_developer_workflow to get the next required workflow step.',
-        'Do not stop after creating files — follow continue_developer_workflow until it returns wait_for_user or mark_done.',
+        'After writing implementation files: re-read the file and verify every businessRule and acceptanceCriteria in the packet is satisfied.',
+        'Call record_ai_implementation_completed with taskId, filesChanged, and a short summary. This records the implementation and advances the workflow.',
+        'Call continue_developer_workflow after record_ai_implementation_completed. If it returns nextAction=run_implementation_verification, call run_implementation_verification.',
+        'If run_implementation_verification returns fixableFindings, fix the code and repeat: record_ai_implementation_completed, continue_developer_workflow, run_implementation_verification.',
+        'Stop only when continue_developer_workflow returns wait_for_user — report the required manual action and wait.',
+        'Do not call record_local_test for script tasks — use record_ai_implementation_completed instead.',
         'Do not perform Dataverse upload, plugin registration, GitHub/ADO writes, or deployment without explicit approval.',
       ],
       commit: [
@@ -2405,7 +2882,7 @@ function prepareDeveloperTaskInMemory(task, { customerDevDefaults = null, confir
   const appliedActions = [];
   const skippedActions = [{
     action: 'run_dataverse_check_for_task',
-    reason: 'Dataverse metadata verification for JS/TS is not available through MCP. Use the in-app Verify Implementation modal after implementation/upload.',
+    reason: 'Dataverse Metadata Check for JS/TS runs automatically after implementation via run_implementation_verification (Primarch, when configured) — not during setup, since no artifact exists yet.',
   }];
   const hardBlockers = [];
   const warnings = [];
@@ -2479,7 +2956,7 @@ function prepareDeveloperTaskInMemory(task, { customerDevDefaults = null, confir
   const setup = asObject(task.workflowSetup);
   const workKind = task.crmDeveloperWorkflow?.detectedWorkKind || setup.devTargetKind;
   if (setup.devTargetKind === 'script' || workKind === 'script' || workKind === 'ribbon') {
-    warnings.push('Dataverse metadata verification for JS/TS is not available through MCP. Use the in-app Verify Implementation modal after implementation/upload.');
+    warnings.push('Dataverse metadata verification for JS/TS runs automatically after implementation via run_implementation_verification (Primarch, when configured) — not before.');
   }
   if (!setup.repositoryRoot) missingInputs.push('repositoryRoot');
   if (!workKind || workKind === 'unknown') missingInputs.push('workKind');
@@ -2697,7 +3174,7 @@ function computeImplementationReadiness(task) {
 
   if (!dvSatisfied) {
     if (isScript) {
-      warnings.push('Dataverse metadata verification for JS/TS is not available through MCP. Use the in-app Verify Implementation modal after implementation/upload.');
+      warnings.push('Dataverse metadata verification for JS/TS runs automatically after implementation via run_implementation_verification (Primarch, when configured) — not before.');
     } else {
       blockers.push('Dataverse metadata verification has not been completed or explicitly skipped.');
     }
@@ -2830,14 +3307,81 @@ function computeContinueWorkflowStep(task) {
     || READINESS_VERIFIED_VERDICTS.has(crmReports[0]?.verdict ?? '');
   if (!dvDone) {
     if (isScript) {
+      const mcpVerification = asObject(asObject(task.implementationVerification).mcpVerification);
+      if (!mcpVerification.ranAt) {
+        return {
+          nextAction: 'run_implementation_verification',
+          canProceed: true,
+          requiresUserApproval: false,
+          blockingUserAction: null,
+          recommendedTool: 'run_implementation_verification',
+          instructionForAI: 'Run run_implementation_verification. It automatically runs Dataverse Metadata Check (when Primarch is configured) and reports whether AI Kit review is still needed — only the final manual upload/register/browser Local Test step requires waiting for the user.',
+          allowedWrites: ['run_implementation_verification'],
+          forbiddenWrites: ['commit_task_changes', 'push_task_branch', 'commit_and_push_task_changes'],
+        };
+      }
+      if (mcpVerification.status === 'failed' && (mcpVerification.fixableFindings || []).length > 0) {
+        return {
+          nextAction: 'fix_code',
+          canProceed: true,
+          requiresUserApproval: false,
+          blockingUserAction: null,
+          recommendedTool: 'record_ai_implementation_completed',
+          instructionForAI: 'Fix the fixable findings from run_implementation_verification, then call record_ai_implementation_completed and run_implementation_verification again.',
+          allowedWrites: ['record_ai_implementation_completed', 'run_implementation_verification'],
+          forbiddenWrites: ['commit_task_changes', 'push_task_branch', 'commit_and_push_task_changes'],
+        };
+      }
+      if (mcpVerification.status === 'pending_ai_kit_review') {
+        return {
+          nextAction: 'run_ai_kit_review',
+          canProceed: true,
+          requiresUserApproval: false,
+          blockingUserAction: null,
+          recommendedTool: 'record_ai_kit_review_result',
+          instructionForAI: 'Dataverse Metadata Check is resolved. Read the applicable AI Kit rules and the target file yourself, then call record_ai_kit_review_result with your verdict, then call run_implementation_verification again.',
+          allowedWrites: ['record_ai_kit_review_result', 'run_implementation_verification'],
+          forbiddenWrites: ['commit_task_changes', 'push_task_branch', 'commit_and_push_task_changes'],
+        };
+      }
+      if (mcpVerification.status === 'needs_configuration') {
+        const reason = (mcpVerification.checks || []).find((c) => c.status === 'needs_configuration')?.findings?.[0]
+          ?? 'Dataverse Metadata Check is not configured.';
+        return {
+          nextAction: 'needs_configuration',
+          canProceed: false,
+          requiresUserApproval: true,
+          blockingUserAction: reason,
+          recommendedTool: null,
+          instructionForAI: `${reason} This cannot be resolved by the AI agent — ask the user to configure it, then call continue_developer_workflow again.`,
+          allowedWrites: [],
+          forbiddenWrites: ['commit_task_changes', 'push_task_branch', 'commit_and_push_task_changes'],
+        };
+      }
+      if (mcpVerification.status === 'needs_manual_action') {
+        const manualStep = composeManualVerificationStep(buildModalVerificationSummary(task));
+        return {
+          nextAction: 'wait_for_user',
+          canProceed: false,
+          requiresUserApproval: true,
+          blockingUserAction: manualStep,
+          recommendedTool: null,
+          instructionForAI: `Script File Readiness and local static/business-rule verification are complete, but some Implementation Verification modal rows are still not-run. ${manualStep} Call continue_developer_workflow again after the user completes it.`,
+          allowedWrites: [],
+          forbiddenWrites: ['commit_task_changes', 'push_task_branch', 'commit_and_push_task_changes'],
+        };
+      }
+      // Fallback (should be rare): Dataverse Metadata Check ran but did not resolve. Re-run
+      // run_implementation_verification rather than pointing at the in-app modal — the automated
+      // check can be retried directly.
       return {
-        nextAction: 'wait_for_user',
-        canProceed: false,
-        requiresUserApproval: true,
-        blockingUserAction: 'Run Verify Implementation modal in Task Workbench, then call continue_developer_workflow again.',
-        recommendedTool: null,
-        instructionForAI: 'Dataverse metadata verification for JS/TS requires the in-app Verify Implementation modal. Ask the user to run it and confirm, then call continue_developer_workflow again.',
-        allowedWrites: [],
+        nextAction: 'run_implementation_verification',
+        canProceed: true,
+        requiresUserApproval: false,
+        blockingUserAction: null,
+        recommendedTool: 'run_implementation_verification',
+        instructionForAI: 'Dataverse Metadata Check has not resolved yet. Call run_implementation_verification again.',
+        allowedWrites: ['run_implementation_verification'],
         forbiddenWrites: ['commit_task_changes', 'push_task_branch', 'commit_and_push_task_changes'],
       };
     }
@@ -2858,13 +3402,13 @@ function computeContinueWorkflowStep(task) {
   const aiKitDone = !!aiKitReview.completedAt || aiKitReview.status === 'passed' || aiKitReview.status === 'skipped';
   if (!aiKitDone) {
     return {
-      nextAction: 'wait_for_user',
-      canProceed: false,
-      requiresUserApproval: true,
-      blockingUserAction: 'Run AI Kit review in Task Workbench, then call continue_developer_workflow again.',
-      recommendedTool: null,
-      instructionForAI: 'AI Kit review is required before branch creation. Ask the user to run it and confirm, then call continue_developer_workflow again.',
-      allowedWrites: [],
+      nextAction: 'run_ai_kit_review',
+      canProceed: true,
+      requiresUserApproval: false,
+      blockingUserAction: null,
+      recommendedTool: 'record_ai_kit_review_result',
+      instructionForAI: 'AI Kit review is required before branch creation. Read the applicable AI Kit rules and the target file yourself, then call record_ai_kit_review_result with your verdict, then call continue_developer_workflow again.',
+      allowedWrites: ['record_ai_kit_review_result'],
       forbiddenWrites: ['commit_task_changes', 'push_task_branch', 'commit_and_push_task_changes'],
     };
   }
@@ -2880,6 +3424,84 @@ function computeContinueWorkflowStep(task) {
     allowedWrites: [],
     forbiddenWrites: [],
   };
+}
+
+/**
+ * Sets the canonical UI-visible status/waitingState/attentionState fields for a workflow phase.
+ * Mirrors Rust's task_mcp_set_status_phase (src-tauri/src/lib.rs) so headless fallback writes
+ * (--data-dir mode, no live app) never diverge from the bridge-mode implementation used by the
+ * running Task Workbench app.
+ */
+function setStatusPhase(task, phase) {
+  switch (phase) {
+    case 'new':
+      task.status = 'new';
+      task.waitingState = null;
+      task.attentionState = null;
+      break;
+    case 'analyzed':
+      task.status = 'analyzed';
+      task.waitingState = null;
+      task.attentionState = null;
+      break;
+    case 'development':
+      task.status = 'in-progress';
+      task.waitingState = null;
+      task.attentionState = null;
+      break;
+    case 'testing':
+      task.status = 'in-progress';
+      task.waitingState = 'consultant-testing';
+      task.attentionState = null;
+      break;
+    case 'review':
+      task.status = 'ready-for-review';
+      task.waitingState = 'code-review';
+      task.attentionState = null;
+      break;
+    case 'done':
+      task.status = 'done';
+      task.waitingState = null;
+      task.attentionState = null;
+      task.completedAt = new Date().toISOString();
+      break;
+    default:
+      break;
+  }
+}
+
+/**
+ * Canonical developer workflow transition service — fallback-mode mirror of Rust's
+ * task_mcp_apply_developer_workflow_transition. MCP write tools must call this instead of
+ * writing status/waitingState/helper fields ad hoc, so the app-visible phase (NEW/ANALYZED/
+ * DEVELOPMENT/TESTING/CODE REVIEW/DONE) never drifts from what MCP recorded, even when the task
+ * is later opened in the live Task Workbench app.
+ */
+function applyDeveloperWorkflowTransition(task, transition, payload = {}) {
+  switch (transition) {
+    case 'technical_plan_approved':
+      // Leaving NEW/Analyze: a plan can only be approved once the task has been analyzed.
+      if (task.status === 'new') setStatusPhase(task, 'analyzed');
+      // If code can now be written (all other gates satisfied), move straight into
+      // DEVELOPMENT so the UI does not show a stale NEW/Analyze or Analyzed phase.
+      if (payload.canWriteCode && task.status !== 'in-progress') setStatusPhase(task, 'development');
+      break;
+    case 'ai_implementation_completed':
+      // Implementation files were written by AI. This is DEVELOPMENT / Verify Implementation —
+      // do not set a testing waitingState here; the manual CRM upload + in-app Verify
+      // Implementation step still has to happen first.
+      if (task.status !== 'in-progress') setStatusPhase(task, 'development');
+      break;
+    case 'manual_crm_verification_completed':
+      // Manual CRM upload/registration + Verify Implementation is done — hand off to
+      // consultant testing.
+      setStatusPhase(task, 'testing');
+      break;
+    default:
+      break;
+  }
+  task.crmDeveloperWorkflow = asObject(task.crmDeveloperWorkflow);
+  task.crmDeveloperWorkflow.updatedAt = new Date().toISOString();
 }
 
 async function callToolFallback(name, args = {}) {
@@ -3200,10 +3822,319 @@ async function callToolFallback(name, args = {}) {
       task.crmDeveloperWorkflow.planApproval = { approved: true, approvedAt: now };
       task.crmDeveloperWorkflow.updatedAt = now;
       appendMcpAuditNote(task, 'approve_technical_plan_if_safe [AI safe auto-approval]');
-      await saveTasks(tasks);
 
       const refreshedPacket = buildDeveloperWorkPacket(task, devDefaults);
+      // Advance the app-visible phase through the canonical transition, so the UI never stays
+      // on NEW/Analyze once this packet would report canWriteCode=true.
+      applyDeveloperWorkflowTransition(task, 'technical_plan_approved', { canWriteCode: !!refreshedPacket.canWriteCode });
+      await saveTasks(tasks);
+
       return { ...common, canApprove: true, planRefreshed: canRefresh, approvedAt: now, workPacket: refreshedPacket };
+    }
+    case 'record_ai_implementation_completed': {
+      const taskId = String(args.taskId ?? '').trim();
+      if (!taskId) return { ...common, error: 'Missing required argument: taskId' };
+      const filesChanged = Array.isArray(args.filesChanged) ? args.filesChanged : [];
+      if (filesChanged.length === 0) return { ...common, error: 'filesChanged must be a non-empty array' };
+      const summary = String(args.summary ?? '').trim();
+      if (!summary) return { ...common, error: 'Missing required argument: summary' };
+
+      const index = tasks.findIndex((t) => t.id === taskId);
+      if (index < 0) return { ...common, error: `Task not found: ${taskId}` };
+      const task = tasks[index];
+
+      if (task.taskMode !== 'developer') return { ...common, error: 'Task is not in developer mode.' };
+      const planApproval = asObject(task.crmDeveloperWorkflow?.planApproval);
+      if (!planApproval.approved || planApproval.invalidatedAt) {
+        return { ...common, error: 'Technical plan is not approved. Approve the plan before recording implementation.' };
+      }
+
+      const now = new Date().toISOString();
+      task.crmDeveloperWorkflow = asObject(task.crmDeveloperWorkflow);
+      task.crmDeveloperWorkflow.lastAiImplementation = {
+        filesChanged,
+        summary,
+        implementationChecks: Array.isArray(args.implementationChecks) ? args.implementationChecks : [],
+        completedAt: now,
+      };
+      if (!task.mcpChecklistOverrides || typeof task.mcpChecklistOverrides !== 'object') {
+        task.mcpChecklistOverrides = {};
+      }
+      task.mcpChecklistOverrides['implementation-done'] = 'done';
+      task.localTestRecord = {
+        status: 'not-needed',
+        updatedAt: now,
+        note: 'Script implementation completed by AI — no local test required before Dataverse upload.',
+      };
+      task.mcpChecklistOverrides['local-test-done'] = 'optional';
+
+      let implementedArtifactPath = null;
+      if (isScriptWorkflowTask(task)) {
+        implementedArtifactPath = resolveImplementedScriptArtifact(task, filesChanged);
+        applyImplementedScriptArtifactToWorkflowSetup(task, implementedArtifactPath);
+      }
+      // The implementation changed — any previous run_implementation_verification result is stale.
+      if (task.implementationVerification && task.implementationVerification.mcpVerification) {
+        delete task.implementationVerification.mcpVerification;
+      }
+
+      appendMcpAuditNote(task, `record_ai_implementation_completed: ${filesChanged.join(', ')}`);
+      applyDeveloperWorkflowTransition(task, 'ai_implementation_completed', {});
+      await saveTasks(tasks);
+      return {
+        ...common,
+        recorded: true,
+        implementedArtifactPath,
+        nextStep: 'Call continue_developer_workflow, then run_implementation_verification before the manual Dataverse Upload / Verify Implementation step.',
+        requiresManualCrmAction: true,
+      };
+    }
+    case 'record_ai_kit_review_result': {
+      const taskId = String(args.taskId ?? '').trim();
+      if (!taskId) return { ...common, error: 'Missing required argument: taskId' };
+      const status = String(args.status ?? '').trim();
+      if (!['passed', 'failed', 'warnings'].includes(status)) {
+        return { ...common, error: `Invalid status '${status}'. Allowed: passed, failed, warnings` };
+      }
+      const reviewedFiles = Array.isArray(args.reviewedFiles) ? args.reviewedFiles.filter((f) => typeof f === 'string') : [];
+      const findings = Array.isArray(args.findings) ? args.findings.filter((f) => typeof f === 'string') : [];
+      const fixableFindings = Array.isArray(args.fixableFindings) ? args.fixableFindings : [];
+
+      const index = tasks.findIndex((t) => t.id === taskId);
+      if (index < 0) return { ...common, error: `Task not found: ${taskId}` };
+      const task = tasks[index];
+      const now = new Date().toISOString();
+
+      task.implementationVerification = asObject(task.implementationVerification);
+      task.implementationVerification.aiCodeReview = {
+        status,
+        reviewSource: 'claude-ai-kit',
+        reviewedFiles,
+        findings,
+        fixableFindings,
+        runAt: now,
+      };
+      task.implementationVerification.updatedAt = now;
+      // Keeps continue_developer_workflow's separate pre-branch AI Kit gate
+      // (task.aiKitReview.completedAt/status) from dead-ending after this review.
+      task.aiKitReview = { completedAt: now, status, reviewSource: 'claude-ai-kit' };
+
+      appendMcpAuditNote(task, `record_ai_kit_review_result -> ${status}`);
+      await saveTasks(tasks);
+
+      const implementationVerification = buildModalVerificationSummary(task);
+      const unresolvedRequiredRows = unresolvedModalRows(implementationVerification);
+      return {
+        ...common,
+        taskId,
+        recorded: true,
+        implementationVerification,
+        unresolvedRequiredRows,
+        nextRecommendedStep: 'Call run_implementation_verification again to confirm all automated checks are resolved.',
+      };
+    }
+    case 'run_implementation_verification': {
+      const taskId = String(args.taskId ?? '').trim();
+      if (!taskId) return { ...common, error: 'Missing required argument: taskId' };
+      const task = getTaskById(tasks, taskId);
+      if (!task) return { ...common, error: `Task not found: ${taskId}` };
+      if (task.taskMode !== 'developer') return { ...common, error: 'Task is not in developer mode.' };
+      if (!isScriptWorkflowTask(task)) {
+        return { ...common, error: 'run_implementation_verification currently supports script/ribbon tasks only. Use run_dataverse_check_for_task for plugin tasks.' };
+      }
+
+      const requestedChecks = Array.isArray(args.checks) && args.checks.length > 0 ? new Set(args.checks) : null;
+      const runCheck = (key) => !requestedChecks || requestedChecks.has(key);
+
+      const checks = [];
+      const fixableFindings = [];
+      let readiness = null;
+      let staticResult = null;
+
+      if (runCheck('scriptFileReadiness')) {
+        readiness = await checkScriptFileReadinessForVerification(task);
+        checks.push({ name: readiness.name, status: readiness.status, findings: readiness.findings });
+        if (readiness.fixable) {
+          fixableFindings.push({ id: 'script-file-readiness', description: readiness.fixDescription || readiness.findings[0] });
+        }
+      }
+
+      if (runCheck('localStaticVerification')) {
+        if (readiness && readiness.fileContent) {
+          const template = matchTaskTemplate(task.title);
+          staticResult = runStaticBusinessRuleChecks(template, readiness.fileContent);
+          checks.push({ name: staticResult.name, status: staticResult.status, findings: staticResult.findings });
+          fixableFindings.push(...staticResult.fixableFindings);
+        } else {
+          checks.push({ name: 'Local Static/Business-Rule Verification', status: 'skipped', findings: ['Skipped — script file is not readable.'] });
+        }
+      }
+
+      // Dataverse Metadata Check: this standalone MCP fallback (app not running) has no Primarch
+      // client of its own — the real check runs through the Task Workbench app's local bridge
+      // (Rust), which the fallback here cannot reach. Report needs_configuration (not a generic
+      // needs_manual_action) so the caller knows exactly what unblocks it.
+      if (runCheck('dataverseMetadataCheck')) {
+        const resolvedStatus = deriveDataverseCheckStatusForVerification(task);
+        if (IMPL_CHECK_RESOLVED_STATUSES.has(resolvedStatus)) {
+          checks.push({ name: 'Dataverse Metadata Check', status: resolvedStatus, findings: [`Existing Dataverse Metadata Check status: ${resolvedStatus}.`] });
+        } else {
+          checks.push({
+            name: 'Dataverse Metadata Check',
+            status: 'needs_configuration',
+            findings: [
+              'Automated Dataverse Metadata Check requires the Task Workbench app to be running (the MCP bridge runs Primarch verification). ' +
+              'Start the app, then call run_implementation_verification again — or run Dataverse Metadata Check manually in the Implementation Verification modal.',
+            ],
+          });
+        }
+      }
+
+      // AI Internal Code Review: the calling AI agent performs this review itself (reads the AI
+      // Kit rules and target file directly, no separate API key needed) and records its verdict
+      // via record_ai_kit_review_result. This works identically with or without the app running.
+      if (runCheck('aiInternalCodeReview')) {
+        const aiStatus = asObject(asObject(task.implementationVerification).aiCodeReview).status;
+        if (IMPL_CHECK_RESOLVED_STATUSES.has(aiStatus)) {
+          checks.push({ name: 'AI Internal Code Review', status: aiStatus, findings: [`Existing AI Kit review status: ${aiStatus}.`] });
+        } else {
+          checks.push({
+            name: 'AI Internal Code Review',
+            status: 'needs_ai_kit_review',
+            findings: ['Read the applicable AI Kit rules and the target file yourself (use get_power_platform_ai_kit_status and get_developer_work_packet for context), then call record_ai_kit_review_result with your verdict.'],
+          });
+        }
+      }
+
+      if (runCheck('localTest')) {
+        const localTestCheck = localTestImplPassthrough(task);
+        checks.push({ name: localTestCheck.name, status: localTestCheck.status, findings: localTestCheck.findings });
+      }
+
+      // Roll up the top-level status/nextAction. Agent-actionable outcomes (fix code, run the AI
+      // Kit review) take priority over needs_configuration — that requires the user to act, so it
+      // should not block work the agent can already do right now. needs_configuration only wins
+      // once there is nothing left for the agent itself to act on. Never needs_manual_action/
+      // wait_for_user for Dataverse Check or AI Review merely because this is a JS/TS task.
+      const hasNeedsConfiguration = checks.some((c) => c.status === 'needs_configuration');
+      const hasNeedsAiReview = checks.some((c) => c.status === 'needs_ai_kit_review');
+      let status;
+      let nextAction;
+      if (fixableFindings.length > 0) {
+        status = 'failed';
+        nextAction = 'fix_code';
+      } else if (hasNeedsAiReview) {
+        status = 'pending_ai_kit_review';
+        nextAction = 'run_ai_kit_review';
+      } else if (hasNeedsConfiguration) {
+        status = 'needs_configuration';
+        nextAction = 'needs_configuration';
+      } else if (checks.some((c) => c.status === 'needs_manual_action' || c.status === 'failed' || c.status === 'skipped')) {
+        status = 'needs_manual_action';
+        nextAction = 'wait_for_user';
+      } else {
+        status = 'passed';
+        nextAction = 'continue_workflow';
+      }
+
+      // Fail-fast: never tell the agent to call record_ai_kit_review_result if this MCP session
+      // cannot actually reach it — that produces a confusing "tool not found"/"bridge not running"
+      // error after the fact instead of one clear, actionable instruction now.
+      let missingRequiredTools = [];
+      if (nextAction === 'run_ai_kit_review' && !computeMcpCapabilities().canRecordAiKitReview) {
+        status = 'tooling_error';
+        nextAction = 'reload_mcp_or_start_app';
+        missingRequiredTools = ['record_ai_kit_review_result'];
+      }
+
+      const now = new Date().toISOString();
+      task.implementationVerification = asObject(task.implementationVerification);
+      task.implementationVerification.mcpVerification = { status, checks, fixableFindings, nextAction, ranAt: now };
+      // Mirror Script File Readiness into the UI-visible buildCheck field so the Implementation
+      // Verification modal reflects this run without a redundant manual "Check Script File" click.
+      if (readiness) {
+        task.implementationVerification.buildCheck = {
+          status: readiness.status,
+          runAt: now,
+          summary: readiness.findings[0],
+          findings: readiness.findings.map((f) => `${readiness.status === 'passed' ? 'pass' : 'fail'}|${f}`),
+        };
+      }
+      appendMcpAuditNote(task, `run_implementation_verification -> ${status}/${nextAction}`);
+      await saveTasks(tasks);
+
+      // Modal-truth summary, built from the SAME canonical fields ImplementationVerification
+      // Modal reads (now including the buildCheck we just wrote above).
+      const implementationVerification = buildModalVerificationSummary(task);
+      if (staticResult) {
+        implementationVerification.staticBusinessRules = {
+          status: staticResult.status,
+          label: staticResult.name,
+          findings: staticResult.findings,
+        };
+      }
+      const unresolvedRequiredRows = unresolvedModalRows(implementationVerification);
+      const nextRecommendedStep = nextAction === 'reload_mcp_or_start_app'
+        ? 'Stop. Ask the user to start Task Workbench and reload the MCP server. Do not claim AI Kit review must be done manually unless the tool capability check says AI review cannot be automated.'
+        : nextAction === 'needs_configuration'
+          ? (checks.find((c) => c.status === 'needs_configuration')?.findings?.[0]
+            ?? 'Resolve the required configuration, then call run_implementation_verification again.')
+          : nextAction === 'fix_code'
+            ? 'Fix the fixable findings, then call record_ai_implementation_completed and run_implementation_verification again.'
+            : nextAction === 'run_ai_kit_review'
+              ? 'Read the applicable AI Kit rules and the target file, then call record_ai_kit_review_result with your verdict, then call run_implementation_verification again.'
+              : nextAction === 'wait_for_user'
+                ? composeManualVerificationStep(implementationVerification)
+                : 'All Implementation Verification checks are resolved. Call continue_developer_workflow to proceed.';
+
+      return {
+        ...common, taskId, status, checks, fixableFindings, nextAction,
+        implementationVerification, unresolvedRequiredRows, nextRecommendedStep,
+        missingRequiredTools, instructionForAI: nextRecommendedStep,
+      };
+    }
+    case 'get_implementation_verification_summary': {
+      const taskId = String(args.taskId ?? '').trim();
+      if (!taskId) return { ...common, error: 'Missing required argument: taskId' };
+      const task = getTaskById(tasks, taskId);
+      if (!task) return { ...common, error: `Task not found: ${taskId}` };
+
+      const implementationVerification = buildModalVerificationSummary(task);
+      const persistedMcp = asObject(asObject(task.implementationVerification).mcpVerification);
+      const persistedChecks = Array.isArray(persistedMcp.checks) ? persistedMcp.checks : [];
+      const staticCheck = persistedChecks.find((c) => c.name === 'Local Static/Business-Rule Verification');
+      if (staticCheck) {
+        implementationVerification.staticBusinessRules = {
+          status: staticCheck.status, label: staticCheck.name, findings: staticCheck.findings || [],
+        };
+      }
+
+      const unresolvedRequiredRows = unresolvedModalRows(implementationVerification);
+      const fixableFindings = Array.isArray(persistedMcp.fixableFindings) ? persistedMcp.fixableFindings : [];
+      // Reuse the nextAction persisted by run_implementation_verification when available, so this
+      // read-only summary never diverges from the actual last run (needs_configuration/
+      // run_ai_kit_review/etc.) — only fall back to the simple derivation when nothing has run yet.
+      const nextAction = persistedMcp.nextAction
+        || (fixableFindings.length > 0 ? 'fix_code' : (unresolvedRequiredRows.length > 0 ? 'wait_for_user' : 'continue_workflow'));
+      const nextRecommendedStep = nextAction === 'needs_configuration'
+        ? (persistedChecks.find((c) => c.status === 'needs_configuration')?.findings?.[0]
+          ?? 'Resolve the required configuration, then call run_implementation_verification again.')
+        : nextAction === 'fix_code'
+          ? 'Fix the fixable findings, then call record_ai_implementation_completed and run_implementation_verification again.'
+          : nextAction === 'run_ai_kit_review'
+            ? 'Read the applicable AI Kit rules and the target file, then call record_ai_kit_review_result with your verdict, then call run_implementation_verification again.'
+            : nextAction === 'wait_for_user'
+              ? composeManualVerificationStep(implementationVerification)
+              : 'All Implementation Verification checks are resolved. Call continue_developer_workflow to proceed.';
+
+      return {
+        ...common, taskId, implementationVerification, checks: persistedChecks,
+        unresolvedRequiredRows, fixableFindings, nextAction, nextRecommendedStep,
+      };
+    }
+    case 'get_task_workbench_mcp_capabilities': {
+      const capabilities = computeMcpCapabilities();
+      return { ...common, ...capabilities };
     }
     default:
       throw new Error(`Tool '${name}' is not available in read-only fallback mode.`);
@@ -3278,8 +4209,23 @@ async function callTool(name, args = {}) {
       },
     };
   } catch (error) {
+    // get_task_workbench_mcp_capabilities must always be answerable, even with no bridge and no
+    // --data-dir/--fallback-readonly flags — that is exactly the condition it exists to diagnose.
+    // Erroring out here (like every other tool does) would defeat its purpose as a health check.
+    if (name === 'get_task_workbench_mcp_capabilities') {
+      const capabilities = await callToolFallback(name, args);
+      return {
+        ...capabilities,
+        bridge: {
+          mode: capabilities.bridgeMode === 'offline' ? 'offline' : 'fallback-readonly',
+          reason: 'task-workbench bridge unavailable',
+          bridgeError: error instanceof Error ? error.message : String(error),
+        },
+      };
+    }
+
     const fallbackAllowed = isFallbackReadOnlyEnabled() || !!getCliDataDir();
-    const fallbackWriteAllowed = (name === 'prepare_developer_task' || name === 'approve_technical_plan_if_safe') && !!getCliDataDir();
+    const fallbackWriteAllowed = FALLBACK_WRITE_ALLOWED_TOOL_NAMES.has(name) && !!getCliDataDir();
     if (!fallbackAllowed || (!READ_ONLY_TOOL_NAMES.has(name) && !fallbackWriteAllowed)) {
       throw new Error(
         `task-workbench local bridge is not running at ${bridgeUrl}. Start task-workbench app first. `
@@ -3404,5 +4350,8 @@ if (!process.env.VITEST) {
 }
 
 // Named exports for unit tests. Does not affect runtime behaviour when executed as a script.
-export { READ_ONLY_TOOL_NAMES, TOOL_DEFINITIONS, TASK_TEMPLATES, matchTaskTemplate, callToolFallback };
+export {
+  READ_ONLY_TOOL_NAMES, TOOL_DEFINITIONS, TASK_TEMPLATES, matchTaskTemplate, callToolFallback, applyDeveloperWorkflowTransition,
+  REQUIRED_DEVELOPER_WORKFLOW_TOOLS, FALLBACK_WRITE_ALLOWED_TOOL_NAMES, computeMcpCapabilitiesFromToolNames,
+};
 

@@ -311,7 +311,7 @@ describe('buildAiWorkflowPrompt â€” setup prompt (not ready)', () => {
       implementationVerification: undefined,
     }));
     expect(prompt).toContain('prepare_developer_task');
-    expect(prompt).toContain('Dataverse metadata verification for JS/TS is not available through MCP');
+    expect(prompt).toContain('Dataverse metadata verification for JS/TS runs automatically after implementation via run_implementation_verification');
     expect(prompt).not.toContain('â†’ call `run_dataverse_check_for_task`');
     expect(prompt).not.toContain('-> call `run_dataverse_check_for_task`');
     expect(prompt).not.toContain('do not call run_dataverse_check_for_task');
@@ -534,13 +534,13 @@ describe('buildAiWorkflowPrompt â€” implementation prompt (ready task)', ()
     expect(buildAiWorkflowPrompt(makeReadyTask())).toContain('Primarch');
   });
 
-  it('rule 7: JS script implementation prompt uses in-app verification instead of run_dataverse_check_for_task', () => {
+  it('rule 7: JS script implementation prompt runs Dataverse check via run_implementation_verification, not run_dataverse_check_for_task', () => {
     const prompt = buildAiWorkflowPrompt(makeReadyScriptTask({
       crmVerificationReports: undefined,
       implementationVerification: undefined,
     }));
-    expect(prompt).toContain('Dataverse metadata verification for JS/TS is not available through MCP');
-    expect(prompt).toContain('Verify Implementation modal');
+    expect(prompt).toContain('run_implementation_verification runs Dataverse Metadata Check for script/ribbon files automatically');
+    expect(prompt).toContain('needs_configuration');
     expect(prompt).not.toContain('run_dataverse_check_for_task');
     expect(prompt).not.toContain('run run_dataverse_check_for_task');
   });
@@ -557,8 +557,10 @@ describe('buildAiWorkflowPrompt â€” implementation prompt (ready task)', ()
     expect(buildAiWorkflowPrompt(makeReadyTask())).toContain('Do not perform external writes');
   });
 
-  it('rule 11: record results back into Task Workbench', () => {
-    expect(buildAiWorkflowPrompt(makeReadyTask())).toContain('Record local test results');
+  it('rule 8: directs script tasks to record_ai_implementation_completed and plugin tasks to record_local_test', () => {
+    const prompt = buildAiWorkflowPrompt(makeReadyTask());
+    expect(prompt).toContain('record_ai_implementation_completed');
+    expect(prompt).toContain('record_local_test');
   });
 
   it('rule 9: summarize what was changed at end', () => {
@@ -1282,9 +1284,9 @@ describe('buildAiWorkflowPrompt – existing file acceptance guardrails', () => 
     expect(prompt).toContain('do not leave any TODO in output');
   });
 
-  it('prohibits continue_developer_workflow and record_local_test while TODO remains', () => {
+  it('prohibits record_ai_implementation_completed and continue_developer_workflow while TODO remains', () => {
     const prompt = buildAiWorkflowPrompt(makeReadyTask());
-    expect(prompt).toContain('Do not call continue_developer_workflow or record_local_test while any TODO');
+    expect(prompt).toContain('Do not call record_ai_implementation_completed, continue_developer_workflow, or record_local_test while any TODO');
   });
 
   it('prohibits accepting existing file outside fieldMappings as complete', () => {
@@ -1315,8 +1317,10 @@ describe('buildAiWorkflowPrompt – post-implementation workflow', () => {
     expect(buildAiWorkflowPrompt(makeReadyTask())).toContain('continue_developer_workflow');
   });
 
-  it('instructs AI not to stop after creating files', () => {
-    expect(buildAiWorkflowPrompt(makeReadyTask())).toContain('Do not stop after creating files');
+  it('instructs AI to call record_ai_implementation_completed then continue_developer_workflow after file write', () => {
+    const prompt = buildAiWorkflowPrompt(makeReadyTask());
+    expect(prompt).toContain('record_ai_implementation_completed');
+    expect(prompt).toContain('continue_developer_workflow');
   });
 
   it('references requiresUserApproval as the gate for branch/push actions', () => {
@@ -1367,9 +1371,9 @@ describe('buildAiWorkflowPrompt – requiresFieldMappings stop condition and val
 });
 
 describe('buildAiWorkflowPrompt – TODO/scaffold hard stop rules', () => {
-  it('rule 13 blocks continue_developer_workflow while any TODO remains', () => {
+  it('rule 13 blocks record_ai_implementation_completed and continue_developer_workflow while any TODO remains', () => {
     const prompt = buildAiWorkflowPrompt(makeReadyTask());
-    expect(prompt).toContain('Do not call continue_developer_workflow or record_local_test while any TODO');
+    expect(prompt).toContain('Do not call record_ai_implementation_completed, continue_developer_workflow, or record_local_test while any TODO');
   });
 
   it('post-implementation rule 5 states TODO is never acceptable in final output', () => {
@@ -1377,9 +1381,9 @@ describe('buildAiWorkflowPrompt – TODO/scaffold hard stop rules', () => {
     expect(prompt).toContain('TODO comments in final implementation output are never acceptable');
   });
 
-  it('post-implementation rule 5 blocks continue_developer_workflow until every TODO is replaced', () => {
+  it('post-implementation rule 6 blocks record_ai_implementation_completed until every TODO is replaced', () => {
     const prompt = buildAiWorkflowPrompt(makeReadyTask());
-    expect(prompt).toContain('Do not call continue_developer_workflow or record_local_test until every TODO, FIXME, and placeholder comment has been replaced');
+    expect(prompt).toContain('Do not call record_ai_implementation_completed or continue_developer_workflow until every TODO, FIXME, and placeholder comment has been replaced');
   });
 
   it('post-implementation rule 5 allows fixing TODO when packet provides enough information', () => {
@@ -1397,6 +1401,35 @@ describe('buildAiWorkflowPrompt – TODO/scaffold hard stop rules', () => {
     const readyPrompt = buildAiWorkflowPrompt(makeReadyTask());
     expect(setupPrompt).not.toContain('TODO comments in final implementation output are never acceptable');
     expect(readyPrompt).toContain('TODO comments in final implementation output are never acceptable');
+  });
+
+  it('post-implementation step 1 requires verifying businessRules and acceptanceCriteria', () => {
+    const prompt = buildAiWorkflowPrompt(makeReadyTask());
+    expect(prompt).toContain('businessRules');
+    expect(prompt).toContain('acceptanceCriteria');
+  });
+
+  it('post-implementation step 2 instructs to call record_ai_implementation_completed not record_local_test for script tasks', () => {
+    const prompt = buildAiWorkflowPrompt(makeReadyTask());
+    expect(prompt).toContain('record_ai_implementation_completed');
+    expect(prompt).toContain('Do not call record_local_test for script/ribbon tasks');
+  });
+
+  it('instructs AI to call run_implementation_verification when continue_developer_workflow recommends it', () => {
+    const prompt = buildAiWorkflowPrompt(makeReadyTask());
+    expect(prompt).toContain('run_implementation_verification');
+    expect(prompt).toContain('nextAction=run_implementation_verification');
+  });
+
+  it('instructs AI to loop record_ai_implementation_completed + verification on fixable findings', () => {
+    const prompt = buildAiWorkflowPrompt(makeReadyTask());
+    expect(prompt).toContain('fixableFindings');
+    expect(prompt).toContain('repeat from step 2');
+  });
+
+  it('instructs AI to stop only on wait_for_user or explicit approval, not immediately after implementation', () => {
+    const prompt = buildAiWorkflowPrompt(makeReadyTask());
+    expect(prompt).toContain('Stop only when continue_developer_workflow returns wait_for_user');
   });
 });
 

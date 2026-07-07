@@ -135,6 +135,46 @@ describe('computeImplVerifyNextStep', () => {
     expect(latestAiReview).toBeDefined();
     expect(latestAiReview!.id).toBe('rev1');
   });
+
+  // ── Modal footer must match MCP's composeManualVerificationStep wording ──────────────────
+  // (see mcp/task-workbench-mcp.mjs composeManualVerificationStep and
+  // task_mcp_compose_manual_verification_step in src-tauri/src/lib.rs — keep all three in sync)
+
+  it('footer message mentions Dataverse, AI review, and Local Test when all three are unresolved', () => {
+    const task = makeTask({ implementationVerification: { buildCheck: { status: 'passed' } } });
+    const step = computeImplVerifyNextStep(task);
+    expect(step).toBe(
+      'Run Dataverse Metadata Check and AI Kit/Settings Review. '
+      + 'Then upload/register the web resource manually and record Local Test/browser validation.',
+    );
+  });
+
+  it('footer message omits Dataverse once resolved — only mentions AI review and Local Test', () => {
+    // Dataverse passed, AI review still not-run, Local Test still not-run: the composer must
+    // not tell the user to re-run a check that already passed.
+    const task = makeTask({
+      crmVerificationReports: [makeReport('pass')],
+      implementationVerification: { buildCheck: { status: 'passed' } },
+    });
+    const step = computeImplVerifyNextStep(task);
+    expect(step).toBe(
+      'Run AI Kit/Settings Review. Then upload/register the web resource manually and record Local Test/browser validation.',
+    );
+  });
+
+  it('footer message does not say "in the Implementation Verification modal" (user is already in it)', () => {
+    const task = makeTask({ implementationVerification: { buildCheck: { status: 'passed' } } });
+    expect(computeImplVerifyNextStep(task)).not.toContain('Implementation Verification modal');
+  });
+
+  it('suggests consultant testing once Local Test is recorded even if Dataverse/AI review are not-run', () => {
+    // Existing behavior preserved: local === 'passed'/'not-needed' short-circuits before the
+    // manual-action composer, regardless of dv/ai state.
+    const task = makeTask({
+      implementationVerification: { buildCheck: { status: 'passed' }, localTest: { status: 'not-needed' } },
+    });
+    expect(computeImplVerifyNextStep(task)).toBe('Send to consultant testing or request code review');
+  });
 });
 
 // ---------------------------------------------------------------------------

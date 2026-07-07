@@ -43,6 +43,28 @@ export function deriveDataverseCheckStatus(task: Task): ImplCheckStatus {
   return 'not-run';
 }
 
+/**
+ * Composes the same manual-action message as MCP's continue_developer_workflow /
+ * get_task_workflow_overview.nextRecommendedStep / run_implementation_verification (see
+ * composeManualVerificationStep in mcp/task-workbench-mcp.mjs and
+ * task_mcp_compose_manual_verification_step in src-tauri/src/lib.rs — keep all three in sync).
+ * The modal omits "in the Implementation Verification modal" since the user is already in it.
+ */
+function composeManualVerificationStep(dvNeeds: boolean, aiNeeds: boolean, localNeeds: boolean): string {
+  const modalNames: string[] = [];
+  if (dvNeeds) modalNames.push('Dataverse Metadata Check');
+  if (aiNeeds) modalNames.push('AI Kit/Settings Review');
+
+  const parts: string[] = [];
+  if (modalNames.length > 0) parts.push(`Run ${modalNames.join(' and ')}.`);
+  if (localNeeds) {
+    parts.push(parts.length > 0
+      ? 'Then upload/register the web resource manually and record Local Test/browser validation.'
+      : 'Upload/register the web resource manually and record Local Test/browser validation.');
+  }
+  return parts.length > 0 ? parts.join(' ') : 'All Implementation Verification checks are resolved.';
+}
+
 export function computeImplVerifyNextStep(task: Task): string {
   const bld = deriveBuildCheckStatus(task);
   const dv  = deriveDataverseCheckStatus(task);
@@ -65,9 +87,11 @@ export function computeImplVerifyNextStep(task: Task): string {
     ['passed', 'warnings', 'skipped', 'manually-verified'].includes(bld) &&
     ['passed', 'warnings', 'skipped', 'manually-verified'].includes(dv) &&
     ['passed', 'warnings', 'skipped', 'manually-verified'].includes(ai);
-  return allAccountedFor
-    ? 'Run local test or continue to consultant testing'
-    : 'Continue with manual verification or consultant testing';
+  if (allAccountedFor) {
+    return 'Run local test or continue to consultant testing';
+  }
+  // Same wording MCP uses for needs_manual_action: only mention the rows still unresolved.
+  return composeManualVerificationStep(dv === 'not-run', ai === 'not-run', true);
 }
 
 // ---------------------------------------------------------------------------
@@ -184,6 +208,7 @@ export default function ImplementationVerificationModal({
   const [reviewBusy,         setReviewBusy]         = useState(false);
   const [continueBusy,       setContinueBusy]       = useState(false);
   const [reviewConfirmPending, setReviewConfirmPending] = useState(false);
+  const [testingConfirmPending, setTestingConfirmPending] = useState(false);
   const [reviewRunKind, setReviewRunKind] = useState<'ai-kit' | 'settings' | null>(null);
 
   const iv           = task.implementationVerification;
@@ -380,6 +405,19 @@ export default function ImplementationVerificationModal({
     setTestingBusy(false);
   }
 
+  function handleTestingClick() {
+    if (hasUntouchedChecks && !testingConfirmPending) {
+      setTestingConfirmPending(true);
+    } else {
+      void handleTestingConfirmed();
+    }
+  }
+
+  async function handleTestingConfirmed() {
+    setTestingConfirmPending(false);
+    await handleTesting();
+  }
+
   function handleReviewClick() {
     if (hasUntouchedChecks && !reviewConfirmPending) {
       setReviewConfirmPending(true);
@@ -469,6 +507,23 @@ export default function ImplementationVerificationModal({
               </button>
             </div>
           )}
+          {testingConfirmPending && (
+            <div style={{
+              fontSize: 12, color: 'var(--color-warning, #d29922)',
+              border: '1px solid var(--color-warning, #d29922)', borderRadius: 4,
+              padding: '6px 10px', display: 'flex', alignItems: 'center', gap: 10,
+            }}>
+              <span style={{ flex: 1 }}>
+                Some implementation checks are not completed. Continue to Consultant Testing anyway?
+              </span>
+              <button className="btn btn-danger btn-sm" onClick={() => void handleTestingConfirmed()} disabled={testingBusy} type="button">
+                {testingBusy ? <><span className="btn-spinner" /> Moving</> : 'Continue to Consultant Testing'}
+              </button>
+              <button className="btn btn-ghost btn-sm" onClick={() => setTestingConfirmPending(false)} type="button">
+                Cancel
+              </button>
+            </div>
+          )}
           <div style={{ display: 'flex', gap: 8, justifyContent: 'flex-end', alignItems: 'center', flexWrap: 'wrap' }}>
             <button className="btn btn-ghost btn-sm" onClick={onClose} disabled={anyBusy} type="button">Cancel</button>
             <button
@@ -482,8 +537,8 @@ export default function ImplementationVerificationModal({
             </button>
             <button
               className="btn btn-secondary btn-sm"
-              onClick={handleTesting}
-              disabled={anyBusy}
+              onClick={handleTestingClick}
+              disabled={anyBusy || testingConfirmPending}
               title="Move task to Consultant Testing phase"
               type="button"
             >

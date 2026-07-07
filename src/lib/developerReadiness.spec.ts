@@ -307,7 +307,7 @@ describe('getDeveloperReadiness â€” common checks', () => {
     }));
     expect(r.blockers).not.toContain('Dataverse metadata verification has not been completed or explicitly skipped.');
     expect(r.categorizedBlockers.find(b => b.mcpTool === 'run_dataverse_check_for_task')).toBeUndefined();
-    expect(r.warnings).toContain('Dataverse metadata verification for JS/TS is not available through MCP. Use the in-app Verify Implementation modal after implementation/upload.');
+    expect(r.warnings).toContain('Dataverse metadata verification for JS/TS runs automatically after implementation via run_implementation_verification (Primarch, when configured) — not before.');
   });
 
   it('accepts verdict=warnings as completed verification', () => {

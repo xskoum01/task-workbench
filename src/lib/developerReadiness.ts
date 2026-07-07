@@ -177,7 +177,7 @@ export function getDeveloperReadiness(task: Task, customer?: Customer): Develope
   // Dataverse verification â€” workflow-action (AI runs the check), not a hard blocker
   if (!isDataverseVerificationSatisfied(task)) {
     if (isScript) {
-      warnings.push('Dataverse metadata verification for JS/TS is not available through MCP. Use the in-app Verify Implementation modal after implementation/upload.');
+      warnings.push('Dataverse metadata verification for JS/TS runs automatically after implementation via run_implementation_verification (Primarch, when configured) — not before.');
     } else {
       addBlocker(
         categorizedBlockers,

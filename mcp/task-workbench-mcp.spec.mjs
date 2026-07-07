@@ -6,7 +6,7 @@
  * the script's process.exit handler from firing during tests.
  */
 import { describe, it, expect } from 'vitest';
-import { READ_ONLY_TOOL_NAMES, TOOL_DEFINITIONS, TASK_TEMPLATES, matchTaskTemplate, callToolFallback } from './task-workbench-mcp.mjs';
+import { READ_ONLY_TOOL_NAMES, TOOL_DEFINITIONS, TASK_TEMPLATES, matchTaskTemplate, callToolFallback, applyDeveloperWorkflowTransition } from './task-workbench-mcp.mjs';
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -154,6 +154,156 @@ describe('approve_technical_plan_if_safe MCP exposure', () => {
   });
 });
 
+// ---------------------------------------------------------------------------
+// Canonical developer workflow transition — applyDeveloperWorkflowTransition
+// ---------------------------------------------------------------------------
+//
+// Regression coverage for the bug where record_ai_implementation_completed and
+// approve_technical_plan_if_safe wrote helper fields (mcpChecklistOverrides,
+// localTestRecord, lastAiImplementation) but never updated task.status/waitingState —
+// the canonical fields TaskDetail / CrmDeveloperWorkflowPanel / workflowPlan.ts read to
+// render the top-level phase (NEW/ANALYZED/DEVELOPMENT/TESTING/CODE REVIEW/DONE).
+
+describe('applyDeveloperWorkflowTransition — canonical workflow phase', () => {
+  it('technical_plan_approved advances status out of new when canWriteCode=true (straight to DEVELOPMENT)', () => {
+    const task = makeTask({ status: 'new', crmDeveloperWorkflow: {} });
+    applyDeveloperWorkflowTransition(task, 'technical_plan_approved', { canWriteCode: true });
+    expect(task.status).toBe('in-progress');
+    expect(task.waitingState).toBeNull();
+  });
+
+  it('technical_plan_approved only reaches analyzed when canWriteCode=false', () => {
+    const task = makeTask({ status: 'new', crmDeveloperWorkflow: {} });
+    applyDeveloperWorkflowTransition(task, 'technical_plan_approved', { canWriteCode: false });
+    expect(task.status).toBe('analyzed');
+  });
+
+  it('ai_implementation_completed sets status to in-progress (DEVELOPMENT) without a testing waitingState', () => {
+    const task = makeTask({ status: 'analyzed', crmDeveloperWorkflow: {} });
+    applyDeveloperWorkflowTransition(task, 'ai_implementation_completed', {});
+    expect(task.status).toBe('in-progress');
+    expect(task.waitingState).not.toBe('consultant-testing');
+  });
+
+  it('manual_crm_verification_completed moves the task into testing (consultant-testing waitingState)', () => {
+    const task = makeTask({ status: 'in-progress', crmDeveloperWorkflow: {} });
+    applyDeveloperWorkflowTransition(task, 'manual_crm_verification_completed', {});
+    expect(task.status).toBe('in-progress');
+    expect(task.waitingState).toBe('consultant-testing');
+  });
+});
+
+describe('approve_technical_plan_if_safe — advances the app-visible phase (fallback mode)', () => {
+  it('moves status out of new once the plan is approved and canWriteCode=true', async () => {
+    const os = await import('node:os');
+    const fs = await import('node:fs/promises');
+    const path = await import('node:path');
+
+    const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'tw-mcp-phase-approve-'));
+    const task = makeTask({
+      id: 'task-phase-approve',
+      status: 'new',
+      title: 'Script: Předvyplnění servisního požadavku',
+      customerId: 'nvr-test',
+      workflowSetup: {
+        devTargetKind: 'script',
+        repositoryRoot: 'C:\\Repos\\NVR',
+        actionType: 'create-new-script',
+        primaryEntityLogicalName: 'nvr_servicecase',
+        artifactPath: 'Scripts\\nvr_servicecase_events.js',
+        confirmedAt: '2026-06-01T10:00:00.000Z',
+        eventName: 'onChange',
+        eventFieldName: 'nvr_assetid',
+        onLoadFunctionName: 'nvr_servicecase_OnLoad',
+        onChangeFunctionName: 'nvr_assetid_OnChange',
+      },
+      crmDeveloperWorkflow: {
+        detectedWorkKind: 'script',
+        technicalPlan: {
+          workKind: 'script',
+          summary: 'Create onChange handler for nvr_assetid on nvr_servicecase.',
+          implementationSteps: ['Implement the onChange prefill handler.'],
+          fieldMappings: [],
+          unmappedSourceFields: [],
+          risks: [],
+          testChecklist: [],
+          target: { entityLogicalName: 'nvr_servicecase', scriptPath: 'Scripts\\nvr_servicecase_events.js', eventName: 'onChange', eventFieldName: 'nvr_assetid' },
+        },
+      },
+      implementationVerification: { dataverseCheck: { status: 'skipped' } },
+    });
+    await fs.writeFile(path.join(tmpDir, 'tasks.json'), JSON.stringify([task]));
+    const origArgv = process.argv;
+    process.argv = [...process.argv, '--data-dir', tmpDir, '--fallback-readonly'];
+    try {
+      const result = await callToolFallback('approve_technical_plan_if_safe', { taskId: 'task-phase-approve' });
+      expect(result.canApprove).toBe(true);
+      expect(result.workPacket.canWriteCode).toBe(true);
+
+      const saved = JSON.parse(await fs.readFile(path.join(tmpDir, 'tasks.json'), 'utf8'));
+      const savedTask = saved.find((t) => t.id === 'task-phase-approve');
+      // canWriteCode=true means code can now be written — the UI must not show NEW/Analyze.
+      expect(savedTask.status).not.toBe('new');
+      expect(savedTask.status).toBe('in-progress');
+    } finally {
+      process.argv = origArgv;
+      await fs.rm(tmpDir, { recursive: true });
+    }
+  });
+});
+
+describe('record_ai_implementation_completed — advances to DEVELOPMENT / Verify Implementation', () => {
+  it('sets status to in-progress, marks implementation-done, and does not jump to testing', async () => {
+    const os = await import('node:os');
+    const fs = await import('node:fs/promises');
+    const path = await import('node:path');
+
+    const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'tw-mcp-phase-impl-'));
+    const task = makeTask({
+      id: 'task-phase-impl',
+      status: 'analyzed',
+      taskMode: 'developer',
+      workflowSetup: {
+        devTargetKind: 'script',
+        repositoryRoot: 'C:\\Repo',
+        artifactPath: 'Scripts\\nvr.js',
+        confirmedAt: '2026-06-01T10:00:00.000Z',
+      },
+      crmDeveloperWorkflow: {
+        detectedWorkKind: 'script',
+        planApproval: { approved: true, approvedAt: '2026-06-01T10:05:00.000Z' },
+      },
+    });
+    await fs.writeFile(path.join(tmpDir, 'tasks.json'), JSON.stringify([task]));
+    const origArgv = process.argv;
+    process.argv = [...process.argv, '--data-dir', tmpDir, '--fallback-readonly'];
+    try {
+      const result = await callToolFallback('record_ai_implementation_completed', {
+        taskId: 'task-phase-impl',
+        filesChanged: ['Scripts\\nvr.js'],
+        summary: 'Implemented the onChange handler.',
+      });
+      expect(result.recorded).toBe(true);
+      expect(result.requiresManualCrmAction).toBe(true);
+
+      const saved = JSON.parse(await fs.readFile(path.join(tmpDir, 'tasks.json'), 'utf8'));
+      const savedTask = saved.find((t) => t.id === 'task-phase-impl');
+      expect(savedTask.status).toBe('in-progress');
+      expect(savedTask.waitingState).not.toBe('consultant-testing');
+      expect(savedTask.mcpChecklistOverrides['implementation-done']).toBe('done');
+
+      // continue_developer_workflow must not silently skip ahead to testing/done, and must not
+      // jump straight to wait_for_user either — run_implementation_verification has to run first.
+      const cont = await callToolFallback('continue_developer_workflow', { taskId: 'task-phase-impl' });
+      expect(cont.nextAction).toBe('run_implementation_verification');
+      expect(cont.recommendedTool).toBe('run_implementation_verification');
+    } finally {
+      process.argv = origArgv;
+      await fs.rm(tmpDir, { recursive: true });
+    }
+  });
+});
+
 describe('callToolFallback get_developer_work_packet', () => {
   it('returns a simple no-code decision when technical plan approval is pending', async () => {
     const os = await import('node:os');
@@ -280,8 +430,8 @@ describe('callToolFallback get_developer_work_packet', () => {
       expect(packet.writeTarget.handlers).toEqual({ onLoad: 'nvr_servicecase_OnLoad', onChange: 'nvr_assetid_OnChange' });
       expect(packet.conventions.sources).toContain('Scripts\\nvr_contact_events.js');
       expect(packet.conventions.relatedFiles).toContain('Scripts\\nvr_contact_events.js');
-      expect(packet.dataverse.verificationStatus).toBe('not_available_for_js_ts_mcp');
-      expect(packet.dataverse.instruction).toContain('Verify Implementation modal');
+      expect(packet.dataverse.verificationStatus).toBe('missing');
+      expect(packet.dataverse.instruction).toContain('run_implementation_verification');
       expect(JSON.stringify(packet)).not.toContain('run_dataverse_check_for_task');
       expect(packet.reviewTestCommit.localValidation).toContain('Test onChange with empty and populated asset.');
       expect(packet.reviewTestCommit.commit.join(' ')).toContain('Commit only files related to this task');
@@ -610,7 +760,7 @@ describe('callToolFallback continue_developer_workflow', () => {
     }
   });
 
-  it('returns wait_for_user for Dataverse verification after local test recorded (script task)', async () => {
+  it('returns run_implementation_verification (not wait_for_user) before verification has run (script task)', async () => {
     const os = await import('node:os');
     const fs = await import('node:fs/promises');
     const path = await import('node:path');
@@ -622,16 +772,16 @@ describe('callToolFallback continue_developer_workflow', () => {
       workflowSetup: { devTargetKind: 'script', repositoryRoot: 'C:\\Repo', artifactPath: 'Scripts\\nvr.js' },
       crmDeveloperWorkflow: { detectedWorkKind: 'script' },
       localTestRecord: { status: 'passed', updatedAt: '2026-06-15T10:00:00.000Z' },
-      // No implementationVerification — Dataverse check not done
+      // No implementationVerification — Dataverse check not done, mcpVerification never ran
     })]));
 
     const origArgv = process.argv;
     process.argv = [...process.argv, '--data-dir', tmpDir, '--fallback-readonly'];
     try {
       const result = await callToolFallback('continue_developer_workflow', { taskId: 'task-cdw-nodv' });
-      expect(result.nextAction).toBe('wait_for_user');
-      expect(result.requiresUserApproval).toBe(true);
-      expect(result.blockingUserAction).toContain('Verify Implementation modal');
+      expect(result.nextAction).toBe('run_implementation_verification');
+      expect(result.canProceed).toBe(true);
+      expect(result.recommendedTool).toBe('run_implementation_verification');
       expect(result.nextAction).not.toBe('mark_done');
     } finally {
       process.argv = origArgv;
@@ -639,7 +789,115 @@ describe('callToolFallback continue_developer_workflow', () => {
     }
   });
 
-  it('returns wait_for_user for AI Kit review after Dataverse verification done', async () => {
+  it('returns wait_for_user with the exact modal-check message when mcpVerification is needs_manual_action', async () => {
+    const os = await import('node:os');
+    const fs = await import('node:fs/promises');
+    const path = await import('node:path');
+
+    const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'tw-mcp-cdw-verified-'));
+    await fs.writeFile(path.join(tmpDir, 'tasks.json'), JSON.stringify([makeTask({
+      id: 'task-cdw-verified',
+      taskMode: 'developer',
+      workflowSetup: { devTargetKind: 'script', repositoryRoot: 'C:\\Repo', artifactPath: 'Scripts\\nvr.js' },
+      crmDeveloperWorkflow: { detectedWorkKind: 'script' },
+      localTestRecord: { status: 'passed', updatedAt: '2026-06-15T10:00:00.000Z' },
+      implementationVerification: {
+        mcpVerification: { status: 'needs_manual_action', checks: [], fixableFindings: [], nextAction: 'wait_for_user', ranAt: '2026-06-15T10:10:00.000Z' },
+      },
+    })]));
+
+    const origArgv = process.argv;
+    process.argv = [...process.argv, '--data-dir', tmpDir, '--fallback-readonly'];
+    try {
+      const result = await callToolFallback('continue_developer_workflow', { taskId: 'task-cdw-verified' });
+      expect(result.nextAction).toBe('wait_for_user');
+      expect(result.requiresUserApproval).toBe(true);
+      expect(result.blockingUserAction).toBe(
+        'Run Dataverse Metadata Check and AI Kit/Settings Review in the Implementation Verification modal. '
+        + 'Then upload/register the web resource manually and record Local Test/browser validation.',
+      );
+      // Blocked from reaching commit/push while verification rows are unresolved.
+      expect(result.nextAction).not.toBe('propose_branch');
+      expect(result.forbiddenWrites).toContain('commit_task_changes');
+      expect(result.forbiddenWrites).toContain('push_task_branch');
+    } finally {
+      process.argv = origArgv;
+      await fs.rm(tmpDir, { recursive: true });
+    }
+  });
+
+  it('retries run_implementation_verification when mcpVerification is passed but Dataverse Metadata Check was never actually recorded', async () => {
+    const os = await import('node:os');
+    const fs = await import('node:fs/promises');
+    const path = await import('node:path');
+
+    const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'tw-mcp-cdw-verified-passed-'));
+    await fs.writeFile(path.join(tmpDir, 'tasks.json'), JSON.stringify([makeTask({
+      id: 'task-cdw-verified-passed',
+      taskMode: 'developer',
+      workflowSetup: { devTargetKind: 'script', repositoryRoot: 'C:\\Repo', artifactPath: 'Scripts\\nvr.js' },
+      crmDeveloperWorkflow: { detectedWorkKind: 'script' },
+      localTestRecord: { status: 'passed', updatedAt: '2026-06-15T10:00:00.000Z' },
+      implementationVerification: {
+        mcpVerification: { status: 'passed', checks: [], fixableFindings: [], nextAction: 'continue_workflow', ranAt: '2026-06-15T10:10:00.000Z' },
+      },
+    })]));
+
+    const origArgv = process.argv;
+    process.argv = [...process.argv, '--data-dir', tmpDir, '--fallback-readonly'];
+    try {
+      const result = await callToolFallback('continue_developer_workflow', { taskId: 'task-cdw-verified-passed' });
+      // mcpVerification.status='passed' with no crmVerificationReports/dataverseCheck override is
+      // an inconsistent/synthetic state a real run_implementation_verification call would never
+      // produce (a real "passed" always means Dataverse Metadata Check resolved for real). This is
+      // a rare-case backstop: retry the automated check rather than pointing at the old modal-only flow.
+      expect(result.nextAction).toBe('run_implementation_verification');
+      expect(result.canProceed).toBe(true);
+      expect(result.recommendedTool).toBe('run_implementation_verification');
+    } finally {
+      process.argv = origArgv;
+      await fs.rm(tmpDir, { recursive: true });
+    }
+  });
+
+  it('returns fix_code when mcpVerification failed with fixable findings', async () => {
+    const os = await import('node:os');
+    const fs = await import('node:fs/promises');
+    const path = await import('node:path');
+
+    const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'tw-mcp-cdw-fixcode-'));
+    await fs.writeFile(path.join(tmpDir, 'tasks.json'), JSON.stringify([makeTask({
+      id: 'task-cdw-fixcode',
+      taskMode: 'developer',
+      workflowSetup: { devTargetKind: 'script', repositoryRoot: 'C:\\Repo', artifactPath: 'Scripts\\nvr.js' },
+      crmDeveloperWorkflow: { detectedWorkKind: 'script' },
+      localTestRecord: { status: 'passed', updatedAt: '2026-06-15T10:00:00.000Z' },
+      implementationVerification: {
+        mcpVerification: {
+          status: 'failed',
+          checks: [],
+          fixableFindings: [{ id: 'no-xrm-page', description: 'Must not reference Xrm.Page.' }],
+          nextAction: 'fix_code',
+          ranAt: '2026-06-15T10:10:00.000Z',
+        },
+      },
+    })]));
+
+    const origArgv = process.argv;
+    process.argv = [...process.argv, '--data-dir', tmpDir, '--fallback-readonly'];
+    try {
+      const result = await callToolFallback('continue_developer_workflow', { taskId: 'task-cdw-fixcode' });
+      expect(result.nextAction).toBe('fix_code');
+      expect(result.canProceed).toBe(true);
+      expect(result.allowedWrites).toContain('record_ai_implementation_completed');
+      expect(result.allowedWrites).toContain('run_implementation_verification');
+    } finally {
+      process.argv = origArgv;
+      await fs.rm(tmpDir, { recursive: true });
+    }
+  });
+
+  it('returns run_ai_kit_review (agent-runnable) for AI Kit review after Dataverse verification done', async () => {
     const os = await import('node:os');
     const fs = await import('node:fs/promises');
     const path = await import('node:path');
@@ -659,9 +917,11 @@ describe('callToolFallback continue_developer_workflow', () => {
     process.argv = [...process.argv, '--data-dir', tmpDir, '--fallback-readonly'];
     try {
       const result = await callToolFallback('continue_developer_workflow', { taskId: 'task-cdw-noaikit' });
-      expect(result.nextAction).toBe('wait_for_user');
-      expect(result.requiresUserApproval).toBe(true);
-      expect(result.blockingUserAction).toContain('AI Kit review');
+      expect(result.nextAction).toBe('run_ai_kit_review');
+      expect(result.canProceed).toBe(true);
+      expect(result.requiresUserApproval).toBe(false);
+      expect(result.recommendedTool).toBe('record_ai_kit_review_result');
+      expect(result.instructionForAI).toContain('AI Kit review');
     } finally {
       process.argv = origArgv;
       await fs.rm(tmpDir, { recursive: true });
@@ -718,7 +978,9 @@ describe('callToolFallback continue_developer_workflow', () => {
     try {
       const result = await callToolFallback('continue_developer_workflow', { taskId: 'task-cdw-nodone' });
       expect(result.nextAction).not.toBe('mark_done');
-      expect(result.canProceed).toBe(false);
+      // run_implementation_verification is AI-runnable, but branch/commit/push remain forbidden.
+      expect(result.nextAction).toBe('run_implementation_verification');
+      expect(result.forbiddenWrites).toContain('commit_task_changes');
     } finally {
       process.argv = origArgv;
       await fs.rm(tmpDir, { recursive: true });
@@ -1568,7 +1830,7 @@ describe('callToolFallback prepare_developer_task', () => {
       expect(result.approvalGates[0].type).toBe('technical-plan-approval');
       expect(result.hardBlockers).toEqual([]);
       expect(result.skippedActions.some((item) => item.action === 'run_dataverse_check_for_task')).toBe(true);
-      expect(result.warnings).toContain('Dataverse metadata verification for JS/TS is not available through MCP. Use the in-app Verify Implementation modal after implementation/upload.');
+      expect(result.warnings).toContain('Dataverse metadata verification for JS/TS runs automatically after implementation via run_implementation_verification (Primarch, when configured) — not before.');
       expect(result.implementationReadiness.blockers).not.toContain('Dataverse metadata verification has not been completed or explicitly skipped.');
       expect(result.task.workflowSetup.primaryEntityLogicalName).toBe('nvr_servicecase');
       expect(result.task.workflowSetup.artifactPath).toBe('Scripts\\nvr_servicecase_events.js');
@@ -3231,6 +3493,882 @@ describe('get_developer_work_packet – stale entity risk filtering', () => {
       const packet = await callToolFallback('get_developer_work_packet', { taskId: 'task-gdwp-allowed' });
       const risks = packet.implementation?.risks ?? [];
       expect(risks.some((r) => r.includes('nvr_customerasset'))).toBe(true);
+    } finally {
+      process.argv = origArgv;
+      await fs.rm(tmpDir, { recursive: true });
+    }
+  });
+
+  it('approved nvr-training-sh-script-prefill task: packet contains businessRules and acceptanceCriteria', async () => {
+    const { os, fs, path } = await importHelpers();
+    const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'tw-mcp-brac-'));
+    const task = makeApprovedTaskWithStaleNvrAssetRisk('task-brac');
+    await fs.writeFile(path.join(tmpDir, 'tasks.json'), JSON.stringify([task]));
+    const origArgv = process.argv;
+    process.argv = [...process.argv, '--data-dir', tmpDir, '--fallback-readonly'];
+    try {
+      const packet = await callToolFallback('get_developer_work_packet', { taskId: 'task-brac' });
+      const br = packet.implementation?.businessRules ?? [];
+      const ac = packet.implementation?.acceptanceCriteria ?? [];
+      expect(br.length).toBeGreaterThan(0);
+      expect(ac.length).toBeGreaterThan(0);
+      // Key business rules must be present
+      expect(br.some((r) => r.includes('no-op'))).toBe(true);
+      expect(br.some((r) => r.includes('nvr_statuscustom'))).toBe(true);
+      expect(br.some((r) => r.includes('Xrm.Page'))).toBe(true);
+      // Acceptance criteria must cover prefill path and empty-field no-op
+      expect(ac.some((c) => c.includes('empty') && c.includes('nvr_assetid'))).toBe(true);
+      expect(ac.some((c) => c.includes('nvr_customerid'))).toBe(true);
+    } finally {
+      process.argv = origArgv;
+      await fs.rm(tmpDir, { recursive: true });
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// record_ai_implementation_completed tool
+// ---------------------------------------------------------------------------
+
+describe('record_ai_implementation_completed tool', () => {
+  async function importHelpers() {
+    const { default: os } = await import('node:os');
+    const { default: fs } = await import('node:fs/promises');
+    const { default: path } = await import('node:path');
+    return { os, fs, path };
+  }
+
+  function makeApprovedScriptTask(id = 'task-raic') {
+    return makeTask({
+      id,
+      title: 'Script: Předvyplnění servisního požadavku',
+      taskMode: 'developer',
+      workflowSetup: {
+        devTargetKind: 'script',
+        repositoryRoot: 'C:\\Repos\\NVR',
+        actionType: 'create-new-script',
+        primaryEntityLogicalName: 'nvr_servicecase',
+        artifactPath: 'Scripts\\nvr_servicecase_events.js',
+        confirmedAt: '2026-06-01T10:00:00.000Z',
+      },
+      crmDeveloperWorkflow: {
+        detectedWorkKind: 'script',
+        planApproval: { approved: true, approvedAt: '2026-06-01T11:00:00.000Z' },
+        technicalPlan: {
+          workKind: 'script',
+          summary: 'Create onChange handler.',
+          implementationSteps: ['Implement onChange handler.'],
+          fieldMappings: [],
+          risks: [],
+          testChecklist: [],
+        },
+      },
+    });
+  }
+
+  it('tool definition is present in TOOL_DEFINITIONS', () => {
+    const tool = findTool('record_ai_implementation_completed');
+    expect(tool).toBeDefined();
+    expect(tool.inputSchema.required).toContain('taskId');
+    expect(tool.inputSchema.required).toContain('filesChanged');
+    expect(tool.inputSchema.required).toContain('summary');
+  });
+
+  it('tool is not in READ_ONLY_TOOL_NAMES (it writes)', () => {
+    expect(READ_ONLY_TOOL_NAMES.has('record_ai_implementation_completed')).toBe(false);
+  });
+
+  it('records implementation and sets checklist overrides', async () => {
+    const { os, fs, path } = await importHelpers();
+    const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'tw-mcp-raic1-'));
+    const task = makeApprovedScriptTask('task-raic-1');
+    await fs.writeFile(path.join(tmpDir, 'tasks.json'), JSON.stringify([task]));
+    const origArgv = process.argv;
+    process.argv = [...process.argv, '--data-dir', tmpDir];
+    try {
+      const result = await callToolFallback('record_ai_implementation_completed', {
+        taskId: 'task-raic-1',
+        filesChanged: ['Scripts/nvr_servicecase_events.js'],
+        summary: 'Implemented onChange prefill handler.',
+      });
+      expect(result.recorded).toBe(true);
+      expect(result.requiresManualCrmAction).toBe(true);
+      expect(result.nextStep).toContain('Upload');
+
+      const raw = JSON.parse(await fs.readFile(path.join(tmpDir, 'tasks.json'), 'utf8'));
+      const saved = raw.find((t) => t.id === 'task-raic-1');
+      expect(saved.mcpChecklistOverrides?.['implementation-done']).toBe('done');
+      expect(saved.mcpChecklistOverrides?.['local-test-done']).toBe('optional');
+      expect(saved.localTestRecord?.status).toBe('not-needed');
+      expect(saved.crmDeveloperWorkflow.lastAiImplementation?.filesChanged).toEqual(['Scripts/nvr_servicecase_events.js']);
+    } finally {
+      process.argv = origArgv;
+      await fs.rm(tmpDir, { recursive: true });
+    }
+  });
+
+  it('returns error when task is not developer mode', async () => {
+    const { os, fs, path } = await importHelpers();
+    const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'tw-mcp-raic2-'));
+    const task = makeApprovedScriptTask('task-raic-2');
+    task.taskMode = 'general';
+    await fs.writeFile(path.join(tmpDir, 'tasks.json'), JSON.stringify([task]));
+    const origArgv = process.argv;
+    process.argv = [...process.argv, '--data-dir', tmpDir];
+    try {
+      const result = await callToolFallback('record_ai_implementation_completed', {
+        taskId: 'task-raic-2',
+        filesChanged: ['Scripts/nvr_servicecase_events.js'],
+        summary: 'Implemented.',
+      });
+      expect(result.error).toContain('developer mode');
+    } finally {
+      process.argv = origArgv;
+      await fs.rm(tmpDir, { recursive: true });
+    }
+  });
+
+  it('returns error when plan is not approved', async () => {
+    const { os, fs, path } = await importHelpers();
+    const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'tw-mcp-raic3-'));
+    const task = makeApprovedScriptTask('task-raic-3');
+    task.crmDeveloperWorkflow.planApproval = { approved: false };
+    await fs.writeFile(path.join(tmpDir, 'tasks.json'), JSON.stringify([task]));
+    const origArgv = process.argv;
+    process.argv = [...process.argv, '--data-dir', tmpDir];
+    try {
+      const result = await callToolFallback('record_ai_implementation_completed', {
+        taskId: 'task-raic-3',
+        filesChanged: ['Scripts/nvr_servicecase_events.js'],
+        summary: 'Implemented.',
+      });
+      expect(result.error).toContain('not approved');
+    } finally {
+      process.argv = origArgv;
+      await fs.rm(tmpDir, { recursive: true });
+    }
+  });
+
+  it('returns error when filesChanged is empty', async () => {
+    const { os, fs, path } = await importHelpers();
+    const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'tw-mcp-raic4-'));
+    const task = makeApprovedScriptTask('task-raic-4');
+    await fs.writeFile(path.join(tmpDir, 'tasks.json'), JSON.stringify([task]));
+    const origArgv = process.argv;
+    process.argv = [...process.argv, '--data-dir', tmpDir];
+    try {
+      const result = await callToolFallback('record_ai_implementation_completed', {
+        taskId: 'task-raic-4',
+        filesChanged: [],
+        summary: 'Implemented.',
+      });
+      expect(result.error).toContain('filesChanged');
+    } finally {
+      process.argv = origArgv;
+      await fs.rm(tmpDir, { recursive: true });
+    }
+  });
+
+  it('persists the implemented script artifact into workflowSetup so the UI script panel resolves it', async () => {
+    const { os, fs, path } = await importHelpers();
+    const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'tw-mcp-raic5-'));
+    const task = makeApprovedScriptTask('task-raic-5');
+    // Simulate the reported bug: no artifact selected on the task yet.
+    delete task.workflowSetup.artifactPath;
+    await fs.writeFile(path.join(tmpDir, 'tasks.json'), JSON.stringify([task]));
+    const origArgv = process.argv;
+    process.argv = [...process.argv, '--data-dir', tmpDir];
+    try {
+      const result = await callToolFallback('record_ai_implementation_completed', {
+        taskId: 'task-raic-5',
+        filesChanged: ['Scripts\\nvr_servicecase_events.js'],
+        summary: 'Implemented onChange prefill handler.',
+      });
+      expect(result.implementedArtifactPath).toBe('Scripts\\nvr_servicecase_events.js');
+
+      const raw = JSON.parse(await fs.readFile(path.join(tmpDir, 'tasks.json'), 'utf8'));
+      const saved = raw.find((t) => t.id === 'task-raic-5');
+      expect(saved.workflowSetup.artifactPath).toBe('Scripts\\nvr_servicecase_events.js');
+      expect(saved.workflowSetup.desiredScriptFile).toBe('nvr_servicecase_events.js');
+      expect(saved.workflowSetup.absoluteScriptPath).toBe(path.join('C:\\Repos\\NVR', 'Scripts\\nvr_servicecase_events.js'));
+    } finally {
+      process.argv = origArgv;
+      await fs.rm(tmpDir, { recursive: true });
+    }
+  });
+
+  it('invalidates a stale run_implementation_verification result when re-recording implementation', async () => {
+    const { os, fs, path } = await importHelpers();
+    const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'tw-mcp-raic6-'));
+    const task = makeApprovedScriptTask('task-raic-6');
+    task.implementationVerification = {
+      mcpVerification: { status: 'failed', checks: [], fixableFindings: [{ id: 'no-xrm-page', description: 'x' }], nextAction: 'fix_code', ranAt: '2026-06-01T12:00:00.000Z' },
+    };
+    await fs.writeFile(path.join(tmpDir, 'tasks.json'), JSON.stringify([task]));
+    const origArgv = process.argv;
+    process.argv = [...process.argv, '--data-dir', tmpDir];
+    try {
+      await callToolFallback('record_ai_implementation_completed', {
+        taskId: 'task-raic-6',
+        filesChanged: ['Scripts/nvr_servicecase_events.js'],
+        summary: 'Fixed Xrm.Page usage.',
+      });
+      const raw = JSON.parse(await fs.readFile(path.join(tmpDir, 'tasks.json'), 'utf8'));
+      const saved = raw.find((t) => t.id === 'task-raic-6');
+      expect(saved.implementationVerification.mcpVerification).toBeUndefined();
+    } finally {
+      process.argv = origArgv;
+      await fs.rm(tmpDir, { recursive: true });
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// run_implementation_verification tool
+// ---------------------------------------------------------------------------
+
+describe('run_implementation_verification tool', () => {
+  async function importHelpers() {
+    const { default: os } = await import('node:os');
+    const { default: fs } = await import('node:fs/promises');
+    const { default: path } = await import('node:path');
+    return { os, fs, path };
+  }
+
+  const GOOD_SCRIPT = `
+    function nvr_assetid_OnChange(executionContext) {
+      const formContext = executionContext.getFormContext();
+      const assetAttr = formContext.getAttribute("nvr_assetid");
+      const assetIdValue = assetAttr && assetAttr.getValue();
+      if (!assetIdValue || assetIdValue.length === 0) {
+        return;
+      }
+      const assetId = assetIdValue[0].id;
+      Xrm.WebApi.retrieveRecord("nvr_customerasset", assetId, "?$select=nvr_customerid,nvr_contactid,nvr_isunderwarranty,nvr_statuscustom").then(function (asset) {
+        const statusValue = (asset.nvr_statuscustom || "").toLowerCase();
+        if (statusValue === "inactive" || statusValue === "retired" || statusValue === "lost") {
+          formContext.ui.setFormNotification("Selected asset is inactive/retired/lost.", "WARNING", "nvr_assetid_status");
+          return;
+        }
+        const customerAttr = formContext.getAttribute("nvr_customerid");
+        if (customerAttr) {
+          customerAttr.setValue(asset.nvr_customerid ? [{ id: asset.nvr_customerid, entityType: "account", name: "" }] : null);
+        }
+      });
+    }
+  `;
+
+  const BAD_SCRIPT = `
+    function nvr_assetid_OnChange(executionContext) {
+      // TODO: implement retrieveRecord call
+      var formContext = Xrm.Page;
+      formContext.data.save();
+    }
+  `;
+
+  function makeVerificationTask(id, { repositoryRoot, artifactPath, devTargetKind = 'script' }) {
+    return makeTask({
+      id,
+      title: 'Script: Předvyplnění servisního požadavku',
+      taskMode: 'developer',
+      workflowSetup: { devTargetKind, repositoryRoot, artifactPath },
+      crmDeveloperWorkflow: {
+        detectedWorkKind: devTargetKind,
+        planApproval: { approved: true },
+        // Non-empty fieldMappings so the scaffold/TODO guard in computeContinueWorkflowStep
+        // does not fire ahead of the check under test.
+        technicalPlan: {
+          workKind: devTargetKind,
+          summary: 'Prefill service case from asset.',
+          implementationSteps: ['Implement onChange handler.'],
+          fieldMappings: [
+            { source: 'nvr_customerasset.nvr_customerid', target: 'nvr_servicecase.nvr_customerid' },
+            { source: 'nvr_customerasset.nvr_contactid', target: 'nvr_servicecase.nvr_contactid' },
+            { source: 'nvr_customerasset.nvr_isunderwarranty', target: 'nvr_servicecase.nvr_iswarrantycase' },
+          ],
+          risks: [],
+          testChecklist: [],
+        },
+      },
+    });
+  }
+
+  it('tool definition is present and read-only', () => {
+    const tool = findTool('run_implementation_verification');
+    expect(tool).toBeDefined();
+    expect(tool.inputSchema.required).toEqual(['taskId']);
+    expect(READ_ONLY_TOOL_NAMES.has('run_implementation_verification')).toBe(true);
+  });
+
+  it('passes Script File Readiness and Local Static/Business-Rule Verification for a compliant script', async () => {
+    const { os, fs, path } = await importHelpers();
+    const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'tw-mcp-riv-good-'));
+    const scriptsDir = path.join(tmpDir, 'Scripts');
+    await fs.mkdir(scriptsDir, { recursive: true });
+    await fs.writeFile(path.join(scriptsDir, 'nvr_servicecase_events.js'), GOOD_SCRIPT);
+    const task = makeVerificationTask('task-riv-good', { repositoryRoot: tmpDir, artifactPath: 'Scripts/nvr_servicecase_events.js' });
+    await fs.writeFile(path.join(tmpDir, 'tasks.json'), JSON.stringify([task]));
+
+    const origArgv = process.argv;
+    process.argv = [...process.argv, '--data-dir', tmpDir];
+    try {
+      const result = await callToolFallback('run_implementation_verification', { taskId: 'task-riv-good' });
+      expect(result.fixableFindings).toEqual([]);
+      const readinessCheck = result.checks.find((c) => c.name === 'Script File Readiness');
+      expect(readinessCheck.status).toBe('passed');
+      const staticCheck = result.checks.find((c) => c.name === 'Local Static/Business-Rule Verification');
+      expect(staticCheck.status).toBe('passed');
+      // No fixable findings, but AI Internal Code Review has not been recorded yet — the agent
+      // must review it itself (record_ai_kit_review_result), not wait_for_user.
+      expect(result.status).toBe('pending_ai_kit_review');
+      expect(result.nextAction).toBe('run_ai_kit_review');
+    } finally {
+      process.argv = origArgv;
+      await fs.rm(tmpDir, { recursive: true });
+    }
+  });
+
+  it('returns fix_code with fixable findings for a script violating business rules (TODO, Xrm.Page, autosave)', async () => {
+    const { os, fs, path } = await importHelpers();
+    const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'tw-mcp-riv-bad-'));
+    const scriptsDir = path.join(tmpDir, 'Scripts');
+    await fs.mkdir(scriptsDir, { recursive: true });
+    await fs.writeFile(path.join(scriptsDir, 'nvr_servicecase_events.js'), BAD_SCRIPT);
+    const task = makeVerificationTask('task-riv-bad', { repositoryRoot: tmpDir, artifactPath: 'Scripts/nvr_servicecase_events.js' });
+    await fs.writeFile(path.join(tmpDir, 'tasks.json'), JSON.stringify([task]));
+
+    const origArgv = process.argv;
+    process.argv = [...process.argv, '--data-dir', tmpDir];
+    try {
+      const result = await callToolFallback('run_implementation_verification', { taskId: 'task-riv-bad' });
+      expect(result.status).toBe('failed');
+      expect(result.nextAction).toBe('fix_code');
+      expect(result.fixableFindings.length).toBeGreaterThan(0);
+      const ids = result.fixableFindings.map((f) => f.id);
+      expect(ids).toContain('no-xrm-page');
+      expect(ids).toContain('no-autosave');
+      expect(ids).toContain('no-todo-fixme-placeholder');
+      expect(ids).toContain('retrieve-source-entity');
+    } finally {
+      process.argv = origArgv;
+      await fs.rm(tmpDir, { recursive: true });
+    }
+  });
+
+  it('returns a fixable Script File Readiness finding when the artifact file does not exist on disk', async () => {
+    const { os, fs, path } = await importHelpers();
+    const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'tw-mcp-riv-missing-'));
+    const task = makeVerificationTask('task-riv-missing', { repositoryRoot: tmpDir, artifactPath: 'Scripts/does_not_exist.js' });
+    await fs.writeFile(path.join(tmpDir, 'tasks.json'), JSON.stringify([task]));
+
+    const origArgv = process.argv;
+    process.argv = [...process.argv, '--data-dir', tmpDir];
+    try {
+      const result = await callToolFallback('run_implementation_verification', { taskId: 'task-riv-missing' });
+      expect(result.status).toBe('failed');
+      expect(result.nextAction).toBe('fix_code');
+      const readinessCheck = result.checks.find((c) => c.name === 'Script File Readiness');
+      expect(readinessCheck.status).toBe('failed');
+    } finally {
+      process.argv = origArgv;
+      await fs.rm(tmpDir, { recursive: true });
+    }
+  });
+
+  it('rejects non-script (plugin) tasks with a clear error', async () => {
+    const { os, fs, path } = await importHelpers();
+    const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'tw-mcp-riv-plugin-'));
+    const task = makeVerificationTask('task-riv-plugin', { repositoryRoot: tmpDir, artifactPath: 'Plugins/Foo.cs', devTargetKind: 'plugin' });
+    await fs.writeFile(path.join(tmpDir, 'tasks.json'), JSON.stringify([task]));
+
+    const origArgv = process.argv;
+    process.argv = [...process.argv, '--data-dir', tmpDir];
+    try {
+      const result = await callToolFallback('run_implementation_verification', { taskId: 'task-riv-plugin' });
+      expect(result.error).toContain('script/ribbon tasks only');
+    } finally {
+      process.argv = origArgv;
+      await fs.rm(tmpDir, { recursive: true });
+    }
+  });
+
+  it('persists mcpVerification to the task so continue_developer_workflow can read it back', async () => {
+    const { os, fs, path } = await importHelpers();
+    const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'tw-mcp-riv-persist-'));
+    const scriptsDir = path.join(tmpDir, 'Scripts');
+    await fs.mkdir(scriptsDir, { recursive: true });
+    await fs.writeFile(path.join(scriptsDir, 'nvr_servicecase_events.js'), GOOD_SCRIPT);
+    const task = makeVerificationTask('task-riv-persist', { repositoryRoot: tmpDir, artifactPath: 'Scripts/nvr_servicecase_events.js' });
+    task.localTestRecord = { status: 'not-needed' };
+    await fs.writeFile(path.join(tmpDir, 'tasks.json'), JSON.stringify([task]));
+
+    const origArgv = process.argv;
+    process.argv = [...process.argv, '--data-dir', tmpDir];
+    try {
+      await callToolFallback('run_implementation_verification', { taskId: 'task-riv-persist' });
+      const raw = JSON.parse(await fs.readFile(path.join(tmpDir, 'tasks.json'), 'utf8'));
+      const saved = raw.find((t) => t.id === 'task-riv-persist');
+      expect(saved.implementationVerification.mcpVerification.ranAt).toBeDefined();
+      expect(saved.implementationVerification.buildCheck.status).toBe('passed');
+
+      // continue_developer_workflow must now report run_ai_kit_review (the agent can perform the
+      // remaining review itself), not re-recommend run_implementation_verification.
+      const cont = await callToolFallback('continue_developer_workflow', { taskId: 'task-riv-persist' });
+      expect(cont.nextAction).toBe('run_ai_kit_review');
+    } finally {
+      process.argv = origArgv;
+      await fs.rm(tmpDir, { recursive: true });
+    }
+  });
+
+  // ── Split-brain regression coverage: MCP verification must orchestrate over the same
+  // canonical fields ImplementationVerificationModal reads, not a side-channel result. ──────
+
+  it('does not return passed while Dataverse Metadata Check is not-run and required', async () => {
+    const { os, fs, path } = await importHelpers();
+    const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'tw-mcp-riv-dv-notrun-'));
+    const scriptsDir = path.join(tmpDir, 'Scripts');
+    await fs.mkdir(scriptsDir, { recursive: true });
+    await fs.writeFile(path.join(scriptsDir, 'nvr_servicecase_events.js'), GOOD_SCRIPT);
+    // No crmVerificationReports, no dataverseCheck override — modal would show "Not run".
+    const task = makeVerificationTask('task-riv-dv-notrun', { repositoryRoot: tmpDir, artifactPath: 'Scripts/nvr_servicecase_events.js' });
+    await fs.writeFile(path.join(tmpDir, 'tasks.json'), JSON.stringify([task]));
+
+    const origArgv = process.argv;
+    process.argv = [...process.argv, '--data-dir', tmpDir];
+    try {
+      const result = await callToolFallback('run_implementation_verification', { taskId: 'task-riv-dv-notrun' });
+      expect(result.status).not.toBe('passed');
+      const dvCheck = result.checks.find((c) => c.name === 'Dataverse Metadata Check');
+      // Standalone MCP fallback (no bridge) cannot run Primarch itself — needs_configuration
+      // reports exactly what unblocks it, not a generic needs_manual_action.
+      expect(dvCheck.status).toBe('needs_configuration');
+      expect(dvCheck.findings[0]).toContain('Task Workbench app');
+      // MCP must not fabricate a dataverseCheck override — the modal row stays genuinely not-run.
+      const raw = JSON.parse(await fs.readFile(path.join(tmpDir, 'tasks.json'), 'utf8'));
+      const saved = raw.find((t) => t.id === 'task-riv-dv-notrun');
+      expect(saved.implementationVerification.dataverseCheck).toBeUndefined();
+    } finally {
+      process.argv = origArgv;
+      await fs.rm(tmpDir, { recursive: true });
+    }
+  });
+
+  it('reports Dataverse Metadata Check as resolved once the modal has already recorded a verdict', async () => {
+    const { os, fs, path } = await importHelpers();
+    const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'tw-mcp-riv-dv-done-'));
+    const scriptsDir = path.join(tmpDir, 'Scripts');
+    await fs.mkdir(scriptsDir, { recursive: true });
+    await fs.writeFile(path.join(scriptsDir, 'nvr_servicecase_events.js'), GOOD_SCRIPT);
+    const task = makeVerificationTask('task-riv-dv-done', { repositoryRoot: tmpDir, artifactPath: 'Scripts/nvr_servicecase_events.js' });
+    task.crmVerificationReports = [{ verdict: 'pass' }];
+    task.implementationVerification = { aiCodeReview: { status: 'skipped' } };
+    await fs.writeFile(path.join(tmpDir, 'tasks.json'), JSON.stringify([task]));
+
+    const origArgv = process.argv;
+    process.argv = [...process.argv, '--data-dir', tmpDir];
+    try {
+      const result = await callToolFallback('run_implementation_verification', { taskId: 'task-riv-dv-done' });
+      const dvCheck = result.checks.find((c) => c.name === 'Dataverse Metadata Check');
+      expect(dvCheck.status).toBe('passed');
+    } finally {
+      process.argv = origArgv;
+      await fs.rm(tmpDir, { recursive: true });
+    }
+  });
+
+  it('does not return passed while AI Internal Code Review is not-run and required', async () => {
+    const { os, fs, path } = await importHelpers();
+    const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'tw-mcp-riv-ai-notrun-'));
+    const scriptsDir = path.join(tmpDir, 'Scripts');
+    await fs.mkdir(scriptsDir, { recursive: true });
+    await fs.writeFile(path.join(scriptsDir, 'nvr_servicecase_events.js'), GOOD_SCRIPT);
+    const task = makeVerificationTask('task-riv-ai-notrun', { repositoryRoot: tmpDir, artifactPath: 'Scripts/nvr_servicecase_events.js' });
+    // Dataverse already resolved so AI Internal Code Review is isolated as the only pending row.
+    task.crmVerificationReports = [{ verdict: 'pass' }];
+    await fs.writeFile(path.join(tmpDir, 'tasks.json'), JSON.stringify([task]));
+
+    const origArgv = process.argv;
+    process.argv = [...process.argv, '--data-dir', tmpDir];
+    try {
+      const result = await callToolFallback('run_implementation_verification', { taskId: 'task-riv-ai-notrun' });
+      expect(result.status).not.toBe('passed');
+      const aiCheck = result.checks.find((c) => c.name === 'AI Internal Code Review');
+      // The calling agent can perform this review itself — needs_ai_kit_review, not a generic
+      // needs_manual_action.
+      expect(aiCheck.status).toBe('needs_ai_kit_review');
+      expect(aiCheck.findings[0]).toContain('record_ai_kit_review_result');
+      // MCP must not fabricate an aiCodeReview result — do not conflate static checks with AI review.
+      const raw = JSON.parse(await fs.readFile(path.join(tmpDir, 'tasks.json'), 'utf8'));
+      const saved = raw.find((t) => t.id === 'task-riv-ai-notrun');
+      expect(saved.implementationVerification.aiCodeReview).toBeUndefined();
+      // The deterministic static-rule check is its own row, distinct from AI Internal Code Review.
+      const staticCheck = result.checks.find((c) => c.name === 'Local Static/Business-Rule Verification');
+      expect(staticCheck).toBeDefined();
+      expect(staticCheck.name).not.toBe(aiCheck.name);
+    } finally {
+      process.argv = origArgv;
+      await fs.rm(tmpDir, { recursive: true });
+    }
+  });
+
+  it('does not auto-pass the modal Local Test row — it stays not-run separate from task.localTestRecord', async () => {
+    const { os, fs, path } = await importHelpers();
+    const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'tw-mcp-riv-localtest-'));
+    const scriptsDir = path.join(tmpDir, 'Scripts');
+    await fs.mkdir(scriptsDir, { recursive: true });
+    await fs.writeFile(path.join(scriptsDir, 'nvr_servicecase_events.js'), GOOD_SCRIPT);
+    const task = makeVerificationTask('task-riv-localtest', { repositoryRoot: tmpDir, artifactPath: 'Scripts/nvr_servicecase_events.js' });
+    // Simulates record_ai_implementation_completed's effect: the workflow-gate field is
+    // 'not-needed', but the modal's own Local Test row must remain untouched by MCP.
+    task.localTestRecord = { status: 'not-needed' };
+    await fs.writeFile(path.join(tmpDir, 'tasks.json'), JSON.stringify([task]));
+
+    const origArgv = process.argv;
+    process.argv = [...process.argv, '--data-dir', tmpDir];
+    try {
+      const result = await callToolFallback('run_implementation_verification', { taskId: 'task-riv-localtest' });
+      const localTestCheck = result.checks.find((c) => c.name === 'Local Test');
+      expect(localTestCheck.status).toBe('needs_manual_action');
+      expect(result.status).not.toBe('passed');
+
+      const raw = JSON.parse(await fs.readFile(path.join(tmpDir, 'tasks.json'), 'utf8'));
+      const saved = raw.find((t) => t.id === 'task-riv-localtest');
+      // task.localTestRecord ('not-needed', the continue_developer_workflow gate) must not leak
+      // into implementationVerification.localTest (the modal row) as an auto-pass.
+      expect(saved.implementationVerification.localTest).toBeUndefined();
+      expect(saved.localTestRecord.status).toBe('not-needed');
+    } finally {
+      process.argv = origArgv;
+      await fs.rm(tmpDir, { recursive: true });
+    }
+  });
+
+  it('reports passed only once Dataverse, AI review, and Local Test are all resolved in the modal', async () => {
+    const { os, fs, path } = await importHelpers();
+    const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'tw-mcp-riv-all-resolved-'));
+    const scriptsDir = path.join(tmpDir, 'Scripts');
+    await fs.mkdir(scriptsDir, { recursive: true });
+    await fs.writeFile(path.join(scriptsDir, 'nvr_servicecase_events.js'), GOOD_SCRIPT);
+    const task = makeVerificationTask('task-riv-all-resolved', { repositoryRoot: tmpDir, artifactPath: 'Scripts/nvr_servicecase_events.js' });
+    task.crmVerificationReports = [{ verdict: 'pass' }];
+    task.implementationVerification = {
+      aiCodeReview: { status: 'passed' },
+      localTest: { status: 'not-needed' },
+    };
+    await fs.writeFile(path.join(tmpDir, 'tasks.json'), JSON.stringify([task]));
+
+    const origArgv = process.argv;
+    process.argv = [...process.argv, '--data-dir', tmpDir];
+    try {
+      const result = await callToolFallback('run_implementation_verification', { taskId: 'task-riv-all-resolved' });
+      expect(result.status).toBe('passed');
+      expect(result.nextAction).toBe('continue_workflow');
+    } finally {
+      process.argv = origArgv;
+      await fs.rm(tmpDir, { recursive: true });
+    }
+  });
+
+  // ── Modal-visible implementationVerification summary + nextRecommendedStep ──────────────
+
+  it('response includes a modal-visible implementationVerification summary matching the live example', async () => {
+    const { os, fs, path } = await importHelpers();
+    const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'tw-mcp-riv-summary-'));
+    const scriptsDir = path.join(tmpDir, 'Scripts');
+    await fs.mkdir(scriptsDir, { recursive: true });
+    await fs.writeFile(path.join(scriptsDir, 'nvr_servicecase_events.js'), GOOD_SCRIPT);
+    // No crmVerificationReports, no aiCodeReview, no localTest — matches the reported live state:
+    // Script File Readiness passed, static rules passed, Dataverse/AI/Local Test needs_manual_action.
+    const task = makeVerificationTask('task-riv-summary', { repositoryRoot: tmpDir, artifactPath: 'Scripts/nvr_servicecase_events.js' });
+    await fs.writeFile(path.join(tmpDir, 'tasks.json'), JSON.stringify([task]));
+
+    const origArgv = process.argv;
+    process.argv = [...process.argv, '--data-dir', tmpDir];
+    try {
+      const result = await callToolFallback('run_implementation_verification', { taskId: 'task-riv-summary' });
+      const iv = result.implementationVerification;
+      expect(iv.buildCheck).toMatchObject({ status: 'passed', label: 'Script File Readiness' });
+      expect(iv.dataverseCheck).toMatchObject({ status: 'needs_manual_action', label: 'Dataverse Metadata Check' });
+      expect(iv.aiCodeReview).toMatchObject({ status: 'needs_manual_action', label: 'AI Internal Code Review' });
+      expect(iv.localTest).toMatchObject({ status: 'needs_manual_action', label: 'Local Test' });
+      expect(iv.staticBusinessRules).toMatchObject({ status: 'passed', label: 'Local Static/Business-Rule Verification' });
+      // Static rules are a distinct row from AI Internal Code Review.
+      expect(iv.staticBusinessRules.label).not.toBe(iv.aiCodeReview.label);
+
+      expect(result.unresolvedRequiredRows.sort()).toEqual(['aiCodeReview', 'dataverseCheck', 'localTest']);
+      // Top-level nextRecommendedStep reflects the tool-orchestration nextAction (run_ai_kit_review
+      // — agent-actionable), not the modal-summary unresolvedRequiredRows wording above.
+      expect(result.nextAction).toBe('run_ai_kit_review');
+      expect(result.nextRecommendedStep).toBe(
+        'Read the applicable AI Kit rules and the target file, then call record_ai_kit_review_result with your verdict, then call run_implementation_verification again.',
+      );
+    } finally {
+      process.argv = origArgv;
+      await fs.rm(tmpDir, { recursive: true });
+    }
+  });
+
+  it('nextRecommendedStep omits resolved rows and only mentions Local Test when Dataverse/AI review already passed', async () => {
+    const { os, fs, path } = await importHelpers();
+    const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'tw-mcp-riv-partial-'));
+    const scriptsDir = path.join(tmpDir, 'Scripts');
+    await fs.mkdir(scriptsDir, { recursive: true });
+    await fs.writeFile(path.join(scriptsDir, 'nvr_servicecase_events.js'), GOOD_SCRIPT);
+    const task = makeVerificationTask('task-riv-partial', { repositoryRoot: tmpDir, artifactPath: 'Scripts/nvr_servicecase_events.js' });
+    task.crmVerificationReports = [{ verdict: 'pass' }];
+    task.implementationVerification = { aiCodeReview: { status: 'skipped' } };
+    await fs.writeFile(path.join(tmpDir, 'tasks.json'), JSON.stringify([task]));
+
+    const origArgv = process.argv;
+    process.argv = [...process.argv, '--data-dir', tmpDir];
+    try {
+      const result = await callToolFallback('run_implementation_verification', { taskId: 'task-riv-partial' });
+      expect(result.unresolvedRequiredRows).toEqual(['localTest']);
+      expect(result.nextRecommendedStep).toBe('Upload/register the web resource manually and record Local Test/browser validation.');
+    } finally {
+      process.argv = origArgv;
+      await fs.rm(tmpDir, { recursive: true });
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// record_ai_kit_review_result tool
+// ---------------------------------------------------------------------------
+
+describe('record_ai_kit_review_result tool', () => {
+  async function importHelpers() {
+    const { default: os } = await import('node:os');
+    const { default: fs } = await import('node:fs/promises');
+    const { default: path } = await import('node:path');
+    return { os, fs, path };
+  }
+
+  it('tool definition is present with the expected status enum and required fields', () => {
+    const tool = findTool('record_ai_kit_review_result');
+    expect(tool).toBeDefined();
+    expect(tool.inputSchema.required).toEqual(['taskId', 'status']);
+    expect(tool.inputSchema.properties.status.enum).toEqual(['passed', 'failed', 'warnings']);
+  });
+
+  it('rejects an invalid status value', async () => {
+    const { os, fs, path } = await importHelpers();
+    const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'tw-mcp-aikit-badstatus-'));
+    await fs.writeFile(path.join(tmpDir, 'tasks.json'), JSON.stringify([makeTask({ id: 'task-aikit-bad', taskMode: 'developer' })]));
+
+    const origArgv = process.argv;
+    process.argv = [...process.argv, '--data-dir', tmpDir];
+    try {
+      const result = await callToolFallback('record_ai_kit_review_result', { taskId: 'task-aikit-bad', status: 'ok' });
+      expect(result.error).toContain('Invalid status');
+    } finally {
+      process.argv = origArgv;
+      await fs.rm(tmpDir, { recursive: true });
+    }
+  });
+
+  it('persists the review to implementationVerification.aiCodeReview and task.aiKitReview without calling any external system', async () => {
+    const { os, fs, path } = await importHelpers();
+    const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'tw-mcp-aikit-record-'));
+    await fs.writeFile(path.join(tmpDir, 'tasks.json'), JSON.stringify([makeTask({ id: 'task-aikit-record', taskMode: 'developer' })]));
+
+    const origArgv = process.argv;
+    process.argv = [...process.argv, '--data-dir', tmpDir];
+    try {
+      const result = await callToolFallback('record_ai_kit_review_result', {
+        taskId: 'task-aikit-record',
+        status: 'passed',
+        reviewedFiles: ['Scripts/nvr_servicecase_events.js'],
+        findings: ['No TODOs found.', 'Client API usage correct.'],
+      });
+      expect(result.recorded).toBe(true);
+
+      const raw = JSON.parse(await fs.readFile(path.join(tmpDir, 'tasks.json'), 'utf8'));
+      const saved = raw.find((t) => t.id === 'task-aikit-record');
+      expect(saved.implementationVerification.aiCodeReview).toMatchObject({
+        status: 'passed',
+        reviewSource: 'claude-ai-kit',
+        reviewedFiles: ['Scripts/nvr_servicecase_events.js'],
+        findings: ['No TODOs found.', 'Client API usage correct.'],
+      });
+      // Keeps continue_developer_workflow's separate pre-branch AI Kit gate from dead-ending.
+      expect(saved.aiKitReview).toMatchObject({ status: 'passed', reviewSource: 'claude-ai-kit' });
+      expect(saved.aiKitReview.completedAt).toBeDefined();
+
+      // implementationVerification.aiCodeReview (the modal-visible row) now reports the recorded
+      // status instead of needs_manual_action/not-run.
+      const summary = await callToolFallback('get_implementation_verification_summary', { taskId: 'task-aikit-record' });
+      expect(summary.implementationVerification.aiCodeReview.status).toBe('passed');
+    } finally {
+      process.argv = origArgv;
+      await fs.rm(tmpDir, { recursive: true });
+    }
+  });
+
+  it('resolves the AI Kit review gate so continue_developer_workflow no longer dead-ends on it', async () => {
+    const { os, fs, path } = await importHelpers();
+    const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'tw-mcp-aikit-cdw-'));
+    await fs.writeFile(path.join(tmpDir, 'tasks.json'), JSON.stringify([makeTask({
+      id: 'task-aikit-cdw',
+      taskMode: 'developer',
+      workflowSetup: { devTargetKind: 'script', repositoryRoot: 'C:\\Repo', artifactPath: 'Scripts\\nvr.js' },
+      crmDeveloperWorkflow: { detectedWorkKind: 'script' },
+      localTestRecord: { status: 'passed', updatedAt: '2026-06-15T10:00:00.000Z' },
+      crmVerificationReports: [{ verdict: 'pass' }],
+      // No aiKitReview yet.
+    })]));
+
+    const origArgv = process.argv;
+    process.argv = [...process.argv, '--data-dir', tmpDir, '--fallback-readonly'];
+    try {
+      const before = await callToolFallback('continue_developer_workflow', { taskId: 'task-aikit-cdw' });
+      expect(before.nextAction).toBe('run_ai_kit_review');
+
+      await callToolFallback('record_ai_kit_review_result', { taskId: 'task-aikit-cdw', status: 'passed' });
+
+      const after = await callToolFallback('continue_developer_workflow', { taskId: 'task-aikit-cdw' });
+      expect(after.nextAction).not.toBe('run_ai_kit_review');
+      expect(after.nextAction).toBe('propose_branch');
+    } finally {
+      process.argv = origArgv;
+      await fs.rm(tmpDir, { recursive: true });
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// get_implementation_verification_summary tool
+// ---------------------------------------------------------------------------
+
+describe('get_implementation_verification_summary tool', () => {
+  async function importHelpers() {
+    const { default: os } = await import('node:os');
+    const { default: fs } = await import('node:fs/promises');
+    const { default: path } = await import('node:path');
+    return { os, fs, path };
+  }
+
+  it('tool definition is present and read-only', () => {
+    const tool = findTool('get_implementation_verification_summary');
+    expect(tool).toBeDefined();
+    expect(tool.inputSchema.required).toEqual(['taskId']);
+    expect(READ_ONLY_TOOL_NAMES.has('get_implementation_verification_summary')).toBe(true);
+  });
+
+  it('returns the same summary and nextRecommendedStep as run_implementation_verification without re-running checks', async () => {
+    const { os, fs, path } = await importHelpers();
+    const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'tw-mcp-givs-1-'));
+    const scriptsDir = path.join(tmpDir, 'Scripts');
+    await fs.mkdir(scriptsDir, { recursive: true });
+    await fs.writeFile(
+      path.join(scriptsDir, 'nvr_servicecase_events.js'),
+      'function nvr_assetid_OnChange(ctx) { Xrm.WebApi.retrieveRecord("nvr_customerasset", "id"); }',
+    );
+    const task = makeTask({
+      id: 'task-givs-1',
+      title: 'Script: Předvyplnění servisního požadavku',
+      taskMode: 'developer',
+      workflowSetup: { devTargetKind: 'script', repositoryRoot: tmpDir, artifactPath: 'Scripts/nvr_servicecase_events.js' },
+      crmDeveloperWorkflow: {
+        detectedWorkKind: 'script',
+        planApproval: { approved: true },
+        technicalPlan: {
+          workKind: 'script', summary: 'Prefill.', implementationSteps: [],
+          fieldMappings: [
+            { source: 'nvr_customerasset.nvr_customerid', target: 'nvr_servicecase.nvr_customerid' },
+            { source: 'nvr_customerasset.nvr_contactid', target: 'nvr_servicecase.nvr_contactid' },
+            { source: 'nvr_customerasset.nvr_isunderwarranty', target: 'nvr_servicecase.nvr_iswarrantycase' },
+          ],
+          risks: [], testChecklist: [],
+        },
+      },
+    });
+    await fs.writeFile(path.join(tmpDir, 'tasks.json'), JSON.stringify([task]));
+
+    const origArgv = process.argv;
+    process.argv = [...process.argv, '--data-dir', tmpDir];
+    try {
+      const ranResult = await callToolFallback('run_implementation_verification', { taskId: 'task-givs-1' });
+      const summaryResult = await callToolFallback('get_implementation_verification_summary', { taskId: 'task-givs-1' });
+
+      expect(summaryResult.implementationVerification).toEqual(ranResult.implementationVerification);
+      expect(summaryResult.unresolvedRequiredRows.sort()).toEqual(ranResult.unresolvedRequiredRows.sort());
+      expect(summaryResult.nextRecommendedStep).toBe(ranResult.nextRecommendedStep);
+      expect(summaryResult.nextAction).toBe(ranResult.nextAction);
+    } finally {
+      process.argv = origArgv;
+      await fs.rm(tmpDir, { recursive: true });
+    }
+  });
+
+  it('returns not-run/needs_manual_action summary for a task where nothing has been verified yet', async () => {
+    const { os, fs, path } = await importHelpers();
+    const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'tw-mcp-givs-2-'));
+    const task = makeTask({
+      id: 'task-givs-2',
+      taskMode: 'developer',
+      workflowSetup: { devTargetKind: 'script', repositoryRoot: 'C:\\Repo', artifactPath: 'Scripts\\nvr.js' },
+      crmDeveloperWorkflow: { detectedWorkKind: 'script' },
+    });
+    await fs.writeFile(path.join(tmpDir, 'tasks.json'), JSON.stringify([task]));
+
+    const origArgv = process.argv;
+    process.argv = [...process.argv, '--data-dir', tmpDir, '--fallback-readonly'];
+    try {
+      const result = await callToolFallback('get_implementation_verification_summary', { taskId: 'task-givs-2' });
+      expect(result.implementationVerification.buildCheck.status).toBe('not-run');
+      expect(result.implementationVerification.dataverseCheck.status).toBe('needs_manual_action');
+      expect(result.nextAction).toBe('wait_for_user');
+    } finally {
+      process.argv = origArgv;
+      await fs.rm(tmpDir, { recursive: true });
+    }
+  });
+
+  it('returns error for missing task', async () => {
+    const { os, fs, path } = await importHelpers();
+    const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'tw-mcp-givs-3-'));
+    await fs.writeFile(path.join(tmpDir, 'tasks.json'), JSON.stringify([]));
+    const origArgv = process.argv;
+    process.argv = [...process.argv, '--data-dir', tmpDir, '--fallback-readonly'];
+    try {
+      const result = await callToolFallback('get_implementation_verification_summary', { taskId: 'does-not-exist' });
+      expect(result.error).toContain('Task not found');
+    } finally {
+      process.argv = origArgv;
+      await fs.rm(tmpDir, { recursive: true });
+    }
+  });
+
+  it('legacy task.localTestRecord cannot make the modal-visible localTest row appear resolved', async () => {
+    // Regression: record_ai_implementation_completed sets task.localTestRecord.status='not-needed'
+    // (the continue_developer_workflow step-1 gate) — that must never leak into or be conflated
+    // with implementationVerification.localTest (the modal's Local Test row).
+    const { os, fs, path } = await importHelpers();
+    const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'tw-mcp-givs-4-'));
+    const task = makeTask({
+      id: 'task-givs-4',
+      taskMode: 'developer',
+      workflowSetup: { devTargetKind: 'script', repositoryRoot: 'C:\\Repo', artifactPath: 'Scripts\\nvr.js' },
+      crmDeveloperWorkflow: { detectedWorkKind: 'script' },
+      localTestRecord: {
+        status: 'not-needed',
+        note: 'Script implementation completed by AI — no local test required before Dataverse upload.',
+      },
+    });
+    await fs.writeFile(path.join(tmpDir, 'tasks.json'), JSON.stringify([task]));
+
+    const origArgv = process.argv;
+    process.argv = [...process.argv, '--data-dir', tmpDir, '--fallback-readonly'];
+    try {
+      const result = await callToolFallback('get_implementation_verification_summary', { taskId: 'task-givs-4' });
+      expect(result.implementationVerification.localTest.status).toBe('needs_manual_action');
+      expect(result.implementationVerification.localTest.message).toBe(
+        'Record Local Test in the Implementation Verification modal after manual/browser CRM testing (or mark it not-needed there).',
+      );
+      expect(result.implementationVerification.localTest).not.toHaveProperty('note');
+      expect(JSON.stringify(result.implementationVerification.localTest).toLowerCase()).not.toContain('localtestrecord');
     } finally {
       process.argv = origArgv;
       await fs.rm(tmpDir, { recursive: true });
