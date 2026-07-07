@@ -89,74 +89,35 @@ describe('CopyAiWorkflowPromptButton copy flow — explicit repositoryRoot + scr
     expect(copied).toContain('* Repository root: C:\\Users\\vskoumal\\Documents\\CRM\\VSK-Test');
   });
 
-  it('copied prompt contains Scripts folder absolute path', () => {
+  it('copied prompt contains Script directory line', () => {
     const copied = simulateCopy(makeFreshNvrTask(), VSK_CUSTOMER_FULL);
-    expect(copied).toContain('* Scripts folder: C:\\Users\\vskoumal\\Documents\\CRM\\VSK-Test\\Scripts');
+    expect(copied).toContain('* Script directory: C:\\Users\\vskoumal\\Documents\\CRM\\VSK-Test\\Scripts');
   });
 
-  it('copied prompt contains Derived absolute target file', () => {
+  it('copied prompt contains the derived absolute target file preview', () => {
     const copied = simulateCopy(makeFreshNvrTask(), VSK_CUSTOMER_FULL);
     expect(copied).toContain(
-      '* Derived absolute target file: C:\\Users\\vskoumal\\Documents\\CRM\\VSK-Test\\Scripts\\nvr_servicecase_events.js',
+      '* Target file preview: C:\\Users\\vskoumal\\Documents\\CRM\\VSK-Test\\Scripts\\nvr_servicecase_events.js (not yet saved to task setup)',
     );
   });
 
-  it('copied prompt contains repositoryRoot in save block', () => {
+  it('copied prompt contains the entity preview', () => {
+    expect(simulateCopy(makeFreshNvrTask(), VSK_CUSTOMER_FULL)).toContain('* Entity: nvr_servicecase');
+  });
+
+  it('copied prompt contains the event/field preview', () => {
+    expect(simulateCopy(makeFreshNvrTask(), VSK_CUSTOMER_FULL)).toContain('* Event / field: onChange / nvr_assetid');
+  });
+
+  it('copied prompt contains the known-preview disclaimer', () => {
+    expect(simulateCopy(makeFreshNvrTask(), VSK_CUSTOMER_FULL)).toContain('Known preview only; file writes require workPacket.canWriteCode === true.');
+  });
+
+  it('copied prompt does not contain a full set_task_developer_target save-parameter dump', () => {
     const copied = simulateCopy(makeFreshNvrTask(), VSK_CUSTOMER_FULL);
-    expect(copied).toContain('* repositoryRoot: C:\\Users\\vskoumal\\Documents\\CRM\\VSK-Test');
-  });
-
-  it('copied prompt contains artifactPath in save block', () => {
-    const copied = simulateCopy(makeFreshNvrTask(), VSK_CUSTOMER_FULL);
-    expect(copied).toContain('* artifactPath: Scripts\\nvr_servicecase_events.js');
-  });
-
-  it('copied prompt contains absoluteScriptPath in save block', () => {
-    const copied = simulateCopy(makeFreshNvrTask(), VSK_CUSTOMER_FULL);
-    expect(copied).toContain(
-      '* absoluteScriptPath: C:\\Users\\vskoumal\\Documents\\CRM\\VSK-Test\\Scripts\\nvr_servicecase_events.js',
-    );
-  });
-
-  it('copied prompt contains Derived relative target file', () => {
-    const copied = simulateCopy(makeFreshNvrTask(), VSK_CUSTOMER_FULL);
-    expect(copied).toContain('* Derived relative target file: Scripts\\nvr_servicecase_events.js');
-  });
-
-  it('copied prompt contains actionType in save block', () => {
-    expect(simulateCopy(makeFreshNvrTask(), VSK_CUSTOMER_FULL)).toContain('* actionType: create-new-script');
-  });
-
-  it('copied prompt contains primaryEntityLogicalName in save block', () => {
-    expect(simulateCopy(makeFreshNvrTask(), VSK_CUSTOMER_FULL)).toContain('* primaryEntityLogicalName: nvr_servicecase');
-  });
-
-  it('copied prompt contains eventName in save block', () => {
-    expect(simulateCopy(makeFreshNvrTask(), VSK_CUSTOMER_FULL)).toContain('* eventName: onChange');
-  });
-
-  it('copied prompt contains eventFieldName in save block', () => {
-    expect(simulateCopy(makeFreshNvrTask(), VSK_CUSTOMER_FULL)).toContain('* eventFieldName: nvr_assetid');
-  });
-
-  it('copied prompt contains onLoadFunctionName in save block', () => {
-    expect(simulateCopy(makeFreshNvrTask(), VSK_CUSTOMER_FULL)).toContain('* onLoadFunctionName: nvr_servicecase_OnLoad');
-  });
-
-  it('copied prompt contains onChangeFunctionName in save block', () => {
-    expect(simulateCopy(makeFreshNvrTask(), VSK_CUSTOMER_FULL)).toContain('* onChangeFunctionName: nvr_assetid_OnChange');
-  });
-
-  it('copied prompt contains mainHelperSuggestion in save block', () => {
-    expect(simulateCopy(makeFreshNvrTask(), VSK_CUSTOMER_FULL)).toContain('* mainHelperSuggestion: prefillServiceCaseFromAsset');
-  });
-
-  it('copied prompt contains namingSource in save block', () => {
-    expect(simulateCopy(makeFreshNvrTask(), VSK_CUSTOMER_FULL)).toContain('* namingSource: Scripts_Naming');
-  });
-
-  it('copied prompt contains the full save-instructions block header', () => {
-    expect(simulateCopy(makeFreshNvrTask(), VSK_CUSTOMER_FULL)).toContain('Save this derived target via set_task_developer_target with:');
+    expect(copied).not.toContain('Save this derived target via set_task_developer_target with:');
+    expect(copied).not.toContain('onLoadFunctionName:');
+    expect(copied).not.toContain('mainHelperSuggestion:');
   });
 });
 
@@ -168,7 +129,7 @@ describe('CopyAiWorkflowPromptButton copy flow — explicit repositoryRoot + scr
 // resolveCustomerForPrompt() at copy time to derive the absolute path.
 
 describe('CopyAiWorkflowPromptButton copy flow — folderName + crmBaseDirectory (real-world)', () => {
-  it('resolves absolute target path from folderName + crmBaseDirectory', () => {
+  it('resolves absolute target preview path from folderName + crmBaseDirectory', () => {
     const copied = simulateCopy(makeFreshNvrTask(), VSK_CUSTOMER_FOLDER_ONLY, VSK_CRM_BASE);
     expect(copied).toContain(
       'C:\\Users\\vskoumal\\Documents\\CRM\\VSK-Test\\Scripts\\nvr_servicecase_events.js',
@@ -180,26 +141,9 @@ describe('CopyAiWorkflowPromptButton copy flow — folderName + crmBaseDirectory
     expect(copied).toContain('* Repository root: C:\\Users\\vskoumal\\Documents\\CRM\\VSK-Test');
   });
 
-  it('contains Scripts folder line derived from folderName + crmBaseDirectory', () => {
+  it('derives the absolute target file preview from repositoryRoot + template Scripts folder (no explicit scriptFolder)', () => {
     const copied = simulateCopy(makeFreshNvrTask(), VSK_CUSTOMER_FOLDER_ONLY, VSK_CRM_BASE);
-    expect(copied).toContain('* Scripts folder: C:\\Users\\vskoumal\\Documents\\CRM\\VSK-Test\\Scripts');
-  });
-
-  it('contains absoluteScriptPath in save block derived from folderName + crmBaseDirectory', () => {
-    const copied = simulateCopy(makeFreshNvrTask(), VSK_CUSTOMER_FOLDER_ONLY, VSK_CRM_BASE);
-    expect(copied).toContain(
-      '* absoluteScriptPath: C:\\Users\\vskoumal\\Documents\\CRM\\VSK-Test\\Scripts\\nvr_servicecase_events.js',
-    );
-  });
-
-  it('contains repositoryRoot in save block derived from folderName + crmBaseDirectory', () => {
-    const copied = simulateCopy(makeFreshNvrTask(), VSK_CUSTOMER_FOLDER_ONLY, VSK_CRM_BASE);
-    expect(copied).toContain('* repositoryRoot: C:\\Users\\vskoumal\\Documents\\CRM\\VSK-Test');
-  });
-
-  it('contains artifactPath with backslash separator', () => {
-    const copied = simulateCopy(makeFreshNvrTask(), VSK_CUSTOMER_FOLDER_ONLY, VSK_CRM_BASE);
-    expect(copied).toContain('* artifactPath: Scripts\\nvr_servicecase_events.js');
+    expect(copied).toContain('* Target file preview: C:\\Users\\vskoumal\\Documents\\CRM\\VSK-Test\\Scripts\\nvr_servicecase_events.js (not yet saved to task setup)');
   });
 
   it('does not contain forward-slash Windows paths when crmBaseDirectory uses backslashes', () => {
@@ -218,7 +162,7 @@ describe('CopyAiWorkflowPromptButton copy flow — folderName + crmBaseDirectory
 // ── Copy-flow: customer with resolvedRepositoryPath ───────────────────────────
 
 describe('CopyAiWorkflowPromptButton copy flow — customer with resolvedRepositoryPath', () => {
-  it('produces absolute target path from resolvedRepositoryPath', () => {
+  it('produces absolute target preview path from resolvedRepositoryPath', () => {
     const copied = simulateCopy(makeFreshNvrTask(), VSK_CUSTOMER_RESOLVED);
     expect(copied).toContain(
       'C:\\Users\\vskoumal\\Documents\\CRM\\VSK-Test\\Scripts\\nvr_servicecase_events.js',
@@ -229,19 +173,12 @@ describe('CopyAiWorkflowPromptButton copy flow — customer with resolvedReposit
     const copied = simulateCopy(makeFreshNvrTask(), VSK_CUSTOMER_RESOLVED);
     expect(copied).toContain('* Repository root: C:\\Users\\vskoumal\\Documents\\CRM\\VSK-Test');
   });
-
-  it('contains absoluteScriptPath in save block', () => {
-    const copied = simulateCopy(makeFreshNvrTask(), VSK_CUSTOMER_RESOLVED);
-    expect(copied).toContain(
-      '* absoluteScriptPath: C:\\Users\\vskoumal\\Documents\\CRM\\VSK-Test\\Scripts\\nvr_servicecase_events.js',
-    );
-  });
 });
 
 // ── Copy-flow: customer with only repositoryRoot ──────────────────────────────
 
 describe('CopyAiWorkflowPromptButton copy flow — customer with repositoryRoot only', () => {
-  it('derives absolute target path from repositoryRoot + template Scripts folder', () => {
+  it('derives absolute target preview path from repositoryRoot + template Scripts folder', () => {
     const copied = simulateCopy(makeFreshNvrTask(), VSK_CUSTOMER_REPO_ONLY);
     expect(copied).toContain(
       'C:\\Users\\vskoumal\\Documents\\CRM\\VSK-Test\\Scripts\\nvr_servicecase_events.js',
@@ -286,9 +223,9 @@ describe('CopyAiWorkflowPromptButton copy flow — negative assertions', () => {
     expect(copied).not.toContain('CRM/VSK-Test');
   });
 
-  it('does not contain Target file: NOT SET', () => {
+  it('does not contain "Target file: not yet set" once a preview path is derivable', () => {
     const copied = simulateCopy(makeFreshNvrTask(), VSK_CUSTOMER_FULL);
-    expect(copied).not.toContain('Target file: NOT SET');
+    expect(copied).not.toContain('Target file: not yet set');
   });
 
   it('does not contain TBD', () => {
@@ -306,10 +243,10 @@ describe('CopyAiWorkflowPromptButton copy flow — negative assertions', () => {
     expect(copied).not.toContain('AssetPrefill');
   });
 
-  it('desiredScriptFile in save block is nvr_servicecase_events.js, not doubled prefix', () => {
+  it('target file preview uses nvr_servicecase_events.js, not a doubled nvr_ prefix', () => {
     const copied = simulateCopy(makeFreshNvrTask(), VSK_CUSTOMER_FULL);
-    expect(copied).not.toContain('* desiredScriptFile: nvr_nvr_servicecase_events.js');
-    expect(copied).toContain('* desiredScriptFile: nvr_servicecase_events.js');
+    expect(copied).not.toContain('nvr_nvr_servicecase_events.js');
+    expect(copied).toContain('nvr_servicecase_events.js');
   });
 });
 
@@ -356,19 +293,19 @@ describe('CopyAiWorkflowPromptButton — prop wiring contract (logic level)', ()
   it('TaskDetail.tsx: customer + settings.crmBaseDirectory → absolute paths', () => {
     // TaskDetail.tsx: crmBaseDirectory={settings?.crmBaseDirectory}
     const prompt = simulateCopy(makeFreshNvrTask(), VSK_CUSTOMER_FOLDER_ONLY, VSK_CRM_BASE);
-    expect(prompt).toContain('* absoluteScriptPath: C:\\Users\\vskoumal\\Documents\\CRM\\VSK-Test\\Scripts\\nvr_servicecase_events.js');
+    expect(prompt).toContain('C:\\Users\\vskoumal\\Documents\\CRM\\VSK-Test\\Scripts\\nvr_servicecase_events.js');
   });
 
   it('TasksPage.tsx: customer + settings.crmBaseDirectory → absolute paths', () => {
     // TasksPage.tsx: crmBaseDirectory={settings?.crmBaseDirectory}
     const prompt = simulateCopy(makeFreshNvrTask(), VSK_CUSTOMER_FOLDER_ONLY, VSK_CRM_BASE);
-    expect(prompt).toContain('* repositoryRoot: C:\\Users\\vskoumal\\Documents\\CRM\\VSK-Test');
+    expect(prompt).toContain('* Repository root: C:\\Users\\vskoumal\\Documents\\CRM\\VSK-Test');
   });
 
   it('PlanningView.tsx: customer + settings.crmBaseDirectory → absolute paths', () => {
     // PlanningView.tsx: crmBaseDirectory={settings?.crmBaseDirectory}
     const prompt = simulateCopy(makeFreshNvrTask(), VSK_CUSTOMER_FOLDER_ONLY, VSK_CRM_BASE);
-    expect(prompt).toContain('* Scripts folder: C:\\Users\\vskoumal\\Documents\\CRM\\VSK-Test\\Scripts');
+    expect(prompt).toContain('C:\\Users\\vskoumal\\Documents\\CRM\\VSK-Test\\Scripts\\nvr_servicecase_events.js');
   });
 
   it('dropping crmBaseDirectory silently loses absolute paths when customer only has folderName', () => {

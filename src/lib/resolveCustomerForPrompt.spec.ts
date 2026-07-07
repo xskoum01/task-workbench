@@ -185,20 +185,20 @@ describe('resolveCustomerForPrompt + buildAiWorkflowPrompt integration', () => {
     expect(prompt).toContain('C:\\Users\\vskoumal\\Documents\\CRM\\VSK-Test\\Scripts\\nvr_servicecase_events.js');
   });
 
-  it('enriched customer produces absoluteScriptPath in save block', () => {
+  it('enriched customer produces a target file preview with the absolute path', () => {
     const rawCustomer = makeCustomer({ folderName: 'VSK-Test' });
     const enriched    = resolveCustomerForPrompt(rawCustomer, 'C:\\Users\\vskoumal\\Documents\\CRM');
 
     const prompt = buildAiWorkflowPrompt(makeFreshNvrTask(), enriched);
-    expect(prompt).toContain('* absoluteScriptPath: C:\\Users\\vskoumal\\Documents\\CRM\\VSK-Test\\Scripts\\nvr_servicecase_events.js');
+    expect(prompt).toContain('* Target file preview: C:\\Users\\vskoumal\\Documents\\CRM\\VSK-Test\\Scripts\\nvr_servicecase_events.js (not yet saved to task setup)');
   });
 
-  it('enriched customer produces repositoryRoot in save block', () => {
+  it('enriched customer produces a Repository root line in customer developer defaults', () => {
     const rawCustomer = makeCustomer({ folderName: 'VSK-Test' });
     const enriched    = resolveCustomerForPrompt(rawCustomer, 'C:\\Users\\vskoumal\\Documents\\CRM');
 
     const prompt = buildAiWorkflowPrompt(makeFreshNvrTask(), enriched);
-    expect(prompt).toContain('* repositoryRoot: C:\\Users\\vskoumal\\Documents\\CRM\\VSK-Test');
+    expect(prompt).toContain('* Repository root: C:\\Users\\vskoumal\\Documents\\CRM\\VSK-Test');
   });
 
   it('raw customer without resolvedRepositoryPath does NOT produce absolute path', () => {
