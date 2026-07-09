@@ -179,8 +179,31 @@ const TASK_TEMPLATES = [
       onChangeFunctionName: 'nvr_priority_OnChange',
       mainHelperSuggestion: 'updateDescriptionRequirementByPriority',
     },
-    sourceFields: ['nvr_priority'],
-    targetFields: ['nvr_description'],
+    // This is a UI/business-rule script (required-level + notification toggling), not a
+    // source→target field-mapping script — it must not define sourceFields/targetFields.
+    // Doing so previously made deterministicPlanDraft/templateFieldMapping fabricate a bogus
+    // "source.nvr_priority -> nvr_labservicecase.nvr_description" field mapping (nvr_priority's
+    // value is never copied anywhere), which then let approval slip through for the wrong
+    // reason instead of being recognized as not needing field mappings at all.
+    implementationPattern: 'ui-business-rule',
+    requiresFieldMappings: false,
+    referencedFields: ['nvr_priority', 'nvr_description'],
+    triggerFields: ['nvr_priority'],
+    affectedFields: ['nvr_description'],
+    uiRules: [
+      'If nvr_priority == 100000002 (High), set nvr_description required and show a form notification.',
+      'Otherwise, set nvr_description not required and clear the notification.',
+    ],
+    optionSetValues: { nvr_priority: { High: 100000002 } },
+    notificationIds: ['nvr_description_required_notice'],
+    forbiddenOperations: [
+      'Xrm.WebApi',
+      'autosave (formContext.data.save())',
+      'Xrm.Page',
+      'setValue on nvr_description',
+      'early returns unless explicitly allowed by existing repo style',
+      'generated header/task-summary comments',
+    ],
     notes: 'Form OnLoad + onChange on nvr_priority. When nvr_priority is High (100000002), make nvr_description required and show a form notification; otherwise make it not required and clear the notification.',
     businessRules: [
       'High priority is choice value 100000002. Compare against this value, not a hardcoded label string.',
@@ -1709,12 +1732,37 @@ function planApprovalSafetyCheck(task, packet) {
   const requiresFm = impl.requiresFieldMappings === true;
   const fmCount = Array.isArray(impl.fieldMappings) ? impl.fieldMappings.length : 0;
   const fmSource = impl.fieldMappingsSource ?? 'none';
+  const implementationPattern = impl.implementationPattern ?? null;
+  const isNonMappingPattern = implementationPattern === 'ui-business-rule' || implementationPattern === 'ribbon-action';
+
   if (requiresFm) {
     if (fmCount === 0) {
       reasons.push('Field mappings are required but not defined. Define source→target field mappings in the technical plan before approving.');
     }
     if (fmSource !== 'template' && fmSource !== 'plan') {
       reasons.push(`fieldMappingsSource='${fmSource}' is not a trusted source. Only 'template' or 'plan' field mapping sources can be auto-approved.`);
+    }
+  } else if (isNonMappingPattern) {
+    // UI/business-rule and ribbon-action scripts legitimately have no fieldMappings by design
+    // (impl.requiresFieldMappings is already false for this pattern — see buildDeveloperWorkPacket).
+    // Waiving the field-mapping checks above must not waive scrutiny outright: the rest of the
+    // write target and business context still has to be concrete before auto-approval.
+    const wt = asObject(packet?.writeTarget);
+    if (!wt.targetEntity) reasons.push('Target entity is not set.');
+    if (!wt.artifactPath) reasons.push('Target file/artifact path is not set.');
+    if (!wt.eventName && !wt.eventFieldName) reasons.push('Event/eventField is not set.');
+    const referencedFields = Array.isArray(impl.referencedFields) ? impl.referencedFields : [];
+    const affectedFields = Array.isArray(impl.affectedFields) ? impl.affectedFields : [];
+    if (referencedFields.length === 0 && affectedFields.length === 0) {
+      reasons.push('No referenced/affected fields are defined for this UI/business-rule script.');
+    }
+    const businessRules = Array.isArray(impl.businessRules) ? impl.businessRules : [];
+    if (businessRules.length === 0) {
+      reasons.push('No business rules are defined for this UI/business-rule script.');
+    }
+    const acceptanceCriteria = Array.isArray(impl.acceptanceCriteria) ? impl.acceptanceCriteria : [];
+    if (acceptanceCriteria.length === 0) {
+      reasons.push('No acceptance criteria are defined for this UI/business-rule script.');
     }
   }
 
@@ -2966,6 +3014,14 @@ function isScaffoldOnlyTask(task) {
   const emptyFieldMappings = !plan?.fieldMappings || plan.fieldMappings.length === 0;
   if (!emptyFieldMappings) return false;
   const template = matchTaskTemplate(task.title || '', task.originalMessage || '');
+  const setup = asObject(task.workflowSetup);
+  const implementationPattern = setup.implementationPattern || template?.implementationPattern || null;
+  // UI/business-rule and ribbon-action scripts have no fieldMappings by design — an explicit
+  // pattern/override is authoritative and skips the legacy heuristics below, which would
+  // otherwise misread a stale plan.unmappedSourceFields as "still needs field mappings".
+  if (implementationPattern === 'ui-business-rule' || implementationPattern === 'ribbon-action') return false;
+  if (typeof setup.requiresFieldMappings === 'boolean') return setup.requiresFieldMappings;
+  if (typeof template?.requiresFieldMappings === 'boolean') return template.requiresFieldMappings;
   if (template && Array.isArray(template.sourceFields) && template.sourceFields.length > 0) return true;
   if (Array.isArray(plan?.unmappedSourceFields) && plan.unmappedSourceFields.length > 0) return true;
   const detection = detectAndExtractFieldMappings(task);
@@ -3010,7 +3066,30 @@ function buildDeveloperWorkPacket(task, customerDevDefaults = null) {
     textExtractedValidation = textResult.validationFields;
     textDetectionSources = textResult.sources || [];
   }
-  const requiresFieldMappings = templateNeedsMapping || planHasUnmappedWithNoMapped || textDetectedRequired;
+  // Script implementation pattern: 'field-mapping' (source→target copy/prefill, needs
+  // fieldMappings), 'ui-business-rule' (form UI logic — required level, visibility,
+  // notifications, locking, option filtering — no fieldMappings by design), or
+  // 'ribbon-action'. workflowSetup override wins over the template.
+  const implementationPattern =
+    setup.implementationPattern ||
+    template?.implementationPattern ||
+    (templateNeedsMapping ? 'field-mapping' : null);
+  const isNonMappingPattern = implementationPattern === 'ui-business-rule' || implementationPattern === 'ribbon-action';
+  // An explicit requiresFieldMappings (workflowSetup override, then template) is authoritative:
+  // it overrides the heuristic signals below in both directions. This matters because
+  // planHasUnmappedWithNoMapped/textDetectedRequired are heuristics derived from legacy/stale
+  // plan data or a text scan — without an explicit override, a UI/business-rule script with no
+  // field-mapping needs could still get incorrectly flagged as requiring mappings by a stale
+  // plan.unmappedSourceFields left over from an earlier save, blocking approval for a task that
+  // was never a field-mapping task to begin with.
+  const explicitRequiresFieldMappings =
+    typeof setup.requiresFieldMappings === 'boolean' ? setup.requiresFieldMappings :
+    typeof template?.requiresFieldMappings === 'boolean' ? template.requiresFieldMappings :
+    null;
+  const heuristicRequiresFieldMappings = templateNeedsMapping || planHasUnmappedWithNoMapped || textDetectedRequired;
+  const requiresFieldMappings = isNonMappingPattern
+    ? false
+    : (explicitRequiresFieldMappings !== null ? explicitRequiresFieldMappings : heuristicRequiresFieldMappings);
   // Template path: auto-derive fieldMappings from template sourceFields/targetFields when plan is empty
   const templateDerivedMappings = (templateNeedsMapping && emptyFieldMappings && template && template.sourceEntity && targetEntity)
     ? (() => {
@@ -3181,16 +3260,34 @@ function buildDeveloperWorkPacket(task, customerDevDefaults = null) {
     writeTarget,
     implementation: {
       workKind,
+      implementationPattern,
       summary: plan?.summary || summarize(task.analysisResult?.summaryEn ?? task.analysisResult?.summary ?? task.title),
       steps: sanitizedSteps,
       requiresFieldMappings,
       // Prefer text-extracted mappings when structured plan mappings are absent.
       fieldMappings: finalFieldMappings,
       unmappedSourceFields: plan?.unmappedSourceFields || [],
-      // Read-only context fields: from template additionalSourceFields or text extraction.
+      // UI/business-rule and ribbon-action script context — populated from the template (or a
+      // workflowSetup override). Not used for field-mapping scripts, which use fieldMappings
+      // above instead.
+      referencedFields: Array.isArray(setup.referencedFields) ? setup.referencedFields : (Array.isArray(template?.referencedFields) ? template.referencedFields : []),
+      triggerFields: Array.isArray(setup.triggerFields) ? setup.triggerFields : (Array.isArray(template?.triggerFields) ? template.triggerFields : []),
+      affectedFields: Array.isArray(setup.affectedFields) ? setup.affectedFields : (Array.isArray(template?.affectedFields) ? template.affectedFields : []),
+      uiRules: Array.isArray(template?.uiRules) ? template.uiRules : [],
+      optionSetValues: template?.optionSetValues && typeof template.optionSetValues === 'object' ? template.optionSetValues : {},
+      notificationIds: Array.isArray(template?.notificationIds) ? template.notificationIds : [],
+      forbiddenOperations: Array.isArray(template?.forbiddenOperations) ? template.forbiddenOperations : [],
+      // Read-only context fields: from template additionalSourceFields, referenced/affected
+      // fields (ui-business-rule/ribbon-action scripts), or text extraction.
       validationFields: [
         ...(Array.isArray(template?.additionalSourceFields)
           ? template.additionalSourceFields.map((f) => `${template.sourceEntity || 'source'}.${f}`)
+          : []),
+        ...(isNonMappingPattern && targetEntity
+          ? [...new Set([
+              ...(Array.isArray(template?.referencedFields) ? template.referencedFields : []),
+              ...(Array.isArray(template?.affectedFields) ? template.affectedFields : []),
+            ])].map((f) => `${targetEntity}.${f}`)
           : []),
         ...textExtractedValidation,
       ],

@@ -2319,6 +2319,196 @@ describe('callToolFallback prepare_developer_task â€” explicit-assignment i
 });
 
 // ---------------------------------------------------------------------------
+// 11c. UI/business-rule script implementation pattern â€” approve_technical_plan_if_safe
+// must not require fieldMappings for scripts that legitimately have none by design.
+// ---------------------------------------------------------------------------
+
+describe('ui-business-rule implementation pattern (no fieldMappings by design)', () => {
+  const LAB_TITLE = '[TEST] Script: Povinný popis pro vysokou prioritu servisního případu';
+  const LAB_DESCRIPTION =
+    'Create a JavaScript form script for the NVR Training Automation Lab table `nvr_labservicecase`. ' +
+    'Target file: Scripts\\nvr_labservicecase_events.js. ' +
+    'Events: Form OnLoad, OnChange of `nvr_priority`. ' +
+    'Handlers: `nvr_labservicecase_OnLoad`, `nvr_priority_OnChange`. ' +
+    'Logic: if nvr_priority is High (100000002), make nvr_description required and show a notification, ' +
+    'otherwise make nvr_description not required and clear the notification.';
+
+  async function withTasksFixture(tasks, customers, fn) {
+    const os = await import('node:os');
+    const fs = await import('node:fs/promises');
+    const path = await import('node:path');
+    const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'tw-mcp-uibr-'));
+    await fs.writeFile(path.join(tmpDir, 'tasks.json'), JSON.stringify(tasks));
+    if (customers) await fs.writeFile(path.join(tmpDir, 'customers.json'), JSON.stringify(customers));
+    const origArgv = process.argv;
+    process.argv = [...process.argv, '--data-dir', tmpDir];
+    try {
+      await fn(tmpDir, fs, path);
+    } finally {
+      process.argv = origArgv;
+      await fs.rm(tmpDir, { recursive: true });
+    }
+  }
+
+  const CUSTOMERS = [{ id: 'cust-uibr', repositoryRoot: 'C:\\Repo\\Lab', scriptFolder: 'C:\\Repo\\Lab\\Scripts' }];
+
+  it('is classified as implementationPattern=ui-business-rule with requiresFieldMappings=false', async () => {
+    await withTasksFixture(
+      [makeTask({ id: 'task-uibr-001', title: LAB_TITLE, originalMessage: LAB_DESCRIPTION, customerId: 'cust-uibr', workflowSetup: {} })],
+      CUSTOMERS,
+      async () => {
+        await callToolFallback('prepare_developer_task', { taskId: 'task-uibr-001' });
+        const packet = await callToolFallback('get_developer_work_packet', { taskId: 'task-uibr-001' });
+        expect(packet.implementation.implementationPattern).toBe('ui-business-rule');
+        expect(packet.implementation.requiresFieldMappings).toBe(false);
+        expect(packet.implementation.referencedFields).toEqual(['nvr_priority', 'nvr_description']);
+        expect(packet.implementation.affectedFields).toEqual(['nvr_description']);
+        expect(packet.implementation.forbiddenOperations.join(' ')).toContain('Xrm.WebApi');
+      },
+    );
+  });
+
+  it('is not scaffoldOnly despite empty fieldMappings', async () => {
+    await withTasksFixture(
+      [makeTask({ id: 'task-uibr-002', title: LAB_TITLE, originalMessage: LAB_DESCRIPTION, customerId: 'cust-uibr', workflowSetup: {} })],
+      CUSTOMERS,
+      async () => {
+        await callToolFallback('prepare_developer_task', { taskId: 'task-uibr-002' });
+        const packet = await callToolFallback('get_developer_work_packet', { taskId: 'task-uibr-002' });
+        expect(packet.implementation.fieldMappings).toEqual([]);
+        expect(packet.implementation.scaffoldOnly).toBe(false);
+      },
+    );
+  });
+
+  it('approve_technical_plan_if_safe approves the lab priority-description task, and canWriteCode becomes true', async () => {
+    await withTasksFixture(
+      [makeTask({ id: 'task-uibr-003', title: LAB_TITLE, originalMessage: LAB_DESCRIPTION, customerId: 'cust-uibr', workflowSetup: {} })],
+      CUSTOMERS,
+      async () => {
+        await callToolFallback('prepare_developer_task', { taskId: 'task-uibr-003' });
+        const approval = await callToolFallback('approve_technical_plan_if_safe', { taskId: 'task-uibr-003' });
+        expect(approval.canApprove).toBe(true);
+        expect(approval.workPacket.canWriteCode).toBe(true);
+        expect(approval.workPacket.implementation.fieldMappings).toEqual([]);
+
+        const packetAfter = await callToolFallback('get_developer_work_packet', { taskId: 'task-uibr-003' });
+        expect(packetAfter.canWriteCode).toBe(true);
+        expect(packetAfter.writeTarget.targetEntity).toBe('nvr_labservicecase');
+      },
+    );
+  });
+
+  it('does not fabricate a bogus fieldMapping from nvr_priority to nvr_description', async () => {
+    // Regression: this template must not declare sourceFields/targetFields — doing so previously
+    // made deterministicPlanDraft synthesize a fake "source.nvr_priority -> ...nvr_description"
+    // mapping (the priority value is never copied anywhere; only its required-level is toggled).
+    await withTasksFixture(
+      [makeTask({ id: 'task-uibr-004', title: LAB_TITLE, originalMessage: LAB_DESCRIPTION, customerId: 'cust-uibr', workflowSetup: {} })],
+      CUSTOMERS,
+      async () => {
+        const result = await callToolFallback('prepare_developer_task', { taskId: 'task-uibr-004' });
+        expect(result.task.crmWorkflowState.technicalPlan.fieldMappings).toEqual([]);
+      },
+    );
+  });
+
+  it('still blocks a stale legacy plan.unmappedSourceFields signal for this task from forcing scaffoldOnly', async () => {
+    // A pre-existing plan (e.g. saved before this template existed) may carry stale
+    // unmappedSourceFields. The explicit implementationPattern/requiresFieldMappings override
+    // must win over that heuristic signal.
+    await withTasksFixture(
+      [makeTask({
+        id: 'task-uibr-005',
+        title: LAB_TITLE,
+        originalMessage: LAB_DESCRIPTION,
+        customerId: 'cust-uibr',
+        workflowSetup: {},
+        crmDeveloperWorkflow: {
+          detectedWorkKind: 'script',
+          technicalPlan: { fieldMappings: [], unmappedSourceFields: ['nvr_priority'] },
+          planApproval: { approved: true, approvedAt: '2026-01-01T00:00:00.000Z' },
+        },
+      })],
+      CUSTOMERS,
+      async () => {
+        const packet = await callToolFallback('get_developer_work_packet', { taskId: 'task-uibr-005' });
+        expect(packet.implementation.requiresFieldMappings).toBe(false);
+        expect(packet.implementation.scaffoldOnly).toBe(false);
+      },
+    );
+  });
+
+  it('field-mapping script tasks still require fieldMappings (unaffected by the ui-business-rule fix)', async () => {
+    await withTasksFixture(
+      [makeTask({
+        id: 'task-fm-001',
+        title: TASK_TEMPLATES[0].titlePattern,
+        customerId: 'cust-fm',
+        workflowSetup: {},
+      })],
+      [{ id: 'cust-fm', repositoryRoot: 'C:\\Repo\\FM', scriptFolder: 'C:\\Repo\\FM\\Scripts' }],
+      async () => {
+        await callToolFallback('prepare_developer_task', { taskId: 'task-fm-001' });
+        const packet = await callToolFallback('get_developer_work_packet', { taskId: 'task-fm-001' });
+        expect(packet.implementation.requiresFieldMappings).toBe(true);
+        expect(packet.implementation.implementationPattern).toBe('field-mapping');
+      },
+    );
+  });
+
+  it('empty fieldMappings still blocks a field-mapping/prefill script task from being approved', async () => {
+    // No template match — mirrors the existing "plan-based fieldMappings guard" fixture shape:
+    // the plan itself signals unmapped source fields with no corresponding fieldMappings, and no
+    // template/text-extraction path can fill them in, so this must stay blocked.
+    await withTasksFixture(
+      [makeTask({
+        id: 'task-fm-002',
+        title: 'Custom CRM Script Task Without A Template Match',
+        customerId: 'cust-fm2',
+        workflowSetup: {
+          devTargetKind: 'script', repositoryRoot: 'C:\\Repo\\FM2', actionType: 'create-new-script',
+          primaryEntityLogicalName: 'account', artifactPath: 'Scripts\\account_events.js',
+          confirmedAt: '2026-06-01T10:00:00.000Z',
+        },
+        crmDeveloperWorkflow: {
+          detectedWorkKind: 'script',
+          technicalPlan: {
+            workKind: 'script', summary: 'Create account script.',
+            target: { entityLogicalName: 'account', scriptPath: 'Scripts\\account_events.js', eventName: 'OnLoad' },
+            implementationSteps: [], fieldMappings: [], unmappedSourceFields: ['related.field_a'],
+            risks: [], testChecklist: [],
+          },
+          planApproval: null,
+        },
+        implementationVerification: { dataverseCheck: { status: 'skipped' } },
+      })],
+      [{ id: 'cust-fm2', repositoryRoot: 'C:\\Repo\\FM2', scriptFolder: 'C:\\Repo\\FM2\\Scripts' }],
+      async () => {
+        const approval = await callToolFallback('approve_technical_plan_if_safe', { taskId: 'task-fm-002' });
+        expect(approval.canApprove).toBe(false);
+        expect(approval.reasons.join(' ')).toContain('Field mappings are required but not defined');
+      },
+    );
+  });
+
+  it('Dataverse verification context for a ui-business-rule script lists referencedFields/affectedFields, not fieldMappings', async () => {
+    await withTasksFixture(
+      [makeTask({ id: 'task-uibr-006', title: LAB_TITLE, originalMessage: LAB_DESCRIPTION, customerId: 'cust-uibr', workflowSetup: {} })],
+      CUSTOMERS,
+      async () => {
+        await callToolFallback('prepare_developer_task', { taskId: 'task-uibr-006' });
+        const packet = await callToolFallback('get_developer_work_packet', { taskId: 'task-uibr-006' });
+        expect(packet.implementation.validationFields).toEqual(
+          expect.arrayContaining(['nvr_labservicecase.nvr_priority', 'nvr_labservicecase.nvr_description']),
+        );
+        expect(packet.implementation.fieldMappings).toEqual([]);
+      },
+    );
+  });
+});
+
+// ---------------------------------------------------------------------------
 // 12. callToolFallback get_task_full_context â€” developerWorkPacket.scriptNaming
 // ---------------------------------------------------------------------------
 
