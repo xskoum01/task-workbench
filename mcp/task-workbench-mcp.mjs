@@ -162,6 +162,10 @@ const TASK_TEMPLATES = [
     // of title/description markers instead (see matchKeywords/minKeywordMatches below).
     matchKeywords: ['[test] script', 'povinný popis', 'vysokou prioritu', 'nvr_labservicecase', 'nvr_priority', 'nvr_description'],
     minKeywordMatches: 3,
+    // The Czech title markers above are generic enough that a different lab task with a similar
+    // title could hit minKeywordMatches without ever naming this table. Require explicit
+    // Dataverse logical-name evidence before this template is allowed to match at all.
+    requiredKeywords: ['nvr_labservicecase'],
     mode: 'developer',
     workKind: 'script',
     actionType: 'create-new-script',
@@ -240,17 +244,32 @@ const TASK_TEMPLATES = [
  * Match a task title/description against template patterns. Returns the first matching
  * template or null. Matching is substring-based and case-insensitive for robustness.
  *
- * Two matching strategies, tried per-template in declaration order:
+ * Gate, evaluated before any match strategy below — if either is defined and not satisfied,
+ * the template is skipped entirely (never matches via titlePattern or matchKeywords):
+ * - `requiredKeywords` — every listed keyword must be present in the combined text.
+ * - `requiredAnyKeywords` — at least one listed keyword must be present.
+ * Use these to require explicit evidence (e.g. a Dataverse logical name) so a template with
+ * broad/generic matchKeywords cannot match a different task that merely has a similar title.
+ *
+ * Match strategies, tried per-template in declaration order once the gate above passes:
  * 1. `titlePattern` — a single substring that must appear in the title (legacy, exact templates).
  * 2. `matchKeywords` + `minKeywordMatches` — matches when at least `minKeywordMatches` of the
- *    listed keywords appear anywhere in the combined title+description text. Use this when no
- *    single substring reliably identifies the task (e.g. a synthetic test-lab task title).
+ *    listed keywords appear anywhere in the combined text. Use this when no single substring
+ *    reliably identifies the task (e.g. a synthetic test-lab task title).
  */
 function matchTaskTemplate(title, description) {
   const haystack = `${title || ''} ${description || ''}`;
   if (!haystack.trim()) return null;
   const lower = haystack.toLowerCase();
   for (const t of TASK_TEMPLATES) {
+    if (Array.isArray(t.requiredKeywords) && t.requiredKeywords.length > 0) {
+      const allPresent = t.requiredKeywords.every((k) => lower.includes(k.toLowerCase()));
+      if (!allPresent) continue;
+    }
+    if (Array.isArray(t.requiredAnyKeywords) && t.requiredAnyKeywords.length > 0) {
+      const anyPresent = t.requiredAnyKeywords.some((k) => lower.includes(k.toLowerCase()));
+      if (!anyPresent) continue;
+    }
     if (t.titlePattern && String(title || '').toLowerCase().includes(t.titlePattern.toLowerCase())) {
       return t;
     }
@@ -261,6 +280,23 @@ function matchTaskTemplate(title, description) {
     }
   }
   return null;
+}
+
+/**
+ * Combined text used by every template-match / setup-inference path so explicit facts (a
+ * Dataverse logical name, a target file, a handler name) are found regardless of which field
+ * they were typed into. Do not match/infer from task.title + task.originalMessage alone —
+ * task.description and the stored analysis summaries can also carry the explicit assignment
+ * text, depending on how the task was created.
+ */
+function taskTextForInference(task) {
+  return [
+    task?.title,
+    task?.originalMessage,
+    task?.description,
+    task?.analysisResult?.summary,
+    task?.analysisResult?.summaryEn,
+  ].filter(Boolean).join('\n');
 }
 
 const TOOL_DEFINITIONS = [
@@ -2021,6 +2057,15 @@ function sanitizeWorkflowSetup(setup) {
     onChangeFunctionName: setup.onChangeFunctionName,
     mainHelperSuggestion: setup.mainHelperSuggestion,
     absoluteScriptPath: setup.absoluteScriptPath,
+    implementationPattern: setup.implementationPattern,
+    requiresFieldMappings: setup.requiresFieldMappings,
+    referencedFields: setup.referencedFields,
+    triggerFields: setup.triggerFields,
+    affectedFields: setup.affectedFields,
+    uiRules: setup.uiRules,
+    optionSetValues: setup.optionSetValues,
+    notificationIds: setup.notificationIds,
+    forbiddenOperations: setup.forbiddenOperations,
   };
 }
 
@@ -2882,7 +2927,7 @@ function buildTaskFullContext(task, customerDevDefaults) {
   if (customerDevDefaults) detail.customerDevDefaults = customerDevDefaults;
   const workKind = task.crmDeveloperWorkflow?.detectedWorkKind || task.workflowSetup?.devTargetKind;
   if (workKind === 'script' || workKind === 'ribbon') {
-    const naming = computeScriptNaming(matchTaskTemplate(task.title || '', task.originalMessage || ''), customerDevDefaults, task.workflowSetup);
+    const naming = computeScriptNaming(matchTaskTemplate(task.title || '', taskTextForInference(task)), customerDevDefaults, task.workflowSetup);
     if (naming) detail.developerWorkPacket = { scriptNaming: naming };
   }
   return detail;
@@ -3013,7 +3058,7 @@ function isScaffoldOnlyTask(task) {
   const plan = sanitizeTechnicalPlan(workflow.technicalPlan);
   const emptyFieldMappings = !plan?.fieldMappings || plan.fieldMappings.length === 0;
   if (!emptyFieldMappings) return false;
-  const template = matchTaskTemplate(task.title || '', task.originalMessage || '');
+  const template = matchTaskTemplate(task.title || '', taskTextForInference(task));
   const setup = asObject(task.workflowSetup);
   const implementationPattern = setup.implementationPattern || template?.implementationPattern || null;
   // UI/business-rule and ribbon-action scripts have no fieldMappings by design — an explicit
@@ -3036,7 +3081,7 @@ function buildDeveloperWorkPacket(task, customerDevDefaults = null) {
   const workflow = asObject(task.crmDeveloperWorkflow);
   const plan = sanitizeTechnicalPlan(workflow.technicalPlan);
   const readiness = computeImplementationReadiness(task);
-  const template = matchTaskTemplate(task.title || '', task.originalMessage || '');
+  const template = matchTaskTemplate(task.title || '', taskTextForInference(task));
   const workKind = workflow.detectedWorkKind || setup.devTargetKind || plan?.workKind || 'unknown';
   const isScript = workKind === 'script' || workKind === 'ribbon' || setup.devTargetKind === 'script';
   const targetEntity = setup.primaryEntityLogicalName || plan?.target?.entityLogicalName || template?.targetEntity || '';
@@ -3090,6 +3135,16 @@ function buildDeveloperWorkPacket(task, customerDevDefaults = null) {
   const requiresFieldMappings = isNonMappingPattern
     ? false
     : (explicitRequiresFieldMappings !== null ? explicitRequiresFieldMappings : heuristicRequiresFieldMappings);
+  // UI/business-rule and ribbon-action script context — workflowSetup (persisted by
+  // prepareDeveloperTaskInMemory when a template applies) wins over the template, so these
+  // survive even once the task text no longer re-matches the template that originally set them.
+  const referencedFields = Array.isArray(setup.referencedFields) ? setup.referencedFields : (Array.isArray(template?.referencedFields) ? template.referencedFields : []);
+  const triggerFields = Array.isArray(setup.triggerFields) ? setup.triggerFields : (Array.isArray(template?.triggerFields) ? template.triggerFields : []);
+  const affectedFields = Array.isArray(setup.affectedFields) ? setup.affectedFields : (Array.isArray(template?.affectedFields) ? template.affectedFields : []);
+  const uiRules = Array.isArray(setup.uiRules) ? setup.uiRules : (Array.isArray(template?.uiRules) ? template.uiRules : []);
+  const optionSetValues = (setup.optionSetValues && typeof setup.optionSetValues === 'object') ? setup.optionSetValues : (template?.optionSetValues && typeof template.optionSetValues === 'object' ? template.optionSetValues : {});
+  const notificationIds = Array.isArray(setup.notificationIds) ? setup.notificationIds : (Array.isArray(template?.notificationIds) ? template.notificationIds : []);
+  const forbiddenOperations = Array.isArray(setup.forbiddenOperations) ? setup.forbiddenOperations : (Array.isArray(template?.forbiddenOperations) ? template.forbiddenOperations : []);
   // Template path: auto-derive fieldMappings from template sourceFields/targetFields when plan is empty
   const templateDerivedMappings = (templateNeedsMapping && emptyFieldMappings && template && template.sourceEntity && targetEntity)
     ? (() => {
@@ -3267,16 +3322,15 @@ function buildDeveloperWorkPacket(task, customerDevDefaults = null) {
       // Prefer text-extracted mappings when structured plan mappings are absent.
       fieldMappings: finalFieldMappings,
       unmappedSourceFields: plan?.unmappedSourceFields || [],
-      // UI/business-rule and ribbon-action script context — populated from the template (or a
-      // workflowSetup override). Not used for field-mapping scripts, which use fieldMappings
-      // above instead.
-      referencedFields: Array.isArray(setup.referencedFields) ? setup.referencedFields : (Array.isArray(template?.referencedFields) ? template.referencedFields : []),
-      triggerFields: Array.isArray(setup.triggerFields) ? setup.triggerFields : (Array.isArray(template?.triggerFields) ? template.triggerFields : []),
-      affectedFields: Array.isArray(setup.affectedFields) ? setup.affectedFields : (Array.isArray(template?.affectedFields) ? template.affectedFields : []),
-      uiRules: Array.isArray(template?.uiRules) ? template.uiRules : [],
-      optionSetValues: template?.optionSetValues && typeof template.optionSetValues === 'object' ? template.optionSetValues : {},
-      notificationIds: Array.isArray(template?.notificationIds) ? template.notificationIds : [],
-      forbiddenOperations: Array.isArray(template?.forbiddenOperations) ? template.forbiddenOperations : [],
+      // UI/business-rule and ribbon-action script context — workflowSetup first, then template.
+      // Not used for field-mapping scripts, which use fieldMappings above instead.
+      referencedFields,
+      triggerFields,
+      affectedFields,
+      uiRules,
+      optionSetValues,
+      notificationIds,
+      forbiddenOperations,
       // Read-only context fields: from template additionalSourceFields, referenced/affected
       // fields (ui-business-rule/ribbon-action scripts), or text extraction.
       validationFields: [
@@ -3284,10 +3338,7 @@ function buildDeveloperWorkPacket(task, customerDevDefaults = null) {
           ? template.additionalSourceFields.map((f) => `${template.sourceEntity || 'source'}.${f}`)
           : []),
         ...(isNonMappingPattern && targetEntity
-          ? [...new Set([
-              ...(Array.isArray(template?.referencedFields) ? template.referencedFields : []),
-              ...(Array.isArray(template?.affectedFields) ? template.affectedFields : []),
-            ])].map((f) => `${targetEntity}.${f}`)
+          ? [...new Set([...referencedFields, ...affectedFields])].map((f) => `${targetEntity}.${f}`)
           : []),
         ...textExtractedValidation,
       ],
@@ -3486,7 +3537,7 @@ function extractExplicitNvrEntity(text) {
  * function never guesses a generic entity like 'account'/'incident' from title wording alone.
  */
 function genericScriptSetupInference(task) {
-  const text = `${task.title || ''}\n${task.originalMessage || ''}`;
+  const text = taskTextForInference(task);
   if (!/\b(javascript|jscript|form\s*script|web\s*resource|on[-\s]?load|on[-\s]?change|on[-\s]?save)\b/i.test(text)) {
     return null;
   }
@@ -3576,7 +3627,7 @@ function prepareDeveloperTaskInMemory(task, { customerDevDefaults = null, confir
   const approvalGates = [];
   const assumptions = [];
   let confidence = 'none';
-  const template = matchTaskTemplate(task.title || '', task.originalMessage || '');
+  const template = matchTaskTemplate(task.title || '', taskTextForInference(task));
   const now = new Date().toISOString();
 
   if (template) {
@@ -3599,6 +3650,18 @@ function prepareDeveloperTaskInMemory(task, { customerDevDefaults = null, confir
       task.workflowSetup.mainHelperSuggestion = template.scriptNaming.mainHelperSuggestion;
     }
     if (template.pluginTarget?.entityLogicalName) task.workflowSetup.primaryEntityLogicalName = template.pluginTarget.entityLogicalName;
+    // Persist the template's implementation-pattern semantics into workflowSetup itself, so a
+    // later readiness/packet build does not depend on re-matching this template — it survives a
+    // title/description edit, and buildDeveloperWorkPacket reads these setup fields first anyway.
+    if (template.implementationPattern) task.workflowSetup.implementationPattern = template.implementationPattern;
+    if (typeof template.requiresFieldMappings === 'boolean') task.workflowSetup.requiresFieldMappings = template.requiresFieldMappings;
+    if (Array.isArray(template.referencedFields)) task.workflowSetup.referencedFields = template.referencedFields;
+    if (Array.isArray(template.triggerFields)) task.workflowSetup.triggerFields = template.triggerFields;
+    if (Array.isArray(template.affectedFields)) task.workflowSetup.affectedFields = template.affectedFields;
+    if (Array.isArray(template.uiRules)) task.workflowSetup.uiRules = template.uiRules;
+    if (template.optionSetValues && typeof template.optionSetValues === 'object') task.workflowSetup.optionSetValues = template.optionSetValues;
+    if (Array.isArray(template.notificationIds)) task.workflowSetup.notificationIds = template.notificationIds;
+    if (Array.isArray(template.forbiddenOperations)) task.workflowSetup.forbiddenOperations = template.forbiddenOperations;
     task.crmDeveloperWorkflow.detectedWorkKind = template.workKind;
     task.crmDeveloperWorkflow.updatedAt = now;
     appliedActions.push('applied_template', 'set_task_mode', 'set_task_work_classification');
@@ -3893,7 +3956,7 @@ function computeImplementationReadiness(task) {
   const isScript = devTargetKind === 'script' || detectedWorkKind === 'script' || detectedWorkKind === 'ribbon';
 
   if (!isPlugin && !isScript) {
-    const corpus = `${task.title ?? ''} ${task.originalMessage ?? ''} ${task.classificationLabel ?? ''}`.toLowerCase();
+    const corpus = `${taskTextForInference(task)} ${task.classificationLabel ?? ''}`.toLowerCase();
     const looksScript = /\b(javascript|form\s*script|web\s*resource|jscript|on.?load|on.?save|field.*change|column.*change|onchange|onload|onsave)\b/.test(corpus);
     return {
       isImplementationReady: false,
@@ -4337,7 +4400,7 @@ async function callToolFallback(name, args = {}) {
       const workKindVal =
         task.crmDeveloperWorkflow?.detectedWorkKind || task.workflowSetup?.devTargetKind;
       if (workKindVal === 'script' || workKindVal === 'ribbon') {
-        const template = matchTaskTemplate(task.title || '', task.originalMessage || '');
+        const template = matchTaskTemplate(task.title || '', taskTextForInference(task));
         const scriptNaming = computeScriptNaming(template, devDefaults, task.workflowSetup);
         if (scriptNaming) detail.developerWorkPacket = { scriptNaming };
       }
@@ -4525,7 +4588,7 @@ async function callToolFallback(name, args = {}) {
       let matchedTemplate = null;
       if (args.taskId) {
         const task = getTaskById(tasks, args.taskId);
-        if (task) matchedTemplate = matchTaskTemplate(task.title, task.originalMessage);
+        if (task) matchedTemplate = matchTaskTemplate(task.title, taskTextForInference(task));
       }
       return {
         ...common,
@@ -4756,7 +4819,7 @@ async function callToolFallback(name, args = {}) {
         if (isPlugin) {
           checks.push({ name: 'Local Static/Business-Rule Verification', status: 'skipped', findings: ['Not applicable — static rule templates currently cover JS/TS script tasks only.'] });
         } else if (readiness && readiness.fileContent) {
-          const template = matchTaskTemplate(task.title, task.originalMessage);
+          const template = matchTaskTemplate(task.title, taskTextForInference(task));
           staticResult = runStaticBusinessRuleChecks(template, readiness.fileContent);
           checks.push({ name: staticResult.name, status: staticResult.status, findings: staticResult.findings });
           fixableFindings.push(...staticResult.fixableFindings);

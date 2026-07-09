@@ -2509,6 +2509,197 @@ describe('ui-business-rule implementation pattern (no fieldMappings by design)',
 });
 
 // ---------------------------------------------------------------------------
+// 11d. Template matching hardening (requiredKeywords) + taskTextForInference +
+// persisted implementation-pattern setup surviving a template re-match miss.
+// ---------------------------------------------------------------------------
+
+describe('matchTaskTemplate requiredKeywords gate', () => {
+  const LAB_TITLE = '[TEST] Script: Povinný popis pro vysokou prioritu servisního případu';
+
+  it('does NOT match the lab template from the title alone, with no explicit logical name anywhere', () => {
+    expect(matchTaskTemplate(LAB_TITLE, '')).toBeNull();
+  });
+
+  it('DOES match the lab template once the description explicitly names nvr_labservicecase (with nvr_priority/nvr_description)', () => {
+    const matched = matchTaskTemplate(
+      'Some other title entirely',
+      'nvr_labservicecase nvr_priority nvr_description',
+    );
+    expect(matched?.id).toBe('nvr-training-automation-lab-servicecase-priority-description');
+  });
+
+  it('legacy titlePattern templates are unaffected by the requiredKeywords gate', () => {
+    const matched = matchTaskTemplate(TASK_TEMPLATES[0].titlePattern, '');
+    expect(matched?.id).toBe(TASK_TEMPLATES[0].id);
+  });
+});
+
+describe('taskTextForInference — description-only explicit facts', () => {
+  const CZECH_TITLE_NO_ENTITY = '[TEST] Oprava chyby ve servisním případu';
+  const DESCRIPTION_WITH_ENTITY =
+    'JavaScript form script: Form OnLoad and onChange of `nvr_priority` on the `nvr_labservicecase` table. ' +
+    'Target file: Scripts\\nvr_labservicecase_events.js. Handlers: `nvr_labservicecase_OnLoad`, `nvr_priority_OnChange`.';
+
+  async function withTasksFixture(tasks, customers, fn) {
+    const os = await import('node:os');
+    const fs = await import('node:fs/promises');
+    const path = await import('node:path');
+    const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'tw-mcp-desc-only-'));
+    await fs.writeFile(path.join(tmpDir, 'tasks.json'), JSON.stringify(tasks));
+    if (customers) await fs.writeFile(path.join(tmpDir, 'customers.json'), JSON.stringify(customers));
+    const origArgv = process.argv;
+    process.argv = [...process.argv, '--data-dir', tmpDir];
+    try {
+      await fn(tmpDir, fs, path);
+    } finally {
+      process.argv = origArgv;
+      await fs.rm(tmpDir, { recursive: true });
+    }
+  }
+
+  it('infers nvr_labservicecase (not incident) when the explicit logical name is only in task.description, not originalMessage', async () => {
+    await withTasksFixture(
+      [makeTask({
+        id: 'task-desc-only-1',
+        title: CZECH_TITLE_NO_ENTITY,
+        originalMessage: '',
+        description: DESCRIPTION_WITH_ENTITY,
+        taskMode: 'general',
+        customerId: 'cust-desc',
+        workflowSetup: {},
+      })],
+      [{ id: 'cust-desc', repositoryRoot: 'C:\\Repo\\Desc', scriptFolder: 'C:\\Repo\\Desc\\Scripts' }],
+      async () => {
+        const result = await callToolFallback('prepare_developer_task', { taskId: 'task-desc-only-1' });
+        expect(result.appliedActions).toContain('applied_generic_inference');
+        expect(result.task.workflowSetup.primaryEntityLogicalName).toBe('nvr_labservicecase');
+        expect(result.task.workflowSetup.primaryEntityLogicalName).not.toBe('incident');
+      },
+    );
+  });
+
+  it('get_task_templates resolves the lab matchedTemplate when explicit logical names are only in task.description', async () => {
+    await withTasksFixture(
+      [makeTask({
+        id: 'task-desc-only-2',
+        title: '[TEST] Script: Povinný popis pro vysokou prioritu servisního případu',
+        originalMessage: '',
+        description: 'nvr_labservicecase nvr_priority nvr_description',
+        workflowSetup: {},
+      })],
+      null,
+      async () => {
+        const result = await callToolFallback('get_task_templates', { taskId: 'task-desc-only-2' });
+        expect(result.matchedTemplate?.id).toBe('nvr-training-automation-lab-servicecase-priority-description');
+      },
+    );
+  });
+});
+
+describe('persisted implementation-pattern setup survives a later template re-match miss', () => {
+  const LAB_TITLE = '[TEST] Script: Povinný popis pro vysokou prioritu servisního případu';
+  const LAB_DESCRIPTION =
+    'Create a JavaScript form script for the NVR Training Automation Lab table `nvr_labservicecase`. ' +
+    'Target file: Scripts\\nvr_labservicecase_events.js. ' +
+    'Events: Form OnLoad, OnChange of `nvr_priority`. ' +
+    'Handlers: `nvr_labservicecase_OnLoad`, `nvr_priority_OnChange`. ' +
+    'Logic: if nvr_priority is High (100000002), make nvr_description required and show a notification, ' +
+    'otherwise make nvr_description not required and clear the notification.';
+  const CUSTOMERS = [{ id: 'cust-persist', repositoryRoot: 'C:\\Repo\\Persist', scriptFolder: 'C:\\Repo\\Persist\\Scripts' }];
+
+  async function withTasksFixture(tasks, customers, fn) {
+    const os = await import('node:os');
+    const fs = await import('node:fs/promises');
+    const path = await import('node:path');
+    const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'tw-mcp-persist-'));
+    await fs.writeFile(path.join(tmpDir, 'tasks.json'), JSON.stringify(tasks));
+    if (customers) await fs.writeFile(path.join(tmpDir, 'customers.json'), JSON.stringify(customers));
+    const origArgv = process.argv;
+    process.argv = [...process.argv, '--data-dir', tmpDir];
+    try {
+      return await fn(tmpDir, fs, path);
+    } finally {
+      process.argv = origArgv;
+      await fs.rm(tmpDir, { recursive: true });
+    }
+  }
+
+  it('prepare_developer_task persists implementationPattern and the field/rule lists into workflowSetup', async () => {
+    await withTasksFixture(
+      [makeTask({ id: 'task-persist-1', title: LAB_TITLE, originalMessage: LAB_DESCRIPTION, customerId: 'cust-persist', workflowSetup: {} })],
+      CUSTOMERS,
+      async () => {
+        const result = await callToolFallback('prepare_developer_task', { taskId: 'task-persist-1' });
+        const setup = result.task.workflowSetup;
+        expect(setup.implementationPattern).toBe('ui-business-rule');
+        expect(setup.requiresFieldMappings).toBe(false);
+        expect(setup.referencedFields).toEqual(['nvr_priority', 'nvr_description']);
+        expect(setup.triggerFields).toEqual(['nvr_priority']);
+        expect(setup.affectedFields).toEqual(['nvr_description']);
+        expect(setup.uiRules).toEqual([
+          'If nvr_priority == 100000002 (High), set nvr_description required and show a form notification.',
+          'Otherwise, set nvr_description not required and clear the notification.',
+        ]);
+        expect(setup.optionSetValues).toEqual({ nvr_priority: { High: 100000002 } });
+        expect(setup.notificationIds).toEqual(['nvr_description_required_notice']);
+        expect(setup.forbiddenOperations).toEqual(expect.arrayContaining(['Xrm.WebApi', 'Xrm.Page']));
+      },
+    );
+  });
+
+  it('buildDeveloperWorkPacket still reports the persisted pattern/fields once the task no longer re-matches the template', async () => {
+    await withTasksFixture(
+      [makeTask({ id: 'task-persist-2', title: LAB_TITLE, originalMessage: LAB_DESCRIPTION, customerId: 'cust-persist', workflowSetup: {} })],
+      CUSTOMERS,
+      async (tmpDir, fs, path) => {
+        await callToolFallback('prepare_developer_task', { taskId: 'task-persist-2' });
+
+        // Simulate the template no longer matching: strip every explicit marker from the
+        // title/description while leaving the already-persisted workflowSetup untouched.
+        const tasksPath = path.join(tmpDir, 'tasks.json');
+        const tasks = JSON.parse(await fs.readFile(tasksPath, 'utf8'));
+        const task = tasks.find((t) => t.id === 'task-persist-2');
+        expect(matchTaskTemplate(task.title, taskTextForInferenceForTest(task))).toBeTruthy();
+        task.title = 'Generic follow-up task';
+        task.originalMessage = 'Please double check the earlier change.';
+        expect(matchTaskTemplate(task.title, task.originalMessage)).toBeNull();
+        await fs.writeFile(tasksPath, JSON.stringify(tasks));
+
+        const packet = await callToolFallback('get_developer_work_packet', { taskId: 'task-persist-2' });
+        expect(packet.implementation.implementationPattern).toBe('ui-business-rule');
+        expect(packet.implementation.requiresFieldMappings).toBe(false);
+        expect(packet.implementation.fieldMappings).toEqual([]);
+        expect(packet.implementation.scaffoldOnly).toBe(false);
+        expect(packet.implementation.referencedFields).toEqual(['nvr_priority', 'nvr_description']);
+        expect(packet.implementation.affectedFields).toEqual(['nvr_description']);
+      },
+    );
+  });
+
+  // Local helper mirroring the MCP module's taskTextForInference, only used to sanity-check the
+  // "template matches before the mutation" assumption above without importing an unexported fn.
+  function taskTextForInferenceForTest(task) {
+    return [task.title, task.originalMessage, task.description, task.analysisResult?.summary, task.analysisResult?.summaryEn]
+      .filter(Boolean).join('\n');
+  }
+
+  it('template-derived fieldMappings for the field-mapping prefill template are unaffected', async () => {
+    await withTasksFixture(
+      [makeTask({ id: 'task-persist-fm', title: TASK_TEMPLATES[0].titlePattern, customerId: 'cust-fm-persist', workflowSetup: {} })],
+      [{ id: 'cust-fm-persist', repositoryRoot: 'C:\\Repo\\FMPersist', scriptFolder: 'C:\\Repo\\FMPersist\\Scripts' }],
+      async () => {
+        const result = await callToolFallback('prepare_developer_task', { taskId: 'task-persist-fm' });
+        expect(result.task.workflowSetup.implementationPattern).toBeUndefined();
+        const packet = await callToolFallback('get_developer_work_packet', { taskId: 'task-persist-fm' });
+        expect(packet.implementation.implementationPattern).toBe('field-mapping');
+        expect(packet.implementation.requiresFieldMappings).toBe(true);
+        expect(packet.implementation.fieldMappings.length).toBeGreaterThan(0);
+      },
+    );
+  });
+});
+
+// ---------------------------------------------------------------------------
 // 12. callToolFallback get_task_full_context â€” developerWorkPacket.scriptNaming
 // ---------------------------------------------------------------------------
 
