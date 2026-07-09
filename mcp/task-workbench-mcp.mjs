@@ -3674,7 +3674,7 @@ function prepareDeveloperTaskInMemory(task, { customerDevDefaults = null, confir
     // over an already-set value.
     const inferred = genericScriptSetupInference(task);
     if (inferred) {
-      task.taskMode = task.taskMode || 'developer';
+      task.taskMode = 'developer';
       if (!task.workflowSetup || typeof task.workflowSetup !== 'object') task.workflowSetup = {};
       if (!task.crmDeveloperWorkflow || typeof task.crmDeveloperWorkflow !== 'object') task.crmDeveloperWorkflow = { createdAt: now };
       const s = task.workflowSetup;

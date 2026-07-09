@@ -7111,12 +7111,42 @@ fn task_mcp_plan_approval_safety_check(task: &Value, packet: &Value) -> Vec<Stri
     let requires_fm = impl_obj["requiresFieldMappings"].as_bool().unwrap_or(false);
     let fm_count    = impl_obj["fieldMappings"].as_array().map(|a| a.len()).unwrap_or(0);
     let fm_source   = impl_obj["fieldMappingsSource"].as_str().unwrap_or("none");
+    let implementation_pattern = impl_obj["implementationPattern"].as_str();
+    let is_non_mapping_pattern = matches!(implementation_pattern, Some("ui-business-rule") | Some("ribbon-action"));
+
     if requires_fm {
         if fm_count == 0 {
             reasons.push("Field mappings are required but not defined. Define source\u{2192}target field mappings in the technical plan before approving.".to_string());
         }
         if !matches!(fm_source, "template" | "plan") {
             reasons.push(format!("fieldMappingsSource='{fm_source}' is not a trusted source. Only 'template' or 'plan' field mapping sources can be auto-approved."));
+        }
+    } else if is_non_mapping_pattern {
+        // UI/business-rule and ribbon-action scripts legitimately have no fieldMappings by design
+        // (impl.requiresFieldMappings is already false for this pattern — see
+        // task_mcp_developer_work_packet). Waiving the field-mapping checks above must not waive
+        // scrutiny outright: the rest of the write target and business context still has to be
+        // concrete before auto-approval.
+        let wt = &packet["writeTarget"];
+        if wt["targetEntity"].as_str().unwrap_or("").is_empty() {
+            reasons.push("Target entity is not set.".to_string());
+        }
+        if wt["artifactPath"].as_str().unwrap_or("").is_empty() {
+            reasons.push("Target file/artifact path is not set.".to_string());
+        }
+        if wt["eventName"].as_str().unwrap_or("").is_empty() && wt["eventFieldName"].as_str().unwrap_or("").is_empty() {
+            reasons.push("Event/eventField is not set.".to_string());
+        }
+        let referenced_len = impl_obj["referencedFields"].as_array().map(|a| a.len()).unwrap_or(0);
+        let affected_len = impl_obj["affectedFields"].as_array().map(|a| a.len()).unwrap_or(0);
+        if referenced_len == 0 && affected_len == 0 {
+            reasons.push("No referenced/affected fields are defined for this UI/business-rule script.".to_string());
+        }
+        if impl_obj["businessRules"].as_array().map(|a| a.is_empty()).unwrap_or(true) {
+            reasons.push("No business rules are defined for this UI/business-rule script.".to_string());
+        }
+        if impl_obj["acceptanceCriteria"].as_array().map(|a| a.is_empty()).unwrap_or(true) {
+            reasons.push("No acceptance criteria are defined for this UI/business-rule script.".to_string());
         }
     }
 
@@ -7781,7 +7811,7 @@ fn task_mcp_developer_work_packet(task: &Value, customer_dev_defaults: Option<&V
     let plan = &workflow["technicalPlan"];
     let plan_target = &plan["target"];
     let readiness = task_mcp_implementation_readiness(task);
-    let template = task_mcp_match_template(task["title"].as_str().unwrap_or(""));
+    let template = task_mcp_match_template(task["title"].as_str().unwrap_or(""), &task_mcp_task_text_for_inference(task));
     let work_kind = workflow["detectedWorkKind"].as_str()
         .or_else(|| setup["devTargetKind"].as_str())
         .or_else(|| plan["workKind"].as_str())
@@ -7836,7 +7866,52 @@ fn task_mcp_developer_work_packet(task: &Value, customer_dev_defaults: Option<&V
             (false, vec![], vec![], vec![])
         };
 
-    let requires_field_mappings = template_needs_mapping || plan_has_unmapped_with_no_mapped || text_detected_required;
+    // Script implementation pattern: 'field-mapping' (source→target copy/prefill, needs
+    // fieldMappings), 'ui-business-rule' (form UI logic — required level, visibility,
+    // notifications, locking, option filtering — no fieldMappings by design), or
+    // 'ribbon-action'. workflowSetup override wins over the template. Mirrors
+    // mcp/task-workbench-mcp.mjs buildDeveloperWorkPacket — keep in sync.
+    let implementation_pattern: Option<String> = setup["implementationPattern"].as_str().map(str::to_string)
+        .or_else(|| template.as_ref().and_then(|t| t["implementationPattern"].as_str()).map(str::to_string))
+        .or_else(|| if template_needs_mapping { Some("field-mapping".to_string()) } else { None });
+    let is_non_mapping_pattern = matches!(implementation_pattern.as_deref(), Some("ui-business-rule") | Some("ribbon-action"));
+    // An explicit requiresFieldMappings (workflowSetup override, then template) is authoritative:
+    // it overrides the heuristic signals below in both directions — a stale
+    // plan.unmappedSourceFields left over from an earlier save must not force a UI/business-rule
+    // script with no field-mapping needs to be misread as requiring mappings.
+    let explicit_requires_field_mappings: Option<bool> = setup["requiresFieldMappings"].as_bool()
+        .or_else(|| template.as_ref().and_then(|t| t["requiresFieldMappings"].as_bool()));
+    let heuristic_requires_field_mappings = template_needs_mapping || plan_has_unmapped_with_no_mapped || text_detected_required;
+    let requires_field_mappings = if is_non_mapping_pattern {
+        false
+    } else {
+        explicit_requires_field_mappings.unwrap_or(heuristic_requires_field_mappings)
+    };
+    // UI/business-rule and ribbon-action script context — workflowSetup (persisted by
+    // prepare_developer_task when a template applies) wins over the template, so these survive
+    // even once the task text no longer re-matches the template that originally set them.
+    let referenced_fields: Vec<Value> = setup["referencedFields"].as_array().cloned()
+        .or_else(|| template.as_ref().and_then(|t| t["referencedFields"].as_array().cloned()))
+        .unwrap_or_default();
+    let trigger_fields: Vec<Value> = setup["triggerFields"].as_array().cloned()
+        .or_else(|| template.as_ref().and_then(|t| t["triggerFields"].as_array().cloned()))
+        .unwrap_or_default();
+    let affected_fields: Vec<Value> = setup["affectedFields"].as_array().cloned()
+        .or_else(|| template.as_ref().and_then(|t| t["affectedFields"].as_array().cloned()))
+        .unwrap_or_default();
+    let ui_rules: Vec<Value> = setup["uiRules"].as_array().cloned()
+        .or_else(|| template.as_ref().and_then(|t| t["uiRules"].as_array().cloned()))
+        .unwrap_or_default();
+    let option_set_values: Value = if setup["optionSetValues"].is_object() { setup["optionSetValues"].clone() }
+        else if let Some(t) = &template { if t["optionSetValues"].is_object() { t["optionSetValues"].clone() } else { serde_json::json!({}) } }
+        else { serde_json::json!({}) };
+    let notification_ids: Vec<Value> = setup["notificationIds"].as_array().cloned()
+        .or_else(|| template.as_ref().and_then(|t| t["notificationIds"].as_array().cloned()))
+        .unwrap_or_default();
+    let forbidden_operations: Vec<Value> = setup["forbiddenOperations"].as_array().cloned()
+        .or_else(|| template.as_ref().and_then(|t| t["forbiddenOperations"].as_array().cloned()))
+        .unwrap_or_default();
+
     let field_mappings_missing = requires_field_mappings
         && empty_field_mappings
         && text_extracted_mappings.is_empty()
@@ -8041,7 +8116,8 @@ fn task_mcp_developer_work_packet(task: &Value, customer_dev_defaults: Option<&V
             .collect())
         .unwrap_or_default();
 
-    // ── validationFields: from template additionalSourceFields + text extraction ──
+    // ── validationFields: from template additionalSourceFields, referenced/affected fields
+    // (ui-business-rule/ribbon-action scripts), or text extraction ──
     let validation_fields: Vec<Value> = {
         let mut vf: Vec<Value> = Vec::new();
         if let Some(tpl) = &template {
@@ -8050,6 +8126,18 @@ fn task_mcp_developer_work_packet(task: &Value, customer_dev_defaults: Option<&V
                 for f in add {
                     if let Some(fname) = f.as_str() {
                         vf.push(serde_json::json!(format!("{}.{}", src_entity, fname)));
+                    }
+                }
+            }
+        }
+        if is_non_mapping_pattern {
+            if let Some(entity) = target_entity {
+                let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+                for f in referenced_fields.iter().chain(affected_fields.iter()) {
+                    if let Some(fname) = f.as_str() {
+                        if seen.insert(fname.to_string()) {
+                            vf.push(serde_json::json!(format!("{}.{}", entity, fname)));
+                        }
                     }
                 }
             }
@@ -8134,6 +8222,7 @@ fn task_mcp_developer_work_packet(task: &Value, customer_dev_defaults: Option<&V
         "writeTarget": write_target,
         "implementation": {
             "workKind": work_kind,
+            "implementationPattern": implementation_pattern,
             "summary": task_mcp_summarize(plan["summary"].as_str()
                 .or_else(|| task["analysisResult"]["summaryEn"].as_str())
                 .or_else(|| task["analysisResult"]["summary"].as_str())
@@ -8144,6 +8233,15 @@ fn task_mcp_developer_work_packet(task: &Value, customer_dev_defaults: Option<&V
             "fieldMappingsCount": final_field_mappings.len(),
             "fieldMappingsSource": field_mappings_source,
             "unmappedSourceFields": plan["unmappedSourceFields"].as_array().cloned().unwrap_or_default(),
+            // UI/business-rule and ribbon-action script context — workflowSetup first, then
+            // template. Not used for field-mapping scripts, which use fieldMappings above instead.
+            "referencedFields": referenced_fields,
+            "triggerFields": trigger_fields,
+            "affectedFields": affected_fields,
+            "uiRules": ui_rules,
+            "optionSetValues": option_set_values,
+            "notificationIds": notification_ids,
+            "forbiddenOperations": forbidden_operations,
             "validationFields": validation_fields,
             "missingRequiredMappings": missing_required_mappings,
             "scaffoldOnly": scaffold_only,
@@ -9422,7 +9520,12 @@ fn task_mcp_implementation_readiness(task: &Value) -> Value {
             };
 
             if action_type == "create-new-script" {
-                let has_dir      = !setup_path.is_empty() || !plan_path.is_empty();
+                // Mirrors mcp/task-workbench-mcp.mjs computeImplementationReadiness's hasDir
+                // exactly: artifactPath alone is sufficient, it does not also require the
+                // separate bare scriptPath (folder) field or a plan.target.scriptPath. A
+                // customer without an explicit scriptFolder never populates workflowSetup.
+                // scriptPath even once artifactPath is correctly resolved from the template.
+                let has_dir      = !artifact.is_empty() || !setup_path.is_empty();
                 let desired_file = setup["desiredScriptFile"].as_str().unwrap_or("");
                 let has_filename = !artifact.is_empty() || is_specific(setup_path) || is_specific(plan_path) || !desired_file.is_empty();
                 if !has_dir || !has_filename {
@@ -9560,14 +9663,336 @@ fn task_mcp_builtin_templates() -> Vec<Value> {
             },
             "notes": "Compute nvr_netamount, nvr_vatamount, nvr_totalamount from input fields nvr_quantity, nvr_unitprice, nvr_discountpercent, nvr_vatpercent."
         }),
+        serde_json::json!({
+            "id": "nvr-training-automation-lab-servicecase-priority-description",
+            "name": "NVR Training Automation Lab – Script: Povinný popis pro vysokou prioritu servisního případu",
+            "matchKeywords": ["[test] script", "povinný popis", "vysokou prioritu", "nvr_labservicecase", "nvr_priority", "nvr_description"],
+            "minKeywordMatches": 3,
+            "requiredKeywords": ["nvr_labservicecase"],
+            "mode": "developer",
+            "workKind": "script",
+            "actionType": "create-new-script",
+            "targetEntity": "nvr_labservicecase",
+            "scriptTarget": {
+                "entityLogicalName": "nvr_labservicecase",
+                "eventName": "onChange",
+                "eventFieldName": "nvr_priority"
+            },
+            "scriptNaming": {
+                "namingSource": "Scripts_Naming",
+                "scriptsFolderRelative": "Scripts",
+                "desiredScriptFile": "nvr_labservicecase_events.js",
+                "onLoadFunctionName": "nvr_labservicecase_OnLoad",
+                "onChangeFunctionName": "nvr_priority_OnChange",
+                "mainHelperSuggestion": "updateDescriptionRequirementByPriority"
+            },
+            "implementationPattern": "ui-business-rule",
+            "requiresFieldMappings": false,
+            "referencedFields": ["nvr_priority", "nvr_description"],
+            "triggerFields": ["nvr_priority"],
+            "affectedFields": ["nvr_description"],
+            "uiRules": [
+                "If nvr_priority == 100000002 (High), set nvr_description required and show a form notification.",
+                "Otherwise, set nvr_description not required and clear the notification."
+            ],
+            "optionSetValues": { "nvr_priority": { "High": 100000002 } },
+            "notificationIds": ["nvr_description_required_notice"],
+            "forbiddenOperations": [
+                "Xrm.WebApi",
+                "autosave (formContext.data.save())",
+                "Xrm.Page",
+                "setValue on nvr_description",
+                "early returns unless explicitly allowed by existing repo style",
+                "generated header/task-summary comments"
+            ],
+            "notes": "Form OnLoad + onChange on nvr_priority. When nvr_priority is High (100000002), make nvr_description required and show a form notification; otherwise make it not required and clear the notification.",
+            "businessRules": [
+                "High priority is choice value 100000002. Compare against this value, not a hardcoded label string.",
+                "Do not use Xrm.Page — use the execution context passed to the event handler.",
+                "Do not trigger autosave (formContext.data.save()).",
+                "Do not call Xrm.WebApi — this logic is entirely local to the form, no server round trip is needed.",
+                "Never call setValue on nvr_description — only toggle its required level (setIsRequiredLevel) and the form notification. The field value itself is user-entered.",
+                "Do not add early returns unless the existing scripts in the repository already use them.",
+                "Do not add a generated header/task-summary comment block to the script file.",
+                "Run the same logic on both form OnLoad and onChange of nvr_priority, so the required state is correct on load and after every change."
+            ],
+            "acceptanceCriteria": [
+                "On form OnLoad and on change of nvr_priority: when nvr_priority equals 100000002 (High), nvr_description is set to required and a form notification is shown.",
+                "On form OnLoad and on change of nvr_priority: when nvr_priority is not 100000002, nvr_description is set to not required and the notification is cleared.",
+                "No Xrm.Page reference appears in the output code.",
+                "No autosave call appears in the output code.",
+                "No Xrm.WebApi call appears in the output code.",
+                "No setValue call targets nvr_description in the output code."
+            ],
+            "staticRules": [
+                { "id": "no-xrm-page", "description": "Must not reference Xrm.Page.", "type": "must-not-match" },
+                { "id": "no-autosave", "description": "Must not trigger autosave (formContext.data.save()).", "type": "must-not-match" },
+                { "id": "no-webapi", "description": "Must not call Xrm.WebApi — logic is form-local only.", "type": "must-not-match" },
+                { "id": "no-setvalue-on-description", "description": "Must not call setValue on nvr_description — only toggle required level/notification.", "type": "must-not-match" },
+                { "id": "no-todo-fixme-placeholder", "description": "Must not contain TODO/FIXME/placeholder markers.", "type": "must-not-match" },
+                { "id": "checks-high-priority-choice-value", "description": "Must compare nvr_priority against the High choice value 100000002.", "type": "must-match" },
+                { "id": "sets-required-level", "description": "Must toggle nvr_description required level via setIsRequiredLevel.", "type": "must-match" },
+                { "id": "shows-notification", "description": "Must show/clear a form notification.", "type": "must-match" }
+            ]
+        }),
     ]
 }
 
-fn task_mcp_match_template(title: &str) -> Option<Value> {
-    let lower = title.to_lowercase();
-    task_mcp_builtin_templates()
-        .into_iter()
-        .find(|tpl| tpl["titlePattern"].as_str().map(|p| lower.contains(&p.to_lowercase())).unwrap_or(false))
+/// Combined text used by every template-match / setup-inference path, so explicit facts (a
+/// Dataverse logical name, a target file, a handler name) are found regardless of which field
+/// they were typed into. Mirrors mcp/task-workbench-mcp.mjs taskTextForInference — keep in sync.
+fn task_mcp_task_text_for_inference(task: &Value) -> String {
+    [
+        task["title"].as_str(),
+        task["originalMessage"].as_str(),
+        task["description"].as_str(),
+        task["analysisResult"]["summary"].as_str(),
+        task["analysisResult"]["summaryEn"].as_str(),
+    ]
+    .into_iter()
+    .flatten()
+    .filter(|s| !s.is_empty())
+    .collect::<Vec<_>>()
+    .join("\n")
+}
+
+/// Matches a task title/description against template patterns. Mirrors mcp/task-workbench-mcp.mjs
+/// matchTaskTemplate — keep in sync. `requiredKeywords`/`requiredAnyKeywords`, when present, gate
+/// whether a template can match at all (evaluated before titlePattern/matchKeywords), so a template
+/// with broad/generic matchKeywords cannot match a different task that merely has a similar title.
+fn task_mcp_match_template(title: &str, description: &str) -> Option<Value> {
+    let haystack = format!("{title} {description}");
+    if haystack.trim().is_empty() { return None; }
+    let lower = haystack.to_lowercase();
+    let title_lower = title.to_lowercase();
+    for tpl in task_mcp_builtin_templates() {
+        if let Some(required) = tpl["requiredKeywords"].as_array() {
+            if !required.is_empty() {
+                let all_present = required.iter()
+                    .all(|k| k.as_str().map(|s| lower.contains(&s.to_lowercase())).unwrap_or(false));
+                if !all_present { continue; }
+            }
+        }
+        if let Some(required_any) = tpl["requiredAnyKeywords"].as_array() {
+            if !required_any.is_empty() {
+                let any_present = required_any.iter()
+                    .any(|k| k.as_str().map(|s| lower.contains(&s.to_lowercase())).unwrap_or(false));
+                if !any_present { continue; }
+            }
+        }
+        if let Some(pattern) = tpl["titlePattern"].as_str() {
+            if title_lower.contains(&pattern.to_lowercase()) { return Some(tpl); }
+        }
+        if let Some(keywords) = tpl["matchKeywords"].as_array() {
+            if !keywords.is_empty() {
+                let min_matches = tpl["minKeywordMatches"].as_u64().unwrap_or(keywords.len() as u64) as usize;
+                let hits = keywords.iter()
+                    .filter(|k| k.as_str().map(|s| lower.contains(&s.to_lowercase())).unwrap_or(false))
+                    .count();
+                if hits >= min_matches { return Some(tpl); }
+            }
+        }
+    }
+    None
+}
+
+// nvr_ tokens that are field/UI names, not entity logical names. Mirrors
+// mcp/task-workbench-mcp.mjs GENERIC_NVR_FIELD_EXCLUSIONS — keep in sync.
+fn task_mcp_generic_nvr_field_exclusions() -> &'static [&'static str] {
+    &[
+        "nvr_company", "nvr_name", "nvr_type", "nvr_status", "nvr_state", "nvr_date", "nvr_amount",
+        "nvr_note", "nvr_description", "nvr_reference", "nvr_code", "nvr_value", "nvr_flag",
+        "nvr_enabled", "nvr_active", "nvr_class", "nvr_group", "nvr_owner", "nvr_user", "nvr_email",
+        "nvr_phone", "nvr_address", "nvr_city", "nvr_country", "nvr_zip", "nvr_region", "nvr_category",
+        "nvr_priority", "nvr_order", "nvr_price", "nvr_quantity", "nvr_unit", "nvr_currency",
+    ]
+}
+
+/// Extracts the first explicit nvr_<entity> logical name from text, skipping known field-name
+/// tokens and trigger/event suffixes. Mirrors mcp/task-workbench-mcp.mjs extractExplicitNvrEntity
+/// — keep in sync. An explicit custom table name in the text always wins over a generic
+/// keyword/translation guess (this function never performs such a guess itself).
+fn task_mcp_extract_explicit_nvr_entity(text: &str) -> Option<String> {
+    let lower = text.to_lowercase();
+    let bytes = lower.as_bytes();
+    let mut i = 0usize;
+    while let Some(rel) = lower[i..].find("nvr_") {
+        let start = i + rel;
+        // word boundary before
+        let boundary_ok = start == 0 || !(bytes[start - 1].is_ascii_alphanumeric() || bytes[start - 1] == b'_');
+        let mut end = start + 4;
+        while end < bytes.len() && (bytes[end].is_ascii_alphanumeric() || bytes[end] == b'_') { end += 1; }
+        let token = &lower[start..end];
+        i = end.max(start + 4);
+        if !boundary_ok { continue; }
+        // bare = token without leading "nvr_"
+        let bare = &token[4..];
+        if bare.is_empty() || !bare.chars().next().unwrap().is_ascii_alphabetic() { continue; }
+        let bare_trimmed = bare
+            .trim_end_matches("_onchange")
+            .trim_end_matches("_onload")
+            .trim_end_matches("_onsave")
+            .trim_end_matches("_handler")
+            .trim_end_matches("_events");
+        let full = format!("nvr_{bare_trimmed}");
+        if task_mcp_generic_nvr_field_exclusions().contains(&full.as_str()) { continue; }
+        if bare_trimmed.split('_').count() > 3 { continue; }
+        return Some(full);
+    }
+    None
+}
+
+/// Best-effort setup inference for script tasks that do not match any built-in template. Mirrors
+/// mcp/task-workbench-mcp.mjs genericScriptSetupInference — keep in sync. Returns None when the
+/// text does not look like a script task, or no explicit nvr_ target entity is present.
+fn task_mcp_generic_script_setup_inference(task: &Value) -> Option<Value> {
+    let text = task_mcp_task_text_for_inference(task);
+    let lower = text.to_lowercase();
+    let looks_script = ["javascript", "jscript", "form script", "formscript", "web resource",
+        "on-load", "onload", "on load", "on-change", "onchange", "on change", "on-save", "onsave", "on save"]
+        .iter().any(|k| lower.contains(k));
+    if !looks_script { return None; }
+
+    let target_entity = task_mcp_extract_explicit_nvr_entity(&text)?;
+
+    let mut assumptions = vec![format!(
+        "Target entity inferred from explicit logical name \"{target_entity}\" named in the task description."
+    )];
+
+    // Explicit target file path, e.g. "Scripts\nvr_labservicecase_events.js"
+    let file_re_path = regex_lite_find_file_with_path(&text);
+    let mut scripts_folder_relative = "Scripts".to_string();
+    let desired_script_file: String;
+    if let Some((folder, file)) = file_re_path {
+        desired_script_file = file.clone();
+        if !folder.is_empty() { scripts_folder_relative = folder.replace('\\', "/"); }
+        assumptions.push(format!("Target script file inferred from explicit path in the task description."));
+    } else if let Some(file) = regex_lite_find_bare_js_file(&text) {
+        desired_script_file = file.clone();
+        assumptions.push(format!("Target script file inferred from explicit file name \"{file}\" in the task description."));
+    } else {
+        desired_script_file = format!("{target_entity}_events.js");
+        assumptions.push(format!("Target script file name defaulted from the target entity: {desired_script_file}."));
+    }
+
+    let on_load_handler = regex_lite_find_suffixed_identifier(&text, "_OnLoad");
+    let on_change_handler = regex_lite_find_suffixed_identifier(&text, "_OnChange");
+    if on_load_handler.is_some() || on_change_handler.is_some() {
+        assumptions.push("Handler function names taken literally from the task description.".to_string());
+    }
+
+    let has_on_load = lower.contains("on-load") || lower.contains("onload") || lower.contains("on load");
+    let event_field_name = regex_lite_find_onchange_field(&text);
+    let event_name = if event_field_name.is_some() { Some("onChange".to_string()) }
+        else if has_on_load { Some("onLoad".to_string()) } else { None };
+
+    let on_load_function_name = on_load_handler.clone()
+        .or_else(|| if has_on_load { Some(format!("{target_entity}_OnLoad")) } else { None });
+    let on_change_function_name = on_change_handler.clone()
+        .or_else(|| event_field_name.as_ref().map(|f| format!("{f}_OnChange")));
+
+    let action_type = if (lower.contains("update") || lower.contains("modify") || lower.contains("extend"))
+        && lower.contains("existing script") {
+        "update-existing-script"
+    } else {
+        "create-new-script"
+    };
+
+    let confidence = if on_load_handler.is_some() || on_change_handler.is_some() { "high" } else { "medium" };
+
+    Some(serde_json::json!({
+        "workKind": "script",
+        "actionType": action_type,
+        "targetEntity": target_entity,
+        "eventName": event_name,
+        "eventFieldName": event_field_name,
+        "scriptsFolderRelative": scripts_folder_relative,
+        "desiredScriptFile": desired_script_file,
+        "onLoadFunctionName": on_load_function_name,
+        "onChangeFunctionName": on_change_function_name,
+        "confidence": confidence,
+        "assumptions": assumptions,
+    }))
+}
+
+/// Finds the first "<folder>[\\/]<file>.js" token, returning (folder, file). Folder may contain
+/// nested "\\"/"/" separators; only the last segment before the file name is returned as folder.
+fn regex_lite_find_file_with_path(text: &str) -> Option<(String, String)> {
+    let bytes = text.as_bytes();
+    for (i, _) in text.match_indices(".js") {
+        // scan backward from i to collect a path token of [A-Za-z0-9_\\/]
+        let mut start = i;
+        while start > 0 {
+            let c = bytes[start - 1];
+            if c.is_ascii_alphanumeric() || c == b'_' || c == b'\\' || c == b'/' { start -= 1; } else { break; }
+        }
+        let token = &text[start..i + 3];
+        if !(token.contains('\\') || token.contains('/')) { continue; }
+        if !token.ends_with(".js") { continue; }
+        let filename_start = token.rfind(['\\', '/']).map(|p| p + 1).unwrap_or(0);
+        let folder = token[..filename_start.saturating_sub(1)].to_string();
+        let file = token[filename_start..].to_string();
+        if file.len() <= 3 { continue; }
+        return Some((folder, file));
+    }
+    None
+}
+
+fn regex_lite_find_bare_js_file(text: &str) -> Option<String> {
+    let bytes = text.as_bytes();
+    for (i, _) in text.match_indices(".js") {
+        let mut start = i;
+        while start > 0 {
+            let c = bytes[start - 1];
+            if c.is_ascii_alphanumeric() || c == b'_' { start -= 1; } else { break; }
+        }
+        let token = &text[start..i + 3];
+        if token.contains('\\') || token.contains('/') { continue; }
+        if token.len() <= 3 { continue; }
+        return Some(token.to_string());
+    }
+    None
+}
+
+/// Finds the first identifier ending in `suffix` (e.g. "_OnLoad"), case-sensitive to match the
+/// JS regex \b([A-Za-z][A-Za-z0-9_]*_OnLoad)\b.
+fn regex_lite_find_suffixed_identifier(text: &str, suffix: &str) -> Option<String> {
+    let bytes = text.as_bytes();
+    for (i, _) in text.match_indices(suffix) {
+        let end = i + suffix.len();
+        let mut start = i;
+        while start > 0 {
+            let c = bytes[start - 1];
+            if c.is_ascii_alphanumeric() || c == b'_' { start -= 1; } else { break; }
+        }
+        if start == i { continue; } // suffix alone, no identifier prefix
+        let first = bytes[start];
+        if !first.is_ascii_alphabetic() { continue; }
+        return Some(text[start..end].to_string());
+    }
+    None
+}
+
+/// Finds the field name in "onChange of `<field>`" / "on-change of <field>" /
+/// "<field> onChange" patterns (case-insensitive), mirroring the JS eventFieldMatch regexes.
+fn regex_lite_find_onchange_field(text: &str) -> Option<String> {
+    let lower = text.to_lowercase();
+    for marker in ["onchange of ", "on-change of ", "on change of "] {
+        if let Some(pos) = lower.find(marker) {
+            let rest = &text[pos + marker.len()..];
+            let rest = rest.trim_start_matches('`');
+            let mut end = 0;
+            let bytes = rest.as_bytes();
+            while end < bytes.len() && (bytes[end].is_ascii_alphanumeric() || bytes[end] == b'_') { end += 1; }
+            if end > 0 {
+                let field = &rest[..end];
+                if field.chars().next().map(|c| c.is_ascii_alphabetic()).unwrap_or(false) {
+                    return Some(field.to_string());
+                }
+            }
+        }
+    }
+    None
 }
 
 fn task_mcp_script_naming_from_template(task: &Value, template: Option<&Value>, defaults: Option<&Value>) -> Option<Value> {
@@ -9754,6 +10179,23 @@ fn task_mcp_plan_has_template_mapping(plan: &Value, template: Option<&Value>) ->
         let source = format!("{}.{}", source_entity, source_fields[i]);
         let target = format!("{}.{}", target_entity, target_fields[i]);
         actual.iter().any(|item| item["source"].as_str() == Some(source.as_str()) && item["target"].as_str() == Some(target.as_str()))
+    })
+}
+
+/// Snapshot of the setup fields relevant to the caller-facing proposedSetup/appliedSetup summary.
+/// Mirrors mcp/task-workbench-mcp.mjs snapshotProposedSetup — keep in sync.
+fn task_mcp_snapshot_proposed_setup(setup: &Value) -> Value {
+    serde_json::json!({
+        "workKind": setup["devTargetKind"].as_str(),
+        "actionType": setup["actionType"].as_str(),
+        "targetEntity": setup["primaryEntityLogicalName"].as_str(),
+        "eventName": setup["eventName"].as_str(),
+        "eventField": setup["eventFieldName"].as_str(),
+        "targetFile": setup["artifactPath"].as_str().or_else(|| setup["desiredScriptFile"].as_str()),
+        "handlers": {
+            "onLoad": setup["onLoadFunctionName"].as_str(),
+            "onChange": setup["onChangeFunctionName"].as_str(),
+        },
     })
 }
 
@@ -10180,7 +10622,7 @@ fn task_mcp_execute_tool(app: &tauri::AppHandle, tool_name: &str, args: &Value) 
         "get_task_templates" => {
             let matched = args["taskId"].as_str()
                 .and_then(|task_id| task_mcp_get_task(&tasks, task_id))
-                .and_then(|task| task_mcp_match_template(task["title"].as_str().unwrap_or("")));
+                .and_then(|task| task_mcp_match_template(task["title"].as_str().unwrap_or(""), &task_mcp_task_text_for_inference(task)));
             serde_json::json!({
                 "templates": task_mcp_builtin_templates(),
                 "matchedTemplate": matched,
@@ -10220,7 +10662,15 @@ fn task_mcp_execute_tool(app: &tauri::AppHandle, tool_name: &str, args: &Value) 
                 .to_string();
             let dev_defaults = task_mcp_find_customer(&customers, &customer_id)
                 .and_then(|c| task_mcp_customer_dev_defaults(c, &crm_base_dir));
-            let template = task_mcp_match_template(tasks[index]["title"].as_str().unwrap_or(""));
+            let template = task_mcp_match_template(
+                tasks[index]["title"].as_str().unwrap_or(""),
+                &task_mcp_task_text_for_inference(&tasks[index]),
+            );
+            let generic_inference = if template.is_none() {
+                task_mcp_generic_script_setup_inference(&tasks[index])
+            } else {
+                None
+            };
             let now = chrono_now_iso();
 
             let mut applied: Vec<&str> = Vec::new();
@@ -10232,6 +10682,8 @@ fn task_mcp_execute_tool(app: &tauri::AppHandle, tool_name: &str, args: &Value) 
             let mut warnings: Vec<String> = Vec::new();
             let mut missing: Vec<String> = Vec::new();
             let mut gates: Vec<Value> = Vec::new();
+            let mut confidence = "none".to_string();
+            let mut assumptions: Vec<String> = Vec::new();
 
             {
                 let task = &mut tasks[index];
@@ -10258,9 +10710,58 @@ fn task_mcp_execute_tool(app: &tauri::AppHandle, tool_name: &str, args: &Value) 
                     if let Some(entity) = tpl["pluginTarget"]["entityLogicalName"].as_str() {
                         task["workflowSetup"]["primaryEntityLogicalName"] = serde_json::json!(entity);
                     }
+                    // Persist the template's implementation-pattern semantics into workflowSetup
+                    // itself, so a later readiness/packet build does not depend on re-matching
+                    // this template. Mirrors mcp/task-workbench-mcp.mjs prepareDeveloperTaskInMemory.
+                    if let Some(v) = tpl["implementationPattern"].as_str() { task["workflowSetup"]["implementationPattern"] = serde_json::json!(v); }
+                    if let Some(v) = tpl["requiresFieldMappings"].as_bool() { task["workflowSetup"]["requiresFieldMappings"] = serde_json::json!(v); }
+                    if tpl["referencedFields"].is_array() { task["workflowSetup"]["referencedFields"] = tpl["referencedFields"].clone(); }
+                    if tpl["triggerFields"].is_array() { task["workflowSetup"]["triggerFields"] = tpl["triggerFields"].clone(); }
+                    if tpl["affectedFields"].is_array() { task["workflowSetup"]["affectedFields"] = tpl["affectedFields"].clone(); }
+                    if tpl["uiRules"].is_array() { task["workflowSetup"]["uiRules"] = tpl["uiRules"].clone(); }
+                    if tpl["optionSetValues"].is_object() { task["workflowSetup"]["optionSetValues"] = tpl["optionSetValues"].clone(); }
+                    if tpl["notificationIds"].is_array() { task["workflowSetup"]["notificationIds"] = tpl["notificationIds"].clone(); }
+                    if tpl["forbiddenOperations"].is_array() { task["workflowSetup"]["forbiddenOperations"] = tpl["forbiddenOperations"].clone(); }
                     task["crmDeveloperWorkflow"]["detectedWorkKind"] = serde_json::json!(work_kind);
                     task["crmDeveloperWorkflow"]["updatedAt"] = serde_json::json!(now);
                     applied.extend(["applied_template", "set_task_mode", "set_task_work_classification"]);
+                    confidence = "high".to_string();
+                    assumptions.push(format!(
+                        "Setup proposed from built-in template \"{}\" matched against the task title/description.",
+                        tpl["id"].as_str().unwrap_or("")
+                    ));
+                } else if let Some(ref inferred) = generic_inference {
+                    // No built-in template matched. Fall back to a best-effort inference from
+                    // explicit facts in the task text, so an explicit assignment does not force a
+                    // hard "set it manually" blocker. Never applied over an already-set value.
+                    task["taskMode"] = serde_json::json!("developer");
+                    if task["workflowSetup"].is_null() { task["workflowSetup"] = serde_json::json!({}); }
+                    if task["crmDeveloperWorkflow"].is_null() { task["crmDeveloperWorkflow"] = serde_json::json!({"createdAt": now}); }
+                    let s = &mut task["workflowSetup"];
+                    if s["devTargetKind"].as_str().unwrap_or("").is_empty() { s["devTargetKind"] = serde_json::json!("script"); }
+                    if s["workIntent"].as_str().unwrap_or("").is_empty() {
+                        let action_type = inferred["actionType"].as_str().unwrap_or("create-new-script");
+                        s["workIntent"] = serde_json::json!(if action_type.starts_with("create-") { "create" } else { "update" });
+                    }
+                    if s["actionType"].as_str().unwrap_or("").is_empty() { s["actionType"] = inferred["actionType"].clone(); }
+                    if s["primaryEntityLogicalName"].as_str().unwrap_or("").is_empty() { s["primaryEntityLogicalName"] = inferred["targetEntity"].clone(); }
+                    if s["eventName"].as_str().unwrap_or("").is_empty() && !inferred["eventName"].is_null() { s["eventName"] = inferred["eventName"].clone(); }
+                    if s["eventFieldName"].as_str().unwrap_or("").is_empty() && !inferred["eventFieldName"].is_null() { s["eventFieldName"] = inferred["eventFieldName"].clone(); }
+                    if s["scriptPath"].as_str().unwrap_or("").is_empty() { s["scriptPath"] = inferred["scriptsFolderRelative"].clone(); }
+                    if s["desiredScriptFile"].as_str().unwrap_or("").is_empty() { s["desiredScriptFile"] = inferred["desiredScriptFile"].clone(); }
+                    if s["namingSource"].as_str().unwrap_or("").is_empty() { s["namingSource"] = serde_json::json!("Scripts_Naming"); }
+                    if s["onLoadFunctionName"].as_str().unwrap_or("").is_empty() && !inferred["onLoadFunctionName"].is_null() { s["onLoadFunctionName"] = inferred["onLoadFunctionName"].clone(); }
+                    if s["onChangeFunctionName"].as_str().unwrap_or("").is_empty() && !inferred["onChangeFunctionName"].is_null() { s["onChangeFunctionName"] = inferred["onChangeFunctionName"].clone(); }
+                    if task["crmDeveloperWorkflow"]["detectedWorkKind"].as_str().unwrap_or("").is_empty() {
+                        task["crmDeveloperWorkflow"]["detectedWorkKind"] = serde_json::json!("script");
+                    }
+                    task["crmDeveloperWorkflow"]["updatedAt"] = serde_json::json!(now);
+                    applied.extend(["applied_generic_inference", "set_task_mode", "set_task_work_classification"]);
+                    confidence = inferred["confidence"].as_str().unwrap_or("medium").to_string();
+                    assumptions.extend(
+                        inferred["assumptions"].as_array().cloned().unwrap_or_default()
+                            .iter().filter_map(|v| v.as_str().map(str::to_string))
+                    );
                 }
 
                 if let Some(ref defaults) = dev_defaults {
@@ -10336,12 +10837,22 @@ fn task_mcp_execute_tool(app: &tauri::AppHandle, tool_name: &str, args: &Value) 
                 if work_kind.is_empty() || work_kind == "unknown" { missing.push("workKind".into()); }
                 if action_type.is_empty() { missing.push("actionType".into()); }
                 if task["workflowSetup"]["primaryEntityLogicalName"].as_str().unwrap_or("").is_empty() { missing.push("targetEntity".into()); }
-                if dev_target_kind == "script"
-                    && action_type == "create-new-script"
-                    && (task["workflowSetup"]["scriptPath"].as_str().unwrap_or("").is_empty()
-                        || task["workflowSetup"]["desiredScriptFile"].as_str().unwrap_or("").is_empty()
-                        || task["workflowSetup"]["artifactPath"].as_str().unwrap_or("").is_empty()) {
-                    missing.push("script target path".into());
+                if dev_target_kind == "script" && action_type == "create-new-script" {
+                    // Mirrors task_mcp_implementation_readiness's OR-based script-target check: a
+                    // specific artifactPath alone is sufficient, it does not also require the
+                    // separate bare scriptPath (folder) field. A customer without an explicit
+                    // scriptFolder (only crmBaseDirectory + folderName) never populates
+                    // workflowSetup.scriptPath, even once artifactPath/desiredScriptFile are
+                    // correctly resolved from the template/naming step.
+                    let script_path = task["workflowSetup"]["scriptPath"].as_str().unwrap_or("");
+                    let artifact_path = task["workflowSetup"]["artifactPath"].as_str().unwrap_or("");
+                    let desired_file = task["workflowSetup"]["desiredScriptFile"].as_str().unwrap_or("");
+                    let is_specific = |p: &str| p.ends_with(".js") || p.ends_with(".ts") || p.ends_with(".jsx") || p.ends_with(".tsx");
+                    let has_dir = !script_path.is_empty() || !artifact_path.is_empty();
+                    let has_file_name = is_specific(artifact_path) || is_specific(script_path) || !desired_file.is_empty();
+                    if !has_dir || !has_file_name {
+                        missing.push("script target path".into());
+                    }
                 }
                 if dev_target_kind == "plugin" && task["workflowSetup"]["pluginProject"].as_str().unwrap_or("").is_empty() {
                     missing.push("plugin project".into());
@@ -10405,16 +10916,25 @@ fn task_mcp_execute_tool(app: &tauri::AppHandle, tool_name: &str, args: &Value) 
             detail["implementationReadiness"] = readiness.clone();
             if let Some(ref dd) = dev_defaults { detail["customerDevDefaults"] = dd.clone(); }
             updated = true;
+            let applied_actions: Vec<&str> = applied.into_iter().collect::<HashSet<_>>().into_iter().collect();
+            let requires_user_confirmation = applied_actions.contains(&"applied_template") || applied_actions.contains(&"applied_generic_inference");
+            let applied_setup = task_mcp_snapshot_proposed_setup(&task["workflowSetup"]);
             serde_json::json!({
                 "taskId": task_id,
                 "status": status,
-                "appliedActions": applied.into_iter().collect::<HashSet<_>>().into_iter().collect::<Vec<_>>(),
+                "appliedActions": applied_actions,
                 "skippedActions": skipped,
                 "hardBlockers": hard_blockers,
                 "approvalGates": gates,
                 "warnings": warnings,
                 "missingInputs": missing,
                 "implementationReadiness": readiness,
+                "proposedSetup": applied_setup.clone(),
+                "appliedSetup": applied_setup,
+                "confidence": confidence,
+                "assumptions": assumptions,
+                "requiresUserConfirmation": requires_user_confirmation,
+                "businessRules": template.as_ref().and_then(|t| t["businessRules"].as_array()).cloned().unwrap_or_default(),
                 "task": detail,
             })
         }
@@ -17132,7 +17652,7 @@ mod developer_work_packet_tests {
 
     #[test]
     fn template_match_finds_nvr_training_script_title() {
-        let tpl = task_mcp_match_template("Script: \u{50}\u{159}edvyplnění servisn\u{ed}ho po\u{17e}adavku");
+        let tpl = task_mcp_match_template("Script: \u{50}\u{159}edvyplnění servisn\u{ed}ho po\u{17e}adavku", "");
         assert!(tpl.is_some(), "task_mcp_match_template must match Czech NVR training script title");
         assert_eq!(
             tpl.as_ref().and_then(|t| t["sourceEntity"].as_str()),
@@ -17367,6 +17887,217 @@ mod developer_work_packet_tests {
             Some(true),
             "canWriteCode must be true after approval is set on a valid template task; got packet: {:?}", packet["decisionReason"]
         );
+    }
+
+    // ── ui-business-rule implementation pattern (Rust live bridge parity with the JS fallback) ──
+
+    fn make_lab_ui_business_rule_task() -> Value {
+        serde_json::json!({
+            "id": "task-lab-ui-br",
+            "title": "[TEST] Script: Povinný popis pro vysokou prioritu servisního případu",
+            "status": "in-progress",
+            "taskMode": "developer",
+            "customerId": "cust-lab",
+            "originalMessage": "Create a JavaScript form script for the NVR Training Automation Lab table `nvr_labservicecase`. Target file: Scripts\\nvr_labservicecase_events.js. Events: Form OnLoad, OnChange of `nvr_priority`. Handlers: `nvr_labservicecase_OnLoad`, `nvr_priority_OnChange`. Logic: if nvr_priority is High (100000002), make nvr_description required and show a notification, otherwise make nvr_description not required and clear the notification.",
+            "workflowSetup": {
+                "devTargetKind": "script",
+                "actionType": "create-new-script",
+                "primaryEntityLogicalName": "nvr_labservicecase",
+                "repositoryRoot": "C:/repos/Lab",
+                "artifactPath": "Scripts/nvr_labservicecase_events.js",
+                "desiredScriptFile": "nvr_labservicecase_events.js",
+                "confirmedAt": "2026-06-01T10:00:00Z",
+                "eventName": "onChange",
+                "eventFieldName": "nvr_priority",
+                "onLoadFunctionName": "nvr_labservicecase_OnLoad",
+                "onChangeFunctionName": "nvr_priority_OnChange",
+                "implementationPattern": "ui-business-rule",
+                "requiresFieldMappings": false,
+                "referencedFields": ["nvr_priority", "nvr_description"],
+                "triggerFields": ["nvr_priority"],
+                "affectedFields": ["nvr_description"],
+            },
+            "crmDeveloperWorkflow": {
+                "detectedWorkKind": "script",
+                "planApproval": Value::Null,
+                "technicalPlan": {
+                    "workKind": "script",
+                    "summary": "Toggle nvr_description required level based on nvr_priority.",
+                    "implementationSteps": [
+                        "Use the selected script target Scripts/nvr_labservicecase_events.js.",
+                        "Implement create-new-script for nvr_labservicecase.",
+                        "Keep external Dataverse registration/upload as a manual approved action outside this setup step.",
+                    ],
+                    "fieldMappings": [],
+                    "unmappedSourceFields": [],
+                    "risks": [],
+                    "testChecklist": [],
+                    "target": {
+                        "entityLogicalName": "nvr_labservicecase",
+                        "eventName": "onChange",
+                        "eventFieldName": "nvr_priority",
+                    }
+                }
+            },
+            "crmVerificationReports": [{ "verdict": "pass" }],
+        })
+    }
+
+    #[test]
+    fn lab_task_template_matches_only_with_explicit_logical_name_in_description() {
+        // Title alone (no nvr_labservicecase anywhere) must not match the lab template.
+        let title = "[TEST] Script: Povinný popis pro vysokou prioritu servisního případu";
+        assert!(task_mcp_match_template(title, "").is_none(),
+            "Lab template must not match from the title alone with no explicit logical name");
+
+        // Explicit logical names in the description must match, regardless of title wording.
+        let matched = task_mcp_match_template("Some other title entirely", "nvr_labservicecase nvr_priority nvr_description");
+        assert_eq!(matched.and_then(|t| t["id"].as_str().map(str::to_string)),
+            Some("nvr-training-automation-lab-servicecase-priority-description".to_string()));
+    }
+
+    #[test]
+    fn lab_task_work_packet_reports_ui_business_rule_pattern_with_no_field_mappings() {
+        let task = make_lab_ui_business_rule_task();
+        let packet = task_mcp_developer_work_packet(&task, None, None);
+        let impl_obj = &packet["implementation"];
+        assert_eq!(impl_obj["implementationPattern"].as_str(), Some("ui-business-rule"));
+        assert_eq!(impl_obj["requiresFieldMappings"].as_bool(), Some(false));
+        assert_eq!(impl_obj["fieldMappings"].as_array().map(|a| a.len()), Some(0));
+        assert_eq!(impl_obj["scaffoldOnly"].as_bool(), Some(false));
+        assert_eq!(impl_obj["referencedFields"].as_array().cloned(),
+            Some(vec![serde_json::json!("nvr_priority"), serde_json::json!("nvr_description")]));
+        assert_eq!(impl_obj["affectedFields"].as_array().cloned(), Some(vec![serde_json::json!("nvr_description")]));
+    }
+
+    #[test]
+    fn lab_task_does_not_fabricate_priority_to_description_mapping() {
+        // Regression: the lab template must not declare sourceFields/targetFields — doing so
+        // would make task_mcp_prepare_plan_draft synthesize a fake mapping (the priority value is
+        // never copied anywhere; only its required-level is toggled).
+        let mut task = make_lab_ui_business_rule_task();
+        task["crmDeveloperWorkflow"] = Value::Null;
+        let template = task_mcp_match_template(task["title"].as_str().unwrap(), &task_mcp_task_text_for_inference(&task));
+        assert!(template.is_some(), "Precondition: lab template must match");
+        let plan = task_mcp_prepare_plan_draft(&task, template.as_ref()).expect("plan draft must be produced");
+        assert_eq!(plan["fieldMappings"].as_array().map(|a| a.len()), Some(0),
+            "Must not fabricate a field mapping for a ui-business-rule script; got: {:?}", plan["fieldMappings"]);
+    }
+
+    #[test]
+    fn lab_task_approve_technical_plan_if_safe_approves_without_field_mappings() {
+        let task = make_lab_ui_business_rule_task();
+        let packet = task_mcp_developer_work_packet(&task, None, None);
+        let reasons = task_mcp_plan_approval_safety_check(&task, &packet);
+        assert!(reasons.is_empty(), "Expected no safety blocks for the lab ui-business-rule task, got: {:?}", reasons);
+    }
+
+    #[test]
+    fn lab_task_can_write_code_true_after_approval() {
+        let mut task = make_lab_ui_business_rule_task();
+        task["crmDeveloperWorkflow"]["planApproval"] = serde_json::json!({
+            "approved": true,
+            "approvedAt": "2026-06-29T10:00:00Z",
+        });
+        let packet = task_mcp_developer_work_packet(&task, None, None);
+        assert_eq!(packet["canWriteCode"].as_bool(), Some(true),
+            "canWriteCode must be true once the ui-business-rule plan is approved; decisionReason: {:?}", packet["decisionReason"]);
+        assert_eq!(packet["implementation"]["fieldMappings"].as_array().map(|a| a.len()), Some(0));
+        assert_eq!(packet["implementation"]["scaffoldOnly"].as_bool(), Some(false));
+    }
+
+    #[test]
+    fn lab_task_approval_blocked_when_business_context_incomplete() {
+        // Waiving fieldMappings for ui-business-rule must not waive scrutiny outright — missing
+        // target entity/file/event/fields/business rules still blocks auto-approval. Breaks the
+        // template match too (title/description changed), so targetEntity has no fallback left:
+        // implementationPattern still comes from the persisted workflowSetup, but the entity does
+        // not, isolating exactly the "target entity is not set" condition.
+        let mut task = make_lab_ui_business_rule_task();
+        task["workflowSetup"]["primaryEntityLogicalName"] = Value::Null;
+        task["crmDeveloperWorkflow"]["technicalPlan"]["target"]["entityLogicalName"] = Value::Null;
+        task["title"] = serde_json::json!("Generic follow-up task");
+        task["originalMessage"] = serde_json::json!("Please double check the earlier change.");
+        assert!(task_mcp_match_template(task["title"].as_str().unwrap(), &task_mcp_task_text_for_inference(&task)).is_none(),
+            "Precondition: template must no longer match so targetEntity has no template fallback");
+        let packet = task_mcp_developer_work_packet(&task, None, None);
+        let reasons = task_mcp_plan_approval_safety_check(&task, &packet);
+        assert!(reasons.iter().any(|r| r.contains("Target entity is not set")),
+            "Expected a target-entity reason, got: {:?}", reasons);
+    }
+
+    #[test]
+    fn lab_task_work_packet_reads_workflow_setup_before_template_when_template_no_longer_matches() {
+        // Once persisted, the pattern/fields must survive a task text edit that no longer
+        // re-matches the template — workflowSetup wins over the (now absent) template.
+        let mut task = make_lab_ui_business_rule_task();
+        task["title"] = serde_json::json!("Generic follow-up task");
+        task["originalMessage"] = serde_json::json!("Please double check the earlier change.");
+        assert!(task_mcp_match_template(task["title"].as_str().unwrap(), &task_mcp_task_text_for_inference(&task)).is_none(),
+            "Precondition: template must no longer match after the text edit");
+
+        let packet = task_mcp_developer_work_packet(&task, None, None);
+        let impl_obj = &packet["implementation"];
+        assert_eq!(impl_obj["implementationPattern"].as_str(), Some("ui-business-rule"));
+        assert_eq!(impl_obj["requiresFieldMappings"].as_bool(), Some(false));
+        assert_eq!(impl_obj["fieldMappings"].as_array().map(|a| a.len()), Some(0));
+        assert_eq!(impl_obj["scaffoldOnly"].as_bool(), Some(false));
+        assert_eq!(impl_obj["affectedFields"].as_array().cloned(), Some(vec![serde_json::json!("nvr_description")]));
+    }
+
+    #[test]
+    fn field_mapping_prefill_template_still_requires_field_mappings_unaffected_by_ui_business_rule_fix() {
+        let task = make_template_task_no_plan_mappings();
+        let packet = task_mcp_developer_work_packet(&task, None, None);
+        assert_eq!(packet["implementation"]["implementationPattern"].as_str(), Some("field-mapping"));
+        assert_eq!(packet["implementation"]["requiresFieldMappings"].as_bool(), Some(true));
+    }
+
+    #[test]
+    fn lab_template_matches_the_exact_real_czech_task_text() {
+        // Uses the literal title/originalMessage from the real NVR Training Automation Lab task
+        // (474ae9c3-0533-4d2d-b930-f914aa7c4148), to verify Czech diacritics don't break the
+        // requiredKeywords/matchKeywords lowercase comparison against the actual live text.
+        let title = "[TEST] Script: Povinný popis pro vysokou prioritu servisního případu";
+        let original_message = r#"Co:
+V testovací aplikaci NVR Training Automation Lab vytvořit jednoduchý JavaScript formulářový script pro tabulku Lab Service Case.
+
+Cíl:
+Na formuláři Lab Service Case řídit pole Description podle hodnoty Priority.
+
+Tabulka:
+- nvr_labservicecase
+
+Cílový soubor:
+- Scripts\nvr_labservicecase_events.js
+
+Události:
+- Form OnLoad
+- OnChange pole nvr_priority
+
+Handler names:
+- nvr_labservicecase_OnLoad
+- nvr_priority_OnChange
+
+Business logika:
+1. Při načtení formuláře i při změně pole nvr_priority se vyhodnotí aktuální priorita.
+2. Pokud je nvr_priority = High (100000002):
+   - pole nvr_description se nastaví jako required
+   - na poli nvr_description se zobrazí form notification:
+     "For high priority cases, description is required."
+3. Pokud je nvr_priority prázdné, Low (100000000) nebo Normal (100000001):
+   - pole nvr_description se nastaví jako not required
+   - notification na nvr_description se odstraní"#;
+        let task = serde_json::json!({ "title": title, "originalMessage": original_message });
+        let matched = task_mcp_match_template(title, &task_mcp_task_text_for_inference(&task));
+        assert_eq!(
+            matched.and_then(|t| t["id"].as_str().map(str::to_string)),
+            Some("nvr-training-automation-lab-servicecase-priority-description".to_string()),
+            "Lab template must match the real task's exact Czech title/description"
+        );
+        let inferred_entity = task_mcp_extract_explicit_nvr_entity(&task_mcp_task_text_for_inference(&task));
+        assert_eq!(inferred_entity, Some("nvr_labservicecase".to_string()),
+            "Explicit nvr_labservicecase in the real description must win over the generic Czech title wording — must not become 'incident'");
     }
 
     // ── task_mcp_apply_developer_workflow_transition: canonical workflow phase ───────────────
