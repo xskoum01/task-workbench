@@ -295,6 +295,32 @@ export type ImplCheckStatus =
 
 export type LocalTestImplStatus = 'not-run' | 'passed' | 'failed' | 'not-needed';
 
+/**
+ * Hard-gate status for the Dataverse Metadata Check, derived by normalizeDataverseGate
+ * (src/lib/implementationGate.ts) from the raw check status plus whether warnings have been
+ * explicitly accepted. Mirrors task_mcp_normalize_dataverse_gate in src-tauri/src/lib.rs.
+ */
+export type DataverseGateStatus = 'passed' | 'warnings_unaccepted' | 'failed' | 'needs_configuration' | 'not_run';
+
+/**
+ * Hard-gate status for the AI Kit Code Review, derived by getAiKitReviewGate
+ * (src/lib/implementationGate.ts). Mirrors task_mcp_ai_kit_review_gate in src-tauri/src/lib.rs.
+ */
+export type AiReviewGateStatus = 'passed' | 'incomplete' | 'failed' | 'pending' | 'not_run';
+
+/**
+ * Persisted, visible acceptance record for Dataverse Metadata Check warnings. Set only via an
+ * explicit user action in the Implementation Verification modal (accept_dataverse_warnings) —
+ * never set implicitly by the AI or by running the check again.
+ */
+export interface DataverseWarningsAccepted {
+  accepted: boolean;
+  acceptedAt?: string;
+  acceptedBy?: 'user' | 'ai';
+  reason?: string;
+  acceptedWarningIds?: string[];
+}
+
 /** Single optional verification check record — Dataverse check or AI code review. */
 export interface ImplCheckRecord {
   status: ImplCheckStatus;
@@ -306,6 +332,26 @@ export interface ImplCheckRecord {
   manuallyVerifiedAt?: string;
   summary?: string;
   findings?: string[];
+  /** Files actually reviewed for this AI Kit review result. */
+  reviewedFiles?: string[];
+  /** Where the review came from (e.g. "ai-kit", "settings", "legacy"). */
+  reviewSource?: string;
+  /** Findings the AI Kit review judged fixable — a non-empty list blocks the hard gate. */
+  fixableFindings?: Array<{ id: string; description: string }>;
+  /** Findings the reviewer judged non-blocking/informational. */
+  nonFixableWarnings?: string[];
+  /** AI Kit rules files consulted for this review. */
+  rulesFiles?: string[];
+  /** CRM code review checklist files consulted for this review. */
+  checklistFiles?: string[];
+  /** Known PR review comment files consulted for this review. */
+  knownPrReviewFiles?: string[];
+  /** Checklist items explicitly checked during this review. */
+  checkedItems?: string[];
+  /** Checklist items explicitly skipped during this review, with a reason. */
+  skippedItems?: Array<{ item: string; reason: string } | string>;
+  /** Timestamp the review was recorded, if distinct from runAt. */
+  reviewedAt?: string;
 }
 
 /** Local test record inside the implementation verification block. */
@@ -315,17 +361,31 @@ export interface ImplLocalTestRecord {
   notes?: string;
 }
 
+/** Manual override state for the Dataverse Metadata Check, plus hard-gate detail fields. */
+export interface DataverseCheckOverride extends Omit<Pick<ImplCheckRecord, 'status' | 'skippedAt' | 'skippedReason' | 'manuallyVerifiedAt'>, 'status'> {
+  /** Adds 'needs_configuration' — set when the Primarch/Dataverse connection is missing or the active environment doesn't match the task's expected environment. */
+  status: ImplCheckStatus | 'needs_configuration';
+  /** User's explicit acceptance of the current Dataverse warnings — required to pass the gate. */
+  warningsAccepted?: DataverseWarningsAccepted;
+  /** Expected vs. active Dataverse/Primarch environment for this task, and whether they mismatch. */
+  environment?: { expected?: string; active?: string; mismatch: boolean };
+  /** Human-readable status message for display in the modal. */
+  message?: string;
+}
+
 /**
  * Optional Development-phase verification state.
- * All four checks are non-blocking — the task stays in Development regardless.
+ * Build and Local Test remain non-blocking soft checks. Dataverse Metadata Check and AI Internal
+ * Code Review are hard gates (see src/lib/implementationGate.ts) that block moving the task to
+ * Code Review / Waiting for PR unless they cleanly pass or the user explicitly accepts warnings.
  * dataverseCheck.status = 'not-run' or undefined means no manual override;
  * the displayed status is derived from task.crmVerificationReports[0].verdict.
  */
 export interface ImplementationVerification {
   /** Build / project readiness check result. */
   buildCheck?: ImplCheckRecord;
-  /** Manual override for Dataverse check status (skipped / manually-verified). */
-  dataverseCheck?: Pick<ImplCheckRecord, 'status' | 'skippedAt' | 'skippedReason' | 'manuallyVerifiedAt'>;
+  /** Manual override for Dataverse check status (skipped / manually-verified), plus gate detail. */
+  dataverseCheck?: DataverseCheckOverride;
   /** AI internal code review result. */
   aiCodeReview?: ImplCheckRecord;
   /** Local test record. */
@@ -494,6 +554,29 @@ export interface Task {
    * Used by delete_test_task to guard against accidental deletion of real tasks.
    */
   mcpTestTask?: boolean;
+
+  /**
+   * Git branch/commit workflow state for this task. Written by the MCP tools
+   * `create_or_checkout_task_branch`, `commit_task_changes`, `push_task_branch`, and
+   * `commit_and_push_task_changes` (see src-tauri/src/lib.rs, search "gitWorkflow").
+   * The Tauri-only UI path (createOrCheckoutTaskBranch, commitTaskChanges, ...) does not
+   * write this field automatically — callers update it explicitly via updateTask.
+   */
+  gitWorkflow?: GitWorkflowState;
+}
+
+/** See the `gitWorkflow` field doc comment on `Task` for who writes each field. */
+export interface GitWorkflowState {
+  /** Set only by create_or_checkout_task_branch after the user approved this exact name. */
+  confirmedBranch?: string;
+  confirmedAt?: string;
+  /** Set only when create_or_checkout_task_branch actually created a new branch (vs. checking out an existing one). */
+  branchCreatedAt?: string;
+  lastCommitHash?: string;
+  lastCommitAt?: string;
+  lastCommitBranch?: string;
+  lastPushedBranch?: string;
+  lastPushedAt?: string;
 }
 
 export type ClassificationState = 'pending' | 'analyzed' | 'rejected' | 'created';
@@ -667,6 +750,12 @@ export interface Customer {
   jsConventionsSource?: string;
   /** Path to a reference C# plugin file used as the coding conventions source for AI-generated plugins. */
   pluginConventionsSource?: string;
+  /**
+   * Expected Dataverse environment label for this customer (e.g. "contoso-prod"). Compared
+   * against the active Primarch connection's environment label (settings.primarchMcpEnvironmentLabel)
+   * to catch a mismatched connection before running the Dataverse Metadata Check.
+   */
+  dataverseEnvironmentLabel?: string;
 }
 
 /**
@@ -893,6 +982,13 @@ export interface AppSettings {
   primarchMcpLastStatus?: 'not_configured' | 'connected' | 'error';
   /** Last MCP connection error message (redacted of secrets). */
   primarchMcpLastError?: string;
+  /**
+   * Environment label of the active Primarch connection (e.g. "contoso-prod"). Compared against
+   * a customer's Customer.dataverseEnvironmentLabel to catch a mismatched connection before
+   * running the Dataverse Metadata Check. Default "" — no expected/active mismatch is reported
+   * until both sides are configured.
+   */
+  primarchMcpEnvironmentLabel?: string;
 
   // ── Power Platform AI Kit ─────────────────────────────────────────────────
   /**
@@ -1351,6 +1447,23 @@ export interface GitCommitPreview {
   aheadCount?: number;
   /** True when the working tree is clean and there are unpushed commits ready to push. */
   pushableWithoutCommit?: boolean;
+  /** Deterministically generated suggested branch name for this task (see generateBranchName). */
+  proposedBranchName?: string | null;
+  /** True when a local branch named `proposedBranchName` already exists. */
+  branchExists?: boolean;
+  /**
+   * Always `false` from this preview — get_git_commit_preview / prepare_commit_for_task is
+   * read-only and never creates a branch. Only create_or_checkout_task_branch can create one.
+   */
+  branchCreated: boolean;
+  /** Always `false` from this preview — this call never checks out a branch either. */
+  checkoutPerformed: boolean;
+  /** 'ready_to_commit' when already on the proposed branch (or none proposed); otherwise approval is needed first. */
+  nextAction?: 'ready_to_commit' | 'ask_user_to_approve_branch_creation';
+  /** Task-implementation files that are ignored by the repo's real .gitignore and were excluded from changedFiles. */
+  gitIgnoredTaskFiles?: string[];
+  /** The set of choices the UI must offer for each entry in gitIgnoredTaskFiles. */
+  gitIgnoredTaskFileOptions?: Array<'force-add' | 'update-gitignore' | 'leave-untracked'>;
 }
 
 export interface GitCommitResult {

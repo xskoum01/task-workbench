@@ -259,9 +259,18 @@ export function getGitCommitPreview(repoRoot: string, taskJson?: unknown): Promi
   return invoke('get_git_commit_preview', { repoRoot, taskJson: taskJson ?? null });
 }
 
-/** Stages the listed files and creates a git commit. */
-export function commitTaskChanges(repoRoot: string, files: string[], message: string): Promise<GitCommitResult> {
-  return invoke('commit_task_changes', { repoRoot, files, message });
+/**
+ * Stages the listed files and creates a git commit.
+ * `forceAddFiles` (optional) force-adds specific `.gitignore`-matched paths — only pass paths
+ * the user explicitly approved via the "Force-add" action on a gitignored task file.
+ */
+export function commitTaskChanges(
+  repoRoot: string,
+  files: string[],
+  message: string,
+  forceAddFiles?: string[],
+): Promise<GitCommitResult> {
+  return invoke('commit_task_changes', { repoRoot, files, message, forceAddFiles: forceAddFiles ?? null });
 }
 
 /** Pushes the current branch to origin. Blocks main/master; no force push. */
@@ -269,9 +278,17 @@ export function pushTaskBranch(repoRoot: string): Promise<GitPushResult> {
   return invoke('push_task_branch', { repoRoot });
 }
 
-/** Stages files, commits, then pushes — single-step wrapper. */
-export function commitAndPushTaskChanges(repoRoot: string, files: string[], message: string): Promise<GitPushResult> {
-  return invoke('commit_and_push_task_changes', { repoRoot, files, message });
+/**
+ * Stages files, commits, then pushes — single-step wrapper.
+ * `forceAddFiles` (optional) — see commitTaskChanges.
+ */
+export function commitAndPushTaskChanges(
+  repoRoot: string,
+  files: string[],
+  message: string,
+  forceAddFiles?: string[],
+): Promise<GitPushResult> {
+  return invoke('commit_and_push_task_changes', { repoRoot, files, message, forceAddFiles: forceAddFiles ?? null });
 }
 
 /**
@@ -281,6 +298,24 @@ export function commitAndPushTaskChanges(repoRoot: string, files: string[], mess
  */
 export function createGitBranch(repoRoot: string, branchName: string): Promise<{ ok: boolean; branch: string }> {
   return invoke('create_git_branch', { repoRoot, branchName });
+}
+
+/**
+ * Creates (from the current HEAD — no fetch, no rebase onto a remote base) or checks out the
+ * given branch. Use this for the "AI proposed a name, user approved it" moment — unlike
+ * createGitBranch, this never fetches from origin and never rejects because the branch already
+ * exists (it checks it out instead). Never force-checks-out: if git refuses because uncommitted
+ * changes would be overwritten, that refusal is surfaced as an error verbatim. Never commits
+ * or pushes.
+ */
+export function createOrCheckoutTaskBranch(repoRoot: string, branchName: string): Promise<{
+  ok: boolean;
+  previousBranch: string;
+  currentBranch: string;
+  branchCreated: boolean;
+  branchCheckedOut: boolean;
+}> {
+  return invoke('create_or_checkout_task_branch_command', { repoRoot, branchName });
 }
 
 /** Scans a C# file for Dataverse logical-name references using the Rust scanner (same as MCP path). */

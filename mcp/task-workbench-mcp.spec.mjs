@@ -932,7 +932,7 @@ describe('callToolFallback continue_developer_workflow', () => {
     }
   });
 
-  it('returns propose_branch with requiresUserApproval=true after all verifications done', async () => {
+  it('returns propose_branch recommending create_or_checkout_task_branch when no branch is confirmed yet', async () => {
     const os = await import('node:os');
     const fs = await import('node:fs/promises');
     const path = await import('node:path');
@@ -944,8 +944,20 @@ describe('callToolFallback continue_developer_workflow', () => {
       workflowSetup: { devTargetKind: 'script', repositoryRoot: 'C:\\Repo', artifactPath: 'Scripts\\nvr.js' },
       crmDeveloperWorkflow: { detectedWorkKind: 'script' },
       localTestRecord: { status: 'passed', updatedAt: '2026-06-15T10:00:00.000Z' },
-      implementationVerification: { dataverseCheck: { status: 'skipped' } },
+      implementationVerification: {
+        dataverseCheck: { status: 'skipped' },
+        // Hard gate: a "passed" AI Kit review only satisfies the gate with full review details
+        // (reviewedFiles/rulesFiles/checklistFiles/knownPrReviewFiles all non-empty).
+        aiCodeReview: {
+          status: 'passed',
+          reviewedFiles: ['Scripts/nvr.js'],
+          rulesFiles: ['ai-rules/crm-javascript-rules.md'],
+          checklistFiles: ['ai-rules/crm-code-review-checklist.md'],
+          knownPrReviewFiles: ['ai-rules/known-pr-review-comments.md'],
+        },
+      },
       aiKitReview: { status: 'passed', completedAt: '2026-06-15T10:05:00.000Z' },
+      // No gitWorkflow.confirmedBranch yet.
     })]));
 
     const origArgv = process.argv;
@@ -955,7 +967,94 @@ describe('callToolFallback continue_developer_workflow', () => {
       expect(result.nextAction).toBe('propose_branch');
       // Branch creation must require explicit user approval
       expect(result.requiresUserApproval).toBe(true);
-      expect(result.forbiddenWrites).not.toContain('commit_task_changes');
+      expect(result.recommendedTool).toBe('create_or_checkout_task_branch');
+      // Until a branch is confirmed, commit/push tools must remain forbidden.
+      expect(result.forbiddenWrites).toContain('commit_task_changes');
+      expect(result.forbiddenWrites).toContain('push_task_branch');
+      expect(result.forbiddenWrites).toContain('commit_and_push_task_changes');
+      expect(result.allowedWrites).toContain('prepare_commit_for_task');
+      expect(result.allowedWrites).toContain('create_or_checkout_task_branch');
+    } finally {
+      process.argv = origArgv;
+      await fs.rm(tmpDir, { recursive: true });
+    }
+  });
+
+  it('returns prepare_commit when gitWorkflow.confirmedBranch is already set', async () => {
+    const os = await import('node:os');
+    const fs = await import('node:fs/promises');
+    const path = await import('node:path');
+
+    const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'tw-mcp-cdw-branch-confirmed-'));
+    await fs.writeFile(path.join(tmpDir, 'tasks.json'), JSON.stringify([makeTask({
+      id: 'task-cdw-branch-confirmed',
+      taskMode: 'developer',
+      workflowSetup: { devTargetKind: 'script', repositoryRoot: 'C:\\Repo', artifactPath: 'Scripts\\nvr.js' },
+      crmDeveloperWorkflow: { detectedWorkKind: 'script' },
+      localTestRecord: { status: 'passed', updatedAt: '2026-06-15T10:00:00.000Z' },
+      implementationVerification: {
+        dataverseCheck: { status: 'skipped' },
+        aiCodeReview: {
+          status: 'passed',
+          reviewedFiles: ['Scripts/nvr.js'],
+          rulesFiles: ['ai-rules/crm-javascript-rules.md'],
+          checklistFiles: ['ai-rules/crm-code-review-checklist.md'],
+          knownPrReviewFiles: ['ai-rules/known-pr-review-comments.md'],
+        },
+      },
+      aiKitReview: { status: 'passed', completedAt: '2026-06-15T10:05:00.000Z' },
+      gitWorkflow: { confirmedBranch: 'feature/123-add-thing', confirmedAt: '2026-06-15T10:06:00.000Z' },
+    })]));
+
+    const origArgv = process.argv;
+    process.argv = [...process.argv, '--data-dir', tmpDir, '--fallback-readonly'];
+    try {
+      const result = await callToolFallback('continue_developer_workflow', { taskId: 'task-cdw-branch-confirmed' });
+      expect(result.nextAction).toBe('prepare_commit');
+      expect(result.requiresUserApproval).toBe(true);
+      expect(result.recommendedTool).toBe('prepare_commit_for_task');
+      expect(result.instructionForAI).toContain('feature/123-add-thing');
+      expect(result.allowedWrites).toContain('prepare_commit_for_task');
+      expect(result.allowedWrites).toContain('commit_task_changes');
+      // Pushing still requires a further separate approval.
+      expect(result.forbiddenWrites).toContain('push_task_branch');
+      expect(result.forbiddenWrites).toContain('commit_and_push_task_changes');
+      expect(result.allowedWrites).not.toContain('push_task_branch');
+      expect(result.allowedWrites).not.toContain('commit_and_push_task_changes');
+    } finally {
+      process.argv = origArgv;
+      await fs.rm(tmpDir, { recursive: true });
+    }
+  });
+
+  it('returns run_ai_kit_review (not propose_branch) when task.aiKitReview.status is passed but implementationVerification.aiCodeReview is missing/incomplete', async () => {
+    // Regression coverage for the AI Kit review hard-gate fix: recording ANY verdict (including
+    // "failed") always sets task.aiKitReview.completedAt, so the old gate (completedAt ||
+    // status==='passed'||'skipped' on task.aiKitReview) let a failed/incomplete review through.
+    // The gate must read implementationVerification.aiCodeReview instead.
+    const os = await import('node:os');
+    const fs = await import('node:fs/promises');
+    const path = await import('node:path');
+
+    const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'tw-mcp-cdw-aigate-regression-'));
+    await fs.writeFile(path.join(tmpDir, 'tasks.json'), JSON.stringify([makeTask({
+      id: 'task-cdw-aigate-regression',
+      taskMode: 'developer',
+      workflowSetup: { devTargetKind: 'script', repositoryRoot: 'C:\\Repo', artifactPath: 'Scripts\\nvr.js' },
+      crmDeveloperWorkflow: { detectedWorkKind: 'script' },
+      localTestRecord: { status: 'passed', updatedAt: '2026-06-15T10:00:00.000Z' },
+      implementationVerification: { dataverseCheck: { status: 'skipped' } },
+      // Old-style gate flag looks satisfied, but the canonical field was never recorded/complete.
+      aiKitReview: { status: 'passed', completedAt: '2026-06-15T10:05:00.000Z' },
+    })]));
+
+    const origArgv = process.argv;
+    process.argv = [...process.argv, '--data-dir', tmpDir, '--fallback-readonly'];
+    try {
+      const result = await callToolFallback('continue_developer_workflow', { taskId: 'task-cdw-aigate-regression' });
+      expect(result.nextAction).toBe('run_ai_kit_review');
+      expect(result.nextAction).not.toBe('propose_branch');
+      expect(result.recommendedTool).toBe('record_ai_kit_review_result');
     } finally {
       process.argv = origArgv;
       await fs.rm(tmpDir, { recursive: true });
@@ -985,6 +1084,70 @@ describe('callToolFallback continue_developer_workflow', () => {
       // run_implementation_verification is AI-runnable, but branch/commit/push remain forbidden.
       expect(result.nextAction).toBe('run_implementation_verification');
       expect(result.forbiddenWrites).toContain('commit_task_changes');
+    } finally {
+      process.argv = origArgv;
+      await fs.rm(tmpDir, { recursive: true });
+    }
+  });
+
+  it('returns review_dataverse_warnings and blocks commit/push when mcpVerification is warnings_unaccepted', async () => {
+    const os = await import('node:os');
+    const fs = await import('node:fs/promises');
+    const path = await import('node:path');
+
+    const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'tw-mcp-cdw-warnings-unaccepted-'));
+    await fs.writeFile(path.join(tmpDir, 'tasks.json'), JSON.stringify([makeTask({
+      id: 'task-cdw-warnings-unaccepted',
+      taskMode: 'developer',
+      workflowSetup: { devTargetKind: 'script', repositoryRoot: 'C:\\Repo', artifactPath: 'Scripts\\nvr.js' },
+      crmDeveloperWorkflow: { detectedWorkKind: 'script' },
+      localTestRecord: { status: 'passed', updatedAt: '2026-06-15T10:00:00.000Z' },
+      implementationVerification: {
+        mcpVerification: { status: 'warnings_unaccepted', checks: [], fixableFindings: [], nextAction: 'review_dataverse_warnings', ranAt: '2026-06-15T10:10:00.000Z' },
+      },
+    })]));
+
+    const origArgv = process.argv;
+    process.argv = [...process.argv, '--data-dir', tmpDir, '--fallback-readonly'];
+    try {
+      const result = await callToolFallback('continue_developer_workflow', { taskId: 'task-cdw-warnings-unaccepted' });
+      expect(result.nextAction).toBe('review_dataverse_warnings');
+      expect(result.canProceed).toBe(false);
+      expect(result.requiresUserApproval).toBe(true);
+      expect(result.recommendedTool).toBeNull();
+      expect(result.allowedWrites).toEqual([]);
+      expect(result.forbiddenWrites).toContain('commit_task_changes');
+      expect(result.forbiddenWrites).toContain('push_task_branch');
+    } finally {
+      process.argv = origArgv;
+      await fs.rm(tmpDir, { recursive: true });
+    }
+  });
+
+  it('routes a plugin task through run_implementation_verification, not the old run_dataverse_check_for_task branch', async () => {
+    const os = await import('node:os');
+    const fs = await import('node:fs/promises');
+    const path = await import('node:path');
+
+    const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'tw-mcp-cdw-plugin-'));
+    await fs.writeFile(path.join(tmpDir, 'tasks.json'), JSON.stringify([makeTask({
+      id: 'task-cdw-plugin',
+      taskMode: 'developer',
+      workflowSetup: { devTargetKind: 'plugin', repositoryRoot: 'C:\\Repo', pluginProject: 'Foo.Plugins', artifactPath: 'C:\\Repo\\Plugins\\Foo.Plugins\\Foo.cs' },
+      crmDeveloperWorkflow: { detectedWorkKind: 'plugin' },
+      localTestRecord: { status: 'passed', updatedAt: '2026-06-15T10:00:00.000Z' },
+      // No implementationVerification — Dataverse check not done, mcpVerification never ran.
+    })]));
+
+    const origArgv = process.argv;
+    process.argv = [...process.argv, '--data-dir', tmpDir, '--fallback-readonly'];
+    try {
+      const result = await callToolFallback('continue_developer_workflow', { taskId: 'task-cdw-plugin' });
+      // Plugins now go through the same mcpVerification-based branch as script/ribbon tasks.
+      expect(result.nextAction).toBe('run_implementation_verification');
+      expect(result.nextAction).not.toBe('verify_dataverse');
+      expect(result.recommendedTool).toBe('run_implementation_verification');
+      expect(result.recommendedTool).not.toBe('run_dataverse_check_for_task');
     } finally {
       process.argv = origArgv;
       await fs.rm(tmpDir, { recursive: true });
@@ -1294,6 +1457,41 @@ describe('new tool definitions (v0.5.0)', () => {
     expect(types).toContain('publish-customizations');
     expect(types).toContain('pull-request');
     expect(types).toContain('manual-check');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Regression: create_branch_for_task / create_or_checkout_task_branch MCP exposure.
+// Both are Git-mutation tools that are proxied straight to the live Rust bridge (no JS
+// fallback implementation) — but they still must be declared in TOOL_DEFINITIONS so a client
+// connected only to the JS side can see them via tools/list. create_branch_for_task was
+// previously missing from this list entirely.
+// ---------------------------------------------------------------------------
+
+describe('create_branch_for_task / create_or_checkout_task_branch MCP exposure', () => {
+  it('TOOL_DEFINITIONS includes create_branch_for_task', () => {
+    expect(findTool('create_branch_for_task')).toBeDefined();
+  });
+
+  it('TOOL_DEFINITIONS includes create_or_checkout_task_branch', () => {
+    expect(findTool('create_or_checkout_task_branch')).toBeDefined();
+  });
+
+  it('create_branch_for_task requires taskId and branchName', () => {
+    const tool = findTool('create_branch_for_task');
+    expect(tool.inputSchema.required).toContain('taskId');
+    expect(tool.inputSchema.required).toContain('branchName');
+  });
+
+  it('create_or_checkout_task_branch requires taskId and branchName', () => {
+    const tool = findTool('create_or_checkout_task_branch');
+    expect(tool.inputSchema.required).toContain('taskId');
+    expect(tool.inputSchema.required).toContain('branchName');
+  });
+
+  it('neither tool is in READ_ONLY_TOOL_NAMES (both are Git-mutation writes)', () => {
+    expect(READ_ONLY_TOOL_NAMES.has('create_branch_for_task')).toBe(false);
+    expect(READ_ONLY_TOOL_NAMES.has('create_or_checkout_task_branch')).toBe(false);
   });
 });
 
@@ -3879,17 +4077,59 @@ describe('run_implementation_verification tool', () => {
     }
   });
 
-  it('rejects non-script (plugin) tasks with a clear error', async () => {
+  it('rejects non-verifiable (e.g. repo-only) work kinds with a clear error', async () => {
+    const { os, fs, path } = await importHelpers();
+    const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'tw-mcp-riv-nonverifiable-'));
+    const task = makeVerificationTask('task-riv-nonverifiable', { repositoryRoot: tmpDir, artifactPath: 'Plugins/Foo.cs', devTargetKind: 'repo-only' });
+    await fs.writeFile(path.join(tmpDir, 'tasks.json'), JSON.stringify([task]));
+
+    const origArgv = process.argv;
+    process.argv = [...process.argv, '--data-dir', tmpDir];
+    try {
+      const result = await callToolFallback('run_implementation_verification', { taskId: 'task-riv-nonverifiable' });
+      expect(result.error).toContain('script/ribbon/plugin tasks only');
+    } finally {
+      process.argv = origArgv;
+      await fs.rm(tmpDir, { recursive: true });
+    }
+  });
+
+  it('accepts plugin tasks and runs Plugin File Readiness / Dataverse Metadata Check / AI Internal Code Review', async () => {
     const { os, fs, path } = await importHelpers();
     const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'tw-mcp-riv-plugin-'));
-    const task = makeVerificationTask('task-riv-plugin', { repositoryRoot: tmpDir, artifactPath: 'Plugins/Foo.cs', devTargetKind: 'plugin' });
+    const pluginsDir = path.join(tmpDir, 'Plugins');
+    await fs.mkdir(pluginsDir, { recursive: true });
+    const pluginFilePath = path.join(pluginsDir, 'Foo.cs');
+    await fs.writeFile(pluginFilePath, 'public class Foo : IPlugin { public void Execute(IServiceProvider sp) {} }');
+    // Plugin artifactPath is resolved as-is (no repositoryRoot join, unlike scripts) — the UI lets
+    // the user pick a plugin file directly, so it is expected to already be absolute.
+    const task = makeVerificationTask('task-riv-plugin', { repositoryRoot: tmpDir, artifactPath: pluginFilePath, devTargetKind: 'plugin' });
     await fs.writeFile(path.join(tmpDir, 'tasks.json'), JSON.stringify([task]));
 
     const origArgv = process.argv;
     process.argv = [...process.argv, '--data-dir', tmpDir];
     try {
       const result = await callToolFallback('run_implementation_verification', { taskId: 'task-riv-plugin' });
-      expect(result.error).toContain('script/ribbon tasks only');
+      expect(result.error).toBeUndefined();
+
+      const readinessCheck = result.checks.find((c) => c.name === 'Plugin File Readiness');
+      expect(readinessCheck).toBeDefined();
+      expect(readinessCheck.status).toBe('passed');
+
+      // Static rule templates are JS/TS-only — plugins skip this check rather than attempting
+      // to match a template.
+      const staticCheck = result.checks.find((c) => c.name === 'Local Static/Business-Rule Verification');
+      expect(staticCheck.status).toBe('skipped');
+
+      const dvCheck = result.checks.find((c) => c.name === 'Dataverse Metadata Check');
+      expect(dvCheck).toBeDefined();
+
+      const aiCheck = result.checks.find((c) => c.name === 'AI Internal Code Review');
+      expect(aiCheck).toBeDefined();
+
+      const raw = JSON.parse(await fs.readFile(path.join(tmpDir, 'tasks.json'), 'utf8'));
+      const saved = raw.find((t) => t.id === 'task-riv-plugin');
+      expect(saved.implementationVerification.buildCheck.status).toBe('passed');
     } finally {
       process.argv = origArgv;
       await fs.rm(tmpDir, { recursive: true });
@@ -3948,10 +4188,13 @@ describe('run_implementation_verification tool', () => {
       // reports exactly what unblocks it, not a generic needs_manual_action.
       expect(dvCheck.status).toBe('needs_configuration');
       expect(dvCheck.findings[0]).toContain('Task Workbench app');
-      // MCP must not fabricate a dataverseCheck override — the modal row stays genuinely not-run.
+      // MCP must not fabricate a PASSING verdict — no scan/report was actually run. The hard-gate
+      // persists the needs_configuration marker (with the specific reason) onto dataverseCheck so
+      // the modal shows why, rather than leaving it silently blank.
       const raw = JSON.parse(await fs.readFile(path.join(tmpDir, 'tasks.json'), 'utf8'));
       const saved = raw.find((t) => t.id === 'task-riv-dv-notrun');
-      expect(saved.implementationVerification.dataverseCheck).toBeUndefined();
+      expect(saved.implementationVerification.dataverseCheck.status).toBe('needs_configuration');
+      expect(saved.crmVerificationReports).toBeUndefined();
     } finally {
       process.argv = origArgv;
       await fs.rm(tmpDir, { recursive: true });
@@ -4057,7 +4300,14 @@ describe('run_implementation_verification tool', () => {
     const task = makeVerificationTask('task-riv-all-resolved', { repositoryRoot: tmpDir, artifactPath: 'Scripts/nvr_servicecase_events.js' });
     task.crmVerificationReports = [{ verdict: 'pass' }];
     task.implementationVerification = {
-      aiCodeReview: { status: 'passed' },
+      // Hard gate: a "passed" AI Kit review only satisfies the gate with full review details.
+      aiCodeReview: {
+        status: 'passed',
+        reviewedFiles: ['Scripts/nvr_servicecase_events.js'],
+        rulesFiles: ['ai-rules/crm-javascript-rules.md'],
+        checklistFiles: ['ai-rules/crm-code-review-checklist.md'],
+        knownPrReviewFiles: ['ai-rules/known-pr-review-comments.md'],
+      },
       localTest: { status: 'not-needed' },
     };
     await fs.writeFile(path.join(tmpDir, 'tasks.json'), JSON.stringify([task]));
@@ -4113,7 +4363,11 @@ describe('run_implementation_verification tool', () => {
     }
   });
 
-  it('nextRecommendedStep omits resolved rows and only mentions Local Test when Dataverse/AI review already passed', async () => {
+  it('modal summary treats aiCodeReview="skipped" as resolved, but the hard gate still requires a genuine passed AI Kit review', async () => {
+    // "skipped" is a legitimate modal-display override (shown as resolved so the UI doesn't nag),
+    // but it is not one of the three real review verdicts (passed/failed/warnings) the hard gate
+    // accepts — aiKitReviewGate treats it as not_run, same as never having reviewed at all. This
+    // is intentional: the hardening closes exactly this kind of bypass.
     const { os, fs, path } = await importHelpers();
     const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'tw-mcp-riv-partial-'));
     const scriptsDir = path.join(tmpDir, 'Scripts');
@@ -4128,8 +4382,196 @@ describe('run_implementation_verification tool', () => {
     process.argv = [...process.argv, '--data-dir', tmpDir];
     try {
       const result = await callToolFallback('run_implementation_verification', { taskId: 'task-riv-partial' });
+      // Modal-visible summary still shows aiCodeReview as resolved ("skipped") — only localTest
+      // is genuinely not-run from the modal's point of view.
       expect(result.unresolvedRequiredRows).toEqual(['localTest']);
-      expect(result.nextRecommendedStep).toBe('Upload/register the web resource manually and record Local Test/browser validation.');
+      // But the tool-orchestration nextAction is driven by the hard gate, which does not accept
+      // "skipped" as a satisfying AI Kit review verdict.
+      expect(result.nextAction).toBe('run_ai_kit_review');
+      expect(result.nextRecommendedStep).toBe(
+        'Read the applicable AI Kit rules and the target file, then call record_ai_kit_review_result with your verdict, then call run_implementation_verification again.',
+      );
+    } finally {
+      process.argv = origArgv;
+      await fs.rm(tmpDir, { recursive: true });
+    }
+  });
+
+  // ── Hard-gate coverage: warnings_unaccepted / not_run rollup buckets ────────────────────
+
+  it('reports warnings_unaccepted when Dataverse Metadata Check has warnings that are not yet accepted', async () => {
+    const { os, fs, path } = await importHelpers();
+    const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'tw-mcp-riv-dv-warnings-'));
+    const scriptsDir = path.join(tmpDir, 'Scripts');
+    await fs.mkdir(scriptsDir, { recursive: true });
+    await fs.writeFile(path.join(scriptsDir, 'nvr_servicecase_events.js'), GOOD_SCRIPT);
+    const task = makeVerificationTask('task-riv-dv-warnings', { repositoryRoot: tmpDir, artifactPath: 'Scripts/nvr_servicecase_events.js' });
+    task.crmVerificationReports = [{ verdict: 'warnings' }];
+    task.implementationVerification = {
+      aiCodeReview: {
+        status: 'passed',
+        reviewedFiles: ['Scripts/nvr_servicecase_events.js'],
+        rulesFiles: ['ai-rules/crm-javascript-rules.md'],
+        checklistFiles: ['ai-rules/crm-code-review-checklist.md'],
+        knownPrReviewFiles: ['ai-rules/known-pr-review-comments.md'],
+      },
+      localTest: { status: 'not-needed' },
+    };
+    await fs.writeFile(path.join(tmpDir, 'tasks.json'), JSON.stringify([task]));
+
+    const origArgv = process.argv;
+    process.argv = [...process.argv, '--data-dir', tmpDir];
+    try {
+      const result = await callToolFallback('run_implementation_verification', { taskId: 'task-riv-dv-warnings' });
+      const dvCheck = result.checks.find((c) => c.name === 'Dataverse Metadata Check');
+      expect(dvCheck.status).toBe('warnings_unaccepted');
+      expect(dvCheck.rawStatus).toBe('warnings');
+      // warnings_unaccepted requires the user, but ranks below fix_code/run_ai_kit_review/
+      // needs_configuration and above the generic needs_manual_action/wait_for_user bucket.
+      expect(result.status).toBe('warnings_unaccepted');
+      expect(result.nextAction).toBe('review_dataverse_warnings');
+      expect(result.nextRecommendedStep).toContain('warnings that are not yet accepted');
+      expect(result.progressionGate.canProceed).toBe(false);
+      expect(result.progressionGate.dataverseGateStatus).toBe('warnings_unaccepted');
+      expect(result.progressionGate.requiresUserAction).toBe(true);
+      expect(result.progressionGate.nextRecommendedAction).toBe('review_dataverse_warnings');
+    } finally {
+      process.argv = origArgv;
+      await fs.rm(tmpDir, { recursive: true });
+    }
+  });
+
+  it('reports passed for Dataverse Metadata Check once warnings are explicitly accepted', async () => {
+    const { os, fs, path } = await importHelpers();
+    const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'tw-mcp-riv-dv-warnings-accepted-'));
+    const scriptsDir = path.join(tmpDir, 'Scripts');
+    await fs.mkdir(scriptsDir, { recursive: true });
+    await fs.writeFile(path.join(scriptsDir, 'nvr_servicecase_events.js'), GOOD_SCRIPT);
+    const task = makeVerificationTask('task-riv-dv-warnings-accepted', { repositoryRoot: tmpDir, artifactPath: 'Scripts/nvr_servicecase_events.js' });
+    task.crmVerificationReports = [{ verdict: 'warnings' }];
+    task.implementationVerification = {
+      dataverseCheck: { warningsAccepted: { accepted: true } },
+      aiCodeReview: {
+        status: 'passed',
+        reviewedFiles: ['Scripts/nvr_servicecase_events.js'],
+        rulesFiles: ['ai-rules/crm-javascript-rules.md'],
+        checklistFiles: ['ai-rules/crm-code-review-checklist.md'],
+        knownPrReviewFiles: ['ai-rules/known-pr-review-comments.md'],
+      },
+      localTest: { status: 'not-needed' },
+    };
+    await fs.writeFile(path.join(tmpDir, 'tasks.json'), JSON.stringify([task]));
+
+    const origArgv = process.argv;
+    process.argv = [...process.argv, '--data-dir', tmpDir];
+    try {
+      const result = await callToolFallback('run_implementation_verification', { taskId: 'task-riv-dv-warnings-accepted' });
+      const dvCheck = result.checks.find((c) => c.name === 'Dataverse Metadata Check');
+      expect(dvCheck.status).toBe('passed');
+      expect(result.status).toBe('passed');
+      expect(result.nextAction).toBe('continue_workflow');
+      expect(result.progressionGate.canProceed).toBe(true);
+    } finally {
+      process.argv = origArgv;
+      await fs.rm(tmpDir, { recursive: true });
+    }
+  });
+
+  it('rolls a dataverse "not_run" check up into needs_manual_action, never silently into passed', async () => {
+    // Requesting only dataverseMetadataCheck (skipping scriptFileReadiness) means the artifact
+    // path is never resolved, so the check reports "not_run" with no fixable finding attached —
+    // this exercises the rollup's not_run bucket in isolation from the readiness check's own
+    // fixable "failed" finding.
+    const { os, fs, path } = await importHelpers();
+    const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'tw-mcp-riv-dv-notrun-standalone-'));
+    const task = makeVerificationTask('task-riv-dv-notrun-standalone', { repositoryRoot: tmpDir, artifactPath: '', devTargetKind: 'script' });
+    await fs.writeFile(path.join(tmpDir, 'tasks.json'), JSON.stringify([task]));
+
+    const origArgv = process.argv;
+    process.argv = [...process.argv, '--data-dir', tmpDir];
+    try {
+      const result = await callToolFallback('run_implementation_verification', {
+        taskId: 'task-riv-dv-notrun-standalone',
+        checks: ['dataverseMetadataCheck'],
+      });
+      const dvCheck = result.checks.find((c) => c.name === 'Dataverse Metadata Check');
+      expect(dvCheck.status).toBe('not_run');
+      expect(dvCheck.findings[0]).toContain('artifact file path is not resolved');
+      expect(result.fixableFindings).toEqual([]);
+      expect(result.status).toBe('needs_manual_action');
+      expect(result.nextAction).toBe('wait_for_user');
+    } finally {
+      process.argv = origArgv;
+      await fs.rm(tmpDir, { recursive: true });
+    }
+  });
+
+  // ── Dataverse environment-mismatch hard gate ────────────────────────────────────────────
+
+  it('blocks Dataverse Metadata Check with needs_configuration on an environment mismatch, without trusting the existing report', async () => {
+    const { os, fs, path } = await importHelpers();
+    const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'tw-mcp-riv-dv-envmismatch-'));
+    const scriptsDir = path.join(tmpDir, 'Scripts');
+    await fs.mkdir(scriptsDir, { recursive: true });
+    await fs.writeFile(path.join(scriptsDir, 'nvr_servicecase_events.js'), GOOD_SCRIPT);
+    const task = makeVerificationTask('task-riv-dv-envmismatch', { repositoryRoot: tmpDir, artifactPath: 'Scripts/nvr_servicecase_events.js' });
+    task.customerId = 'cust-envmismatch';
+    // A previously-recorded passing report exists — the mismatch must still block progression
+    // rather than trusting a report that may have run against the wrong Dataverse environment.
+    // The standalone fallback has no Primarch client of its own to begin with (see the
+    // "requires the Task Workbench app" branch above), so the meaningful assertion here is that
+    // the mismatch is reported with its own specific reason instead of the generic one, and that
+    // the existing report/state is left untouched rather than being reinterpreted as valid.
+    task.crmVerificationReports = [{ verdict: 'pass' }];
+    await fs.writeFile(path.join(tmpDir, 'tasks.json'), JSON.stringify([task]));
+    await fs.writeFile(path.join(tmpDir, 'customers.json'), JSON.stringify([
+      { id: 'cust-envmismatch', dataverseEnvironmentLabel: 'Production' },
+    ]));
+    await fs.writeFile(path.join(tmpDir, 'settings.json'), JSON.stringify({ primarchMcpEnvironmentLabel: 'Sandbox' }));
+
+    const origArgv = process.argv;
+    process.argv = [...process.argv, '--data-dir', tmpDir];
+    try {
+      const result = await callToolFallback('run_implementation_verification', { taskId: 'task-riv-dv-envmismatch' });
+      const dvCheck = result.checks.find((c) => c.name === 'Dataverse Metadata Check');
+      expect(dvCheck.status).toBe('needs_configuration');
+      expect(dvCheck.findings[0]).toContain("does not match this task's expected environment");
+      expect(dvCheck.findings[0]).toContain('Production');
+      expect(dvCheck.findings[0]).toContain('Sandbox');
+      expect(dvCheck.environment).toEqual({ expected: 'Production', active: 'Sandbox', mismatch: true });
+
+      const raw = JSON.parse(await fs.readFile(path.join(tmpDir, 'tasks.json'), 'utf8'));
+      const saved = raw.find((t) => t.id === 'task-riv-dv-envmismatch');
+      expect(saved.crmVerificationReports).toEqual([{ verdict: 'pass' }]);
+      expect(saved.implementationVerification.dataverseCheck.status).toBe('needs_configuration');
+    } finally {
+      process.argv = origArgv;
+      await fs.rm(tmpDir, { recursive: true });
+    }
+  });
+
+  it('does not report a mismatch when customer/settings environment labels match case-insensitively', async () => {
+    const { os, fs, path } = await importHelpers();
+    const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'tw-mcp-riv-dv-envmatch-'));
+    const scriptsDir = path.join(tmpDir, 'Scripts');
+    await fs.mkdir(scriptsDir, { recursive: true });
+    await fs.writeFile(path.join(scriptsDir, 'nvr_servicecase_events.js'), GOOD_SCRIPT);
+    const task = makeVerificationTask('task-riv-dv-envmatch', { repositoryRoot: tmpDir, artifactPath: 'Scripts/nvr_servicecase_events.js' });
+    task.customerId = 'cust-envmatch';
+    task.crmVerificationReports = [{ verdict: 'pass' }];
+    await fs.writeFile(path.join(tmpDir, 'tasks.json'), JSON.stringify([task]));
+    await fs.writeFile(path.join(tmpDir, 'customers.json'), JSON.stringify([
+      { id: 'cust-envmatch', dataverseEnvironmentLabel: 'PRODUCTION' },
+    ]));
+    await fs.writeFile(path.join(tmpDir, 'settings.json'), JSON.stringify({ primarchMcpEnvironmentLabel: 'production' }));
+
+    const origArgv = process.argv;
+    process.argv = [...process.argv, '--data-dir', tmpDir];
+    try {
+      const result = await callToolFallback('run_implementation_verification', { taskId: 'task-riv-dv-envmatch' });
+      const dvCheck = result.checks.find((c) => c.name === 'Dataverse Metadata Check');
+      expect(dvCheck.environment.mismatch).toBe(false);
+      expect(dvCheck.status).toBe('passed');
     } finally {
       process.argv = origArgv;
       await fs.rm(tmpDir, { recursive: true });
@@ -4229,11 +4671,92 @@ describe('record_ai_kit_review_result tool', () => {
       const before = await callToolFallback('continue_developer_workflow', { taskId: 'task-aikit-cdw' });
       expect(before.nextAction).toBe('run_ai_kit_review');
 
-      await callToolFallback('record_ai_kit_review_result', { taskId: 'task-aikit-cdw', status: 'passed' });
+      // Hard gate: status='passed' alone is not enough — reviewedFiles/rulesFiles/checklistFiles/
+      // knownPrReviewFiles must also be non-empty for the gate to actually pass.
+      await callToolFallback('record_ai_kit_review_result', {
+        taskId: 'task-aikit-cdw',
+        status: 'passed',
+        reviewedFiles: ['Scripts/nvr.js'],
+        rulesFiles: ['ai-rules/crm-javascript-rules.md'],
+        checklistFiles: ['ai-rules/crm-code-review-checklist.md'],
+        knownPrReviewFiles: ['ai-rules/known-pr-review-comments.md'],
+      });
 
       const after = await callToolFallback('continue_developer_workflow', { taskId: 'task-aikit-cdw' });
       expect(after.nextAction).not.toBe('run_ai_kit_review');
       expect(after.nextAction).toBe('propose_branch');
+    } finally {
+      process.argv = origArgv;
+      await fs.rm(tmpDir, { recursive: true });
+    }
+  });
+
+  // ── gateStatus / missingReviewDetails hard-gate response fields ─────────────────────────
+
+  it('returns gateStatus="passed" when status=passed and all detail fields are non-empty', async () => {
+    const { os, fs, path } = await importHelpers();
+    const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'tw-mcp-aikit-gate-passed-'));
+    await fs.writeFile(path.join(tmpDir, 'tasks.json'), JSON.stringify([makeTask({ id: 'task-aikit-gate-passed', taskMode: 'developer' })]));
+
+    const origArgv = process.argv;
+    process.argv = [...process.argv, '--data-dir', tmpDir];
+    try {
+      const result = await callToolFallback('record_ai_kit_review_result', {
+        taskId: 'task-aikit-gate-passed',
+        status: 'passed',
+        reviewedFiles: ['Scripts/nvr.js'],
+        rulesFiles: ['ai-rules/crm-javascript-rules.md'],
+        checklistFiles: ['ai-rules/crm-code-review-checklist.md'],
+        knownPrReviewFiles: ['ai-rules/known-pr-review-comments.md'],
+      });
+      expect(result.gateStatus).toBe('passed');
+      expect(result.missingReviewDetails).toEqual([]);
+      expect(result.nextRecommendedStep).toBe('Call run_implementation_verification again to confirm all automated checks are resolved.');
+    } finally {
+      process.argv = origArgv;
+      await fs.rm(tmpDir, { recursive: true });
+    }
+  });
+
+  it('returns gateStatus="incomplete" when status=passed but the detail fields are empty', async () => {
+    const { os, fs, path } = await importHelpers();
+    const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'tw-mcp-aikit-gate-incomplete-'));
+    await fs.writeFile(path.join(tmpDir, 'tasks.json'), JSON.stringify([makeTask({ id: 'task-aikit-gate-incomplete', taskMode: 'developer' })]));
+
+    const origArgv = process.argv;
+    process.argv = [...process.argv, '--data-dir', tmpDir];
+    try {
+      const result = await callToolFallback('record_ai_kit_review_result', { taskId: 'task-aikit-gate-incomplete', status: 'passed' });
+      expect(result.gateStatus).toBe('incomplete');
+      expect(result.missingReviewDetails).toEqual(expect.arrayContaining([
+        'reviewedFiles is empty', 'rulesFiles is empty', 'checklistFiles is empty', 'knownPrReviewFiles is empty',
+      ]));
+      expect(result.nextRecommendedStep).toContain('gateStatus=incomplete');
+    } finally {
+      process.argv = origArgv;
+      await fs.rm(tmpDir, { recursive: true });
+    }
+  });
+
+  it('returns gateStatus="failed" when fixableFindings is present, even though status=passed', async () => {
+    const { os, fs, path } = await importHelpers();
+    const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'tw-mcp-aikit-gate-fixable-'));
+    await fs.writeFile(path.join(tmpDir, 'tasks.json'), JSON.stringify([makeTask({ id: 'task-aikit-gate-fixable', taskMode: 'developer' })]));
+
+    const origArgv = process.argv;
+    process.argv = [...process.argv, '--data-dir', tmpDir];
+    try {
+      const result = await callToolFallback('record_ai_kit_review_result', {
+        taskId: 'task-aikit-gate-fixable',
+        status: 'passed',
+        reviewedFiles: ['Scripts/nvr.js'],
+        rulesFiles: ['ai-rules/crm-javascript-rules.md'],
+        checklistFiles: ['ai-rules/crm-code-review-checklist.md'],
+        knownPrReviewFiles: ['ai-rules/known-pr-review-comments.md'],
+        fixableFindings: [{ id: 'todo-left-in', description: 'Remove leftover TODO comment.' }],
+      });
+      expect(result.gateStatus).toBe('failed');
+      expect(result.missingReviewDetails).toContain('fixableFindings is non-empty');
     } finally {
       process.argv = origArgv;
       await fs.rm(tmpDir, { recursive: true });

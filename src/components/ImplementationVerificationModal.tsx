@@ -1,14 +1,17 @@
 /**
  * ImplementationVerificationModal
  *
- * Optional Development-phase quality gates for plugin tasks (four sections):
- *   1. Build / Project Readiness
- *   2. Dataverse Metadata Check   (via Primarch  read-only)
- *   3. AI Internal Code Review
- *   4. Local Test Record
+ * Development-phase quality gates for plugin tasks (four sections):
+ *   1. Build / Project Readiness       — soft check, non-blocking
+ *   2. Dataverse Metadata Check        — HARD GATE (via Primarch, read-only)
+ *   3. AI Internal Code Review         — HARD GATE
+ *   4. Local Test Record               — soft check, non-blocking
  *
- * All checks are non-blocking. The task stays in Development regardless of
- * results.  Only explicit footer actions move it to Testing or Code Review.
+ * Build and Local Test stay non-blocking — the task can move to Consultant Testing regardless of
+ * their results. Dataverse Metadata Check and AI Internal Code Review are hard gates computed by
+ * computeProgressionGate (src/lib/implementationGate.ts): moving the task to Code Review /
+ * Waiting for PR is blocked unless both gates cleanly pass or the user explicitly accepts
+ * Dataverse warnings. See the footer's hard-block panel and Section 2/3 below.
  */
 
 import { useState } from 'react';
@@ -20,6 +23,12 @@ import type {
   ImplementationVerification,
 } from '../types';
 import type { BuildCheckItem } from '../lib/tauriCommands';
+import {
+  normalizeDataverseGate,
+  deriveDataverseRawStatus,
+  getAiKitReviewGate,
+  computeProgressionGate,
+} from '../lib/implementationGate';
 import Modal from './Modal';
 import Icon from './Icon';
 
@@ -31,16 +40,14 @@ export function deriveBuildCheckStatus(task: Task): ImplCheckStatus {
   return task.implementationVerification?.buildCheck?.status ?? 'not-run';
 }
 
-export function deriveDataverseCheckStatus(task: Task): ImplCheckStatus {
-  const ov = task.implementationVerification?.dataverseCheck;
-  if (ov?.status === 'skipped' || ov?.status === 'manually-verified') return ov.status;
-  const v = task.crmVerificationReports?.[0]?.verdict;
-  if (v === 'pass') return 'passed';
-  if (v === 'warnings') return 'warnings';
-  if (v === 'fail') return 'failed';
-  // not_configured: assistant is set up but MCP has no metadata tools — treat as warnings
-  if (v === 'not_configured') return 'warnings';
-  return 'not-run';
+/**
+ * Thin wrapper around the shared deriveDataverseRawStatus (src/lib/implementationGate.ts) — kept
+ * here so existing callers (TaskDetail, this modal) don't need to change their import. The
+ * underlying logic is the single TypeScript port of task_mcp_derive_dataverse_check_status
+ * (src-tauri/src/lib.rs); do not re-implement the derivation here.
+ */
+export function deriveDataverseCheckStatus(task: Task): ImplCheckStatus | 'needs_configuration' {
+  return deriveDataverseRawStatus(task) as ImplCheckStatus | 'needs_configuration';
 }
 
 /**
@@ -74,6 +81,9 @@ export function computeImplVerifyNextStep(task: Task): string {
   if (bld === 'failed' || dv === 'failed' || ai === 'failed') {
     return 'Fix implementation blockers before testing or review';
   }
+  if (dv === 'needs_configuration') {
+    return 'Configure the Primarch/Dataverse connection (Settings -> CRM Metadata) before proceeding';
+  }
   if (bld === 'warnings' || dv === 'warnings' || ai === 'warnings') {
     return 'Review implementation warnings before proceeding';
   }
@@ -98,31 +108,37 @@ export function computeImplVerifyNextStep(task: Task): string {
 // Status display helpers
 // ---------------------------------------------------------------------------
 
-function statusColor(s: ImplCheckStatus | LocalTestImplStatus): string {
+type DisplayStatus = ImplCheckStatus | LocalTestImplStatus | 'needs_configuration' | 'pending_ai_kit_review';
+
+function statusColor(s: DisplayStatus): string {
   switch (s) {
-    case 'passed':            return 'var(--color-done, #3fb950)';
-    case 'warnings':          return 'var(--color-warning, #d29922)';
-    case 'failed':            return 'var(--color-blocked, #e05555)';
-    case 'skipped':           return 'var(--text-muted)';
-    case 'manually-verified': return 'var(--color-done, #3fb950)';
-    case 'not-needed':        return 'var(--text-muted)';
-    default:                  return 'var(--text-muted)';
+    case 'passed':               return 'var(--color-done, #3fb950)';
+    case 'warnings':              return 'var(--color-warning, #d29922)';
+    case 'failed':                return 'var(--color-blocked, #e05555)';
+    case 'skipped':               return 'var(--text-muted)';
+    case 'manually-verified':     return 'var(--color-done, #3fb950)';
+    case 'not-needed':            return 'var(--text-muted)';
+    case 'needs_configuration':   return 'var(--color-warning, #d29922)';
+    case 'pending_ai_kit_review': return 'var(--color-warning, #d29922)';
+    default:                      return 'var(--text-muted)';
   }
 }
 
-function statusLabel(s: ImplCheckStatus | LocalTestImplStatus): string {
+function statusLabel(s: DisplayStatus): string {
   switch (s) {
-    case 'passed':            return 'Passed';
-    case 'warnings':          return 'Warnings';
-    case 'failed':            return 'Failed';
-    case 'skipped':           return 'Skipped';
-    case 'manually-verified': return 'Manually verified';
-    case 'not-needed':        return 'Not needed';
-    default:                  return 'Not run';
+    case 'passed':               return 'Passed';
+    case 'warnings':              return 'Warnings';
+    case 'failed':                return 'Failed';
+    case 'skipped':               return 'Skipped';
+    case 'manually-verified':     return 'Manually verified';
+    case 'not-needed':            return 'Not needed';
+    case 'needs_configuration':   return 'Needs configuration';
+    case 'pending_ai_kit_review': return 'Pending AI Kit review';
+    default:                      return 'Not run';
   }
 }
 
-function StatusBadge({ status }: { status: ImplCheckStatus | LocalTestImplStatus }) {
+function StatusBadge({ status }: { status: DisplayStatus }) {
   return (
     <span style={{ display: 'inline-flex', alignItems: 'center', fontSize: 11.5, fontWeight: 600, color: statusColor(status) }}>
       <span>{statusLabel(status)}</span>
@@ -130,7 +146,7 @@ function StatusBadge({ status }: { status: ImplCheckStatus | LocalTestImplStatus
   );
 }
 
-function SectionHeader({ num, title, status }: { num: string; title: string; status: ImplCheckStatus | LocalTestImplStatus }) {
+function SectionHeader({ num, title, status }: { num: string; title: string; status: DisplayStatus }) {
   return (
     <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 6 }}>
       <span style={{
@@ -150,6 +166,37 @@ function resultColor(r: BuildCheckItem['result']): string {
   if (r === 'fail') return 'var(--color-blocked, #e05555)';
   return 'var(--text-muted)';
 }
+
+function issueColor(severity: 'error' | 'warning' | 'suggestion' | undefined): string {
+  if (severity === 'error') return 'var(--color-blocked, #e05555)';
+  if (severity === 'warning') return 'var(--color-warning, #d29922)';
+  return 'var(--text-muted)';
+}
+
+// ---------------------------------------------------------------------------
+// Dataverse "checked entities/fields" — read-only passthrough of
+// task.implementationVerification.mcpVerification.checks[Dataverse Metadata Check].checkedReferences
+// (written by run_implementation_verification — see task_mcp_build_verified_references_list in
+// src-tauri/src/lib.rs). Not part of the ImplementationVerification TS type since it is a loosely
+// typed MCP-only side channel; read defensively and render nothing when absent.
+// ---------------------------------------------------------------------------
+
+interface McpCheckedReference {
+  kind?: string;
+  logicalName?: string;
+  entityLogicalName?: string;
+  attributeLogicalName?: string;
+  status?: 'found' | 'missing' | 'unverified';
+}
+
+function getDataverseCheckedReferences(task: Task): McpCheckedReference[] | null {
+  const mcpVerification = (task.implementationVerification as unknown as {
+    mcpVerification?: { checks?: Array<{ name?: string; checkedReferences?: McpCheckedReference[] }> };
+  } | undefined)?.mcpVerification;
+  const entry = mcpVerification?.checks?.find((c) => c.name === 'Dataverse Metadata Check');
+  return entry?.checkedReferences ?? null;
+}
+
 // ---------------------------------------------------------------------------
 // Props
 // ---------------------------------------------------------------------------
@@ -210,12 +257,24 @@ export default function ImplementationVerificationModal({
   const [reviewConfirmPending, setReviewConfirmPending] = useState(false);
   const [testingConfirmPending, setTestingConfirmPending] = useState(false);
   const [reviewRunKind, setReviewRunKind] = useState<'ai-kit' | 'settings' | null>(null);
+  const [dvAcceptReasonOpen, setDvAcceptReasonOpen] = useState(false);
+  const [dvAcceptReason,     setDvAcceptReason]     = useState('');
 
   const iv           = task.implementationVerification;
   const bldStatus    = deriveBuildCheckStatus(task);
-  const dvStatus     = deriveDataverseCheckStatus(task);
+  const dvRawStatus  = deriveDataverseCheckStatus(task);
+  const dvStatus     = dvRawStatus; // display status for Section 2's badge
+  const dvWarningsAccepted = !!iv?.dataverseCheck?.warningsAccepted?.accepted;
+  const dvGateStatus = normalizeDataverseGate(dvRawStatus, dvWarningsAccepted);
+  const dvEnv        = iv?.dataverseCheck?.environment;
+  const dvCheckedRefs = getDataverseCheckedReferences(task);
   const aiStatus: ImplCheckStatus        = iv?.aiCodeReview?.status ?? 'not-run';
   const localStatus: LocalTestImplStatus = iv?.localTest?.status ?? 'not-run';
+  const aiGate       = getAiKitReviewGate(iv?.aiCodeReview);
+  // Never show a "Passed" badge for an AI Kit review recorded as passed but missing required
+  // detail — render it as pending_ai_kit_review instead (hardening requirement).
+  const aiDisplayStatus: DisplayStatus = aiGate.status === 'incomplete' ? 'pending_ai_kit_review' : aiStatus;
+  const progressionGate = computeProgressionGate(task);
   const latestReport = task.crmVerificationReports?.[0];
   // Active AI review: look up by reviewId when present; fall back to aiFileReviews[0] for
   // older records; return undefined when status is not-run so Open review is hidden after reset.
@@ -235,7 +294,8 @@ export default function ImplementationVerificationModal({
 
   const anyBusy = busy || buildCheckRunning || dataverseCheckRunning || aiCodeReviewRunning || testingBusy || reviewBusy || continueBusy;
 
-  // Check if any of the four gates are still untouched (not-run).
+  // Check if any of the four gates are still untouched (not-run). Soft confirmation only —
+  // does not apply to the hard Dataverse/AI Kit gate, which is enforced separately below.
   const hasUntouchedChecks = (
     bldStatus === 'not-run' ||
     dvStatus  === 'not-run' ||
@@ -346,6 +406,35 @@ export default function ImplementationVerificationModal({
     }
   }
 
+  /** Persists the user's explicit acceptance of the current Dataverse warnings (hard-gate unlock). */
+  async function handleAcceptDataverseWarnings() {
+    const reason = dvAcceptReason.trim();
+    if (!reason) return;
+    setBusy(true);
+    await applyUpdate({
+      dataverseCheck: {
+        ...(iv?.dataverseCheck ?? { status: 'warnings' }),
+        warningsAccepted: {
+          accepted: true,
+          acceptedAt: new Date().toISOString(),
+          acceptedBy: 'user',
+          reason,
+          acceptedWarningIds: [],
+        },
+      },
+    });
+    setDvAcceptReasonOpen(false);
+    setDvAcceptReason('');
+    setBusy(false);
+  }
+
+  /** Sends the task back to Claude to fix Dataverse warnings, without accepting them. */
+  async function handleSendDataverseWarningsBackToClaude() {
+    setBusy(true);
+    await onUpdateNextStepAndClose('Review and address the Dataverse Metadata Check warnings, then rerun the check or accept the warnings before moving to Code Review.');
+    setBusy(false);
+  }
+
   // ---------------------------------------------------------------------------
 
   async function handleAiKitReviewRun() {
@@ -419,6 +508,9 @@ export default function ImplementationVerificationModal({
   }
 
   function handleReviewClick() {
+    // Hard gate: Dataverse Metadata Check and AI Internal Code Review must both resolve before
+    // the task can move to Code Review / Waiting for PR. There is no confirm-through path here.
+    if (!progressionGate.canProceed) return;
     if (hasUntouchedChecks && !reviewConfirmPending) {
       setReviewConfirmPending(true);
     } else {
@@ -427,6 +519,7 @@ export default function ImplementationVerificationModal({
   }
 
   async function handleReviewConfirmed() {
+    if (!progressionGate.canProceed) return;
     setReviewConfirmPending(false);
     setReviewBusy(true);
     await onProceedToReview();
@@ -471,6 +564,45 @@ export default function ImplementationVerificationModal({
     );
   }
 
+  /**
+   * The three hard-gate actions for unaccepted Dataverse warnings — shared between Section 2 and
+   * the footer's hard-block panel so the user can act from either place without hunting for it.
+   */
+  function DataverseWarningsActions() {
+    if (dvAcceptReasonOpen) {
+      return (
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+          <input
+            className="form-input form-input-sm"
+            value={dvAcceptReason}
+            onChange={(e) => setDvAcceptReason(e.target.value)}
+            placeholder="Reason for accepting these warnings (required)"
+            disabled={busy}
+          />
+          <div style={{ display: 'flex', gap: 6 }}>
+            <button className="btn btn-secondary btn-sm" onClick={handleAcceptDataverseWarnings} disabled={busy || !dvAcceptReason.trim()} type="button">
+              {busy ? <><span className="btn-spinner" /> Accepting</> : 'Confirm accept warnings'}
+            </button>
+            <button className="btn btn-ghost btn-sm" onClick={() => { setDvAcceptReasonOpen(false); setDvAcceptReason(''); }} disabled={busy} type="button">Cancel</button>
+          </div>
+        </div>
+      );
+    }
+    return (
+      <div style={btnRow}>
+        <button className="btn btn-secondary btn-sm" onClick={() => setDvAcceptReasonOpen(true)} disabled={anyBusy} type="button">
+          Accept Dataverse warnings and continue
+        </button>
+        <button className="btn btn-ghost btn-sm" onClick={handleSendDataverseWarningsBackToClaude} disabled={anyBusy} type="button">
+          Send back to Claude to fix
+        </button>
+        <button className="btn btn-ghost btn-sm" onClick={handleDataverseRun} disabled={anyBusy || dataverseCheckRunning} type="button">
+          Rerun Dataverse check
+        </button>
+      </div>
+    );
+  }
+
   // ---------------------------------------------------------------------------
 
   const sectionStyle: React.CSSProperties = {
@@ -489,7 +621,39 @@ export default function ImplementationVerificationModal({
       onClose={onClose}
       footer={
         <div style={{ display: 'flex', flexDirection: 'column', gap: 8, width: '100%' }}>
-          {/* Confirmation prompt  shown when some checks are untouched */}
+          {/* Hard block  Dataverse Metadata Check / AI Internal Code Review gate not resolved */}
+          {!progressionGate.canProceed && (
+            <div style={{
+              fontSize: 12, color: 'var(--color-blocked, #e05555)',
+              border: '1px solid var(--color-blocked, #e05555)', borderRadius: 4,
+              padding: '8px 10px', display: 'flex', flexDirection: 'column', gap: 6,
+            }}>
+              <div style={{ fontWeight: 600 }}>Cannot move to Code Review yet:</div>
+              <ul style={{ margin: 0, paddingLeft: 16 }}>
+                {progressionGate.blockingChecks.map((c, i) => (
+                  <li key={`check-${i}`}>{c.reason}</li>
+                ))}
+                {progressionGate.blockingFindings.map((f, i) => (
+                  <li key={`finding-${i}`}>{f.description}</li>
+                ))}
+              </ul>
+              {progressionGate.nextRecommendedAction === 'review_dataverse_warnings' && <DataverseWarningsActions />}
+              {progressionGate.nextRecommendedAction === 'needs_configuration' && (
+                <div style={{ fontSize: 11.5 }}>
+                  Configure the Primarch/Dataverse connection (Settings -&gt; CRM Metadata) so it matches this task&apos;s environment, then rerun the check.
+                </div>
+              )}
+              {progressionGate.nextRecommendedAction === 'run_ai_kit_review' && (
+                <div style={{ fontSize: 11.5 }}>
+                  Run the AI Kit Review in Section 3 with full detail (reviewed files, rules, checklist, known PR comments).
+                </div>
+              )}
+              {progressionGate.nextRecommendedAction === 'fix_code' && (
+                <div style={{ fontSize: 11.5 }}>Fix the findings above, then rerun the relevant check.</div>
+              )}
+            </div>
+          )}
+          {/* Confirmation prompt  shown when some soft checks are untouched (build/local test) */}
           {reviewConfirmPending && (
             <div style={{
               fontSize: 12, color: 'var(--color-warning, #d29922)',
@@ -547,8 +711,10 @@ export default function ImplementationVerificationModal({
             <button
               className="btn btn-primary btn-sm"
               onClick={handleReviewClick}
-              disabled={anyBusy || reviewConfirmPending}
-              title="Mark task as Waiting for PR / Code Review"
+              disabled={anyBusy || reviewConfirmPending || !progressionGate.canProceed}
+              title={progressionGate.canProceed
+                ? 'Mark task as Waiting for PR / Code Review'
+                : 'Blocked: resolve the Dataverse Metadata Check and AI Internal Code Review gates first'}
               type="button"
             >
               {reviewBusy ? <><span className="btn-spinner" /> Moving</> : <><Icon name="check" size={13} /> Move to Code Review / Waiting for PR</>}
@@ -642,7 +808,7 @@ export default function ImplementationVerificationModal({
           )}
         </section>
 
-        {/* 2. Dataverse Metadata Check */}
+        {/* 2. Dataverse Metadata Check  HARD GATE */}
         <section style={sectionStyle}>
           <SectionHeader num="2" title="Dataverse Metadata Check" status={dvStatus} />
 
@@ -658,10 +824,78 @@ export default function ImplementationVerificationModal({
             <div style={hintStyle}>Reason: {iv.dataverseCheck.skippedReason}</div>
           )}
 
+          {/* Environment used  expected vs active, with mismatch styling */}
+          {dvEnv && (dvEnv.expected || dvEnv.active) && (
+            <div style={{
+              fontSize: 11, marginBottom: 6,
+              color: dvEnv.mismatch ? 'var(--color-warning, #d29922)' : 'var(--text-muted)',
+              border: dvEnv.mismatch ? '1px solid var(--color-warning, #d29922)' : 'none',
+              borderRadius: 4, padding: dvEnv.mismatch ? '4px 6px' : 0,
+            }}>
+              Environment  expected: {dvEnv.expected ?? '(not set)'}, active: {dvEnv.active ?? '(unknown)'}
+              {dvEnv.mismatch && <strong> — mismatch detected</strong>}
+            </div>
+          )}
+
+          {/* Warnings/failures from the latest verification report */}
+          {latestReport && (latestReport.issues?.length ?? 0) > 0 && dvStatus !== 'skipped' && dvStatus !== 'manually-verified' && (
+            <ul style={{ margin: '0 0 6px 0', paddingLeft: 16 }}>
+              {latestReport.issues!.map((iss, i) => (
+                <li key={i} style={{ fontSize: 11, color: issueColor(iss.severity), lineHeight: 1.5 }}>
+                  <strong>{iss.title}</strong>{iss.detail ? `: ${iss.detail}` : ''}
+                </li>
+              ))}
+            </ul>
+          )}
+
+          {/* Checked entities/fields, grouped by status */}
+          {dvCheckedRefs && dvCheckedRefs.length > 0 && (
+            <div style={{ marginBottom: 6 }}>
+              {(['found', 'missing', 'unverified'] as const).map((grp) => {
+                const items = dvCheckedRefs!.filter((r) => r.status === grp);
+                if (items.length === 0) return null;
+                return (
+                  <div key={grp} style={{ marginBottom: 4 }}>
+                    <div style={{
+                      fontSize: 10, fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.04em',
+                      color: grp === 'found' ? 'var(--color-done, #3fb950)' : grp === 'missing' ? 'var(--color-blocked, #e05555)' : 'var(--color-warning, #d29922)',
+                    }}>
+                      {grp} ({items.length})
+                    </div>
+                    <ul style={{ margin: '2px 0 0 0', paddingLeft: 16 }}>
+                      {items.map((r, i) => (
+                        <li key={i} style={{ fontSize: 11, color: 'var(--text-secondary)' }}>
+                          {r.kind ? `${r.kind}: ` : ''}{r.entityLogicalName ? `${r.entityLogicalName}.` : ''}{r.attributeLogicalName ?? r.logicalName ?? ''}
+                        </li>
+                      ))}
+                    </ul>
+                  </div>
+                );
+              })}
+            </div>
+          )}
+
+          {/* Acceptance state */}
+          {iv?.dataverseCheck?.warningsAccepted?.accepted && (
+            <div style={hintStyle}>
+              Warnings accepted by {iv.dataverseCheck.warningsAccepted.acceptedBy ?? 'user'}
+              {iv.dataverseCheck.warningsAccepted.acceptedAt ? ` on ${new Date(iv.dataverseCheck.warningsAccepted.acceptedAt).toLocaleString()}` : ''}
+              {iv.dataverseCheck.warningsAccepted.reason ? `: ${iv.dataverseCheck.warningsAccepted.reason}` : ''}
+            </div>
+          )}
+
+          {dvGateStatus === 'needs_configuration' && (
+            <div style={{ fontSize: 11.5, color: 'var(--color-warning, #d29922)', marginBottom: 6 }}>
+              {iv?.dataverseCheck?.message ?? "Dataverse Metadata Check cannot run until the Primarch/Dataverse connection is configured and matches this task's environment."}
+            </div>
+          )}
+
           {skipTarget === 'dataverse' ? (
             <SkipForm onConfirm={handleDataverseSkipConfirm} />
           ) : confirmResetTarget === 'dataverse' ? (
             <ConfirmReset onConfirm={handleDataverseResetConfirm} />
+          ) : dvGateStatus === 'warnings_unaccepted' ? (
+            <DataverseWarningsActions />
           ) : (
             <div style={btnRow}>
               {dvStatus !== 'manually-verified' && (
@@ -695,9 +929,9 @@ export default function ImplementationVerificationModal({
           )}
         </section>
 
-        {/* 3. AI Internal Code Review */}
+        {/* 3. AI Internal Code Review  HARD GATE */}
         <section style={sectionStyle}>
-          <SectionHeader num="3" title="AI Internal Code Review" status={aiStatus} />
+          <SectionHeader num="3" title="AI Internal Code Review" status={aiDisplayStatus} />
 
           <div style={hintStyle}>
             {aiReviewMessage}
@@ -713,6 +947,37 @@ export default function ImplementationVerificationModal({
           {aiStatus !== 'not-run' && aiStatus !== 'skipped' && aiStatus !== 'manually-verified' && !latestAiReview && (
             <div style={{ fontSize: 11.5, color: 'var(--color-warning, #d29922)', marginBottom: 6 }}>
               Review details are missing. Run AI Code Review again.
+            </div>
+          )}
+
+          {/* Full detail payload  reviewed files, rules/checklist/PR-comment files, findings */}
+          {iv?.aiCodeReview && (
+            <div style={{ fontSize: 11, color: 'var(--text-muted)', display: 'flex', flexDirection: 'column', gap: 2, marginBottom: 6 }}>
+              {!!iv.aiCodeReview.reviewedFiles?.length && <div>Reviewed files: {iv.aiCodeReview.reviewedFiles.join(', ')}</div>}
+              {!!iv.aiCodeReview.rulesFiles?.length && <div>Rules files: {iv.aiCodeReview.rulesFiles.join(', ')}</div>}
+              {!!iv.aiCodeReview.checklistFiles?.length && <div>Checklist files: {iv.aiCodeReview.checklistFiles.join(', ')}</div>}
+              {!!iv.aiCodeReview.knownPrReviewFiles?.length && <div>Known PR review files: {iv.aiCodeReview.knownPrReviewFiles.join(', ')}</div>}
+              {!!iv.aiCodeReview.checkedItems?.length && <div>Checked items: {iv.aiCodeReview.checkedItems.join(', ')}</div>}
+              {!!iv.aiCodeReview.summary && <div>Summary: {iv.aiCodeReview.summary}</div>}
+            </div>
+          )}
+          {!!iv?.aiCodeReview?.fixableFindings?.length && (
+            <ul style={{ margin: '0 0 6px 0', paddingLeft: 16 }}>
+              {iv.aiCodeReview.fixableFindings.map((f) => (
+                <li key={f.id} style={{ fontSize: 11, color: 'var(--color-blocked, #e05555)', lineHeight: 1.5 }}>{f.description}</li>
+              ))}
+            </ul>
+          )}
+          {!!iv?.aiCodeReview?.nonFixableWarnings?.length && (
+            <ul style={{ margin: '0 0 6px 0', paddingLeft: 16 }}>
+              {iv.aiCodeReview.nonFixableWarnings.map((w, i) => (
+                <li key={i} style={{ fontSize: 11, color: 'var(--color-warning, #d29922)', lineHeight: 1.5 }}>{w}</li>
+              ))}
+            </ul>
+          )}
+          {aiGate.status === 'incomplete' && (
+            <div style={{ fontSize: 11.5, color: 'var(--color-warning, #d29922)', marginBottom: 6 }}>
+              Recorded as passed but missing required review details: {aiGate.missing.join(', ')}. Ask Claude to re-run the AI Kit review with full details.
             </div>
           )}
 

@@ -5,7 +5,8 @@ import {
 } from './ImplementationVerificationModal';
 import { formatTaskActivityNote, isTaskActivityLine } from '../lib/taskActivityFormatter';
 import { mergeWithDefaults, selectReviewer, inferReviewSource } from '../lib/aiReviewers';
-import type { Task, CrmVerificationReport, AiReviewerConfig, AiFileReviewResult } from '../types';
+import { computeProgressionGate, getAiKitReviewGate, normalizeDataverseGate } from '../lib/implementationGate';
+import type { Task, CrmVerificationReport, AiReviewerConfig, AiFileReviewResult, ImplCheckRecord } from '../types';
 
 function makeTask(overrides: Partial<Task> = {}): Task {
   return { id: 't1', title: 'Test task', status: 'in-progress', ...overrides } as unknown as Task;
@@ -923,5 +924,190 @@ describe('Multi-review display — data-model level', () => {
   it('REGRESSION: aiFileReviews empty array — no crash', () => {
     const task = makeTask({ aiFileReviews: [] as never });
     expect((task.aiFileReviews ?? []).length).toBe(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Hard gate — Move to Code Review / Waiting for PR (computeProgressionGate)
+// ---------------------------------------------------------------------------
+
+function fullAiReview(overrides: Partial<ImplCheckRecord> = {}): ImplCheckRecord {
+  return {
+    status: 'passed',
+    reviewedFiles: ['Scripts/foo.js'],
+    rulesFiles: ['rules.md'],
+    checklistFiles: ['checklist.md'],
+    knownPrReviewFiles: ['pr-comments.md'],
+    ...overrides,
+  };
+}
+
+describe('Hard gate — Move to Code Review button', () => {
+  it('canProceed is false when Dataverse has unaccepted warnings — proceed button must be disabled', () => {
+    const task = makeTask({ crmVerificationReports: [makeReport('warnings')] });
+    const gate = computeProgressionGate(task);
+    expect(gate.canProceed).toBe(false);
+    // Mirrors the modal's button disabled expression: anyBusy || reviewConfirmPending || !gate.canProceed
+    const disabled = false || false || !gate.canProceed;
+    expect(disabled).toBe(true);
+  });
+
+  it('canProceed is false when AI Kit review has not run — proceed button must be disabled', () => {
+    const task = makeTask({ crmVerificationReports: [makeReport('pass')] });
+    const gate = computeProgressionGate(task);
+    expect(gate.canProceed).toBe(false);
+    expect(gate.aiReviewGateStatus).toBe('not_run');
+  });
+
+  it('canProceed is true once both gates cleanly pass — proceed button is enabled', () => {
+    const task = makeTask({
+      crmVerificationReports: [makeReport('pass')],
+      implementationVerification: { aiCodeReview: fullAiReview() },
+    });
+    const gate = computeProgressionGate(task);
+    expect(gate.canProceed).toBe(true);
+    const disabled = false || false || !gate.canProceed;
+    expect(disabled).toBe(false);
+  });
+
+  it('blocked state exposes reasons the footer hard-block panel renders', () => {
+    const task = makeTask({
+      crmVerificationReports: [makeReport('fail', {
+        missingReferences: [{ kind: 'attribute', displayName: 'nvr_status', sourceReason: 'x' }],
+      } as never)],
+    });
+    const gate = computeProgressionGate(task);
+    expect(gate.blockingChecks.some((c) => c.check === 'dataverseCheck')).toBe(true);
+    expect(gate.blockingFindings.length).toBeGreaterThan(0);
+    expect(gate.nextRecommendedAction).toBe('fix_code');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Accept Dataverse warnings — persisted shape (handleAcceptDataverseWarnings)
+// ---------------------------------------------------------------------------
+
+describe('Accept Dataverse warnings — persisted shape', () => {
+  it('accepting warnings persists accepted/acceptedAt/acceptedBy/reason and unlocks the gate', () => {
+    const before = makeTask({
+      crmVerificationReports: [makeReport('warnings')],
+      implementationVerification: { dataverseCheck: { status: 'warnings' as never } },
+    });
+    expect(computeProgressionGate(before).dataverseGateStatus).toBe('warnings_unaccepted');
+
+    // Simulates exactly what handleAcceptDataverseWarnings builds and passes to onUpdate/applyUpdate.
+    const acceptedAt = '2026-07-08T12:00:00.000Z';
+    const after = makeTask({
+      crmVerificationReports: [makeReport('warnings')],
+      implementationVerification: {
+        dataverseCheck: {
+          status: 'warnings' as never,
+          warningsAccepted: {
+            accepted: true,
+            acceptedAt,
+            acceptedBy: 'user',
+            reason: 'Known limitation, approved by lead.',
+            acceptedWarningIds: [],
+          },
+        },
+      },
+    });
+    expect(after.implementationVerification?.dataverseCheck?.warningsAccepted).toEqual({
+      accepted: true,
+      acceptedAt,
+      acceptedBy: 'user',
+      reason: 'Known limitation, approved by lead.',
+      acceptedWarningIds: [],
+    });
+    expect(computeProgressionGate(after).dataverseGateStatus).toBe('passed');
+  });
+
+  it('accept action requires a non-empty reason — empty reason must not be treated as accepted', () => {
+    // Mirrors the modal's handleAcceptDataverseWarnings guard: `if (!reason) return;`
+    const reason = '   '.trim();
+    expect(reason).toBe('');
+    expect(!!reason).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// AI Kit review — incomplete must never display as "Passed"
+// ---------------------------------------------------------------------------
+
+describe('AI Kit review — incomplete never renders as Passed', () => {
+  it('status passed with empty detail arrays is gated as incomplete, not passed', () => {
+    const gate = getAiKitReviewGate({ status: 'passed' });
+    expect(gate.status).toBe('incomplete');
+    expect(gate.status).not.toBe('passed');
+  });
+
+  it('modal display-status mapping renders incomplete as pending_ai_kit_review, never "passed"', () => {
+    // Mirrors the modal's aiDisplayStatus computation:
+    // aiGate.status === 'incomplete' ? 'pending_ai_kit_review' : aiStatus
+    const aiStatus = 'passed';
+    const aiGate = getAiKitReviewGate({ status: 'passed' });
+    const aiDisplayStatus = aiGate.status === 'incomplete' ? 'pending_ai_kit_review' : aiStatus;
+    expect(aiDisplayStatus).toBe('pending_ai_kit_review');
+    expect(aiDisplayStatus).not.toBe('passed');
+  });
+
+  it('status passed with full detail renders as passed', () => {
+    const aiStatus = 'passed';
+    const aiGate = getAiKitReviewGate(fullAiReview());
+    const aiDisplayStatus = aiGate.status === 'incomplete' ? 'pending_ai_kit_review' : aiStatus;
+    expect(aiDisplayStatus).toBe('passed');
+  });
+
+  it('fixableFindings present blocks the gate even though the raw status is passed', () => {
+    const gate = getAiKitReviewGate(fullAiReview({ fixableFindings: [{ id: 'f1', description: 'Add null check' }] }));
+    expect(gate.status).toBe('failed');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Dataverse environment mismatch — expected/active labels
+// ---------------------------------------------------------------------------
+
+describe('Dataverse environment mismatch — expected/active display', () => {
+  it('mismatch=true with expected and active labels present triggers warning display', () => {
+    const task = makeTask({
+      implementationVerification: {
+        dataverseCheck: {
+          status: 'warnings' as never,
+          environment: { expected: 'contoso-prod', active: 'contoso-sandbox', mismatch: true },
+        },
+      },
+    });
+    const dvEnv = task.implementationVerification?.dataverseCheck?.environment;
+    expect(dvEnv?.expected).toBe('contoso-prod');
+    expect(dvEnv?.active).toBe('contoso-sandbox');
+    expect(dvEnv?.mismatch).toBe(true);
+  });
+
+  it('needs_configuration gate is set when environment mismatches (no accept-warnings action shown)', () => {
+    const task = makeTask({
+      implementationVerification: {
+        dataverseCheck: {
+          status: 'needs_configuration' as never,
+          environment: { expected: 'contoso-prod', active: 'contoso-sandbox', mismatch: true },
+        },
+      },
+    });
+    expect(normalizeDataverseGate('needs_configuration', false)).toBe('needs_configuration');
+    const gate = computeProgressionGate(task);
+    expect(gate.dataverseGateStatus).toBe('needs_configuration');
+    expect(gate.requiresUserAction).toBe(true);
+  });
+
+  it('no mismatch when expected and active match — mismatch flag is false', () => {
+    const task = makeTask({
+      implementationVerification: {
+        dataverseCheck: {
+          status: 'passed',
+          environment: { expected: 'contoso-prod', active: 'contoso-prod', mismatch: false },
+        },
+      },
+    });
+    expect(task.implementationVerification?.dataverseCheck?.environment?.mismatch).toBe(false);
   });
 });

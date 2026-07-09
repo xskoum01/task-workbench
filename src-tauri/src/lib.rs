@@ -359,6 +359,10 @@ fn default_settings() -> Value {
         "primarchMcpReadOnly": true,
         "primarchMcpLastStatus": "not_configured",
         "primarchMcpLastError": null,
+        // Optional label for the Dataverse environment the active Primarch connection points at
+        // (e.g. "Contoso PROD"). Compared against Customer.dataverseEnvironmentLabel to detect a
+        // mismatched connection before running the Dataverse Metadata Check hard gate.
+        "primarchMcpEnvironmentLabel": "",
         // Other existing fields
         "crmBaseDirectory": "",
         "repositoryTemplate": "",
@@ -1290,6 +1294,92 @@ fn parse_git_fetch_url(remote_output: &str) -> (Option<String>, Option<String>) 
     (None, None)
 }
 
+/// Best-effort ASCII fold for the Czech/Central-European diacritics most common in this
+/// project's task titles. Not a full Unicode NFD normalization (no unicode-normalization
+/// crate dependency) — good enough for a suggested branch-name slug, which the user reviews
+/// and can edit before approving.
+fn remove_diacritics_basic(s: &str) -> String {
+    s.chars().map(|c| match c {
+        'á' | 'à' | 'ä' | 'â' => 'a',
+        'č' => 'c',
+        'ď' => 'd',
+        'é' | 'è' | 'ě' | 'ë' | 'ê' => 'e',
+        'í' | 'ì' | 'î' | 'ï' => 'i',
+        'ň' => 'n',
+        'ó' | 'ò' | 'ô' | 'ö' => 'o',
+        'ř' => 'r',
+        'š' => 's',
+        'ť' => 't',
+        'ú' | 'ů' | 'ü' | 'ù' | 'û' => 'u',
+        'ý' | 'ÿ' => 'y',
+        'ž' => 'z',
+        other => other,
+    }).collect()
+}
+
+/// Sanitizes an arbitrary string into a valid Git branch-name segment. Mirrors
+/// `sanitizeBranchSegment` in `src/lib/gitBranchName.ts`: lowercase, fold diacritics, replace
+/// non-alphanumeric runs with a single hyphen, trim leading/trailing hyphens.
+fn sanitize_branch_segment(raw: &str) -> String {
+    let folded = remove_diacritics_basic(&raw.to_lowercase());
+    let mut result = String::with_capacity(folded.len());
+    let mut last_was_dash = false;
+    for ch in folded.chars() {
+        if ch.is_ascii_alphanumeric() {
+            result.push(ch);
+            last_was_dash = false;
+        } else if !last_was_dash {
+            result.push('-');
+            last_was_dash = true;
+        }
+    }
+    result.trim_matches('-').to_string()
+}
+
+/// Generates a deterministic suggested branch name from a task. Mirrors `generateBranchName`
+/// in `src/lib/gitBranchName.ts` (kept in sync by hand — see that file for the canonical
+/// algorithm and worked examples). Used only to populate `proposedBranchName` in
+/// `prepare_commit_for_task`'s response; the user reviews/edits it before approving.
+fn generate_branch_name(task_json: &Value) -> String {
+    let devops_url = task_json["devopsTaskUrl"].as_str().unwrap_or("");
+    let title_raw  = task_json["title"].as_str().unwrap_or("");
+
+    const MARKER: &str = "/_workitems/edit/";
+    let work_item_id: String = if let Some(pos) = devops_url.find(MARKER) {
+        let after = &devops_url[pos + MARKER.len()..];
+        let end = after.find(|c: char| !c.is_ascii_digit()).unwrap_or(after.len());
+        after[..end].to_string()
+    } else {
+        String::new()
+    };
+
+    let title_stripped = if title_raw.starts_with('[') {
+        title_raw.find(']').map(|end| title_raw[end + 1..].trim()).unwrap_or(title_raw)
+    } else {
+        title_raw
+    };
+
+    let title_segment = sanitize_branch_segment(title_stripped);
+
+    let max_title_len: usize = if work_item_id.is_empty() { 73 } else { 72 };
+    let truncated = if title_segment.chars().count() > max_title_len {
+        title_segment.chars().take(max_title_len).collect::<String>().trim_end_matches('-').to_string()
+    } else {
+        title_segment
+    };
+
+    let body = if work_item_id.is_empty() { truncated } else { format!("{work_item_id}-{truncated}") };
+    let full = format!("feature/{body}");
+
+    if full.chars().count() > 80 {
+        let max_body = 80 - "feature/".len();
+        let capped = body.chars().take(max_body).collect::<String>().trim_end_matches('-').to_string();
+        format!("feature/{capped}")
+    } else {
+        full
+    }
+}
+
 /// Derives a deterministic commit message from task JSON.
 fn generate_commit_message(task_json: &Value) -> String {
     let title     = task_json["title"].as_str().unwrap_or("").trim();
@@ -1433,6 +1523,38 @@ fn git_commit_preview_impl(repo_root: &str, task_json: Option<&Value>) -> Result
         && has_merge_base
         && remote_url.is_some();
 
+    // Branch proposal — this tool is READ-ONLY and NEVER creates or checks out a branch.
+    // proposedBranchName/branchExists are informational only; branchCreated and
+    // checkoutPerformed are always false here by construction. Approving/creating the branch
+    // requires a separate explicit call to create_or_checkout_task_branch.
+    let proposed_branch_name = task_json.map(generate_branch_name);
+    let branch_exists = proposed_branch_name.as_deref()
+        .map(|name| run_git_ro(repo, &["rev-parse", "--verify", &format!("refs/heads/{name}")]).is_some())
+        .unwrap_or(false);
+    let next_action = match &proposed_branch_name {
+        Some(name) if *name == branch => "ready_to_commit",
+        Some(_) => "ask_user_to_approve_branch_creation",
+        None => "ready_to_commit",
+    };
+
+    // Report task-created files that are actually ignored by the repo's real .gitignore
+    // (via `git check-ignore`, NOT the hardcoded noise denylist above) so the commit preview
+    // never silently drops a task file the user expects to see committed.
+    let mut git_ignored_task_files: Vec<String> = Vec::new();
+    if let Some(t) = task_json {
+        for f in task_mcp_related_implementation_files(t) {
+            if run_git_ro(repo, &["check-ignore", "-q", "--", &f]).is_some() {
+                git_ignored_task_files.push(f);
+            }
+        }
+    }
+    if !git_ignored_task_files.is_empty() {
+        warnings.push(format!(
+            "{} task file(s) are ignored by .gitignore and will not be committed unless force-added: {}.",
+            git_ignored_task_files.len(), git_ignored_task_files.join(", ")
+        ));
+    }
+
     Ok(serde_json::json!({
         "ok": true,
         "repoRoot": canonical_root,
@@ -1451,13 +1573,59 @@ fn git_commit_preview_impl(repo_root: &str, task_json: Option<&Value>) -> Result
         "upstreamMatchesCurrentBranch": upstream_matches,
         "aheadCount": ahead_count,
         "pushableWithoutCommit": pushable_without_commit,
+        "proposedBranchName": proposed_branch_name,
+        "branchExists": branch_exists,
+        "branchCreated": false,
+        "checkoutPerformed": false,
+        "nextAction": next_action,
+        "gitIgnoredTaskFiles": git_ignored_task_files,
+        "gitIgnoredTaskFileOptions": ["force-add", "update-gitignore", "leave-untracked"],
     }))
 }
 
+/// Returns the file paths recorded as this task's own implementation (from
+/// `record_ai_implementation_completed`'s `crmDeveloperWorkflow.lastAiImplementation.filesChanged`),
+/// normalized to forward slashes. Empty when nothing has been recorded yet (e.g. non-developer
+/// tasks, or before any implementation was recorded) — callers must treat an empty result as
+/// "no task-scoping information available" rather than "no related files", per
+/// git_commit_impl's unrelated-files guard.
+fn task_mcp_related_implementation_files(task: &Value) -> Vec<String> {
+    task["crmDeveloperWorkflow"]["lastAiImplementation"]["filesChanged"].as_array()
+        .map(|a| a.iter().filter_map(|v| v.as_str().map(|s| s.replace('\\', "/"))).collect())
+        .unwrap_or_default()
+}
+
 /// Core logic for committing selected files â€” shared by Tauri command and MCP handler.
-fn git_commit_impl(repo_root: &str, files: &[String], message: &str) -> Result<Value, String> {
+///
+/// Safety rules (all hard — none of these can be bypassed except via the named opt-ins):
+/// - Refuses to commit on `main`/`master` (a feature branch must be checked out first via
+///   `create_or_checkout_task_branch`).
+/// - `related_files` (when non-empty — i.e. the caller has task-scoping information) is treated
+///   as the set of files this task's own implementation touched; any requested file outside that
+///   set is "unrelated" and is rejected unless `confirm_unrelated` is true. Empty `related_files`
+///   means "no scoping information available" and skips this check entirely (e.g. UI-driven
+///   commits with no recorded AI implementation).
+/// - Files matched by the repo's real `.gitignore` (via `git check-ignore`, not the hardcoded
+///   noise denylist) are rejected unless explicitly listed in `force_add_files`, in which case
+///   they are staged with `git add -f`.
+fn git_commit_impl(
+    repo_root: &str,
+    files: &[String],
+    message: &str,
+    force_add_files: &[String],
+    related_files: &[String],
+    confirm_unrelated: bool,
+) -> Result<Value, String> {
     if message.trim().is_empty() { return Err("Commit message cannot be empty.".into()); }
     if files.is_empty() { return Err("No files specified for commit.".into()); }
+
+    let branch = run_git_ro(repo_root, &["branch", "--show-current"]).unwrap_or_default();
+    if branch == "main" || branch == "master" {
+        return Err(format!(
+            "Refusing to commit directly to '{branch}'. Create/checkout a feature branch first via create_or_checkout_task_branch."
+        ));
+    }
+
     // Validate each file
     for file in files {
         let norm = file.replace('\\', "/");
@@ -1468,23 +1636,70 @@ fn git_commit_impl(repo_root: &str, files: &[String], message: &str) -> Result<V
             return Err(format!("File is in the exclusion list: {file}"));
         }
     }
-    // git add -- <files...>
-    {
+
+    if !related_files.is_empty() && !confirm_unrelated {
+        let related_set: std::collections::HashSet<String> =
+            related_files.iter().map(|f| f.replace('\\', "/")).collect();
+        let unrelated: Vec<&str> = files.iter()
+            .map(|f| f.as_str())
+            .filter(|f| !related_set.contains(&f.replace('\\', "/")))
+            .collect();
+        if !unrelated.is_empty() {
+            return Err(format!(
+                "These files are not part of this task's recorded implementation and require explicit confirmation: {}. Pass confirmUnrelatedFiles=true after the user approves including them.",
+                unrelated.join(", ")
+            ));
+        }
+    }
+
+    let force_set: std::collections::HashSet<&str> = force_add_files.iter().map(String::as_str).collect();
+    let (to_force, to_check): (Vec<&String>, Vec<&String>) = files.iter().partition(|f| force_set.contains(f.as_str()));
+
+    let mut blocked_by_gitignore: Vec<String> = Vec::new();
+    let mut normal_files: Vec<&String> = Vec::new();
+    for f in to_check {
+        if run_git_ro(repo_root, &["check-ignore", "-q", "--", f]).is_some() {
+            blocked_by_gitignore.push(f.clone());
+        } else {
+            normal_files.push(f);
+        }
+    }
+    if !blocked_by_gitignore.is_empty() {
+        return Err(format!(
+            "These files are ignored by .gitignore and were not staged: {}. Pass them in forceAddFiles (after explicit user approval) to force-add, update .gitignore to allow them, or leave them untracked.",
+            blocked_by_gitignore.join(", ")
+        ));
+    }
+
+    // git add -- <normal files>
+    if !normal_files.is_empty() {
         let mut cmd = std::process::Command::new("git");
         hide_console_window(&mut cmd);
         cmd.arg("-C").arg(repo_root).arg("add").arg("--");
-        for f in files { cmd.arg(f); }
+        for f in &normal_files { cmd.arg(f); }
         let out = cmd.output().map_err(|e| format!("Failed to run git add: {e}"))?;
         if !out.status.success() {
             return Err(format!("git add failed: {}", String::from_utf8_lossy(&out.stderr).trim()));
         }
     }
+    // git add -f -- <explicitly force-added files>
+    if !to_force.is_empty() {
+        let mut cmd = std::process::Command::new("git");
+        hide_console_window(&mut cmd);
+        cmd.arg("-C").arg(repo_root).arg("add").arg("-f").arg("--");
+        for f in &to_force { cmd.arg(f); }
+        let out = cmd.output().map_err(|e| format!("Failed to run git add -f: {e}"))?;
+        if !out.status.success() {
+            return Err(format!("git add -f failed: {}", String::from_utf8_lossy(&out.stderr).trim()));
+        }
+    }
+
     // git commit
     git_run(repo_root, &["commit", "-m", message.trim()])
         .map_err(|e| format!("git commit failed: {e}"))?;
     let hash = git_run(repo_root, &["rev-parse", "--short", "HEAD"])
         .unwrap_or_default().trim().to_string();
-    Ok(serde_json::json!({ "ok": true, "commitHash": hash, "summary": format!("Commit {hash} created.") }))
+    Ok(serde_json::json!({ "ok": true, "commitHash": hash, "branch": branch, "summary": format!("Commit {hash} created.") }))
 }
 
 /// Core logic for pushing the current branch â€” shared by Tauri command and MCP handler.
@@ -1662,6 +1877,74 @@ fn create_git_branch(repo_root: String, branch_name: String) -> Result<Value, St
     create_git_branch_impl(&repo_root, &branch_name)
 }
 
+/// Core logic for `create_or_checkout_task_branch` (the ONLY tool that may act on a branch name
+/// the user has just approved — see the module-level Git-workflow comment at
+/// `create_git_branch_impl` for how this differs from `create_branch_for_task`).
+///
+/// Unlike `create_git_branch_impl`, this never fetches from origin and never re-bases the new
+/// branch on the remote default branch — it creates from the CURRENT HEAD, matching the
+/// "create_if_missing_and_checkout" contract: the user already approved this exact branch name
+/// after implementation work happened on the current branch, so there is nothing to reconcile
+/// with a remote base first.
+///
+/// Safety: never forces a checkout. If the branch already exists and checking it out would
+/// overwrite uncommitted local changes, git's own checkout refusal is surfaced verbatim as the
+/// blocker — this function never adds `--force`/`-f`, never stashes, and never discards changes.
+/// Never commits, pushes, or modifies any tracked file's content.
+fn checkout_or_create_task_branch_impl(repo_root: &str, branch_name: &str) -> Result<Value, String> {
+    let name = branch_name.trim();
+    validate_git_branch_name(name)?;
+
+    run_git_ro(repo_root, &["rev-parse", "--show-toplevel"])
+        .ok_or_else(|| format!("Not a Git repository: {repo_root}"))?;
+
+    let previous_branch = run_git_ro(repo_root, &["branch", "--show-current"]).unwrap_or_default();
+    let already_exists = run_git_ro(repo_root, &["rev-parse", "--verify", &format!("refs/heads/{name}")]).is_some();
+
+    let (branch_created, checkout_args): (bool, Vec<&str>) = if already_exists {
+        (false, vec!["checkout", name])
+    } else {
+        (true, vec!["checkout", "-b", name])
+    };
+
+    if previous_branch == name {
+        // Nothing to do â€” already on the target branch. Report as checked-out, not re-created.
+        return Ok(serde_json::json!({
+            "ok": true,
+            "previousBranch": previous_branch,
+            "currentBranch": name,
+            "branchCreated": false,
+            "branchCheckedOut": false,
+        }));
+    }
+
+    let out = {
+        let mut cmd = std::process::Command::new("git");
+        hide_console_window(&mut cmd);
+        cmd.arg("-C").arg(repo_root).args(&checkout_args);
+        cmd.output().map_err(|e| format!("Failed to run git checkout: {e}"))?
+    };
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+        // Git itself refuses when the checkout would overwrite uncommitted changes (e.g.
+        // "error: Your local changes to the following files would be overwritten by checkout").
+        // We never retry with --force â€” surface git's own message as the blocker verbatim.
+        return Err(format!("Cannot switch to branch '{name}': {stderr}"));
+    }
+
+    let current_branch = run_git_ro(repo_root, &["branch", "--show-current"])
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| name.to_string());
+
+    Ok(serde_json::json!({
+        "ok": true,
+        "previousBranch": previous_branch,
+        "currentBranch": current_branch,
+        "branchCreated": branch_created,
+        "branchCheckedOut": true,
+    }))
+}
+
 /// Resolves the repository root for a task in the MCP bridge context.
 fn mcp_resolve_repo_root_for_task(app: &tauri::AppHandle, task: &Value) -> Result<String, String> {
     if let Some(r) = task["workflowSetup"]["repositoryRoot"].as_str().filter(|s| !s.is_empty()) {
@@ -1689,9 +1972,13 @@ fn get_git_commit_preview(repo_root: String, task_json: Option<Value>) -> Result
 
 /// Stages the listed files and creates a git commit.
 /// All file paths must be relative and inside the repository; noise files are rejected.
+/// `force_add_files` (optional) force-adds specific `.gitignore`-matched paths — the caller
+/// (the UI, after the user explicitly approves) is responsible for only passing paths the user
+/// approved. The UI has no task-implementation-file scoping, so the "unrelated files" guard is
+/// not applicable here (empty `related_files`).
 #[tauri::command]
-fn commit_task_changes(repo_root: String, files: Vec<String>, message: String) -> Result<Value, String> {
-    git_commit_impl(&repo_root, &files, &message)
+fn commit_task_changes(repo_root: String, files: Vec<String>, message: String, force_add_files: Option<Vec<String>>) -> Result<Value, String> {
+    git_commit_impl(&repo_root, &files, &message, &force_add_files.unwrap_or_default(), &[], true)
 }
 
 /// Pushes the current branch to origin.
@@ -1701,14 +1988,23 @@ fn push_task_branch(repo_root: String) -> Result<Value, String> {
     git_push_impl(&repo_root)
 }
 
+/// Creates or checks out a task branch from the UI (mirrors the MCP
+/// `create_or_checkout_task_branch` tool's `checkout_or_create_task_branch_impl` core logic —
+/// see that function for the full safety contract). Never pushes, commits, or modifies files.
+#[tauri::command]
+fn create_or_checkout_task_branch_command(repo_root: String, branch_name: String) -> Result<Value, String> {
+    checkout_or_create_task_branch_impl(&repo_root, &branch_name)
+}
+
 /// Stages files, commits, then pushes the current branch â€” a single-step wrapper.
 #[tauri::command]
 fn commit_and_push_task_changes(
     repo_root: String,
     files: Vec<String>,
     message: String,
+    force_add_files: Option<Vec<String>>,
 ) -> Result<Value, String> {
-    let commit_result = git_commit_impl(&repo_root, &files, &message)?;
+    let commit_result = git_commit_impl(&repo_root, &files, &message, &force_add_files.unwrap_or_default(), &[], true)?;
     let hash = commit_result["commitHash"].as_str().unwrap_or("?").to_string();
     let push_result = git_push_impl(&repo_root)?;
     let branch = push_result["branch"].as_str().unwrap_or("?").to_string();
@@ -6671,13 +6967,14 @@ fn task_mcp_local_write_tool_definitions() -> Vec<Value> {
         serde_json::json!({"name":"save_pr_fix_proposal",                "description":"Save local PR fix proposal: summary and proposed changes. Does not edit files, commit, or push.","readOnly":false}),
         serde_json::json!({"name":"update_task_checklist_item",          "description":"Set status of a local workflow checklist item. Strict key and status enum validation.","readOnly":false}),
         serde_json::json!({"name":"set_task_next_step",                  "description":"Set the AI-recommended next action and reason. Does not overwrite analysis or plan.","readOnly":false}),
-        serde_json::json!({"name":"create_branch_for_task",              "description":"This modifies the local Git repository by creating and switching to a new branch. Creates a local branch only â€” no commit, no push, no PR, no GitHub/Azure DevOps API calls.","readOnly":false}),
-        serde_json::json!({"name":"commit_task_changes",                 "description":"WRITE â€” stages the specified files and creates a Git commit in the task repository. Does NOT push. Use push_task_branch or commit_and_push_task_changes to push afterwards.","readOnly":false}),
+        serde_json::json!({"name":"create_branch_for_task",              "description":"This modifies the local Git repository by creating and switching to a new branch, rebased onto the remote base branch (fetches origin first). Creates a local branch only â€” no commit, no push, no PR, no GitHub/Azure DevOps API calls. Prefer create_or_checkout_task_branch for the normal propose-then-approve workflow.","readOnly":false}),
+        serde_json::json!({"name":"create_or_checkout_task_branch",      "description":"WRITE â€” requires explicit prior user approval of the exact branch name. Creates the branch from the CURRENT HEAD (no fetch, no remote-base rebase) if it does not exist, or checks it out if it already exists, and records it as the task's confirmed branch. Rejects main/master and unsafe names. Never force-checks-out (refuses if uncommitted changes would be overwritten, surfacing git's own blocker). Does not commit, push, or modify any file.","readOnly":false}),
+        serde_json::json!({"name":"commit_task_changes",                 "description":"WRITE â€” stages the specified files and creates a Git commit in the task repository. Refuses to commit on main/master. Rejects files outside this task's recorded implementation unless confirmUnrelatedFiles=true, and files ignored by .gitignore unless listed in forceAddFiles (both require explicit user approval). Does NOT push. Use push_task_branch or commit_and_push_task_changes to push afterwards.","readOnly":false}),
         serde_json::json!({"name":"push_task_branch",                    "description":"WRITE â€” pushes the current branch of the task repository to origin. Push to main/master is blocked. No force push.","readOnly":false}),
         serde_json::json!({"name":"commit_and_push_task_changes",        "description":"WRITE â€” stages files, creates a Git commit, and pushes the current branch in one step. No PR creation. Set moveToReviewAfterPush=true to also move the task to Code Review / Waiting for code review.","readOnly":false}),
         serde_json::json!({"name":"mark_testing_confirmed_prepare_commit","description":"WRITE (local task state only) â€” marks consultant testing as confirmed and sets the next step to Prepare commit and push. Does NOT commit, push, or move the task to Code Review.","readOnly":false}),
         serde_json::json!({"name":"record_external_action_completed",     "description":"WRITE (local task state only) â€” records that the developer manually completed an external action (plugin registration, web resource upload, etc.). Does not call any external system.","readOnly":false}),
-        serde_json::json!({"name":"record_ai_kit_review_result",          "description":"WRITE (local task state only) â€” records the result of an AI Kit / Client-API code review performed by the calling AI agent itself (reviewSource=claude-ai-kit). Persists to implementationVerification.aiCodeReview (the same field the modal reads) and task.aiKitReview. Does not call any external LLM, API, or system â€” the caller supplies its own verdict after reading the AI Kit rules and target file directly.","readOnly":false}),
+        serde_json::json!({"name":"record_ai_kit_review_result",          "description":"WRITE (local task state only) â€” records the result of an AI Kit / Client-API code review performed by the calling AI agent itself (reviewSource=claude-ai-kit). Requires reviewedFiles, rulesFiles, checklistFiles, and knownPrReviewFiles to be non-empty for the review to pass the hard gate â€” a status='passed' call with those fields empty is recorded as gateStatus='incomplete', not passed. Persists to implementationVerification.aiCodeReview (the same field the modal reads) and task.aiKitReview. Does not call any external LLM, API, or system â€” the caller supplies its own verdict after reading the AI Kit rules, the CRM code review checklist, known PR review comments, and the target file directly.","readOnly":false}),
     ]
 }
 
@@ -8481,13 +8778,101 @@ fn task_mcp_impl_check_resolved(status: &str) -> bool {
     matches!(status, "passed" | "warnings" | "skipped" | "manually-verified" | "failed")
 }
 
+/// True for script/ribbon AND plugin tasks — the task kinds run_implementation_verification's
+/// hard-gate pipeline covers. Other kinds (repo-only, bugfix, review, general) are not part of
+/// the orchestrated verification pipeline and keep using their existing manual workflow.
+fn task_mcp_is_verifiable_dev_task(task: &Value) -> bool {
+    let setup = task.get("workflowSetup").unwrap_or(&Value::Null);
+    let workflow = task.get("crmDeveloperWorkflow").unwrap_or(&Value::Null);
+    let work_kind = workflow["detectedWorkKind"].as_str()
+        .or_else(|| setup["devTargetKind"].as_str())
+        .unwrap_or("unknown");
+    matches!(work_kind, "script" | "ribbon" | "plugin")
+        || matches!(setup["devTargetKind"].as_str(), Some("script") | Some("plugin"))
+}
+
+fn task_mcp_is_plugin_dev_task(task: &Value) -> bool {
+    let setup = task.get("workflowSetup").unwrap_or(&Value::Null);
+    let workflow = task.get("crmDeveloperWorkflow").unwrap_or(&Value::Null);
+    workflow["detectedWorkKind"].as_str() == Some("plugin") || setup["devTargetKind"].as_str() == Some("plugin")
+}
+
+/// Compares the task's customer's expected Dataverse environment label against the active
+/// Primarch connection's configured environment label. Returns Some((expected, active)) only
+/// when BOTH are set (non-empty, trimmed) and they differ under a case-insensitive comparison —
+/// an intentionally opt-in check: tasks/connections that never set a label are not blocked by a
+/// check that has nothing to compare against.
+fn task_mcp_dataverse_environment_mismatch(task: &Value, customers: &[Value], settings: &Value) -> Option<(String, String)> {
+    let customer_id = task["customerId"].as_str().unwrap_or("");
+    let expected = customers.iter()
+        .find(|c| c["id"].as_str() == Some(customer_id))
+        .and_then(|c| c["dataverseEnvironmentLabel"].as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let active = settings["primarchMcpEnvironmentLabel"].as_str()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    match (expected, active) {
+        (Some(e), Some(a)) if !e.eq_ignore_ascii_case(a) => Some((e.to_string(), a.to_string())),
+        _ => None,
+    }
+}
+
+/// Normalizes a raw Dataverse Metadata Check status (from task_mcp_dataverse_check_from_report,
+/// or a manual override such as "skipped"/"manually-verified") into the hard-gate status used to
+/// decide workflow progression. "warnings" only becomes "passed" once the user has explicitly
+/// accepted them (implementationVerification.dataverseCheck.warningsAccepted.accepted) —
+/// otherwise it is "warnings_unaccepted" and blocks progression, per the hardening spec.
+fn task_mcp_normalize_dataverse_gate(raw_status: &str, warnings_accepted: bool) -> &'static str {
+    match raw_status {
+        "passed" | "skipped" | "manually-verified" => "passed",
+        "warnings" => if warnings_accepted { "passed" } else { "warnings_unaccepted" },
+        "failed" => "failed",
+        "needs_configuration" => "needs_configuration",
+        _ => "not_run",
+    }
+}
+
+/// Evaluates whether a persisted AI Kit review payload (implementationVerification.aiCodeReview)
+/// satisfies the hard-gate requirements: status must be "passed", fixableFindings must be empty,
+/// and reviewedFiles/rulesFiles/checklistFiles/knownPrReviewFiles must all be non-empty — a
+/// "passed" status with missing details is treated as incomplete, not passed. Returns
+/// (gate_status, missing_detail_reasons) where gate_status is one of
+/// "passed" | "incomplete" | "failed" | "pending" | "not_run".
+fn task_mcp_ai_kit_review_gate(review: &Value) -> (&'static str, Vec<String>) {
+    if review.is_null() || !review.is_object() {
+        return ("not_run", vec![]);
+    }
+    let status = review["status"].as_str().unwrap_or("");
+    if status.is_empty() {
+        return ("not_run", vec![]);
+    }
+    let has_items = |key: &str| review[key].as_array().map(|a| !a.is_empty()).unwrap_or(false);
+    let mut missing = Vec::new();
+    if !has_items("reviewedFiles") { missing.push("reviewedFiles is empty".to_string()); }
+    if !has_items("rulesFiles") { missing.push("rulesFiles is empty".to_string()); }
+    if !has_items("checklistFiles") { missing.push("checklistFiles is empty".to_string()); }
+    if !has_items("knownPrReviewFiles") { missing.push("knownPrReviewFiles is empty".to_string()); }
+
+    if has_items("fixableFindings") {
+        missing.push("fixableFindings is non-empty".to_string());
+        return ("failed", missing);
+    }
+    match status {
+        "failed"   => ("failed", missing),
+        "warnings" => ("pending", missing),
+        "passed"   => if missing.is_empty() { ("passed", vec![]) } else { ("incomplete", missing) },
+        _          => ("not_run", vec![]),
+    }
+}
+
 /// Mirrors ImplementationVerificationModal's deriveDataverseCheckStatus (src/components/
 /// ImplementationVerificationModal.tsx). Read-only — run_dataverse_check_for_task rejects
 /// .js/.ts artifacts, so MCP cannot run this check for script tasks; it can only report the
 /// same status the modal would show.
 fn task_mcp_derive_dataverse_check_status(task: &Value) -> String {
     let override_status = task["implementationVerification"]["dataverseCheck"]["status"].as_str().unwrap_or("");
-    if override_status == "skipped" || override_status == "manually-verified" {
+    if matches!(override_status, "skipped" | "manually-verified" | "needs_configuration") {
         return override_status.to_string();
     }
     let verdict = task["crmVerificationReports"].as_array()
@@ -8561,6 +8946,102 @@ fn task_mcp_build_modal_verification_summary(task: &Value) -> Value {
     })
 }
 
+/// Single source of truth for "can this task move to Code Review / Waiting for PR". Computed
+/// from the exact same fields (implementationVerification.dataverseCheck /
+/// implementationVerification.aiCodeReview) that MCP's run_implementation_verification and the
+/// UI's Implementation Verification modal both read/write, so the MCP-facing workflow and the
+/// human-facing "Move to Code Review" button enforce identical rules. Exposed to the frontend via
+/// the get_implementation_progression_gate Tauri command. Pure — no I/O.
+fn task_mcp_compute_progression_gate(task: &Value) -> Value {
+    let dv_raw = task_mcp_derive_dataverse_check_status(task);
+    let dv_warnings_accepted = task_mcp_dataverse_warnings_accepted(task);
+    let dv_gate = task_mcp_normalize_dataverse_gate(&dv_raw, dv_warnings_accepted);
+
+    let ai_review = task["implementationVerification"]["aiCodeReview"].clone();
+    let (ai_gate, ai_missing) = task_mcp_ai_kit_review_gate(&ai_review);
+
+    let mut blocking_checks: Vec<Value> = Vec::new();
+    let mut blocking_findings: Vec<Value> = Vec::new();
+
+    match dv_gate {
+        "passed" => {}
+        "warnings_unaccepted" => blocking_checks.push(serde_json::json!({
+            "check": "dataverseCheck", "status": dv_gate,
+            "reason": "Dataverse Metadata Check completed with warnings that have not been explicitly accepted.",
+        })),
+        "needs_configuration" => blocking_checks.push(serde_json::json!({
+            "check": "dataverseCheck", "status": dv_gate,
+            "reason": "Dataverse Metadata Check cannot run — Primarch/Dataverse connection is not configured or does not match the task's environment.",
+        })),
+        "failed" => {
+            let missing_refs = task["crmVerificationReports"][0]["missingReferences"].as_array().cloned().unwrap_or_default();
+            for m in &missing_refs {
+                let label = m["displayName"].as_str().unwrap_or("unknown");
+                blocking_findings.push(serde_json::json!({ "check": "dataverseCheck", "description": format!("'{label}' was not found in Dataverse.") }));
+            }
+            blocking_checks.push(serde_json::json!({
+                "check": "dataverseCheck", "status": dv_gate,
+                "reason": "Dataverse Metadata Check found missing/incorrect references.",
+            }));
+        }
+        _ => blocking_checks.push(serde_json::json!({
+            "check": "dataverseCheck", "status": dv_gate,
+            "reason": "Dataverse Metadata Check has not run yet.",
+        })),
+    }
+
+    match ai_gate {
+        "passed" => {}
+        "failed" => {
+            for f in ai_review["fixableFindings"].as_array().cloned().unwrap_or_default() {
+                blocking_findings.push(serde_json::json!({ "check": "aiCodeReview", "description": f["description"].clone() }));
+            }
+            blocking_checks.push(serde_json::json!({
+                "check": "aiCodeReview", "status": ai_gate,
+                "reason": "AI Kit Code Review found fixable findings or an explicit failed verdict.",
+            }));
+        }
+        "incomplete" => blocking_checks.push(serde_json::json!({
+            "check": "aiCodeReview", "status": ai_gate,
+            "reason": format!("AI Kit Code Review is missing required details: {}.", ai_missing.join(", ")),
+        })),
+        "pending" => blocking_checks.push(serde_json::json!({
+            "check": "aiCodeReview", "status": ai_gate,
+            "reason": "AI Kit Code Review verdict is 'warnings' — must be resolved to 'passed'.",
+        })),
+        _ => blocking_checks.push(serde_json::json!({
+            "check": "aiCodeReview", "status": ai_gate,
+            "reason": "AI Kit Code Review has not run yet.",
+        })),
+    }
+
+    let can_proceed = blocking_checks.is_empty();
+    let requires_user_action = matches!(dv_gate, "warnings_unaccepted" | "needs_configuration");
+    let next_recommended_action = if can_proceed {
+        "continue_workflow"
+    } else if !blocking_findings.is_empty() {
+        "fix_code"
+    } else if matches!(ai_gate, "incomplete" | "pending" | "not_run") {
+        "run_ai_kit_review"
+    } else if dv_gate == "needs_configuration" {
+        "needs_configuration"
+    } else if dv_gate == "warnings_unaccepted" {
+        "review_dataverse_warnings"
+    } else {
+        "wait_for_user"
+    };
+
+    serde_json::json!({
+        "canProceed": can_proceed,
+        "blockingChecks": blocking_checks,
+        "blockingFindings": blocking_findings,
+        "requiresUserAction": requires_user_action,
+        "nextRecommendedAction": next_recommended_action,
+        "dataverseGateStatus": dv_gate,
+        "aiReviewGateStatus": ai_gate,
+    })
+}
+
 /// Keys of the modal-required rows still unresolved (needs_manual_action or genuinely not-run).
 fn task_mcp_unresolved_modal_rows(summary: &Value) -> Vec<String> {
     let unresolved = |row: &Value| matches!(row["status"].as_str(), Some("needs_manual_action") | Some("not-run"));
@@ -8609,8 +9090,8 @@ fn task_mcp_compute_continue_workflow_step(task: &Value) -> Value {
     let work_kind = workflow["detectedWorkKind"].as_str()
         .or_else(|| setup["devTargetKind"].as_str())
         .unwrap_or("unknown");
-    let is_script = work_kind == "script" || work_kind == "ribbon"
-        || setup["devTargetKind"].as_str() == Some("script");
+    let is_script = task_mcp_is_verifiable_dev_task(task);
+    let _ = work_kind;
 
     // 1. Local test must be recorded
     let local_test_status = task["localTestRecord"]["status"].as_str().unwrap_or("");
@@ -8696,6 +9177,19 @@ fn task_mcp_compute_continue_workflow_step(task: &Value) -> Value {
                     "forbiddenWrites": ["commit_task_changes", "push_task_branch", "commit_and_push_task_changes"],
                 });
             }
+            if mcp_verification["status"].as_str() == Some("warnings_unaccepted") {
+                let reason = "Dataverse Metadata Check completed with warnings that have not been explicitly accepted yet.".to_string();
+                return serde_json::json!({
+                    "nextAction": "review_dataverse_warnings",
+                    "canProceed": false,
+                    "requiresUserApproval": true,
+                    "blockingUserAction": reason,
+                    "recommendedTool": null,
+                    "instructionForAI": format!("{reason} This requires the user: ask them to review the warnings in the Implementation Verification modal and either accept them and continue, or send the task back for you to fix the code and rerun the check."),
+                    "allowedWrites": [],
+                    "forbiddenWrites": ["commit_task_changes", "push_task_branch", "commit_and_push_task_changes"],
+                });
+            }
             if mcp_verification["status"].as_str() == Some("needs_manual_action") {
                 let manual_step = task_mcp_compose_manual_verification_step(&task_mcp_build_modal_verification_summary(task));
                 return serde_json::json!({
@@ -8737,33 +9231,60 @@ fn task_mcp_compute_continue_workflow_step(task: &Value) -> Value {
         });
     }
 
-    // 3. AI Kit review
-    let ai_kit_review = &task["aiKitReview"];
-    let ai_kit_done = !ai_kit_review["completedAt"].is_null()
-        || matches!(ai_kit_review["status"].as_str().unwrap_or(""), "passed" | "skipped");
-    if !ai_kit_done {
+    // 3. AI Kit review — hard gate. Reads implementationVerification.aiCodeReview (the canonical
+    // field the modal reads), NOT the looser task.aiKitReview.completedAt flag: recording ANY
+    // verdict (including "failed") always sets completedAt, so gating on completedAt alone would
+    // let a failed/incomplete review through. task_mcp_ai_kit_review_gate requires status=="passed"
+    // AND fixableFindings empty AND reviewedFiles/rulesFiles/checklistFiles/knownPrReviewFiles all
+    // non-empty.
+    let ai_review = &task["implementationVerification"]["aiCodeReview"];
+    let (ai_gate, ai_missing) = task_mcp_ai_kit_review_gate(ai_review);
+    if ai_gate != "passed" {
+        let instruction = match ai_gate {
+            "failed" => "AI Kit review found fixable findings or has an explicit 'failed' verdict. Fix the code, then call record_ai_kit_review_result again with status='passed' and full review details, then call continue_developer_workflow again.".to_string(),
+            "incomplete" => format!("AI Kit review was recorded as 'passed' but is missing required details: {}. Call record_ai_kit_review_result again including reviewedFiles, rulesFiles, checklistFiles, and knownPrReviewFiles, then call continue_developer_workflow again.", ai_missing.join(", ")),
+            "pending" => "AI Kit review verdict is 'warnings' — resolve the warnings, then call record_ai_kit_review_result again with status='passed', then call continue_developer_workflow again.".to_string(),
+            _ => "AI Kit review is required before branch creation. Read the applicable AI Kit rules, the CRM code review checklist, known PR review comments, and the target file yourself, then call record_ai_kit_review_result with your verdict and full review details, then call continue_developer_workflow again.".to_string(),
+        };
         return serde_json::json!({
             "nextAction": "run_ai_kit_review",
             "canProceed": true,
             "requiresUserApproval": false,
             "blockingUserAction": null,
             "recommendedTool": "record_ai_kit_review_result",
-            "instructionForAI": "AI Kit review is required before branch creation. Read the applicable AI Kit rules and the target file yourself, then call record_ai_kit_review_result with your verdict, then call continue_developer_workflow again.",
-            "allowedWrites": ["record_ai_kit_review_result"],
+            "instructionForAI": instruction,
+            "allowedWrites": ["record_ai_kit_review_result", "record_ai_implementation_completed"],
             "forbiddenWrites": ["commit_task_changes", "push_task_branch", "commit_and_push_task_changes"],
         });
     }
 
-    // 4. Propose branch — requires explicit user approval
+    // 4. Propose/confirm branch, then commit — each step requires its OWN explicit user
+    // approval. Confirming a branch name does not imply the commit is approved, and vice versa.
+    let confirmed_branch = task["gitWorkflow"]["confirmedBranch"].as_str().filter(|s| !s.is_empty());
+    if let Some(branch) = confirmed_branch {
+        return serde_json::json!({
+            "nextAction": "prepare_commit",
+            "canProceed": true,
+            "requiresUserApproval": true,
+            "blockingUserAction": "Ask the user to confirm the commit (files + message) before committing.",
+            "recommendedTool": "prepare_commit_for_task",
+            "instructionForAI": format!(
+                "Branch '{branch}' was already created/checked out and confirmed. Call prepare_commit_for_task to show the user exactly what would be committed (changed files, ignored/gitignored files, suggested message), then ask for a SEPARATE explicit approval of the commit itself before calling commit_task_changes. Do not call push_task_branch or commit_and_push_task_changes without a further separate approval to push."
+            ),
+            "allowedWrites": ["prepare_commit_for_task", "commit_task_changes"],
+            "forbiddenWrites": ["push_task_branch", "commit_and_push_task_changes"],
+        });
+    }
+
     serde_json::json!({
         "nextAction": "propose_branch",
         "canProceed": true,
         "requiresUserApproval": true,
-        "blockingUserAction": "Ask the user to confirm the proposed branch name before creating the branch.",
-        "recommendedTool": "prepare_commit_for_task",
-        "instructionForAI": "Implementation, verification, and AI Kit review are complete. Propose a branch name and ask the user to confirm before creating the branch. Do not call commit_task_changes or push_task_branch without explicit user approval.",
-        "allowedWrites": [],
-        "forbiddenWrites": [],
+        "blockingUserAction": "Ask the user to confirm the proposed branch name before creating/checking it out.",
+        "recommendedTool": "create_or_checkout_task_branch",
+        "instructionForAI": "Implementation, verification, and AI Kit review are complete. Call prepare_commit_for_task to get a suggested branch name (proposedBranchName) and see whether it already exists (branchExists), propose that name to the user, and ask them to confirm the exact branch name. Once the user approves, call create_or_checkout_task_branch with mode='create_if_missing_and_checkout' to actually create/check out the branch — prepare_commit_for_task alone never creates or checks out anything. Do not call commit_task_changes, push_task_branch, or commit_and_push_task_changes until a SEPARATE explicit approval of the commit itself, after the branch exists.",
+        "allowedWrites": ["prepare_commit_for_task", "create_or_checkout_task_branch"],
+        "forbiddenWrites": ["commit_task_changes", "push_task_branch", "commit_and_push_task_changes"],
     })
 }
 
@@ -10258,9 +10779,10 @@ fn task_mcp_execute_tool(app: &tauri::AppHandle, tool_name: &str, args: &Value) 
             if tasks[index]["taskMode"].as_str() != Some("developer") {
                 return Err("Task is not in developer mode.".to_string());
             }
-            if !task_mcp_is_script_workflow_task(&tasks[index]) {
-                return Err("run_implementation_verification currently supports script/ribbon tasks only. Use run_dataverse_check_for_task for plugin tasks.".to_string());
+            if !task_mcp_is_verifiable_dev_task(&tasks[index]) {
+                return Err("run_implementation_verification currently supports script/ribbon/plugin tasks only.".to_string());
             }
+            let is_plugin = task_mcp_is_plugin_dev_task(&tasks[index]);
 
             let requested_checks: Option<std::collections::HashSet<String>> = args["checks"].as_array()
                 .filter(|a| !a.is_empty())
@@ -10273,20 +10795,28 @@ fn task_mcp_execute_tool(app: &tauri::AppHandle, tool_name: &str, args: &Value) 
             let mut readiness_finding: Option<String> = None;
             let mut file_content: Option<String> = None;
             let mut absolute_script_path: Option<String> = None;
+            let readiness_label = if is_plugin { "Plugin File Readiness" } else { "Script File Readiness" };
 
             if run_check("scriptFileReadiness") {
-                let absolute_path = task_mcp_resolve_script_absolute_path(&tasks[index]);
+                let absolute_path = if is_plugin {
+                    match mcp_resolve_artifact_path(app, &tasks[index].clone(), true, &mut tasks, index) {
+                        Ok((p, _inferred)) => Some(p),
+                        Err(_) => None,
+                    }
+                } else {
+                    task_mcp_resolve_script_absolute_path(&tasks[index])
+                };
                 absolute_script_path = absolute_path.clone();
                 let (status, finding, fixable) = match &absolute_path {
                     None => (
                         "failed".to_string(),
-                        "No script artifact path is set on the task. Call record_ai_implementation_completed with filesChanged first.".to_string(),
+                        format!("No {} artifact path is set on the task. Call record_ai_implementation_completed with filesChanged first.", if is_plugin { "plugin" } else { "script" }),
                         Some("Persist the implemented file path via record_ai_implementation_completed before verifying.".to_string()),
                     ),
                     Some(p) => match fs::read_to_string(p) {
                         Err(e) => (
                             "failed".to_string(),
-                            format!("Script file not found or unreadable at {p}: {e}"),
+                            format!("Artifact file not found or unreadable at {p}: {e}"),
                             Some("Verify the implemented file was written to the expected path and call record_ai_implementation_completed again.".to_string()),
                         ),
                         Ok(content) => {
@@ -10294,29 +10824,31 @@ fn task_mcp_execute_tool(app: &tauri::AppHandle, tool_name: &str, args: &Value) 
                             let line_count = content.lines().count();
                             let file_name = std::path::Path::new(p).file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| p.clone());
                             let finding = if is_empty {
-                                format!("Script file exists but is empty: {file_name}.")
+                                format!("Artifact file exists but is empty: {file_name}.")
                             } else {
-                                format!("Script file found: {file_name} ({line_count} lines).")
+                                format!("Artifact file found: {file_name} ({line_count} lines).")
                             };
                             if !is_empty { file_content = Some(content); }
                             (
                                 if is_empty { "failed".to_string() } else { "passed".to_string() },
                                 finding,
-                                if is_empty { Some("Write the actual implementation to the script file.".to_string()) } else { None },
+                                if is_empty { Some("Write the actual implementation to the artifact file.".to_string()) } else { None },
                             )
                         }
                     },
                 };
-                checks.push(serde_json::json!({ "name": "Script File Readiness", "status": status, "findings": [finding] }));
+                checks.push(serde_json::json!({ "name": readiness_label, "status": status, "findings": [finding] }));
                 if let Some(fix_description) = fixable {
-                    fixable_findings.push(serde_json::json!({ "id": "script-file-readiness", "description": fix_description }));
+                    fixable_findings.push(serde_json::json!({ "id": "artifact-file-readiness", "description": fix_description }));
                 }
                 readiness_status = Some(status);
                 readiness_finding = Some(finding);
             }
 
             if run_check("localStaticVerification") {
-                if let Some(content) = &file_content {
+                if is_plugin {
+                    checks.push(serde_json::json!({ "name": "Local Static/Business-Rule Verification", "status": "skipped", "findings": ["Not applicable — static rule templates currently cover JS/TS script tasks only."] }));
+                } else if let Some(content) = &file_content {
                     let template = task_mcp_builtin_templates().into_iter()
                         .find(|t| tasks[index]["title"].as_str().unwrap_or("").to_lowercase()
                             .contains(&t["titlePattern"].as_str().unwrap_or("__none__").to_lowercase()));
@@ -10331,23 +10863,66 @@ fn task_mcp_execute_tool(app: &tauri::AppHandle, tool_name: &str, args: &Value) 
             // Dataverse Metadata Check: actually run it (Rust JS/TS + C# scanners against
             // Primarch), same as run_dataverse_check_for_task, instead of the old read-only
             // passthrough. Persists to task.crmVerificationReports — the modal's canonical field.
+            // Hard gate: "warnings" only counts as resolved once the user has explicitly accepted
+            // them (implementationVerification.dataverseCheck.warningsAccepted) — see
+            // task_mcp_normalize_dataverse_gate.
             if run_check("dataverseMetadataCheck") {
+                if tasks[index]["implementationVerification"].is_null() { tasks[index]["implementationVerification"] = serde_json::json!({}); }
+                if tasks[index]["implementationVerification"]["dataverseCheck"].is_null() { tasks[index]["implementationVerification"]["dataverseCheck"] = serde_json::json!({}); }
+                // "needs_configuration" is only ever a transient override — clear a stale one from a
+                // prior run before deciding this run's outcome, so a since-fixed configuration
+                // doesn't leave the modal permanently stuck reporting needs_configuration.
+                if tasks[index]["implementationVerification"]["dataverseCheck"]["status"].as_str() == Some("needs_configuration") {
+                    tasks[index]["implementationVerification"]["dataverseCheck"]["status"] = Value::Null;
+                }
+                let settings = load_settings(app.clone())?;
+                let customers = task_mcp_load_customers(app).unwrap_or_default();
+                let expected_env = customers.iter()
+                    .find(|c| c["id"].as_str() == tasks[index]["customerId"].as_str())
+                    .and_then(|c| c["dataverseEnvironmentLabel"].as_str()).map(str::to_string);
+                let active_env = settings["primarchMcpEnvironmentLabel"].as_str()
+                    .filter(|s| !s.trim().is_empty()).map(str::to_string);
+                let env_mismatch = task_mcp_dataverse_environment_mismatch(&tasks[index], &customers, &settings);
+                let environment_detail = serde_json::json!({
+                    "expected": expected_env,
+                    "active": active_env,
+                    "mismatch": env_mismatch.is_some(),
+                });
+
                 match &absolute_script_path {
                     None => {
                         checks.push(serde_json::json!({
                             "name": "Dataverse Metadata Check",
-                            "status": "skipped",
-                            "findings": ["Skipped — script file path is not resolved yet."],
+                            "status": "not_run",
+                            "findings": ["Skipped — artifact file path is not resolved yet."],
+                            "environment": environment_detail,
+                        }));
+                    }
+                    Some(_) if env_mismatch.is_some() => {
+                        let (expected, active) = env_mismatch.unwrap();
+                        let reason = format!(
+                            "Active Primarch/Dataverse connection ('{active}') does not match this task's expected environment ('{expected}'). Switch the connection or update the task's customer environment label in Settings, then rerun the check. The check was NOT run against the wrong environment.",
+                        );
+                        tasks[index]["implementationVerification"]["dataverseCheck"]["status"] = serde_json::json!("needs_configuration");
+                        tasks[index]["implementationVerification"]["dataverseCheck"]["message"] = serde_json::json!(reason);
+                        checks.push(serde_json::json!({
+                            "name": "Dataverse Metadata Check",
+                            "status": "needs_configuration",
+                            "findings": [reason],
+                            "environment": environment_detail,
                         }));
                     }
                     Some(path) => {
-                        let settings = load_settings(app.clone())?;
                         match get_mcp_config(&settings) {
                             Err(msg) => {
+                                let reason = format!("Dataverse Metadata Check is not configured: {msg}");
+                                tasks[index]["implementationVerification"]["dataverseCheck"]["status"] = serde_json::json!("needs_configuration");
+                                tasks[index]["implementationVerification"]["dataverseCheck"]["message"] = serde_json::json!(reason);
                                 checks.push(serde_json::json!({
                                     "name": "Dataverse Metadata Check",
                                     "status": "needs_configuration",
-                                    "findings": [format!("Dataverse Metadata Check is not configured: {msg}")],
+                                    "findings": [reason],
+                                    "environment": environment_detail,
                                 }));
                             }
                             Ok(_) => {
@@ -10357,14 +10932,29 @@ fn task_mcp_execute_tool(app: &tauri::AppHandle, tool_name: &str, args: &Value) 
                                 match task_mcp_run_dataverse_metadata_check(app, &mut tasks, index, path, scan_hint.as_deref(), None) {
                                     Ok(report) => {
                                         let (dv_status, finding, dv_fixable) = task_mcp_dataverse_check_from_report(&report);
+                                        let warnings_accepted = task_mcp_dataverse_warnings_accepted(&tasks[index]);
+                                        let gate_status = task_mcp_normalize_dataverse_gate(&dv_status, warnings_accepted);
                                         fixable_findings.extend(dv_fixable);
-                                        checks.push(serde_json::json!({ "name": "Dataverse Metadata Check", "status": dv_status, "findings": [finding] }));
+                                        let checked_references = task_mcp_build_verified_references_list(&report);
+                                        if tasks[index]["implementationVerification"].is_null() { tasks[index]["implementationVerification"] = serde_json::json!({}); }
+                                        if tasks[index]["implementationVerification"]["dataverseCheck"].is_null() { tasks[index]["implementationVerification"]["dataverseCheck"] = serde_json::json!({}); }
+                                        tasks[index]["implementationVerification"]["dataverseCheck"]["environment"] = environment_detail.clone();
+                                        checks.push(serde_json::json!({
+                                            "name": "Dataverse Metadata Check",
+                                            "status": gate_status,
+                                            "rawStatus": dv_status,
+                                            "findings": [finding],
+                                            "environment": environment_detail,
+                                            "checkedReferences": checked_references,
+                                            "warningsAccepted": tasks[index]["implementationVerification"]["dataverseCheck"]["warningsAccepted"].clone(),
+                                        }));
                                     }
                                     Err(e) => {
                                         checks.push(serde_json::json!({
                                             "name": "Dataverse Metadata Check",
                                             "status": "failed",
                                             "findings": [format!("Dataverse Metadata Check failed: {e}")],
+                                            "environment": environment_detail,
                                         }));
                                     }
                                 }
@@ -10376,17 +10966,49 @@ fn task_mcp_execute_tool(app: &tauri::AppHandle, tool_name: &str, args: &Value) 
 
             // AI Internal Code Review: Claude (the calling MCP agent) performs this review itself
             // — read the AI Kit rules and target file, then call record_ai_kit_review_result. Only
-            // a passthrough when a result has already been recorded.
+            // a passthrough when a result has already been recorded. Hard gate: a "passed" review
+            // with missing details (reviewedFiles/rulesFiles/checklistFiles/knownPrReviewFiles) is
+            // treated as incomplete, and any fixableFindings block the gate regardless of status —
+            // see task_mcp_ai_kit_review_gate.
             if run_check("aiInternalCodeReview") {
-                let ai_status = tasks[index]["implementationVerification"]["aiCodeReview"]["status"].as_str().unwrap_or("").to_string();
-                if task_mcp_impl_check_resolved(&ai_status) {
-                    checks.push(serde_json::json!({ "name": "AI Internal Code Review", "status": ai_status, "findings": [format!("Existing AI Kit review status: {ai_status}.")] }));
-                } else {
-                    checks.push(serde_json::json!({
-                        "name": "AI Internal Code Review",
-                        "status": "needs_ai_kit_review",
-                        "findings": ["Read the applicable AI Kit rules and the target file yourself (use get_power_platform_ai_kit_status and get_developer_work_packet for context), then call record_ai_kit_review_result with your verdict."],
-                    }));
+                let ai_review = tasks[index]["implementationVerification"]["aiCodeReview"].clone();
+                let (gate_status, missing_details) = task_mcp_ai_kit_review_gate(&ai_review);
+                match gate_status {
+                    "passed" => {
+                        checks.push(serde_json::json!({ "name": "AI Internal Code Review", "status": "passed", "findings": ["AI Kit review passed with full review details recorded."], "review": ai_review }));
+                    }
+                    "failed" => {
+                        let ai_fixable = ai_review["fixableFindings"].as_array().cloned().unwrap_or_default();
+                        if ai_fixable.is_empty() {
+                            fixable_findings.push(serde_json::json!({ "id": "ai-kit-review-failed", "description": "AI Kit review verdict is 'failed'. Address the findings and call record_ai_kit_review_result again." }));
+                        } else {
+                            fixable_findings.extend(ai_fixable);
+                        }
+                        checks.push(serde_json::json!({ "name": "AI Internal Code Review", "status": "failed", "findings": ["AI Kit review found fixable issues."], "review": ai_review }));
+                    }
+                    "incomplete" => {
+                        checks.push(serde_json::json!({
+                            "name": "AI Internal Code Review",
+                            "status": "needs_ai_kit_review",
+                            "findings": [format!("AI Kit review was recorded as 'passed' but is missing required details ({}). Re-run the review and include them.", missing_details.join(", "))],
+                            "review": ai_review,
+                        }));
+                    }
+                    "pending" => {
+                        checks.push(serde_json::json!({
+                            "name": "AI Internal Code Review",
+                            "status": "needs_ai_kit_review",
+                            "findings": ["AI Kit review verdict is 'warnings' — resolve the warnings (fix or justify) and call record_ai_kit_review_result again with a 'passed' verdict."],
+                            "review": ai_review,
+                        }));
+                    }
+                    _ => {
+                        checks.push(serde_json::json!({
+                            "name": "AI Internal Code Review",
+                            "status": "needs_ai_kit_review",
+                            "findings": ["Read the applicable AI Kit rules, the CRM code review checklist, known PR review comments, and the target file yourself (use get_power_platform_ai_kit_status and get_developer_work_packet for context), then call record_ai_kit_review_result with your verdict and full review details."],
+                        }));
+                    }
                 }
             }
 
@@ -10445,6 +11067,7 @@ fn task_mcp_execute_tool(app: &tauri::AppHandle, tool_name: &str, args: &Value) 
                     .to_string(),
                 "fix_code" => "Fix the fixable findings, then call record_ai_implementation_completed and run_implementation_verification again.".to_string(),
                 "run_ai_kit_review" => "Read the applicable AI Kit rules and the target file, then call record_ai_kit_review_result with your verdict, then call run_implementation_verification again.".to_string(),
+                "review_dataverse_warnings" => "Dataverse Metadata Check completed with warnings that are not yet accepted. This requires the user: ask them to review the warnings in the Implementation Verification modal and either accept them, or send the task back for you to fix the code, then rerun the check.".to_string(),
                 "wait_for_user" => task_mcp_compose_manual_verification_step(&implementation_verification),
                 _ => "All Implementation Verification checks are resolved. Call continue_developer_workflow to proceed.".to_string(),
             };
@@ -10460,6 +11083,7 @@ fn task_mcp_execute_tool(app: &tauri::AppHandle, tool_name: &str, args: &Value) 
                 "nextRecommendedStep": next_recommended_step,
                 "missingRequiredTools": missing_required_tools,
                 "instructionForAI": next_recommended_step,
+                "progressionGate": task_mcp_compute_progression_gate(&tasks[index]),
             })
         }
 
@@ -10502,6 +11126,7 @@ fn task_mcp_execute_tool(app: &tauri::AppHandle, tool_name: &str, args: &Value) 
                     .to_string(),
                 "fix_code" => "Fix the fixable findings, then call record_ai_implementation_completed and run_implementation_verification again.".to_string(),
                 "run_ai_kit_review" => "Read the applicable AI Kit rules and the target file, then call record_ai_kit_review_result with your verdict, then call run_implementation_verification again.".to_string(),
+                "review_dataverse_warnings" => "Dataverse Metadata Check completed with warnings that are not yet accepted. This requires the user: ask them to review the warnings in the Implementation Verification modal and either accept them, or send the task back for you to fix the code, then rerun the check.".to_string(),
                 "wait_for_user" => task_mcp_compose_manual_verification_step(&implementation_verification),
                 _ => "All Implementation Verification checks are resolved. Call continue_developer_workflow to proceed.".to_string(),
             };
@@ -10514,6 +11139,7 @@ fn task_mcp_execute_tool(app: &tauri::AppHandle, tool_name: &str, args: &Value) 
                 "fixableFindings": fixable_findings,
                 "nextAction": next_action,
                 "nextRecommendedStep": next_recommended_step,
+                "progressionGate": task_mcp_compute_progression_gate(task),
             })
         }
 
@@ -11025,33 +11651,7 @@ fn task_mcp_execute_tool(app: &tauri::AppHandle, tool_name: &str, args: &Value) 
                 _          => "unknown",
             };
 
-            let mut verified: Vec<Value> = Vec::new();
-            for r in report["confirmedReferences"].as_array().unwrap_or(&vec![]) {
-                verified.push(serde_json::json!({
-                    "kind": r["kind"],
-                    "logicalName": r["displayName"],
-                    "entityLogicalName": r["entityLogicalName"],
-                    "attributeLogicalName": r["attributeLogicalName"],
-                    "status": "found",
-                }));
-            }
-            for r in report["missingReferences"].as_array().unwrap_or(&vec![]) {
-                verified.push(serde_json::json!({
-                    "kind": r["kind"],
-                    "logicalName": r["displayName"],
-                    "entityLogicalName": r["entityLogicalName"],
-                    "attributeLogicalName": r["attributeLogicalName"],
-                    "status": "missing",
-                }));
-            }
-            for r in report["ambiguousReferences"].as_array().unwrap_or(&vec![]) {
-                verified.push(serde_json::json!({
-                    "kind": r["kind"],
-                    "logicalName": r["displayName"],
-                    "entityLogicalName": r["entityLogicalName"],
-                    "status": "unverified",
-                }));
-            }
+            let verified = task_mcp_build_verified_references_list(&report);
 
             serde_json::json!({
                 "ok": true,
@@ -11097,14 +11697,24 @@ fn task_mcp_execute_tool(app: &tauri::AppHandle, tool_name: &str, args: &Value) 
             let files: Vec<String> = args["files"].as_array()
                 .map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
                 .unwrap_or_default();
+            let force_add_files: Vec<String> = args["forceAddFiles"].as_array()
+                .map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
+                .unwrap_or_default();
+            let confirm_unrelated = args["confirmUnrelatedFiles"].as_bool().unwrap_or(false);
             if task_id.is_empty() { return Err("Missing required argument: taskId".into()); }
             let task_idx = task_mcp_find_task_index(&tasks, task_id)
                 .ok_or_else(|| format!("Task not found: {task_id}"))?;
             let task_snap = tasks[task_idx].clone();
             let repo_root = mcp_resolve_repo_root_for_task(app, &task_snap)?;
-            let result = git_commit_impl(&repo_root, &files, message)?;
+            let related_files = task_mcp_related_implementation_files(&task_snap);
+            let result = git_commit_impl(&repo_root, &files, message, &force_add_files, &related_files, confirm_unrelated)?;
             let hash = result["commitHash"].as_str().unwrap_or("?").to_string();
-            { let t = &mut tasks[task_idx]; task_mcp_append_audit_note(t, &format!("commit_task_changes -> {hash}")); }
+            { let t = &mut tasks[task_idx];
+              if t["gitWorkflow"].is_null() { t["gitWorkflow"] = serde_json::json!({}); }
+              t["gitWorkflow"]["lastCommitHash"] = serde_json::json!(hash);
+              t["gitWorkflow"]["lastCommitAt"] = serde_json::json!(chrono_now_iso());
+              t["gitWorkflow"]["lastCommitBranch"] = result["branch"].clone();
+              task_mcp_append_audit_note(t, &format!("commit_task_changes -> {hash}")); }
             updated = true;
             result
         }
@@ -11118,7 +11728,13 @@ fn task_mcp_execute_tool(app: &tauri::AppHandle, tool_name: &str, args: &Value) 
             let repo_root = mcp_resolve_repo_root_for_task(app, &task_snap)?;
             let result = git_push_impl(&repo_root)?;
             let branch = result["branch"].as_str().unwrap_or("?").to_string();
-            { let t = &mut tasks[task_idx]; task_mcp_append_audit_note(t, &format!("push_task_branch -> {branch}")); }
+            {
+                let t = &mut tasks[task_idx];
+                if t["gitWorkflow"].is_null() { t["gitWorkflow"] = serde_json::json!({}); }
+                t["gitWorkflow"]["lastPushedBranch"] = serde_json::json!(branch);
+                t["gitWorkflow"]["lastPushedAt"] = serde_json::json!(chrono_now_iso());
+                task_mcp_append_audit_note(t, &format!("push_task_branch -> {branch}"));
+            }
             updated = true;
             result
         }
@@ -11129,12 +11745,17 @@ fn task_mcp_execute_tool(app: &tauri::AppHandle, tool_name: &str, args: &Value) 
             let files: Vec<String> = args["files"].as_array()
                 .map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
                 .unwrap_or_default();
+            let force_add_files: Vec<String> = args["forceAddFiles"].as_array()
+                .map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
+                .unwrap_or_default();
+            let confirm_unrelated = args["confirmUnrelatedFiles"].as_bool().unwrap_or(false);
             let move_to_review = args["moveToReviewAfterPush"].as_bool().unwrap_or(false);
             if task_id.is_empty() { return Err("Missing required argument: taskId".into()); }
             let task_idx = task_mcp_find_task_index(&tasks, task_id)
                 .ok_or_else(|| format!("Task not found: {task_id}"))?;
             let task_snap = tasks[task_idx].clone();
             let repo_root = mcp_resolve_repo_root_for_task(app, &task_snap)?;
+            let related_files = task_mcp_related_implementation_files(&task_snap);
 
             // When moving to Review, require a valid merge base so a normal PR can be created.
             if move_to_review {
@@ -11143,18 +11764,28 @@ fn task_mcp_execute_tool(app: &tauri::AppHandle, tool_name: &str, args: &Value) 
                         return Err(format!(
                             "Current branch has no common history with {base}. \
                              A normal PR cannot be created. \
-                             Create a branch from {base} first using create_branch_for_task, \
+                             Create a branch from {base} first using create_or_checkout_task_branch, \
                              then reapply your changes."
                         ));
                     }
                 }
             }
 
-            let commit = git_commit_impl(&repo_root, &files, message)?;
+            let commit = git_commit_impl(&repo_root, &files, message, &force_add_files, &related_files, confirm_unrelated)?;
             let hash   = commit["commitHash"].as_str().unwrap_or("?").to_string();
             let push   = git_push_impl(&repo_root)?;
             let branch = push["branch"].as_str().unwrap_or("?").to_string();
-            { let t = &mut tasks[task_idx]; task_mcp_append_audit_note(t, &format!("commit_and_push_task_changes -> {hash} {branch}")); }
+            {
+                let t = &mut tasks[task_idx];
+                if t["gitWorkflow"].is_null() { t["gitWorkflow"] = serde_json::json!({}); }
+                let now = chrono_now_iso();
+                t["gitWorkflow"]["lastCommitHash"] = serde_json::json!(hash);
+                t["gitWorkflow"]["lastCommitAt"] = serde_json::json!(now);
+                t["gitWorkflow"]["lastCommitBranch"] = serde_json::json!(branch);
+                t["gitWorkflow"]["lastPushedBranch"] = serde_json::json!(branch);
+                t["gitWorkflow"]["lastPushedAt"] = serde_json::json!(now);
+                task_mcp_append_audit_note(t, &format!("commit_and_push_task_changes -> {hash} {branch}"));
+            }
             if move_to_review {
                 let now = chrono_now_iso();
                 let t = &mut tasks[task_idx];
@@ -11191,6 +11822,47 @@ fn task_mcp_execute_tool(app: &tauri::AppHandle, tool_name: &str, args: &Value) 
             { let t = &mut tasks[task_idx]; task_mcp_append_audit_note(t, &format!("create_branch_for_task -> {branch}")); }
             updated = true;
             result
+        }
+
+        // Guarded, propose-then-approve branch switch: the ONLY tool that may act on a branch
+        // name after the user has explicitly confirmed it. Never fetches, never rebases onto a
+        // remote base, never pushes/commits/modifies files. See checkout_or_create_task_branch_impl
+        // for the full safety contract (never forces checkout).
+        "create_or_checkout_task_branch" => {
+            let task_id     = args["taskId"].as_str().unwrap_or("").trim();
+            let branch_name = args["branchName"].as_str().unwrap_or("").trim();
+            let mode        = args["mode"].as_str().unwrap_or("create_if_missing_and_checkout");
+            if task_id.is_empty()     { return Err("Missing required argument: taskId".into()); }
+            if branch_name.is_empty() { return Err("Missing required argument: branchName".into()); }
+            if mode != "create_if_missing_and_checkout" {
+                return Err(format!("Unsupported mode '{mode}'. Only 'create_if_missing_and_checkout' is supported."));
+            }
+            let task_idx = task_mcp_find_task_index(&tasks, task_id)
+                .ok_or_else(|| format!("Task not found: {task_id}"))?;
+            let task_snap = tasks[task_idx].clone();
+            let repo_root = mcp_resolve_repo_root_for_task(app, &task_snap)?;
+            let result = checkout_or_create_task_branch_impl(&repo_root, branch_name)?;
+
+            let now = chrono_now_iso();
+            let branch_created = result["branchCreated"].as_bool().unwrap_or(false);
+            {
+                let t = &mut tasks[task_idx];
+                if t["gitWorkflow"].is_null() { t["gitWorkflow"] = serde_json::json!({}); }
+                t["gitWorkflow"]["confirmedBranch"] = serde_json::json!(branch_name);
+                t["gitWorkflow"]["confirmedAt"] = serde_json::json!(now);
+                if branch_created { t["gitWorkflow"]["branchCreatedAt"] = serde_json::json!(now); }
+                task_mcp_append_audit_note(t, &format!(
+                    "create_or_checkout_task_branch -> {branch_name} (created={}, checkedOut={})",
+                    result["branchCreated"], result["branchCheckedOut"]
+                ));
+            }
+            updated = true;
+
+            let mut out = result;
+            out["nextRecommendedAction"] = serde_json::json!(
+                "Call prepare_commit_for_task to preview the commit before staging/committing. Do not call commit_task_changes without a separate explicit user approval of the commit."
+            );
+            out
         }
 
         "mark_testing_confirmed_prepare_commit" => {
@@ -11376,31 +12048,36 @@ fn task_mcp_execute_tool(app: &tauri::AppHandle, tool_name: &str, args: &Value) 
         "record_ai_kit_review_result" => {
             let task_id = args["taskId"].as_str().unwrap_or("").trim();
             if task_id.is_empty() { return Err("Missing required argument: taskId".to_string()); }
-            let status = args["status"].as_str().unwrap_or("").trim();
-            if !matches!(status, "passed" | "failed" | "warnings") {
-                return Err(format!("Invalid status '{status}'. Allowed: passed, failed, warnings"));
-            }
-            let reviewed_files: Vec<Value> = args["reviewedFiles"].as_array().cloned().unwrap_or_default();
-            let findings: Vec<Value> = args["findings"].as_array().cloned().unwrap_or_default();
-            let fixable_findings: Vec<Value> = args["fixableFindings"].as_array().cloned().unwrap_or_default();
 
             let index = task_mcp_find_task_index(&tasks, task_id)
                 .ok_or_else(|| format!("Task not found: {task_id}"))?;
             let task = &mut tasks[index];
             let now = chrono_now_iso();
 
-            task_mcp_apply_ai_kit_review_result(task, status, reviewed_files, findings, fixable_findings, &now);
+            task_mcp_apply_ai_kit_review_result(task, args, &now)?;
+            let status = args["status"].as_str().unwrap_or("");
             task_mcp_append_audit_note(task, &format!("record_ai_kit_review_result -> {status}"));
             updated = true;
 
+            let (gate_status, missing_details) = task_mcp_ai_kit_review_gate(&task["implementationVerification"]["aiCodeReview"]);
             let implementation_verification = task_mcp_build_modal_verification_summary(task);
             let unresolved_required_rows = task_mcp_unresolved_modal_rows(&implementation_verification);
+            let next_recommended_step = if gate_status == "passed" {
+                "Call run_implementation_verification again to confirm all automated checks are resolved.".to_string()
+            } else {
+                format!(
+                    "AI Kit review does not satisfy the hard gate yet (gateStatus={gate_status}): {}. Fix the findings and/or include the missing review details, then call record_ai_kit_review_result again.",
+                    if missing_details.is_empty() { "see findings/fixableFindings".to_string() } else { missing_details.join("; ") }
+                )
+            };
             serde_json::json!({
                 "taskId": task_id,
                 "recorded": true,
+                "gateStatus": gate_status,
+                "missingReviewDetails": missing_details,
                 "implementationVerification": implementation_verification,
                 "unresolvedRequiredRows": unresolved_required_rows,
-                "nextRecommendedStep": "Call run_implementation_verification again to confirm all automated checks are resolved.",
+                "nextRecommendedStep": next_recommended_step,
             })
         }
 
@@ -13685,6 +14362,42 @@ async fn run_crm_verification_for_scan(
     }
 }
 
+/// Reads whether the user has explicitly accepted the current Dataverse Metadata Check warnings
+/// (implementationVerification.dataverseCheck.warningsAccepted.accepted). Never true unless a
+/// prior accept_dataverse_warnings call set it — the AI cannot set this itself.
+fn task_mcp_dataverse_warnings_accepted(task: &Value) -> bool {
+    task["implementationVerification"]["dataverseCheck"]["warningsAccepted"]["accepted"].as_bool().unwrap_or(false)
+}
+
+/// Builds the flat "kind/logicalName/entity/attribute/status" reference list the Implementation
+/// Verification modal and run_dataverse_check_for_task both render as "checked entities/fields" —
+/// factored out so run_implementation_verification's Dataverse Metadata Check step reports the
+/// exact same detail shape.
+fn task_mcp_build_verified_references_list(report: &Value) -> Vec<Value> {
+    let mut verified: Vec<Value> = Vec::new();
+    for r in report["confirmedReferences"].as_array().unwrap_or(&vec![]) {
+        verified.push(serde_json::json!({
+            "kind": r["kind"], "logicalName": r["displayName"],
+            "entityLogicalName": r["entityLogicalName"], "attributeLogicalName": r["attributeLogicalName"],
+            "status": "found",
+        }));
+    }
+    for r in report["missingReferences"].as_array().unwrap_or(&vec![]) {
+        verified.push(serde_json::json!({
+            "kind": r["kind"], "logicalName": r["displayName"],
+            "entityLogicalName": r["entityLogicalName"], "attributeLogicalName": r["attributeLogicalName"],
+            "status": "missing",
+        }));
+    }
+    for r in report["ambiguousReferences"].as_array().unwrap_or(&vec![]) {
+        verified.push(serde_json::json!({
+            "kind": r["kind"], "logicalName": r["displayName"], "entityLogicalName": r["entityLogicalName"],
+            "status": "unverified",
+        }));
+    }
+    verified
+}
+
 /// Maps a Primarch verification report (as returned by `run_crm_verification_for_scan` /
 /// `task_mcp_run_dataverse_metadata_check`) to a "Dataverse Metadata Check" check-row status,
 /// finding message, and any fixable findings for missing references. Pure — no I/O — so the
@@ -13727,13 +14440,18 @@ fn task_mcp_dataverse_check_from_report(report: &Value) -> (String, String, Vec<
 fn task_mcp_rollup_verification_status(checks: &[Value], fixable_findings_count: usize) -> (&'static str, &'static str) {
     let has_needs_configuration = checks.iter().any(|c| c["status"].as_str() == Some("needs_configuration"));
     let has_needs_ai_review = checks.iter().any(|c| c["status"].as_str() == Some("needs_ai_kit_review"));
+    let has_warnings_unaccepted = checks.iter().any(|c| c["status"].as_str() == Some("warnings_unaccepted"));
     if fixable_findings_count > 0 {
         ("failed", "fix_code")
     } else if has_needs_ai_review {
         ("pending_ai_kit_review", "run_ai_kit_review")
     } else if has_needs_configuration {
         ("needs_configuration", "needs_configuration")
-    } else if checks.iter().any(|c| matches!(c["status"].as_str(), Some("needs_manual_action") | Some("failed") | Some("skipped"))) {
+    } else if has_warnings_unaccepted {
+        // The Dataverse Metadata Check completed with non-blocking warnings, but the user has not
+        // explicitly accepted them yet — this requires user action, not further agent work.
+        ("warnings_unaccepted", "review_dataverse_warnings")
+    } else if checks.iter().any(|c| matches!(c["status"].as_str(), Some("needs_manual_action") | Some("failed") | Some("skipped") | Some("not_run"))) {
         ("needs_manual_action", "wait_for_user")
     } else {
         ("passed", "continue_workflow")
@@ -13742,24 +14460,37 @@ fn task_mcp_rollup_verification_status(checks: &[Value], fixable_findings_count:
 
 /// Applies an AI Kit / Client-API review result (performed by the calling AI agent itself) to a
 /// task: writes implementationVerification.aiCodeReview (the canonical field the modal reads) and
-/// task.aiKitReview (the separate continue_developer_workflow pre-branch gate). Pure mutation — no
-/// I/O — so this is unit testable without a Tauri AppHandle.
-fn task_mcp_apply_ai_kit_review_result(
-    task: &mut Value,
-    status: &str,
-    reviewed_files: Vec<Value>,
-    findings: Vec<Value>,
-    fixable_findings: Vec<Value>,
-    now: &str,
-) {
+/// task.aiKitReview (the separate continue_developer_workflow pre-branch gate). `args` is the raw
+/// record_ai_kit_review_result tool payload — this function is intentionally the single place
+/// that knows the full review payload shape (reviewedFiles, rulesFiles, checklistFiles,
+/// knownPrReviewFiles, nonFixableWarnings, checkedItems, skippedItems, summary), so a "passed"
+/// review missing those details can be told apart from a genuinely complete one (see
+/// task_mcp_ai_kit_review_gate). Pure mutation — no I/O — so this is unit testable without a
+/// Tauri AppHandle.
+fn task_mcp_apply_ai_kit_review_result(task: &mut Value, args: &Value, now: &str) -> Result<(), String> {
+    let status = args["status"].as_str().unwrap_or("").trim();
+    if !matches!(status, "passed" | "failed" | "warnings") {
+        return Err(format!("Invalid status '{status}'. Allowed: passed, failed, warnings"));
+    }
+    let arr = |key: &str| args[key].as_array().cloned().unwrap_or_default();
+    let summary = args["summary"].as_str().unwrap_or("").to_string();
+
     if task["implementationVerification"].is_null() { task["implementationVerification"] = serde_json::json!({}); }
     task["implementationVerification"]["aiCodeReview"] = serde_json::json!({
-        "status":          status,
-        "reviewSource":    "claude-ai-kit",
-        "reviewedFiles":   reviewed_files,
-        "findings":        findings,
-        "fixableFindings": fixable_findings,
-        "runAt":           now,
+        "status":             status,
+        "reviewSource":       "claude-ai-kit",
+        "reviewedFiles":      arr("reviewedFiles"),
+        "findings":           arr("findings"),
+        "fixableFindings":    arr("fixableFindings"),
+        "nonFixableWarnings": arr("nonFixableWarnings"),
+        "rulesFiles":         arr("rulesFiles"),
+        "checklistFiles":     arr("checklistFiles"),
+        "knownPrReviewFiles": arr("knownPrReviewFiles"),
+        "checkedItems":       arr("checkedItems"),
+        "skippedItems":       arr("skippedItems"),
+        "summary":            summary,
+        "reviewedAt":         now,
+        "runAt":              now,
     });
     task["implementationVerification"]["updatedAt"] = serde_json::json!(now);
     task["aiKitReview"] = serde_json::json!({
@@ -13767,6 +14498,7 @@ fn task_mcp_apply_ai_kit_review_result(
         "status":       status,
         "reviewSource": "claude-ai-kit",
     });
+    Ok(())
 }
 
 /// Reads `artifact_path`, scans it for Dataverse logical-name references (C# via
@@ -15872,12 +16604,45 @@ mod tests {
             "workflowSetup": { "devTargetKind": "script" },
             "crmDeveloperWorkflow": { "detectedWorkKind": "script" },
             "localTestRecord": { "status": "passed" },
-            "implementationVerification": { "dataverseCheck": { "status": "skipped" } },
+            "implementationVerification": {
+                "dataverseCheck": { "status": "skipped" },
+                "aiCodeReview": {
+                    "status": "passed",
+                    "reviewedFiles": ["Scripts/nvr_servicecase_events.js"],
+                    "rulesFiles": ["ai-rules/crm-javascript-rules.md"],
+                    "checklistFiles": ["ai-rules/crm-code-review-checklist.md"],
+                    "knownPrReviewFiles": ["ai-rules/known-pr-review-comments.md"],
+                    "fixableFindings": [],
+                },
+            },
             "aiKitReview": { "status": "passed", "completedAt": "2026-06-15T10:00:00.000Z" },
         });
         let result = task_mcp_compute_continue_workflow_step(&task);
         assert_eq!(result["nextAction"].as_str(), Some("propose_branch"));
         assert_eq!(result["requiresUserApproval"].as_bool(), Some(true));
+    }
+
+    #[test]
+    fn continue_developer_workflow_blocks_branch_when_ai_review_recorded_but_missing_details() {
+        // Regression test for the hardening fix: recording ANY aiKitReview verdict used to set
+        // task.aiKitReview.completedAt unconditionally, which made the old gate (`!!completedAt`)
+        // pass even for an incomplete/failed review. The hard gate must read
+        // implementationVerification.aiCodeReview and require full details.
+        let task = serde_json::json!({
+            "id": "task-test-cdw-incomplete-ai-review",
+            "taskMode": "developer",
+            "workflowSetup": { "devTargetKind": "script" },
+            "crmDeveloperWorkflow": { "detectedWorkKind": "script" },
+            "localTestRecord": { "status": "passed" },
+            "implementationVerification": {
+                "dataverseCheck": { "status": "skipped" },
+                "aiCodeReview": { "status": "passed" },
+            },
+            "aiKitReview": { "status": "passed", "completedAt": "2026-06-15T10:00:00.000Z" },
+        });
+        let result = task_mcp_compute_continue_workflow_step(&task);
+        assert_eq!(result["nextAction"].as_str(), Some("run_ai_kit_review"));
+        assert_eq!(result["canProceed"].as_bool(), Some(true));
     }
 
     #[test]
@@ -17033,17 +17798,26 @@ mod developer_work_packet_tests {
         assert_eq!((status, next_action), ("passed", "continue_workflow"));
     }
 
+    fn full_ai_kit_review_args(status: &str) -> Value {
+        serde_json::json!({
+            "status": status,
+            "reviewedFiles": ["Scripts/nvr_servicecase_events.js"],
+            "findings": ["No TODOs; correct Client API usage."],
+            "fixableFindings": [],
+            "nonFixableWarnings": [],
+            "rulesFiles": ["ai-rules/crm-javascript-rules.md"],
+            "checklistFiles": ["ai-rules/crm-code-review-checklist.md"],
+            "knownPrReviewFiles": ["ai-rules/known-pr-review-comments.md"],
+            "checkedItems": ["field mappings", "validation fields", "business rules"],
+            "skippedItems": [],
+            "summary": "Reviewed against AI Kit rules; no issues found.",
+        })
+    }
+
     #[test]
     fn apply_ai_kit_review_result_persists_to_canonical_field_and_ai_kit_review_gate() {
         let mut task = make_template_task_no_plan_mappings();
-        task_mcp_apply_ai_kit_review_result(
-            &mut task,
-            "passed",
-            vec![Value::String("Scripts/nvr_servicecase_events.js".to_string())],
-            vec![Value::String("No TODOs; correct Client API usage.".to_string())],
-            vec![],
-            "2026-07-01T00:00:00Z",
-        );
+        task_mcp_apply_ai_kit_review_result(&mut task, &full_ai_kit_review_args("passed"), "2026-07-01T00:00:00Z").unwrap();
         assert_eq!(task["implementationVerification"]["aiCodeReview"]["status"].as_str(), Some("passed"));
         assert_eq!(task["implementationVerification"]["aiCodeReview"]["reviewSource"].as_str(), Some("claude-ai-kit"));
         // Keeps continue_developer_workflow's separate pre-branch AI Kit gate from dead-ending.
@@ -17052,6 +17826,161 @@ mod developer_work_packet_tests {
 
         let (status, _finding) = task_mcp_ai_internal_code_review_passthrough(&task);
         assert_eq!(status, "passed");
+
+        let (gate_status, missing) = task_mcp_ai_kit_review_gate(&task["implementationVerification"]["aiCodeReview"]);
+        assert_eq!(gate_status, "passed");
+        assert!(missing.is_empty());
+    }
+
+    #[test]
+    fn ai_kit_review_gate_treats_passed_without_details_as_incomplete() {
+        let mut task = make_template_task_no_plan_mappings();
+        task_mcp_apply_ai_kit_review_result(&mut task, &serde_json::json!({"status": "passed"}), "2026-07-01T00:00:00Z").unwrap();
+        let (gate_status, missing) = task_mcp_ai_kit_review_gate(&task["implementationVerification"]["aiCodeReview"]);
+        assert_eq!(gate_status, "incomplete");
+        assert!(!missing.is_empty());
+    }
+
+    #[test]
+    fn ai_kit_review_gate_blocks_on_fixable_findings_even_if_status_is_passed() {
+        let mut args = full_ai_kit_review_args("passed");
+        args["fixableFindings"] = serde_json::json!([{"id": "early-return", "description": "Unrequested early return added."}]);
+        let mut task = make_template_task_no_plan_mappings();
+        task_mcp_apply_ai_kit_review_result(&mut task, &args, "2026-07-01T00:00:00Z").unwrap();
+        let (gate_status, _missing) = task_mcp_ai_kit_review_gate(&task["implementationVerification"]["aiCodeReview"]);
+        assert_eq!(gate_status, "failed");
+    }
+
+    #[test]
+    fn ai_kit_review_gate_not_run_when_no_review_recorded() {
+        let task = make_template_task_no_plan_mappings();
+        let (gate_status, _missing) = task_mcp_ai_kit_review_gate(&task["implementationVerification"]["aiCodeReview"]);
+        assert_eq!(gate_status, "not_run");
+    }
+
+    #[test]
+    fn dataverse_gate_warnings_blocks_until_accepted() {
+        assert_eq!(task_mcp_normalize_dataverse_gate("warnings", false), "warnings_unaccepted");
+        assert_eq!(task_mcp_normalize_dataverse_gate("warnings", true), "passed");
+        assert_eq!(task_mcp_normalize_dataverse_gate("failed", true), "failed");
+        assert_eq!(task_mcp_normalize_dataverse_gate("needs_configuration", true), "needs_configuration");
+        assert_eq!(task_mcp_normalize_dataverse_gate("passed", false), "passed");
+        assert_eq!(task_mcp_normalize_dataverse_gate("", false), "not_run");
+    }
+
+    #[test]
+    fn progression_gate_blocks_on_failed_dataverse_check() {
+        let task = serde_json::json!({
+            "crmVerificationReports": [{"verdict": "fail", "missingReferences": [{"displayName": "nvr_missingfield"}]}],
+        });
+        let gate = task_mcp_compute_progression_gate(&task);
+        assert_eq!(gate["canProceed"].as_bool(), Some(false));
+        assert_eq!(gate["dataverseGateStatus"].as_str(), Some("failed"));
+        assert_eq!(gate["nextRecommendedAction"].as_str(), Some("fix_code"));
+        assert_eq!(gate["blockingFindings"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn progression_gate_blocks_on_unaccepted_dataverse_warnings_until_accepted() {
+        let mut task = serde_json::json!({
+            "crmVerificationReports": [{"verdict": "warnings"}],
+            "implementationVerification": {
+                "aiCodeReview": {
+                    "status": "passed",
+                    "reviewedFiles": ["a.js"], "rulesFiles": ["r.md"], "checklistFiles": ["c.md"], "knownPrReviewFiles": ["p.md"],
+                },
+            },
+        });
+        let gate = task_mcp_compute_progression_gate(&task);
+        assert_eq!(gate["canProceed"].as_bool(), Some(false));
+        assert_eq!(gate["dataverseGateStatus"].as_str(), Some("warnings_unaccepted"));
+        assert_eq!(gate["requiresUserAction"].as_bool(), Some(true));
+        assert_eq!(gate["nextRecommendedAction"].as_str(), Some("review_dataverse_warnings"));
+
+        task["implementationVerification"]["dataverseCheck"]["warningsAccepted"] = serde_json::json!({
+            "accepted": true, "acceptedAt": "2026-07-01T00:00:00Z", "acceptedBy": "user", "reason": "Known false positive.",
+        });
+        let gate_after_accept = task_mcp_compute_progression_gate(&task);
+        assert_eq!(gate_after_accept["canProceed"].as_bool(), Some(true));
+        assert_eq!(gate_after_accept["dataverseGateStatus"].as_str(), Some("passed"));
+    }
+
+    #[test]
+    fn progression_gate_blocks_on_incomplete_ai_review_even_when_dataverse_passed() {
+        let task = serde_json::json!({
+            "crmVerificationReports": [{"verdict": "pass"}],
+            "implementationVerification": { "aiCodeReview": { "status": "passed" } },
+        });
+        let gate = task_mcp_compute_progression_gate(&task);
+        assert_eq!(gate["canProceed"].as_bool(), Some(false));
+        assert_eq!(gate["aiReviewGateStatus"].as_str(), Some("incomplete"));
+        assert_eq!(gate["nextRecommendedAction"].as_str(), Some("run_ai_kit_review"));
+    }
+
+    #[test]
+    fn progression_gate_allows_proceed_when_both_gates_fully_pass() {
+        let task = serde_json::json!({
+            "crmVerificationReports": [{"verdict": "pass"}],
+            "implementationVerification": {
+                "aiCodeReview": {
+                    "status": "passed", "fixableFindings": [],
+                    "reviewedFiles": ["a.js"], "rulesFiles": ["r.md"], "checklistFiles": ["c.md"], "knownPrReviewFiles": ["p.md"],
+                },
+            },
+        });
+        let gate = task_mcp_compute_progression_gate(&task);
+        assert_eq!(gate["canProceed"].as_bool(), Some(true));
+        assert_eq!(gate["blockingChecks"].as_array().unwrap().len(), 0);
+        assert_eq!(gate["nextRecommendedAction"].as_str(), Some("continue_workflow"));
+    }
+
+    #[test]
+    fn progression_gate_needs_configuration_blocks_and_requires_user_action() {
+        // AI review is already fully passed here so the needs_configuration priority can be
+        // observed in isolation — when AI review is still actionable-by-agent, that takes
+        // priority over needs_configuration (mirrors task_mcp_rollup_verification_status: agent-
+        // actionable work must not be blocked by a configuration issue only the user can fix).
+        let task = serde_json::json!({
+            "implementationVerification": {
+                "dataverseCheck": { "status": "needs_configuration" },
+                "aiCodeReview": {
+                    "status": "passed",
+                    "reviewedFiles": ["a.js"], "rulesFiles": ["r.md"], "checklistFiles": ["c.md"], "knownPrReviewFiles": ["p.md"],
+                },
+            },
+        });
+        let gate = task_mcp_compute_progression_gate(&task);
+        assert_eq!(gate["canProceed"].as_bool(), Some(false));
+        assert_eq!(gate["dataverseGateStatus"].as_str(), Some("needs_configuration"));
+        assert_eq!(gate["requiresUserAction"].as_bool(), Some(true));
+        assert_eq!(gate["nextRecommendedAction"].as_str(), Some("needs_configuration"));
+    }
+
+    #[test]
+    fn progression_gate_prioritizes_agent_actionable_ai_review_over_needs_configuration() {
+        let task = serde_json::json!({
+            "implementationVerification": { "dataverseCheck": { "status": "needs_configuration" } },
+        });
+        let gate = task_mcp_compute_progression_gate(&task);
+        assert_eq!(gate["canProceed"].as_bool(), Some(false));
+        assert_eq!(gate["nextRecommendedAction"].as_str(), Some("run_ai_kit_review"));
+    }
+
+    #[test]
+    fn dataverse_environment_mismatch_detected_only_when_both_labels_set_and_differ() {
+        let task = serde_json::json!({"customerId": "cust-1"});
+        let customers = vec![serde_json::json!({"id": "cust-1", "dataverseEnvironmentLabel": "Contoso PROD"})];
+        let settings_mismatch = serde_json::json!({"primarchMcpEnvironmentLabel": "Contoso UAT"});
+        assert_eq!(
+            task_mcp_dataverse_environment_mismatch(&task, &customers, &settings_mismatch),
+            Some(("Contoso PROD".to_string(), "Contoso UAT".to_string()))
+        );
+
+        let settings_match = serde_json::json!({"primarchMcpEnvironmentLabel": "contoso prod"});
+        assert_eq!(task_mcp_dataverse_environment_mismatch(&task, &customers, &settings_match), None);
+
+        let settings_unset = serde_json::json!({});
+        assert_eq!(task_mcp_dataverse_environment_mismatch(&task, &customers, &settings_unset), None);
     }
 
     #[test]
@@ -17777,6 +18706,291 @@ mod developer_work_packet_tests {
     }
 }
 
+// --- Git workflow hardening tests ------------------------------------------
+// Real temp git repos (no mocking of `git` itself) — these exercise actual git subprocess
+// behavior (checkout refusal on dirty trees, check-ignore, branch creation) rather than just
+// the JSON decision-object shape.
+#[cfg(test)]
+mod git_workflow_tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    fn run(repo: &str, args: &[&str]) -> std::process::Output {
+        std::process::Command::new("git").arg("-C").arg(repo).args(args).output()
+            .unwrap_or_else(|e| panic!("failed to run git {args:?}: {e}"))
+    }
+
+    fn init_repo() -> TempDir {
+        let dir = TempDir::new().expect("tempdir");
+        let root = dir.path().to_string_lossy().to_string();
+        assert!(run(&root, &["init", "-b", "main"]).status.success());
+        assert!(run(&root, &["config", "user.email", "test@example.com"]).status.success());
+        assert!(run(&root, &["config", "user.name", "Test"]).status.success());
+        std::fs::write(dir.path().join("README.md"), "hello\n").unwrap();
+        assert!(run(&root, &["add", "README.md"]).status.success());
+        assert!(run(&root, &["commit", "-m", "initial"]).status.success());
+        dir
+    }
+
+    fn current_branch(root: &str) -> String {
+        run_git_ro(root, &["branch", "--show-current"]).unwrap_or_default()
+    }
+
+    #[test]
+    fn prepare_commit_for_task_never_creates_a_branch() {
+        let dir = init_repo();
+        let root = dir.path().to_string_lossy().to_string();
+        let branches_before = run(&root, &["branch", "--list"]);
+        let preview = git_commit_preview_impl(&root, None).expect("preview");
+        assert_eq!(preview["branchCreated"].as_bool(), Some(false));
+        assert_eq!(preview["checkoutPerformed"].as_bool(), Some(false));
+        let branches_after = run(&root, &["branch", "--list"]);
+        assert_eq!(branches_before.stdout, branches_after.stdout, "no branch should have been created");
+        assert_eq!(current_branch(&root), "main");
+    }
+
+    #[test]
+    fn prepare_commit_for_task_reports_proposed_branch_name_and_existence() {
+        let dir = init_repo();
+        let root = dir.path().to_string_lossy().to_string();
+        let task = serde_json::json!({ "title": "Add warranty flag", "devopsTaskUrl": "" });
+        let preview = git_commit_preview_impl(&root, Some(&task)).expect("preview");
+        assert_eq!(preview["proposedBranchName"].as_str(), Some("feature/add-warranty-flag"));
+        assert_eq!(preview["branchExists"].as_bool(), Some(false));
+        assert_eq!(preview["nextAction"].as_str(), Some("ask_user_to_approve_branch_creation"));
+    }
+
+    #[test]
+    fn create_or_checkout_task_branch_creates_a_missing_branch() {
+        let dir = init_repo();
+        let root = dir.path().to_string_lossy().to_string();
+        let result = checkout_or_create_task_branch_impl(&root, "feature/123-add-thing").expect("create");
+        assert_eq!(result["previousBranch"].as_str(), Some("main"));
+        assert_eq!(result["currentBranch"].as_str(), Some("feature/123-add-thing"));
+        assert_eq!(result["branchCreated"].as_bool(), Some(true));
+        assert_eq!(result["branchCheckedOut"].as_bool(), Some(true));
+        assert_eq!(current_branch(&root), "feature/123-add-thing");
+    }
+
+    #[test]
+    fn create_or_checkout_task_branch_checks_out_an_existing_branch() {
+        let dir = init_repo();
+        let root = dir.path().to_string_lossy().to_string();
+        assert!(run(&root, &["branch", "feature/existing"]).status.success());
+        assert_eq!(current_branch(&root), "main");
+
+        let result = checkout_or_create_task_branch_impl(&root, "feature/existing").expect("checkout");
+        assert_eq!(result["branchCreated"].as_bool(), Some(false));
+        assert_eq!(result["branchCheckedOut"].as_bool(), Some(true));
+        assert_eq!(current_branch(&root), "feature/existing");
+    }
+
+    #[test]
+    fn create_or_checkout_task_branch_rejects_main_and_master() {
+        let dir = init_repo();
+        let root = dir.path().to_string_lossy().to_string();
+        assert!(checkout_or_create_task_branch_impl(&root, "main").is_err());
+        assert!(checkout_or_create_task_branch_impl(&root, "master").is_err());
+    }
+
+    #[test]
+    fn create_or_checkout_task_branch_rejects_unsafe_names() {
+        let dir = init_repo();
+        let root = dir.path().to_string_lossy().to_string();
+        for bad in ["feature/../etc", "-bad", "has space", "trailing.", "refs/heads/x", "weird~name"] {
+            assert!(checkout_or_create_task_branch_impl(&root, bad).is_err(), "expected '{bad}' to be rejected");
+        }
+    }
+
+    #[test]
+    fn create_or_checkout_task_branch_never_forces_checkout_over_conflicting_uncommitted_changes() {
+        let dir = init_repo();
+        let root = dir.path().to_string_lossy().to_string();
+        // Create a branch where README.md has different committed content.
+        assert!(checkout_or_create_task_branch_impl(&root, "feature/other").is_ok());
+        std::fs::write(dir.path().join("README.md"), "branch content\n").unwrap();
+        assert!(run(&root, &["commit", "-am", "branch change"]).status.success());
+        assert!(run(&root, &["checkout", "main"]).status.success());
+
+        // Dirty, conflicting change on main that checkout to feature/other would overwrite.
+        std::fs::write(dir.path().join("README.md"), "conflicting uncommitted change\n").unwrap();
+
+        let result = checkout_or_create_task_branch_impl(&root, "feature/other");
+        assert!(result.is_err(), "checkout must be refused, not forced");
+        assert_eq!(current_branch(&root), "main", "must not have switched branches");
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("README.md")).unwrap(),
+            "conflicting uncommitted change\n",
+            "uncommitted change must survive untouched"
+        );
+    }
+
+    #[test]
+    fn create_or_checkout_task_branch_does_not_push_or_commit() {
+        let dir = init_repo();
+        let root = dir.path().to_string_lossy().to_string();
+        let log_before = run(&root, &["log", "--oneline"]);
+        checkout_or_create_task_branch_impl(&root, "feature/no-side-effects").expect("create");
+        let log_after = run(&root, &["log", "--oneline", "feature/no-side-effects"]);
+        // Same commit count/hash on the new branch as main had â€” branch creation adds no commit.
+        assert_eq!(
+            String::from_utf8_lossy(&log_before.stdout).lines().count(),
+            String::from_utf8_lossy(&log_after.stdout).lines().count(),
+        );
+        assert!(run(&root, &["remote"]).stdout.is_empty(), "no remote should exist (nothing could have been pushed)");
+    }
+
+    #[test]
+    fn commit_task_changes_requires_a_feature_branch_not_main_or_master() {
+        let dir = init_repo();
+        let root = dir.path().to_string_lossy().to_string();
+        std::fs::write(dir.path().join("a.txt"), "content\n").unwrap();
+        let result = git_commit_impl(&root, &["a.txt".to_string()], "msg", &[], &[], true);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("Refusing to commit"));
+    }
+
+    #[test]
+    fn commit_task_changes_succeeds_on_a_feature_branch() {
+        let dir = init_repo();
+        let root = dir.path().to_string_lossy().to_string();
+        checkout_or_create_task_branch_impl(&root, "feature/ok").expect("create");
+        std::fs::write(dir.path().join("a.txt"), "content\n").unwrap();
+        let result = git_commit_impl(&root, &["a.txt".to_string()], "msg", &[], &[], true);
+        assert!(result.is_ok(), "{:?}", result);
+        assert_eq!(result.unwrap()["branch"].as_str(), Some("feature/ok"));
+    }
+
+    #[test]
+    fn commit_task_changes_never_pushes() {
+        let dir = init_repo();
+        let root = dir.path().to_string_lossy().to_string();
+        checkout_or_create_task_branch_impl(&root, "feature/ok").expect("create");
+        std::fs::write(dir.path().join("a.txt"), "content\n").unwrap();
+        git_commit_impl(&root, &["a.txt".to_string()], "msg", &[], &[], true).expect("commit");
+        // No remote configured at all â€” a push attempt would have to fail loudly; absence of a
+        // remote plus a successful commit_task_changes call together prove no push was attempted.
+        assert!(run(&root, &["remote"]).stdout.is_empty());
+    }
+
+    #[test]
+    fn commit_task_changes_rejects_unrelated_files_unless_confirmed() {
+        let dir = init_repo();
+        let root = dir.path().to_string_lossy().to_string();
+        checkout_or_create_task_branch_impl(&root, "feature/ok").expect("create");
+        std::fs::write(dir.path().join("a.txt"), "content\n").unwrap();
+        std::fs::write(dir.path().join("b.txt"), "content\n").unwrap();
+        let files = vec!["a.txt".to_string(), "b.txt".to_string()];
+        let related = vec!["a.txt".to_string()];
+
+        let blocked = git_commit_impl(&root, &files, "msg", &[], &related, false);
+        assert!(blocked.is_err());
+        assert!(blocked.unwrap_err().contains("b.txt"));
+
+        let allowed = git_commit_impl(&root, &files, "msg", &[], &related, true);
+        assert!(allowed.is_ok());
+    }
+
+    #[test]
+    fn commit_task_changes_reports_gitignored_files_and_requires_force_add() {
+        let dir = init_repo();
+        let root = dir.path().to_string_lossy().to_string();
+        checkout_or_create_task_branch_impl(&root, "feature/ok").expect("create");
+        std::fs::write(dir.path().join(".gitignore"), "secret.txt\n").unwrap();
+        assert!(run(&root, &["add", ".gitignore"]).status.success());
+        assert!(run(&root, &["commit", "-m", "add gitignore"]).status.success());
+        std::fs::write(dir.path().join("secret.txt"), "shh\n").unwrap();
+
+        let blocked = git_commit_impl(&root, &["secret.txt".to_string()], "msg", &[], &[], true);
+        assert!(blocked.is_err());
+        assert!(blocked.unwrap_err().contains("ignored by .gitignore"));
+
+        let forced = git_commit_impl(
+            &root, &["secret.txt".to_string()], "msg", &["secret.txt".to_string()], &[], true,
+        );
+        assert!(forced.is_ok(), "{:?}", forced);
+    }
+
+    #[test]
+    fn prepare_commit_for_task_reports_ignored_task_created_file() {
+        let dir = init_repo();
+        let root = dir.path().to_string_lossy().to_string();
+        std::fs::write(dir.path().join(".gitignore"), "generated/\n").unwrap();
+        assert!(run(&root, &["add", ".gitignore"]).status.success());
+        assert!(run(&root, &["commit", "-m", "add gitignore"]).status.success());
+        std::fs::create_dir_all(dir.path().join("generated")).unwrap();
+        std::fs::write(dir.path().join("generated/output.js"), "// generated\n").unwrap();
+
+        let task = serde_json::json!({
+            "title": "Test",
+            "crmDeveloperWorkflow": { "lastAiImplementation": { "filesChanged": ["generated/output.js"] } },
+        });
+        let preview = git_commit_preview_impl(&root, Some(&task)).expect("preview");
+        let ignored: Vec<&str> = preview["gitIgnoredTaskFiles"].as_array().unwrap()
+            .iter().filter_map(|v| v.as_str()).collect();
+        assert_eq!(ignored, vec!["generated/output.js"]);
+    }
+
+    #[test]
+    fn push_task_branch_still_requires_a_separate_call_and_blocks_default_branches() {
+        let dir = init_repo();
+        let root = dir.path().to_string_lossy().to_string();
+        // On main: push must be blocked regardless of anything commit_task_changes did.
+        let result = git_push_impl(&root);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("blocked"));
+    }
+
+    #[test]
+    fn continue_workflow_confirmed_branch_step_still_forbids_push_until_separate_approval() {
+        let task = serde_json::json!({
+            "id": "task-git-flow",
+            "taskMode": "developer",
+            "workflowSetup": { "devTargetKind": "script" },
+            "crmDeveloperWorkflow": { "detectedWorkKind": "script" },
+            "localTestRecord": { "status": "not-needed" },
+            "implementationVerification": {
+                "dataverseCheck": { "status": "skipped" },
+                "aiCodeReview": {
+                    "status": "passed",
+                    "reviewedFiles": ["a.js"], "rulesFiles": ["r.md"], "checklistFiles": ["c.md"], "knownPrReviewFiles": ["p.md"],
+                },
+            },
+            "gitWorkflow": { "confirmedBranch": "feature/123-thing" },
+        });
+        let step = task_mcp_compute_continue_workflow_step(&task);
+        assert_eq!(step["nextAction"].as_str(), Some("prepare_commit"));
+        let forbidden: Vec<&str> = step["forbiddenWrites"].as_array().unwrap().iter().filter_map(|v| v.as_str()).collect();
+        assert!(forbidden.contains(&"push_task_branch"));
+        assert!(forbidden.contains(&"commit_and_push_task_changes"));
+        let allowed: Vec<&str> = step["allowedWrites"].as_array().unwrap().iter().filter_map(|v| v.as_str()).collect();
+        assert!(!allowed.contains(&"push_task_branch"));
+    }
+
+    #[test]
+    fn continue_workflow_without_confirmed_branch_recommends_create_or_checkout_task_branch() {
+        let task = serde_json::json!({
+            "id": "task-git-flow-2",
+            "taskMode": "developer",
+            "workflowSetup": { "devTargetKind": "script" },
+            "crmDeveloperWorkflow": { "detectedWorkKind": "script" },
+            "localTestRecord": { "status": "not-needed" },
+            "implementationVerification": {
+                "dataverseCheck": { "status": "skipped" },
+                "aiCodeReview": {
+                    "status": "passed",
+                    "reviewedFiles": ["a.js"], "rulesFiles": ["r.md"], "checklistFiles": ["c.md"], "knownPrReviewFiles": ["p.md"],
+                },
+            },
+        });
+        let step = task_mcp_compute_continue_workflow_step(&task);
+        assert_eq!(step["nextAction"].as_str(), Some("propose_branch"));
+        assert_eq!(step["recommendedTool"].as_str(), Some("create_or_checkout_task_branch"));
+        let forbidden: Vec<&str> = step["forbiddenWrites"].as_array().unwrap().iter().filter_map(|v| v.as_str()).collect();
+        assert!(forbidden.contains(&"commit_task_changes"));
+    }
+}
+
 // --- Entry point -----------------------------------------------------------
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -17860,6 +19074,7 @@ pub fn run() {
                 push_task_branch,
                 commit_and_push_task_changes,
                 create_git_branch,
+                create_or_checkout_task_branch_command,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

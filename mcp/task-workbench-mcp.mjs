@@ -593,7 +593,7 @@ const TOOL_DEFINITIONS = [
   },
   {
     name: 'run_implementation_verification',
-    description: 'Orchestrates the same Verify Implementation checks/state as ImplementationVerificationModal for a script/ribbon task: runs Script File Readiness and Local Static/Business-Rule Verification directly; when running via the Task Workbench app (bridge mode), also runs Dataverse Metadata Check for real via Primarch (read-only, no Dataverse writes) and reports whether AI Internal Code Review still needs to be performed by the calling AI agent (call record_ai_kit_review_result). Local Test remains a read-only passthrough — it is the one genuinely manual/browser step. Never reports status=passed while a required row is still unresolved. No external writes, no web resource upload, no form event registration, no commit/push. Returns status (needs_configuration/failed/pending_ai_kit_review/needs_manual_action/passed), checks, fixableFindings, and nextAction (needs_configuration/fix_code/run_ai_kit_review/wait_for_user/continue_workflow).',
+    description: 'Orchestrates the same Verify Implementation checks/state as ImplementationVerificationModal for a script/ribbon/plugin task: runs Artifact (Script/Plugin) File Readiness and Local Static/Business-Rule Verification directly (static rules are JS/TS-only; skipped for plugins); when running via the Task Workbench app (bridge mode), also runs Dataverse Metadata Check for real via Primarch (read-only, no Dataverse writes) and reports whether AI Internal Code Review still needs to be performed by the calling AI agent (call record_ai_kit_review_result). Both checks are hard gates: Dataverse "warnings" only counts once explicitly accepted, and a "passed" AI Kit review with missing review details is reported as incomplete. Local Test remains a read-only passthrough — it is the one genuinely manual/browser step. Never reports status=passed while a required row is still unresolved. No external writes, no web resource upload, no form event registration, no commit/push. Returns status (needs_configuration/failed/pending_ai_kit_review/warnings_unaccepted/needs_manual_action/passed), checks, fixableFindings, nextAction (needs_configuration/fix_code/run_ai_kit_review/review_dataverse_warnings/wait_for_user/continue_workflow), and progressionGate (the same canProceed/blockingChecks gate the "Move to Code Review" UI action enforces).',
     inputSchema: {
       type: 'object',
       properties: {
@@ -843,6 +843,44 @@ const TOOL_DEFINITIONS = [
     },
   },
   {
+    name: 'create_branch_for_task',
+    description:
+      'WRITE — creates and switches to a new local Git branch, rebased onto the remote base branch ' +
+      '(fetches origin first). Creates a local branch only — no commit, no push, no PR, no GitHub/Azure ' +
+      'DevOps API calls. Prefer create_or_checkout_task_branch for the normal propose-then-approve workflow.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        taskId: { type: 'string', description: 'ID of the task.' },
+        branchName: { type: 'string', description: 'Name of the branch to create.' },
+      },
+      required: ['taskId', 'branchName'],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: 'create_or_checkout_task_branch',
+    description:
+      'WRITE — requires explicit prior user approval of the exact branch name. Creates the branch from ' +
+      'the CURRENT HEAD (no fetch, no remote-base rebase) if it does not exist, or checks it out if it ' +
+      "already exists, and records it as the task's confirmed branch. Rejects main/master and unsafe names. " +
+      "Never force-checks-out (refuses if uncommitted changes would be overwritten, surfacing git's own " +
+      'blocker). Does not commit, push, or modify any file.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        taskId: { type: 'string', description: 'ID of the task.' },
+        branchName: { type: 'string', description: 'User-approved exact branch name to create or check out.' },
+        mode: {
+          type: 'string',
+          description: "Optional. Only 'create_if_missing_and_checkout' is supported (the default).",
+        },
+      },
+      required: ['taskId', 'branchName'],
+      additionalProperties: false,
+    },
+  },
+  {
     name: 'prepare_commit_for_task',
     description:
       'Read-only preview of pending Git changes for a task. Returns the repository root, ' +
@@ -1018,13 +1056,12 @@ const TOOL_DEFINITIONS = [
     name: 'record_ai_kit_review_result',
     description:
       'WRITE (local task state only) â€” records the result of an AI Kit / Client-API code review performed ' +
-      'by the calling AI agent itself (reviewSource is always recorded as "claude-ai-kit"). ' +
-      'Before calling this, read the applicable AI Kit rules (see get_power_platform_ai_kit_status / ' +
-      'workPacket.aiKit.rulesFiles) and the target file(s) yourself, and review against ' +
-      'workPacket.implementation.fieldMappings, validationFields, businessRules, acceptanceCriteria, and ' +
-      'the AI Kit rules (no TODO/FIXME/placeholders, no Xrm.Page/autosave, correct Client API usage). ' +
-      'Persists to task.implementationVerification.aiCodeReview (the same field the Implementation ' +
-      'Verification modal reads) and task.aiKitReview. Does NOT call any external LLM, API, or system.',
+      'by the calling AI agent itself (reviewSource=claude-ai-kit). Requires reviewedFiles, rulesFiles, ' +
+      'checklistFiles, and knownPrReviewFiles to be non-empty for the review to pass the hard gate â€” a ' +
+      "status='passed' call with those fields empty is recorded as gateStatus='incomplete', not passed. " +
+      'Persists to implementationVerification.aiCodeReview (the same field the modal reads) and task.aiKitReview. ' +
+      'Does not call any external LLM, API, or system â€” the caller supplies its own verdict after reading the ' +
+      'AI Kit rules, the CRM code review checklist, known PR review comments, and the target file directly.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -1041,6 +1078,13 @@ const TOOL_DEFINITIONS = [
           },
           description: 'Findings that should be fixed before the task can proceed.',
         },
+        nonFixableWarnings: { type: 'array', items: { type: 'string' }, description: 'Warnings noted but not required to fix.' },
+        rulesFiles: { type: 'array', items: { type: 'string' }, description: 'AI Kit rules files actually consulted. Required (non-empty) for the hard gate to pass.' },
+        checklistFiles: { type: 'array', items: { type: 'string' }, description: 'CRM code review checklist files actually consulted. Required (non-empty) for the hard gate to pass.' },
+        knownPrReviewFiles: { type: 'array', items: { type: 'string' }, description: 'Known PR review comment files actually consulted. Required (non-empty) for the hard gate to pass.' },
+        checkedItems: { type: 'array', items: { type: 'string' }, description: 'Checklist/rule items explicitly checked.' },
+        skippedItems: { type: 'array', items: { type: 'string' }, description: 'Checklist/rule items explicitly skipped, with reason noted in findings/summary.' },
+        summary: { type: 'string', description: 'Short human-readable summary of the review.' },
       },
       required: ['taskId', 'status'],
       additionalProperties: false,
@@ -2083,6 +2127,143 @@ function isScriptWorkflowTask(task) {
   return workKind === 'script' || workKind === 'ribbon' || setup.devTargetKind === 'script';
 }
 
+/** True for script/ribbon AND plugin tasks — the task kinds run_implementation_verification's
+ *  hard-gate pipeline covers. Other kinds (repo-only, bugfix, review, general) are not part of
+ *  the orchestrated verification pipeline and keep using their existing manual workflow. Mirrors
+ *  Rust task_mcp_is_verifiable_dev_task — keep both in sync. */
+function isVerifiableDevTask(task) {
+  const setup = asObject(task.workflowSetup);
+  const workflow = asObject(task.crmDeveloperWorkflow);
+  const workKind = workflow.detectedWorkKind || setup.devTargetKind || 'unknown';
+  return workKind === 'script' || workKind === 'ribbon' || workKind === 'plugin'
+    || setup.devTargetKind === 'script' || setup.devTargetKind === 'plugin';
+}
+
+/** Mirrors Rust task_mcp_is_plugin_dev_task. */
+function isPluginDevTask(task) {
+  const setup = asObject(task.workflowSetup);
+  const workflow = asObject(task.crmDeveloperWorkflow);
+  return workflow.detectedWorkKind === 'plugin' || setup.devTargetKind === 'plugin';
+}
+
+/**
+ * Compares the task's customer's expected Dataverse environment label against the active
+ * Primarch connection's configured environment label. Returns [expected, active] only when BOTH
+ * are set (non-empty, trimmed) and they differ under a case-insensitive comparison — an
+ * intentionally opt-in check: tasks/connections that never set a label are not blocked by a check
+ * that has nothing to compare against. Mirrors Rust task_mcp_dataverse_environment_mismatch.
+ */
+function dataverseEnvironmentMismatch(task, customers, settings) {
+  const customerId = task.customerId || '';
+  const customer = (Array.isArray(customers) ? customers : []).find((c) => c && c.id === customerId);
+  const expected = String(customer?.dataverseEnvironmentLabel ?? '').trim() || null;
+  const active = String(asObject(settings).primarchMcpEnvironmentLabel ?? '').trim() || null;
+  if (expected && active && expected.toLowerCase() !== active.toLowerCase()) {
+    return [expected, active];
+  }
+  return null;
+}
+
+/**
+ * Normalizes a raw Dataverse Metadata Check status (from deriveDataverseCheckStatusForVerification,
+ * or a manual override such as "skipped"/"manually-verified") into the hard-gate status used to
+ * decide workflow progression. "warnings" only becomes "passed" once the user has explicitly
+ * accepted them (implementationVerification.dataverseCheck.warningsAccepted.accepted) —
+ * otherwise it is "warnings_unaccepted" and blocks progression. Mirrors Rust
+ * task_mcp_normalize_dataverse_gate.
+ */
+function normalizeDataverseGate(rawStatus, warningsAccepted) {
+  switch (rawStatus) {
+    case 'passed':
+    case 'skipped':
+    case 'manually-verified':
+      return 'passed';
+    case 'warnings':
+      return warningsAccepted ? 'passed' : 'warnings_unaccepted';
+    case 'failed':
+      return 'failed';
+    case 'needs_configuration':
+      return 'needs_configuration';
+    default:
+      return 'not_run';
+  }
+}
+
+/**
+ * Evaluates whether a persisted AI Kit review payload (implementationVerification.aiCodeReview)
+ * satisfies the hard-gate requirements: status must be "passed", fixableFindings must be empty,
+ * and reviewedFiles/rulesFiles/checklistFiles/knownPrReviewFiles must all be non-empty — a
+ * "passed" status with missing details is treated as incomplete, not passed. Returns
+ * [gateStatus, missingDetailReasons] where gateStatus is one of
+ * "passed" | "incomplete" | "failed" | "pending" | "not_run". Mirrors Rust task_mcp_ai_kit_review_gate.
+ */
+function aiKitReviewGate(review) {
+  if (!review || typeof review !== 'object') return ['not_run', []];
+  const status = review.status || '';
+  if (!status) return ['not_run', []];
+
+  const hasItems = (key) => Array.isArray(review[key]) && review[key].length > 0;
+  const missing = [];
+  if (!hasItems('reviewedFiles')) missing.push('reviewedFiles is empty');
+  if (!hasItems('rulesFiles')) missing.push('rulesFiles is empty');
+  if (!hasItems('checklistFiles')) missing.push('checklistFiles is empty');
+  if (!hasItems('knownPrReviewFiles')) missing.push('knownPrReviewFiles is empty');
+
+  if (hasItems('fixableFindings')) {
+    missing.push('fixableFindings is non-empty');
+    return ['failed', missing];
+  }
+  switch (status) {
+    case 'failed':
+      return ['failed', missing];
+    case 'warnings':
+      return ['pending', missing];
+    case 'passed':
+      return missing.length === 0 ? ['passed', []] : ['incomplete', missing];
+    default:
+      return ['not_run', []];
+  }
+}
+
+/** Reads whether the user has explicitly accepted the current Dataverse Metadata Check warnings
+ *  (implementationVerification.dataverseCheck.warningsAccepted.accepted). Never true unless a
+ *  prior accept_dataverse_warnings call set it. Mirrors Rust task_mcp_dataverse_warnings_accepted. */
+function dataverseWarningsAccepted(task) {
+  return asObject(asObject(asObject(task.implementationVerification).dataverseCheck).warningsAccepted).accepted === true;
+}
+
+/**
+ * Builds the flat "kind/logicalName/entity/attribute/status" reference list the Implementation
+ * Verification modal and Dataverse checks render as "checked entities/fields" — factored out so
+ * run_implementation_verification's Dataverse Metadata Check step reports the exact same detail
+ * shape. Mirrors Rust task_mcp_build_verified_references_list.
+ */
+function buildVerifiedReferencesList(report) {
+  const r = asObject(report);
+  const verified = [];
+  for (const ref of Array.isArray(r.confirmedReferences) ? r.confirmedReferences : []) {
+    verified.push({
+      kind: ref.kind, logicalName: ref.displayName,
+      entityLogicalName: ref.entityLogicalName, attributeLogicalName: ref.attributeLogicalName,
+      status: 'found',
+    });
+  }
+  for (const ref of Array.isArray(r.missingReferences) ? r.missingReferences : []) {
+    verified.push({
+      kind: ref.kind, logicalName: ref.displayName,
+      entityLogicalName: ref.entityLogicalName, attributeLogicalName: ref.attributeLogicalName,
+      status: 'missing',
+    });
+  }
+  for (const ref of Array.isArray(r.ambiguousReferences) ? r.ambiguousReferences : []) {
+    verified.push({
+      kind: ref.kind, logicalName: ref.displayName, entityLogicalName: ref.entityLogicalName,
+      status: 'unverified',
+    });
+  }
+  return verified;
+}
+
 /** Picks the file from filesChanged that best matches the task's known script artifact/name. */
 function resolveImplementedScriptArtifact(task, filesChanged) {
   const scriptCandidates = filesChanged.filter((f) => /\.[jt]sx?$/i.test(String(f)));
@@ -2117,6 +2298,48 @@ function applyImplementedScriptArtifactToWorkflowSetup(task, implementedPath) {
   }
 }
 
+/**
+ * Applies an AI Kit / Client-API review result (performed by the calling AI agent itself) to a
+ * task: writes implementationVerification.aiCodeReview (the canonical field the modal reads) and
+ * task.aiKitReview (the separate continue_developer_workflow pre-branch gate, kept for
+ * back-compat — no longer the real gate). `args` is the raw record_ai_kit_review_result tool
+ * payload — this is the single place that knows the full review payload shape (reviewedFiles,
+ * rulesFiles, checklistFiles, knownPrReviewFiles, nonFixableWarnings, checkedItems, skippedItems,
+ * summary), so a "passed" review missing those details can be told apart from a genuinely
+ * complete one (see aiKitReviewGate). Throws on an invalid status. Mirrors Rust
+ * task_mcp_apply_ai_kit_review_result.
+ */
+function applyAiKitReviewResult(task, args, now) {
+  const status = String(args.status ?? '').trim();
+  if (!['passed', 'failed', 'warnings'].includes(status)) {
+    throw new Error(`Invalid status '${status}'. Allowed: passed, failed, warnings`);
+  }
+  const arr = (key) => (Array.isArray(args[key]) ? args[key] : []);
+  const summary = String(args.summary ?? '');
+
+  task.implementationVerification = asObject(task.implementationVerification);
+  task.implementationVerification.aiCodeReview = {
+    status,
+    reviewSource: 'claude-ai-kit',
+    reviewedFiles: arr('reviewedFiles'),
+    findings: arr('findings'),
+    fixableFindings: arr('fixableFindings'),
+    nonFixableWarnings: arr('nonFixableWarnings'),
+    rulesFiles: arr('rulesFiles'),
+    checklistFiles: arr('checklistFiles'),
+    knownPrReviewFiles: arr('knownPrReviewFiles'),
+    checkedItems: arr('checkedItems'),
+    skippedItems: arr('skippedItems'),
+    summary,
+    reviewedAt: now,
+    runAt: now,
+  };
+  task.implementationVerification.updatedAt = now;
+  // Keeps continue_developer_workflow's separate pre-branch AI Kit gate
+  // (task.aiKitReview.completedAt/status) from dead-ending after this review.
+  task.aiKitReview = { completedAt: now, status, reviewSource: 'claude-ai-kit' };
+}
+
 /** Resolves an absolute filesystem path for the task's current script artifact, if known. */
 function resolveScriptAbsolutePath(task) {
   const setup = asObject(task.workflowSetup);
@@ -2128,14 +2351,69 @@ function resolveScriptAbsolutePath(task) {
   return null;
 }
 
-/** Script File Readiness check for run_implementation_verification: real filesystem read. */
-async function checkScriptFileReadinessForVerification(task) {
-  const absolutePath = resolveScriptAbsolutePath(task);
+/**
+ * Resolves an absolute artifact path for a plugin task, mirroring Rust's mcp_resolve_artifact_path:
+ * explicit workflowSetup.artifactPath/scriptPath first, then infers a single .cs file from the
+ * plugin project folder (repositoryRoot/Plugins/<project>/<project>, or customer.pluginFolder/
+ * <project>/<project>, or settings.crmBaseDirectory/customer.folderName/Plugins/<project>/
+ * <project>). When exactly one .cs file (excluding AssemblyInfo.cs) is found in a candidate
+ * folder, the result is persisted into task.workflowSetup.artifactPath so subsequent calls and
+ * the UI see the same resolved path. Returns null when nothing can be resolved unambiguously.
+ */
+async function resolvePluginArtifactPath(task, customers, settings) {
+  const setup = asObject(task.workflowSetup);
+  const explicit = setup.artifactPath || setup.scriptPath;
+  if (explicit) return String(explicit).replace(/\\/g, '/');
+
+  const projectName = String(setup.pluginProject || task.selectedPluginProject || '').trim();
+  if (!projectName) return null;
+
+  const candidates = [];
+  if (setup.repositoryRoot) {
+    candidates.push(path.join(setup.repositoryRoot, 'Plugins', projectName, projectName));
+  }
+  const customerId = task.customerId || '';
+  if (customerId) {
+    const customer = (Array.isArray(customers) ? customers : []).find((c) => c && c.id === customerId);
+    if (customer?.pluginFolder) {
+      candidates.push(path.join(customer.pluginFolder, projectName, projectName));
+    }
+    const crmBaseDirectory = asObject(settings).crmBaseDirectory;
+    if (crmBaseDirectory && customer?.folderName) {
+      candidates.push(path.join(crmBaseDirectory, customer.folderName, 'Plugins', projectName, projectName));
+    }
+  }
+
+  for (const folder of candidates) {
+    let entries;
+    try {
+      entries = await fs.readdir(folder, { withFileTypes: true });
+    } catch {
+      continue;
+    }
+    const csFiles = entries
+      .filter((e) => e.isFile() && /\.cs$/i.test(e.name) && !/assemblyinfo/i.test(e.name))
+      .map((e) => path.join(folder, e.name).replace(/\\/g, '/'));
+    if (csFiles.length === 1) {
+      setup.artifactPath = csFiles[0];
+      task.workflowSetup = setup;
+      return csFiles[0];
+    }
+    // Zero or multiple matches in this candidate folder: try the next candidate rather than
+    // erroring — a clean single match is preferred, but an ambiguous folder should not prevent
+    // trying other known locations.
+  }
+  return null;
+}
+
+/** Artifact File Readiness check for run_implementation_verification: real filesystem read.
+ *  Generic over script/ribbon (.js/.ts) and plugin (.cs) artifacts — only the wording differs. */
+async function checkArtifactFileReadinessForVerification(absolutePath, isPlugin) {
+  const kind = isPlugin ? 'plugin' : 'script';
   if (!absolutePath) {
     return {
-      name: 'Script File Readiness',
       status: 'failed',
-      findings: ['No script artifact path is set on the task. Call record_ai_implementation_completed with filesChanged first.'],
+      findings: [`No ${kind} artifact path is set on the task. Call record_ai_implementation_completed with filesChanged first.`],
       fixable: true,
       fixDescription: 'Persist the implemented file path via record_ai_implementation_completed before verifying.',
       fileContent: null,
@@ -2146,22 +2424,20 @@ async function checkScriptFileReadinessForVerification(task) {
     const lineCount = content.split('\n').length;
     const isEmpty = content.trim().length === 0;
     return {
-      name: 'Script File Readiness',
       status: isEmpty ? 'failed' : 'passed',
       findings: [
         isEmpty
-          ? `Script file exists but is empty: ${path.basename(absolutePath)}.`
-          : `Script file found: ${path.basename(absolutePath)} (${lineCount} lines).`,
+          ? `Artifact file exists but is empty: ${path.basename(absolutePath)}.`
+          : `Artifact file found: ${path.basename(absolutePath)} (${lineCount} lines).`,
       ],
       fixable: isEmpty,
-      fixDescription: isEmpty ? 'Write the actual implementation to the script file.' : null,
+      fixDescription: isEmpty ? 'Write the actual implementation to the artifact file.' : null,
       fileContent: isEmpty ? null : content,
     };
   } catch (e) {
     return {
-      name: 'Script File Readiness',
       status: 'failed',
-      findings: [`Script file not found or unreadable at ${absolutePath}: ${String(e?.message || e)}`],
+      findings: [`Artifact file not found or unreadable at ${absolutePath}: ${String(e?.message || e)}`],
       fixable: true,
       fixDescription: 'Verify the implemented file was written to the expected path and call record_ai_implementation_completed again.',
       fileContent: null,
@@ -2216,7 +2492,9 @@ const IMPL_CHECK_RESOLVED_STATUSES = new Set(['passed', 'warnings', 'skipped', '
  */
 function deriveDataverseCheckStatusForVerification(task) {
   const override = asObject(asObject(task.implementationVerification).dataverseCheck);
-  if (override.status === 'skipped' || override.status === 'manually-verified') return override.status;
+  if (override.status === 'skipped' || override.status === 'manually-verified' || override.status === 'needs_configuration') {
+    return override.status;
+  }
   const verdict = (Array.isArray(task.crmVerificationReports) ? task.crmVerificationReports : [])[0]?.verdict;
   if (verdict === 'pass') return 'passed';
   if (verdict === 'warnings') return 'warnings';
@@ -2310,6 +2588,111 @@ function unresolvedModalRows(summary) {
   if (unresolved(summary.aiCodeReview)) rows.push('aiCodeReview');
   if (unresolved(summary.localTest)) rows.push('localTest');
   return rows;
+}
+
+/**
+ * Single source of truth for "can this task move to Code Review / Waiting for PR". Computed from
+ * the exact same fields (implementationVerification.dataverseCheck / implementationVerification.
+ * aiCodeReview) that run_implementation_verification and the Implementation Verification modal
+ * both read/write, so the MCP-facing workflow and the human-facing "Move to Code Review" button
+ * enforce identical rules. Mirrors Rust task_mcp_compute_progression_gate. Pure — no I/O.
+ */
+function computeProgressionGate(task) {
+  const dvRaw = deriveDataverseCheckStatusForVerification(task);
+  const dvAccepted = dataverseWarningsAccepted(task);
+  const dvGate = normalizeDataverseGate(dvRaw, dvAccepted);
+
+  const aiReview = asObject(asObject(task.implementationVerification).aiCodeReview);
+  const [aiGate, aiMissing] = aiKitReviewGate(aiReview);
+
+  const blockingChecks = [];
+  const blockingFindings = [];
+
+  switch (dvGate) {
+    case 'passed':
+      break;
+    case 'warnings_unaccepted':
+      blockingChecks.push({
+        check: 'dataverseCheck', status: dvGate,
+        reason: 'Dataverse Metadata Check completed with warnings that have not been explicitly accepted.',
+      });
+      break;
+    case 'needs_configuration':
+      blockingChecks.push({
+        check: 'dataverseCheck', status: dvGate,
+        reason: "Dataverse Metadata Check cannot run — Primarch/Dataverse connection is not configured or does not match the task's environment.",
+      });
+      break;
+    case 'failed': {
+      const missingRefs = Array.isArray(task.crmVerificationReports?.[0]?.missingReferences)
+        ? task.crmVerificationReports[0].missingReferences : [];
+      for (const m of missingRefs) {
+        blockingFindings.push({ check: 'dataverseCheck', description: `'${m.displayName ?? 'unknown'}' was not found in Dataverse.` });
+      }
+      blockingChecks.push({
+        check: 'dataverseCheck', status: dvGate,
+        reason: 'Dataverse Metadata Check found missing/incorrect references.',
+      });
+      break;
+    }
+    default:
+      blockingChecks.push({ check: 'dataverseCheck', status: dvGate, reason: 'Dataverse Metadata Check has not run yet.' });
+  }
+
+  switch (aiGate) {
+    case 'passed':
+      break;
+    case 'failed': {
+      const fixable = Array.isArray(aiReview.fixableFindings) ? aiReview.fixableFindings : [];
+      for (const f of fixable) blockingFindings.push({ check: 'aiCodeReview', description: f.description });
+      blockingChecks.push({
+        check: 'aiCodeReview', status: aiGate,
+        reason: 'AI Kit Code Review found fixable findings or an explicit failed verdict.',
+      });
+      break;
+    }
+    case 'incomplete':
+      blockingChecks.push({
+        check: 'aiCodeReview', status: aiGate,
+        reason: `AI Kit Code Review is missing required details: ${aiMissing.join(', ')}.`,
+      });
+      break;
+    case 'pending':
+      blockingChecks.push({
+        check: 'aiCodeReview', status: aiGate,
+        reason: "AI Kit Code Review verdict is 'warnings' — must be resolved to 'passed'.",
+      });
+      break;
+    default:
+      blockingChecks.push({ check: 'aiCodeReview', status: aiGate, reason: 'AI Kit Code Review has not run yet.' });
+  }
+
+  const canProceed = blockingChecks.length === 0;
+  const requiresUserAction = dvGate === 'warnings_unaccepted' || dvGate === 'needs_configuration';
+  let nextRecommendedAction;
+  if (canProceed) {
+    nextRecommendedAction = 'continue_workflow';
+  } else if (blockingFindings.length > 0) {
+    nextRecommendedAction = 'fix_code';
+  } else if (aiGate === 'incomplete' || aiGate === 'pending' || aiGate === 'not_run') {
+    nextRecommendedAction = 'run_ai_kit_review';
+  } else if (dvGate === 'needs_configuration') {
+    nextRecommendedAction = 'needs_configuration';
+  } else if (dvGate === 'warnings_unaccepted') {
+    nextRecommendedAction = 'review_dataverse_warnings';
+  } else {
+    nextRecommendedAction = 'wait_for_user';
+  }
+
+  return {
+    canProceed,
+    blockingChecks,
+    blockingFindings,
+    requiresUserAction,
+    nextRecommendedAction,
+    dataverseGateStatus: dvGate,
+    aiReviewGateStatus: aiGate,
+  };
 }
 
 /**
@@ -3295,10 +3678,11 @@ function computeContinueWorkflowStep(task) {
     };
   }
 
-  const setup = asObject(task.workflowSetup);
-  const workflow = asObject(task.crmDeveloperWorkflow);
-  const workKind = workflow.detectedWorkKind || setup.devTargetKind || 'unknown';
-  const isScript = workKind === 'script' || workKind === 'ribbon' || setup.devTargetKind === 'script';
+  // isScript here means "routes through the mcpVerification-based branch below" — script, ribbon,
+  // AND plugin tasks all use run_implementation_verification now. Genuinely non-verifiable work
+  // kinds (repo-only, bugfix, review, general, unknown) fall through to the separate
+  // run_dataverse_check_for_task branch further down.
+  const isScript = isVerifiableDevTask(task);
 
   // 1. Local test must be recorded first.
   const localTestRecord = asObject(task.localTestRecord);
@@ -3375,6 +3759,19 @@ function computeContinueWorkflowStep(task) {
           forbiddenWrites: ['commit_task_changes', 'push_task_branch', 'commit_and_push_task_changes'],
         };
       }
+      if (mcpVerification.status === 'warnings_unaccepted') {
+        const reason = 'Dataverse Metadata Check completed with warnings that have not been explicitly accepted yet.';
+        return {
+          nextAction: 'review_dataverse_warnings',
+          canProceed: false,
+          requiresUserApproval: true,
+          blockingUserAction: reason,
+          recommendedTool: null,
+          instructionForAI: `${reason} This requires the user: ask them to review the warnings in the Implementation Verification modal and either accept them and continue, or send the task back for you to fix the code and rerun the check.`,
+          allowedWrites: [],
+          forbiddenWrites: ['commit_task_changes', 'push_task_branch', 'commit_and_push_task_changes'],
+        };
+      }
       if (mcpVerification.status === 'needs_manual_action') {
         const manualStep = composeManualVerificationStep(buildModalVerificationSummary(task));
         return {
@@ -3414,32 +3811,61 @@ function computeContinueWorkflowStep(task) {
     };
   }
 
-  // 3. AI Kit review.
-  const aiKitReview = asObject(task.aiKitReview);
-  const aiKitDone = !!aiKitReview.completedAt || aiKitReview.status === 'passed' || aiKitReview.status === 'skipped';
-  if (!aiKitDone) {
+  // 3. AI Kit review — hard gate. Reads implementationVerification.aiCodeReview (the canonical
+  // field the modal reads), NOT the looser task.aiKitReview.completedAt flag: recording ANY
+  // verdict (including "failed") always sets completedAt, so gating on completedAt alone would
+  // let a failed/incomplete review through. aiKitReviewGate requires status=="passed" AND
+  // fixableFindings empty AND reviewedFiles/rulesFiles/checklistFiles/knownPrReviewFiles all
+  // non-empty.
+  const aiReview = asObject(asObject(task.implementationVerification).aiCodeReview);
+  const [aiGate, aiMissing] = aiKitReviewGate(aiReview);
+  if (aiGate !== 'passed') {
+    const instruction = aiGate === 'failed'
+      ? "AI Kit review found fixable findings or has an explicit 'failed' verdict. Fix the code, then call record_ai_kit_review_result again with status='passed' and full review details, then call continue_developer_workflow again."
+      : aiGate === 'incomplete'
+        ? `AI Kit review was recorded as 'passed' but is missing required details: ${aiMissing.join(', ')}. Call record_ai_kit_review_result again including reviewedFiles, rulesFiles, checklistFiles, and knownPrReviewFiles, then call continue_developer_workflow again.`
+        : aiGate === 'pending'
+          ? "AI Kit review verdict is 'warnings' — resolve the warnings, then call record_ai_kit_review_result again with status='passed', then call continue_developer_workflow again."
+          : 'AI Kit review is required before branch creation. Read the applicable AI Kit rules, the CRM code review checklist, known PR review comments, and the target file yourself, then call record_ai_kit_review_result with your verdict and full review details, then call continue_developer_workflow again.';
     return {
       nextAction: 'run_ai_kit_review',
       canProceed: true,
       requiresUserApproval: false,
       blockingUserAction: null,
       recommendedTool: 'record_ai_kit_review_result',
-      instructionForAI: 'AI Kit review is required before branch creation. Read the applicable AI Kit rules and the target file yourself, then call record_ai_kit_review_result with your verdict, then call continue_developer_workflow again.',
-      allowedWrites: ['record_ai_kit_review_result'],
+      instructionForAI: instruction,
+      allowedWrites: ['record_ai_kit_review_result', 'record_ai_implementation_completed'],
       forbiddenWrites: ['commit_task_changes', 'push_task_branch', 'commit_and_push_task_changes'],
     };
   }
 
-  // 4. Branch creation — requires explicit user approval.
+  // 4. Propose/confirm branch, then commit — each step requires its OWN explicit user
+  // approval. Confirming a branch name does not imply the commit is approved, and vice versa.
+  // Mirrors Rust task_mcp_compute_continue_workflow_step's "4. Propose/confirm branch" section
+  // in src-tauri/src/lib.rs — keep in sync.
+  const confirmedBranch = asObject(task.gitWorkflow).confirmedBranch;
+  if (typeof confirmedBranch === 'string' && confirmedBranch !== '') {
+    return {
+      nextAction: 'prepare_commit',
+      canProceed: true,
+      requiresUserApproval: true,
+      blockingUserAction: 'Ask the user to confirm the commit (files + message) before committing.',
+      recommendedTool: 'prepare_commit_for_task',
+      instructionForAI: `Branch '${confirmedBranch}' was already created/checked out and confirmed. Call prepare_commit_for_task to show the user exactly what would be committed (changed files, ignored/gitignored files, suggested message), then ask for a SEPARATE explicit approval of the commit itself before calling commit_task_changes. Do not call push_task_branch or commit_and_push_task_changes without a further separate approval to push.`,
+      allowedWrites: ['prepare_commit_for_task', 'commit_task_changes'],
+      forbiddenWrites: ['push_task_branch', 'commit_and_push_task_changes'],
+    };
+  }
+
   return {
     nextAction: 'propose_branch',
     canProceed: true,
     requiresUserApproval: true,
-    blockingUserAction: 'Ask the user to confirm the proposed branch name before creating the branch.',
-    recommendedTool: 'prepare_commit_for_task',
-    instructionForAI: 'Implementation, verification, and AI Kit review are complete. Propose a branch name and ask the user to confirm before creating the branch. Do not call commit_task_changes or push_task_branch without explicit user approval.',
-    allowedWrites: [],
-    forbiddenWrites: [],
+    blockingUserAction: 'Ask the user to confirm the proposed branch name before creating/checking it out.',
+    recommendedTool: 'create_or_checkout_task_branch',
+    instructionForAI: "Implementation, verification, and AI Kit review are complete. Call prepare_commit_for_task to get a suggested branch name (proposedBranchName) and see whether it already exists (branchExists), propose that name to the user, and ask them to confirm the exact branch name. Once the user approves, call create_or_checkout_task_branch with mode='create_if_missing_and_checkout' to actually create/check out the branch — prepare_commit_for_task alone never creates or checks out anything. Do not call commit_task_changes, push_task_branch, or commit_and_push_task_changes until a SEPARATE explicit approval of the commit itself, after the branch exists.",
+    allowedWrites: ['prepare_commit_for_task', 'create_or_checkout_task_branch'],
+    forbiddenWrites: ['commit_task_changes', 'push_task_branch', 'commit_and_push_task_changes'],
   };
 }
 
@@ -3909,45 +4335,36 @@ async function callToolFallback(name, args = {}) {
     case 'record_ai_kit_review_result': {
       const taskId = String(args.taskId ?? '').trim();
       if (!taskId) return { ...common, error: 'Missing required argument: taskId' };
-      const status = String(args.status ?? '').trim();
-      if (!['passed', 'failed', 'warnings'].includes(status)) {
-        return { ...common, error: `Invalid status '${status}'. Allowed: passed, failed, warnings` };
-      }
-      const reviewedFiles = Array.isArray(args.reviewedFiles) ? args.reviewedFiles.filter((f) => typeof f === 'string') : [];
-      const findings = Array.isArray(args.findings) ? args.findings.filter((f) => typeof f === 'string') : [];
-      const fixableFindings = Array.isArray(args.fixableFindings) ? args.fixableFindings : [];
 
       const index = tasks.findIndex((t) => t.id === taskId);
       if (index < 0) return { ...common, error: `Task not found: ${taskId}` };
       const task = tasks[index];
       const now = new Date().toISOString();
 
-      task.implementationVerification = asObject(task.implementationVerification);
-      task.implementationVerification.aiCodeReview = {
-        status,
-        reviewSource: 'claude-ai-kit',
-        reviewedFiles,
-        findings,
-        fixableFindings,
-        runAt: now,
-      };
-      task.implementationVerification.updatedAt = now;
-      // Keeps continue_developer_workflow's separate pre-branch AI Kit gate
-      // (task.aiKitReview.completedAt/status) from dead-ending after this review.
-      task.aiKitReview = { completedAt: now, status, reviewSource: 'claude-ai-kit' };
-
+      try {
+        applyAiKitReviewResult(task, args, now);
+      } catch (e) {
+        return { ...common, error: String(e?.message || e) };
+      }
+      const status = String(args.status ?? '').trim();
       appendMcpAuditNote(task, `record_ai_kit_review_result -> ${status}`);
       await saveTasks(tasks);
 
+      const [gateStatus, missingDetails] = aiKitReviewGate(task.implementationVerification.aiCodeReview);
       const implementationVerification = buildModalVerificationSummary(task);
       const unresolvedRequiredRows = unresolvedModalRows(implementationVerification);
+      const nextRecommendedStep = gateStatus === 'passed'
+        ? 'Call run_implementation_verification again to confirm all automated checks are resolved.'
+        : `AI Kit review does not satisfy the hard gate yet (gateStatus=${gateStatus}): ${missingDetails.length ? missingDetails.join('; ') : 'see findings/fixableFindings'}. Fix the findings and/or include the missing review details, then call record_ai_kit_review_result again.`;
       return {
         ...common,
         taskId,
         recorded: true,
+        gateStatus,
+        missingReviewDetails: missingDetails,
         implementationVerification,
         unresolvedRequiredRows,
-        nextRecommendedStep: 'Call run_implementation_verification again to confirm all automated checks are resolved.',
+        nextRecommendedStep,
       };
     }
     case 'run_implementation_verification': {
@@ -3956,28 +4373,38 @@ async function callToolFallback(name, args = {}) {
       const task = getTaskById(tasks, taskId);
       if (!task) return { ...common, error: `Task not found: ${taskId}` };
       if (task.taskMode !== 'developer') return { ...common, error: 'Task is not in developer mode.' };
-      if (!isScriptWorkflowTask(task)) {
-        return { ...common, error: 'run_implementation_verification currently supports script/ribbon tasks only. Use run_dataverse_check_for_task for plugin tasks.' };
+      if (!isVerifiableDevTask(task)) {
+        return { ...common, error: 'run_implementation_verification currently supports script/ribbon/plugin tasks only.' };
       }
+      const isPlugin = isPluginDevTask(task);
+      const readinessLabel = isPlugin ? 'Plugin File Readiness' : 'Script File Readiness';
 
       const requestedChecks = Array.isArray(args.checks) && args.checks.length > 0 ? new Set(args.checks) : null;
       const runCheck = (key) => !requestedChecks || requestedChecks.has(key);
+
+      const [customers, settings] = await Promise.all([loadCustomers(), loadSettings()]);
 
       const checks = [];
       const fixableFindings = [];
       let readiness = null;
       let staticResult = null;
+      let absoluteArtifactPath = null;
 
       if (runCheck('scriptFileReadiness')) {
-        readiness = await checkScriptFileReadinessForVerification(task);
-        checks.push({ name: readiness.name, status: readiness.status, findings: readiness.findings });
+        absoluteArtifactPath = isPlugin
+          ? await resolvePluginArtifactPath(task, customers, settings)
+          : resolveScriptAbsolutePath(task);
+        readiness = await checkArtifactFileReadinessForVerification(absoluteArtifactPath, isPlugin);
+        checks.push({ name: readinessLabel, status: readiness.status, findings: readiness.findings });
         if (readiness.fixable) {
-          fixableFindings.push({ id: 'script-file-readiness', description: readiness.fixDescription || readiness.findings[0] });
+          fixableFindings.push({ id: 'artifact-file-readiness', description: readiness.fixDescription || readiness.findings[0] });
         }
       }
 
       if (runCheck('localStaticVerification')) {
-        if (readiness && readiness.fileContent) {
+        if (isPlugin) {
+          checks.push({ name: 'Local Static/Business-Rule Verification', status: 'skipped', findings: ['Not applicable — static rule templates currently cover JS/TS script tasks only.'] });
+        } else if (readiness && readiness.fileContent) {
           const template = matchTaskTemplate(task.title);
           staticResult = runStaticBusinessRuleChecks(template, readiness.fileContent);
           checks.push({ name: staticResult.name, status: staticResult.status, findings: staticResult.findings });
@@ -3987,39 +4414,112 @@ async function callToolFallback(name, args = {}) {
         }
       }
 
-      // Dataverse Metadata Check: this standalone MCP fallback (app not running) has no Primarch
-      // client of its own — the real check runs through the Task Workbench app's local bridge
-      // (Rust), which the fallback here cannot reach. Report needs_configuration (not a generic
-      // needs_manual_action) so the caller knows exactly what unblocks it.
+      // Dataverse Metadata Check. Hard gate: "warnings" only counts as resolved once the user has
+      // explicitly accepted them (implementationVerification.dataverseCheck.warningsAccepted) —
+      // see normalizeDataverseGate. An environment mismatch between the task's expected customer
+      // environment and the active Primarch connection blocks the check entirely rather than
+      // reporting a result against the wrong environment.
       if (runCheck('dataverseMetadataCheck')) {
-        const resolvedStatus = deriveDataverseCheckStatusForVerification(task);
-        if (IMPL_CHECK_RESOLVED_STATUSES.has(resolvedStatus)) {
-          checks.push({ name: 'Dataverse Metadata Check', status: resolvedStatus, findings: [`Existing Dataverse Metadata Check status: ${resolvedStatus}.`] });
-        } else {
+        task.implementationVerification = asObject(task.implementationVerification);
+        task.implementationVerification.dataverseCheck = asObject(task.implementationVerification.dataverseCheck);
+        // "needs_configuration" is only ever a transient override — clear a stale one from a
+        // prior run before deciding this run's outcome, so a since-fixed configuration doesn't
+        // leave the modal permanently stuck reporting needs_configuration.
+        if (task.implementationVerification.dataverseCheck.status === 'needs_configuration') {
+          delete task.implementationVerification.dataverseCheck.status;
+        }
+        const envMismatch = dataverseEnvironmentMismatch(task, customers, settings);
+        const customer = (Array.isArray(customers) ? customers : []).find((c) => c && c.id === task.customerId);
+        const expectedEnv = String(customer?.dataverseEnvironmentLabel ?? '').trim() || null;
+        const activeEnvRaw = String(asObject(settings).primarchMcpEnvironmentLabel ?? '').trim();
+        const activeEnv = activeEnvRaw || null;
+        const environmentDetail = { expected: expectedEnv, active: activeEnv, mismatch: !!envMismatch };
+
+        if (!absoluteArtifactPath) {
           checks.push({
-            name: 'Dataverse Metadata Check',
-            status: 'needs_configuration',
-            findings: [
-              'Automated Dataverse Metadata Check requires the Task Workbench app to be running (the MCP bridge runs Primarch verification). ' +
-              'Start the app, then call run_implementation_verification again — or run Dataverse Metadata Check manually in the Implementation Verification modal.',
-            ],
+            name: 'Dataverse Metadata Check', status: 'not_run',
+            findings: ['Skipped — artifact file path is not resolved yet.'],
+            environment: environmentDetail,
           });
+        } else if (envMismatch) {
+          const [expected, active] = envMismatch;
+          const reason = `Active Primarch/Dataverse connection ('${active}') does not match this task's expected environment ('${expected}'). Switch the connection or update the task's customer environment label in Settings, then rerun the check. The check was NOT run against the wrong environment.`;
+          task.implementationVerification.dataverseCheck.status = 'needs_configuration';
+          task.implementationVerification.dataverseCheck.message = reason;
+          checks.push({ name: 'Dataverse Metadata Check', status: 'needs_configuration', findings: [reason], environment: environmentDetail });
+        } else {
+          // This standalone MCP fallback (app not running) has no Primarch client of its own —
+          // the real check runs through the Task Workbench app's local bridge (Rust). Fall back
+          // to whatever status is already recorded (a previous real run, or a manual override);
+          // only report "app must be running" when nothing is resolved yet.
+          const resolvedStatus = deriveDataverseCheckStatusForVerification(task);
+          if (IMPL_CHECK_RESOLVED_STATUSES.has(resolvedStatus)) {
+            const report = (Array.isArray(task.crmVerificationReports) ? task.crmVerificationReports : [])[0] ?? {};
+            const warningsAccepted = dataverseWarningsAccepted(task);
+            const gateStatus = normalizeDataverseGate(resolvedStatus, warningsAccepted);
+            const checkedReferences = buildVerifiedReferencesList(report);
+            task.implementationVerification.dataverseCheck.environment = environmentDetail;
+            checks.push({
+              name: 'Dataverse Metadata Check', status: gateStatus, rawStatus: resolvedStatus,
+              findings: [`Existing Dataverse Metadata Check status: ${resolvedStatus}.`],
+              environment: environmentDetail,
+              checkedReferences,
+              warningsAccepted: task.implementationVerification.dataverseCheck.warningsAccepted ?? null,
+            });
+          } else {
+            const reason = 'Automated Dataverse Metadata Check requires the Task Workbench app to be running (the MCP bridge runs Primarch verification). ' +
+              'Start the app, then call run_implementation_verification again — or run Dataverse Metadata Check manually in the Implementation Verification modal.';
+            task.implementationVerification.dataverseCheck.status = 'needs_configuration';
+            task.implementationVerification.dataverseCheck.message = reason;
+            checks.push({ name: 'Dataverse Metadata Check', status: 'needs_configuration', findings: [reason], environment: environmentDetail });
+          }
         }
       }
 
-      // AI Internal Code Review: the calling AI agent performs this review itself (reads the AI
-      // Kit rules and target file directly, no separate API key needed) and records its verdict
-      // via record_ai_kit_review_result. This works identically with or without the app running.
+      // AI Internal Code Review: Claude (the calling MCP agent) performs this review itself —
+      // read the AI Kit rules and target file, then call record_ai_kit_review_result. Hard gate:
+      // a "passed" review with missing details (reviewedFiles/rulesFiles/checklistFiles/
+      // knownPrReviewFiles) is treated as incomplete, and any fixableFindings block the gate
+      // regardless of status — see aiKitReviewGate.
       if (runCheck('aiInternalCodeReview')) {
-        const aiStatus = asObject(asObject(task.implementationVerification).aiCodeReview).status;
-        if (IMPL_CHECK_RESOLVED_STATUSES.has(aiStatus)) {
-          checks.push({ name: 'AI Internal Code Review', status: aiStatus, findings: [`Existing AI Kit review status: ${aiStatus}.`] });
-        } else {
-          checks.push({
-            name: 'AI Internal Code Review',
-            status: 'needs_ai_kit_review',
-            findings: ['Read the applicable AI Kit rules and the target file yourself (use get_power_platform_ai_kit_status and get_developer_work_packet for context), then call record_ai_kit_review_result with your verdict.'],
-          });
+        const aiReview = asObject(asObject(task.implementationVerification).aiCodeReview);
+        const [gateStatus, missingDetails] = aiKitReviewGate(aiReview);
+        switch (gateStatus) {
+          case 'passed':
+            checks.push({ name: 'AI Internal Code Review', status: 'passed', findings: ['AI Kit review passed with full review details recorded.'], review: aiReview });
+            break;
+          case 'failed': {
+            const aiFixable = Array.isArray(aiReview.fixableFindings) ? aiReview.fixableFindings : [];
+            if (aiFixable.length === 0) {
+              fixableFindings.push({ id: 'ai-kit-review-failed', description: "AI Kit review verdict is 'failed'. Address the findings and call record_ai_kit_review_result again." });
+            } else {
+              fixableFindings.push(...aiFixable);
+            }
+            checks.push({ name: 'AI Internal Code Review', status: 'failed', findings: ['AI Kit review found fixable issues.'], review: aiReview });
+            break;
+          }
+          case 'incomplete':
+            checks.push({
+              name: 'AI Internal Code Review',
+              status: 'needs_ai_kit_review',
+              findings: [`AI Kit review was recorded as 'passed' but is missing required details (${missingDetails.join(', ')}). Re-run the review and include them.`],
+              review: aiReview,
+            });
+            break;
+          case 'pending':
+            checks.push({
+              name: 'AI Internal Code Review',
+              status: 'needs_ai_kit_review',
+              findings: ["AI Kit review verdict is 'warnings' — resolve the warnings (fix or justify) and call record_ai_kit_review_result again with a 'passed' verdict."],
+              review: aiReview,
+            });
+            break;
+          default:
+            checks.push({
+              name: 'AI Internal Code Review',
+              status: 'needs_ai_kit_review',
+              findings: ['Read the applicable AI Kit rules, the CRM code review checklist, known PR review comments, and the target file yourself (use get_power_platform_ai_kit_status and get_developer_work_packet for context), then call record_ai_kit_review_result with your verdict and full review details.'],
+            });
         }
       }
 
@@ -4028,13 +4528,17 @@ async function callToolFallback(name, args = {}) {
         checks.push({ name: localTestCheck.name, status: localTestCheck.status, findings: localTestCheck.findings });
       }
 
-      // Roll up the top-level status/nextAction. Agent-actionable outcomes (fix code, run the AI
-      // Kit review) take priority over needs_configuration — that requires the user to act, so it
-      // should not block work the agent can already do right now. needs_configuration only wins
-      // once there is nothing left for the agent itself to act on. Never needs_manual_action/
-      // wait_for_user for Dataverse Check or AI Review merely because this is a JS/TS task.
+      // Roll up the top-level status/nextAction. Priority: agent-actionable outcomes (fix code,
+      // run the AI Kit review) come before needs_configuration — that requires the user to act, so
+      // it must not block work the agent can already do right now. needs_configuration only wins
+      // once there is nothing left for the agent itself to act on. warnings_unaccepted also
+      // requires the user, but ranks below needs_configuration since a resolvable Dataverse
+      // warning is a lesser blocker than a broken configuration. needs_manual_action/wait_for_user
+      // is reserved for the genuinely manual rows (Local Test) plus rows that failed/were skipped/
+      // never ran — never for Dataverse Check or AI Review merely because this is a JS/TS task.
       const hasNeedsConfiguration = checks.some((c) => c.status === 'needs_configuration');
       const hasNeedsAiReview = checks.some((c) => c.status === 'needs_ai_kit_review');
+      const hasWarningsUnaccepted = checks.some((c) => c.status === 'warnings_unaccepted');
       let status;
       let nextAction;
       if (fixableFindings.length > 0) {
@@ -4046,7 +4550,10 @@ async function callToolFallback(name, args = {}) {
       } else if (hasNeedsConfiguration) {
         status = 'needs_configuration';
         nextAction = 'needs_configuration';
-      } else if (checks.some((c) => c.status === 'needs_manual_action' || c.status === 'failed' || c.status === 'skipped')) {
+      } else if (hasWarningsUnaccepted) {
+        status = 'warnings_unaccepted';
+        nextAction = 'review_dataverse_warnings';
+      } else if (checks.some((c) => ['needs_manual_action', 'failed', 'skipped', 'not_run'].includes(c.status))) {
         status = 'needs_manual_action';
         nextAction = 'wait_for_user';
       } else {
@@ -4065,7 +4572,7 @@ async function callToolFallback(name, args = {}) {
       const now = new Date().toISOString();
       task.implementationVerification = asObject(task.implementationVerification);
       task.implementationVerification.mcpVerification = { status, checks, fixableFindings, nextAction, ranAt: now };
-      // Mirror Script File Readiness into the UI-visible buildCheck field so the Implementation
+      // Mirror Artifact File Readiness into the UI-visible buildCheck field so the Implementation
       // Verification modal reflects this run without a redundant manual "Check Script File" click.
       if (readiness) {
         task.implementationVerification.buildCheck = {
@@ -4079,7 +4586,8 @@ async function callToolFallback(name, args = {}) {
       await saveTasks(tasks);
 
       // Modal-truth summary, built from the SAME canonical fields ImplementationVerification
-      // Modal reads (now including the buildCheck we just wrote above).
+      // Modal reads (now including the buildCheck we just wrote above, and the real
+      // crmVerificationReports/aiCodeReview state the checks above may have just written).
       const implementationVerification = buildModalVerificationSummary(task);
       if (staticResult) {
         implementationVerification.staticBusinessRules = {
@@ -4098,14 +4606,17 @@ async function callToolFallback(name, args = {}) {
             ? 'Fix the fixable findings, then call record_ai_implementation_completed and run_implementation_verification again.'
             : nextAction === 'run_ai_kit_review'
               ? 'Read the applicable AI Kit rules and the target file, then call record_ai_kit_review_result with your verdict, then call run_implementation_verification again.'
-              : nextAction === 'wait_for_user'
-                ? composeManualVerificationStep(implementationVerification)
-                : 'All Implementation Verification checks are resolved. Call continue_developer_workflow to proceed.';
+              : nextAction === 'review_dataverse_warnings'
+                ? 'Dataverse Metadata Check completed with warnings that are not yet accepted. This requires the user: ask them to review the warnings in the Implementation Verification modal and either accept them, or send the task back for you to fix the code, then rerun the check.'
+                : nextAction === 'wait_for_user'
+                  ? composeManualVerificationStep(implementationVerification)
+                  : 'All Implementation Verification checks are resolved. Call continue_developer_workflow to proceed.';
 
       return {
         ...common, taskId, status, checks, fixableFindings, nextAction,
         implementationVerification, unresolvedRequiredRows, nextRecommendedStep,
         missingRequiredTools, instructionForAI: nextRecommendedStep,
+        progressionGate: computeProgressionGate(task),
       };
     }
     case 'get_implementation_verification_summary': {
@@ -4138,13 +4649,16 @@ async function callToolFallback(name, args = {}) {
           ? 'Fix the fixable findings, then call record_ai_implementation_completed and run_implementation_verification again.'
           : nextAction === 'run_ai_kit_review'
             ? 'Read the applicable AI Kit rules and the target file, then call record_ai_kit_review_result with your verdict, then call run_implementation_verification again.'
-            : nextAction === 'wait_for_user'
-              ? composeManualVerificationStep(implementationVerification)
-              : 'All Implementation Verification checks are resolved. Call continue_developer_workflow to proceed.';
+            : nextAction === 'review_dataverse_warnings'
+              ? 'Dataverse Metadata Check completed with warnings that are not yet accepted. This requires the user: ask them to review the warnings in the Implementation Verification modal and either accept them, or send the task back for you to fix the code, then rerun the check.'
+              : nextAction === 'wait_for_user'
+                ? composeManualVerificationStep(implementationVerification)
+                : 'All Implementation Verification checks are resolved. Call continue_developer_workflow to proceed.';
 
       return {
         ...common, taskId, implementationVerification, checks: persistedChecks,
         unresolvedRequiredRows, fixableFindings, nextAction, nextRecommendedStep,
+        progressionGate: computeProgressionGate(task),
       };
     }
     case 'get_task_workbench_mcp_capabilities': {

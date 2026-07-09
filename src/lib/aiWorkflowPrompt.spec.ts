@@ -550,6 +550,37 @@ describe('buildAiWorkflowPrompt — post-file-write loop', () => {
     expect(prompt).toContain('requiresUserApproval=true');
   });
 
+  it('instructs stopping and asking the user when the Dataverse gate is not resolved', () => {
+    const prompt = buildAiWorkflowPrompt(makeReadyTask());
+    expect(prompt).toContain('needs_configuration, not run, failed, or warnings not yet accepted');
+    expect(prompt).toContain('nextAction is needs_configuration or review_dataverse_warnings');
+    expect(prompt).toContain('stop and report the exact results to the user');
+    expect(prompt).toContain('Ask whether to fix the code, rerun the check, configure the connection, or accept the warnings');
+    expect(prompt).toContain("do not proceed past this without the user's answer");
+  });
+
+  it('requires the full detail payload when calling record_ai_kit_review_result', () => {
+    const prompt = buildAiWorkflowPrompt(makeReadyTask());
+    expect(prompt).toContain('always including the full detail payload');
+    expect(prompt).toContain('reviewedFiles, rulesFiles, checklistFiles, knownPrReviewFiles, checkedItems');
+    expect(prompt).toContain('findings/fixableFindings/nonFixableWarnings/summary');
+    expect(prompt).toContain('a bare status with empty detail arrays is recorded as incomplete, not passed');
+  });
+
+  it('requires retrying record_ai_kit_review_result when gateStatus is not passed', () => {
+    const prompt = buildAiWorkflowPrompt(makeReadyTask());
+    expect(prompt).toContain("If record_ai_kit_review_result's response reports a gateStatus other than passed");
+    expect(prompt).toContain('or run_implementation_verification returns nextAction=run_ai_kit_review again');
+    expect(prompt).toContain("a status:'passed' call alone is not sufficient");
+  });
+
+  it('stops only once both the Dataverse gate and the AI Kit review gate resolve via nextAction=continue_workflow', () => {
+    const prompt = buildAiWorkflowPrompt(makeReadyTask());
+    expect(prompt).toContain('Stop when run_implementation_verification returns nextAction=continue_workflow');
+    expect(prompt).toContain('meaning both the Dataverse gate and the AI Kit review gate are resolved');
+    expect(prompt).toContain('review_dataverse_warnings');
+  });
+
   it('reports tooling_error distinctly from a manual-review requirement', () => {
     const prompt = buildAiWorkflowPrompt(makeReadyTask());
     expect(prompt).toContain('status=tooling_error');

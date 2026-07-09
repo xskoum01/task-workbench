@@ -39,7 +39,9 @@ import { formatTaskActivityNotes, splitTaskNotes } from '../lib/taskActivityForm
 import { WorkflowStepper } from './WorkflowStepper';
 import CopyAiWorkflowPromptButton from './CopyAiWorkflowPromptButton';
 import { getDeveloperReadiness } from '../lib/developerReadiness';
+import { computeProgressionGate } from '../lib/implementationGate';
 import GitCommitModal from './GitCommitModal';
+import { generateBranchName } from '../lib/gitBranchName';
 import { buildTaskWorkflowPlan } from '../lib/workflowPlan';
 import type { TaskWorkflowPlan } from '../lib/workflowPlan';
 import {
@@ -748,6 +750,12 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
   const [showGitCommitModal, setShowGitCommitModal] = useState(false);
   // When true, GitCommitModal was opened from the Testing → Prepare commit guided flow
   const [gitCommitGuidedMode, setGitCommitGuidedMode] = useState(false);
+  // Compact Git Status section — live current branch + branch list, fetched once when expanded.
+  const [gitStatusLoaded, setGitStatusLoaded]     = useState(false);
+  const [gitStatusLoading, setGitStatusLoading]   = useState(false);
+  const [gitStatusError, setGitStatusError]       = useState<string | null>(null);
+  const [liveCurrentBranch, setLiveCurrentBranch] = useState<string | null>(null);
+  const [liveLocalBranches, setLiveLocalBranches] = useState<string[]>([]);
   // Implementation Verification modal
   const [showImplVerifyModal,    setShowImplVerifyModal]    = useState(false);
   const [implVerifyBuildRunning, setImplVerifyBuildRunning] = useState(false);
@@ -2319,6 +2327,30 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
   }
 
   /**
+   * Loads the live current branch + local branch list for the compact Git Status section.
+   * Fetched once when the section is first expanded — not polled. getGitBranchQuick reads
+   * .git/HEAD directly (no subprocess); listGitBranches spawns a single quick `git branch` call.
+   */
+  async function loadGitStatus() {
+    if (!repoRootForGit || gitStatusLoading) return;
+    setGitStatusLoading(true);
+    setGitStatusError(null);
+    try {
+      const [branch, branches] = await Promise.all([
+        tauriApi.getGitBranchQuick(repoRootForGit),
+        tauriApi.listGitBranches(repoRootForGit).catch(() => []),
+      ]);
+      setLiveCurrentBranch(branch);
+      setLiveLocalBranches(branches);
+      setGitStatusLoaded(true);
+    } catch (e) {
+      setGitStatusError(String(e));
+    } finally {
+      setGitStatusLoading(false);
+    }
+  }
+
+  /**
    * Returns `task.workflowSetup.artifactPath` if set, otherwise tries to infer it.
    * When a unique candidate is inferred, auto-persists it to the task so subsequent
    * actions find it without re-running inference.
@@ -3263,7 +3295,23 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
     }
   }
 
+  /**
+   * Hard gate: Dataverse Metadata Check and AI Internal Code Review must both resolve (cleanly
+   * pass, or Dataverse warnings explicitly accepted) before the task may move to Code Review /
+   * Waiting for PR. Unlike handleContinueToTestingWithGate's dismissable warning banner, this
+   * gate cannot be clicked through — the only way past it is fixing the code, accepting
+   * warnings, or configuring the connection in the Implementation Verification modal.
+   */
   async function handleMarkWaitingForReview() {
+    const gate = computeProgressionGate(task);
+    if (!gate.canProceed) {
+      const reasons = [
+        ...gate.blockingChecks.map((c) => c.reason),
+        ...gate.blockingFindings.map((f) => f.description),
+      ];
+      setAiError(`Cannot move to Code Review yet: ${reasons.join(' ')}`);
+      return;
+    }
     await handleStatusChange('ready-for-review', { waitingState: 'code-review' });
     setFeedback('Marked as Waiting for code review');
   }
@@ -4496,6 +4544,69 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
                   </div>
                 )}
 
+                {/* GIT STATUS — compact summary of task.gitWorkflow vs. the live repo state.
+                    Live current branch / branch list are fetched once when this section is first
+                    expanded (not polled) — see loadGitStatus. */}
+                {repoRootForGit && (
+                  <div style={{ marginTop: 8 }}>
+                    <details onToggle={(e) => { if (e.currentTarget.open && !gitStatusLoaded) void loadGitStatus(); }}>
+                      <summary style={{ cursor: 'pointer', userSelect: 'none' }}>
+                        <span className="detail-action-group-label" style={{ display: 'inline' }}>Git Status</span>
+                      </summary>
+                      {(() => {
+                        const gw = task.gitWorkflow;
+                        const proposedBranch = generateBranchName(task);
+                        const confirmedBranch = gw?.confirmedBranch;
+                        const targetBranch = confirmedBranch ?? proposedBranch;
+                        const existsLocally = gitStatusLoaded && liveLocalBranches.includes(targetBranch);
+                        const approvedButMissing = !!confirmedBranch && gitStatusLoaded
+                          && liveCurrentBranch !== confirmedBranch && !liveLocalBranches.includes(confirmedBranch);
+                        return (
+                          <div style={{ marginTop: 6, fontSize: 11, color: 'var(--color-text-muted)', display: 'flex', flexDirection: 'column', gap: 3 }}>
+                            {gitStatusLoading && <div>Checking repository…</div>}
+                            {gitStatusError && <div style={{ color: 'var(--color-blocked)' }}>Error: {gitStatusError}</div>}
+                            <div>Proposed branch: <code style={{ fontSize: 11 }}>{proposedBranch}</code></div>
+                            <div>
+                              Confirmed branch:{' '}
+                              {confirmedBranch
+                                ? <code style={{ fontSize: 11 }}>{confirmedBranch}</code>
+                                : <em>not approved yet</em>}
+                            </div>
+                            <div>
+                              Current branch:{' '}
+                              {gitStatusLoaded
+                                ? <code style={{ fontSize: 11 }}>{liveCurrentBranch || '(unknown)'}</code>
+                                : <em>expand to check</em>}
+                            </div>
+                            {gitStatusLoaded && (
+                              <div>Exists locally ({targetBranch}): {existsLocally ? 'yes' : 'no'}</div>
+                            )}
+                            <div>
+                              Committed:{' '}
+                              {gw?.lastCommitHash
+                                ? <>yes — <code style={{ fontSize: 11 }}>{gw.lastCommitHash.slice(0, 10)}</code> on {gw.lastCommitBranch ?? '?'} ({gw.lastCommitAt ?? '?'})</>
+                                : 'not yet'}
+                            </div>
+                            <div>
+                              Pushed:{' '}
+                              {gw?.lastPushedBranch
+                                ? <>yes — {gw.lastPushedBranch} ({gw.lastPushedAt ?? '?'})</>
+                                : 'not yet'}
+                            </div>
+                            {approvedButMissing && (
+                              <div style={{ color: 'var(--color-blocked)', fontWeight: 600, marginTop: 2 }}>
+                                Branch &apos;{confirmedBranch}&apos; was approved but is not checked out and does
+                                not exist locally — branch creation may have failed or was never retried. Use
+                                Prepare Commit → Create/Checkout this branch.
+                              </div>
+                            )}
+                          </div>
+                        );
+                      })()}
+                    </details>
+                  </div>
+                )}
+
                 {/* AI Code Tools: draft generation and review */}
                 <div style={{ marginTop: 8 }}>
                   <div className="detail-action-group-label">AI Code Tools</div>
@@ -5178,8 +5289,12 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
           onUpdate={handleUpdateImplVerification}
           onContinueToTesting={handleContinueToTestingWithGate}
           onProceedToReview={async () => {
+            // handleMarkWaitingForReview re-checks the hard gate itself; the modal also disables
+            // its own proceed button when blocked, but keep the modal open on a blocked result
+            // (defense in depth) so the user sees the error instead of the modal silently closing.
+            const gate = computeProgressionGate(task);
             await handleMarkWaitingForReview();
-            setShowImplVerifyModal(false);
+            if (gate.canProceed) setShowImplVerifyModal(false);
           }}
           onUpdateNextStepAndClose={async (nextStep) => {
             await updateTask(task.id, {
