@@ -155,16 +155,89 @@ const TASK_TEMPLATES = [
     },
     notes: 'Compute nvr_netamount, nvr_vatamount, nvr_totalamount from input fields nvr_quantity, nvr_unitprice, nvr_discountpercent, nvr_vatpercent.',
   },
+  {
+    id: 'nvr-training-automation-lab-servicecase-priority-description',
+    name: 'NVR Training Automation Lab – Script: Povinný popis pro vysokou prioritu servisního případu',
+    // No single titlePattern substring reliably identifies this task — match on a combination
+    // of title/description markers instead (see matchKeywords/minKeywordMatches below).
+    matchKeywords: ['[test] script', 'povinný popis', 'vysokou prioritu', 'nvr_labservicecase', 'nvr_priority', 'nvr_description'],
+    minKeywordMatches: 3,
+    mode: 'developer',
+    workKind: 'script',
+    actionType: 'create-new-script',
+    targetEntity: 'nvr_labservicecase',
+    scriptTarget: {
+      entityLogicalName: 'nvr_labservicecase',
+      eventName: 'onChange',
+      eventFieldName: 'nvr_priority',
+    },
+    scriptNaming: {
+      namingSource: 'Scripts_Naming',
+      scriptsFolderRelative: 'Scripts',
+      desiredScriptFile: 'nvr_labservicecase_events.js',
+      onLoadFunctionName: 'nvr_labservicecase_OnLoad',
+      onChangeFunctionName: 'nvr_priority_OnChange',
+      mainHelperSuggestion: 'updateDescriptionRequirementByPriority',
+    },
+    sourceFields: ['nvr_priority'],
+    targetFields: ['nvr_description'],
+    notes: 'Form OnLoad + onChange on nvr_priority. When nvr_priority is High (100000002), make nvr_description required and show a form notification; otherwise make it not required and clear the notification.',
+    businessRules: [
+      'High priority is choice value 100000002. Compare against this value, not a hardcoded label string.',
+      'Do not use Xrm.Page — use the execution context passed to the event handler.',
+      'Do not trigger autosave (formContext.data.save()).',
+      'Do not call Xrm.WebApi — this logic is entirely local to the form, no server round trip is needed.',
+      'Never call setValue on nvr_description — only toggle its required level (setIsRequiredLevel) and the form notification. The field value itself is user-entered.',
+      'Do not add early returns unless the existing scripts in the repository already use them.',
+      'Do not add a generated header/task-summary comment block to the script file.',
+      'Run the same logic on both form OnLoad and onChange of nvr_priority, so the required state is correct on load and after every change.',
+    ],
+    acceptanceCriteria: [
+      'On form OnLoad and on change of nvr_priority: when nvr_priority equals 100000002 (High), nvr_description is set to required and a form notification is shown.',
+      'On form OnLoad and on change of nvr_priority: when nvr_priority is not 100000002, nvr_description is set to not required and the notification is cleared.',
+      'No Xrm.Page reference appears in the output code.',
+      'No autosave call appears in the output code.',
+      'No Xrm.WebApi call appears in the output code.',
+      'No setValue call targets nvr_description in the output code.',
+    ],
+    staticRules: [
+      { id: 'no-xrm-page', description: 'Must not reference Xrm.Page.', type: 'must-not-match', pattern: 'Xrm\\.Page' },
+      { id: 'no-autosave', description: 'Must not trigger autosave (formContext.data.save()).', type: 'must-not-match', pattern: '\\.data\\.save\\s*\\(' },
+      { id: 'no-webapi', description: 'Must not call Xrm.WebApi — logic is form-local only.', type: 'must-not-match', pattern: 'Xrm\\.WebApi' },
+      { id: 'no-setvalue-on-description', description: 'Must not call setValue on nvr_description — only toggle required level/notification.', type: 'must-not-match', pattern: 'setValue\\s*\\([^)]*nvr_description' },
+      { id: 'no-todo-fixme-placeholder', description: 'Must not contain TODO/FIXME/placeholder markers.', type: 'must-not-match', pattern: '\\b(TODO|FIXME|placeholder)\\b' },
+      { id: 'checks-high-priority-choice-value', description: 'Must compare nvr_priority against the High choice value 100000002.', type: 'must-match', pattern: '100000002' },
+      { id: 'sets-required-level', description: 'Must toggle nvr_description required level via setIsRequiredLevel.', type: 'must-match', pattern: 'setIsRequiredLevel' },
+      { id: 'shows-notification', description: 'Must show/clear a form notification.', type: 'must-match', pattern: 'notification' },
+    ],
+  },
 ];
 
 /**
- * Match a task title against template patterns. Returns the first matching template or null.
- * Matching is substring-based and case-insensitive for robustness.
+ * Match a task title/description against template patterns. Returns the first matching
+ * template or null. Matching is substring-based and case-insensitive for robustness.
+ *
+ * Two matching strategies, tried per-template in declaration order:
+ * 1. `titlePattern` — a single substring that must appear in the title (legacy, exact templates).
+ * 2. `matchKeywords` + `minKeywordMatches` — matches when at least `minKeywordMatches` of the
+ *    listed keywords appear anywhere in the combined title+description text. Use this when no
+ *    single substring reliably identifies the task (e.g. a synthetic test-lab task title).
  */
-function matchTaskTemplate(title) {
-  if (!title) return null;
-  const lower = String(title).toLowerCase();
-  return TASK_TEMPLATES.find((t) => lower.includes(t.titlePattern.toLowerCase())) ?? null;
+function matchTaskTemplate(title, description) {
+  const haystack = `${title || ''} ${description || ''}`;
+  if (!haystack.trim()) return null;
+  const lower = haystack.toLowerCase();
+  for (const t of TASK_TEMPLATES) {
+    if (t.titlePattern && String(title || '').toLowerCase().includes(t.titlePattern.toLowerCase())) {
+      return t;
+    }
+    if (Array.isArray(t.matchKeywords) && t.matchKeywords.length > 0) {
+      const minMatches = t.minKeywordMatches ?? t.matchKeywords.length;
+      const hits = t.matchKeywords.filter((k) => lower.includes(k.toLowerCase())).length;
+      if (hits >= minMatches) return t;
+    }
+  }
+  return null;
 }
 
 const TOOL_DEFINITIONS = [
@@ -2761,7 +2834,7 @@ function buildTaskFullContext(task, customerDevDefaults) {
   if (customerDevDefaults) detail.customerDevDefaults = customerDevDefaults;
   const workKind = task.crmDeveloperWorkflow?.detectedWorkKind || task.workflowSetup?.devTargetKind;
   if (workKind === 'script' || workKind === 'ribbon') {
-    const naming = computeScriptNaming(matchTaskTemplate(task.title || ''), customerDevDefaults, task.workflowSetup);
+    const naming = computeScriptNaming(matchTaskTemplate(task.title || '', task.originalMessage || ''), customerDevDefaults, task.workflowSetup);
     if (naming) detail.developerWorkPacket = { scriptNaming: naming };
   }
   return detail;
@@ -2892,7 +2965,7 @@ function isScaffoldOnlyTask(task) {
   const plan = sanitizeTechnicalPlan(workflow.technicalPlan);
   const emptyFieldMappings = !plan?.fieldMappings || plan.fieldMappings.length === 0;
   if (!emptyFieldMappings) return false;
-  const template = matchTaskTemplate(task.title || '');
+  const template = matchTaskTemplate(task.title || '', task.originalMessage || '');
   if (template && Array.isArray(template.sourceFields) && template.sourceFields.length > 0) return true;
   if (Array.isArray(plan?.unmappedSourceFields) && plan.unmappedSourceFields.length > 0) return true;
   const detection = detectAndExtractFieldMappings(task);
@@ -2907,7 +2980,7 @@ function buildDeveloperWorkPacket(task, customerDevDefaults = null) {
   const workflow = asObject(task.crmDeveloperWorkflow);
   const plan = sanitizeTechnicalPlan(workflow.technicalPlan);
   const readiness = computeImplementationReadiness(task);
-  const template = matchTaskTemplate(task.title || '');
+  const template = matchTaskTemplate(task.title || '', task.originalMessage || '');
   const workKind = workflow.detectedWorkKind || setup.devTargetKind || plan?.workKind || 'unknown';
   const isScript = workKind === 'script' || workKind === 'ribbon' || setup.devTargetKind === 'script';
   const targetEntity = setup.primaryEntityLogicalName || plan?.target?.entityLogicalName || template?.targetEntity || '';
@@ -3278,6 +3351,122 @@ function planHasTemplateMapping(plan, template) {
   return expected.every((pair) => actual.some((item) => item?.source === pair.source && item?.target === pair.target));
 }
 
+// nvr_ tokens that are field/UI names, not entity logical names. Mirrors
+// src/lib/scriptAssistant.ts NVR_FIELD_EXCLUSIONS (kept in sync manually — this file is plain
+// Node ESM and cannot import the TS module directly).
+const GENERIC_NVR_FIELD_EXCLUSIONS = new Set([
+  'nvr_company', 'nvr_name', 'nvr_type', 'nvr_status', 'nvr_state', 'nvr_date', 'nvr_amount',
+  'nvr_note', 'nvr_description', 'nvr_reference', 'nvr_code', 'nvr_value', 'nvr_flag',
+  'nvr_enabled', 'nvr_active', 'nvr_class', 'nvr_group', 'nvr_owner', 'nvr_user', 'nvr_email',
+  'nvr_phone', 'nvr_address', 'nvr_city', 'nvr_country', 'nvr_zip', 'nvr_region', 'nvr_category',
+  'nvr_priority', 'nvr_order', 'nvr_price', 'nvr_quantity', 'nvr_unit', 'nvr_currency',
+]);
+
+/**
+ * Extracts the first explicit nvr_<entity> logical name from text, skipping known field-name
+ * tokens and trigger/event suffixes (e.g. nvr_x_OnLoad). An explicit custom table name named in
+ * the text always wins over a generic keyword guess — this function never falls back to a
+ * translated/keyword guess (e.g. Czech "případ" -> "incident"), so it cannot misidentify a task
+ * the way title-only guessing used to.
+ */
+function extractExplicitNvrEntity(text) {
+  const lower = String(text || '').toLowerCase();
+  for (const m of lower.matchAll(/\bnvr_([a-z][a-z0-9]*(?:_[a-z0-9]+)*)\b/g)) {
+    const bare = m[1].replace(/_(onchange|onload|onsave|handler|events)$/i, '');
+    const full = `nvr_${bare}`;
+    if (GENERIC_NVR_FIELD_EXCLUSIONS.has(full)) continue;
+    if (bare.split('_').length > 3) continue;
+    return full;
+  }
+  return null;
+}
+
+/**
+ * Best-effort setup inference for script tasks that do not match any built-in template. Used as
+ * a fallback so an explicit assignment (explicit table name, event/field, target file, handler
+ * names) does not force a hard "set it manually" blocker. Returns null when the text does not
+ * look like a script task, or no explicit nvr_ target entity is present in the text — this
+ * function never guesses a generic entity like 'account'/'incident' from title wording alone.
+ */
+function genericScriptSetupInference(task) {
+  const text = `${task.title || ''}\n${task.originalMessage || ''}`;
+  if (!/\b(javascript|jscript|form\s*script|web\s*resource|on[-\s]?load|on[-\s]?change|on[-\s]?save)\b/i.test(text)) {
+    return null;
+  }
+
+  const targetEntity = extractExplicitNvrEntity(text);
+  if (!targetEntity) return null;
+
+  const assumptions = [`Target entity inferred from explicit logical name "${targetEntity}" named in the task description.`];
+
+  const filePathMatch = text.match(/([A-Za-z0-9_]+[\\/][A-Za-z0-9_]+\.js)\b/);
+  const bareFileMatch = text.match(/\b([A-Za-z0-9_]+\.js)\b/);
+  let desiredScriptFile;
+  let scriptsFolderRelative = 'Scripts';
+  if (filePathMatch) {
+    const parts = filePathMatch[1].split(/[\\/]/);
+    desiredScriptFile = parts.pop();
+    if (parts.length > 0) scriptsFolderRelative = parts.join('/');
+    assumptions.push(`Target script file inferred from explicit path "${filePathMatch[1]}" in the task description.`);
+  } else if (bareFileMatch) {
+    desiredScriptFile = bareFileMatch[1];
+    assumptions.push(`Target script file inferred from explicit file name "${desiredScriptFile}" in the task description.`);
+  } else {
+    desiredScriptFile = `${targetEntity}_events.js`;
+    assumptions.push(`Target script file name defaulted from the target entity: ${desiredScriptFile}.`);
+  }
+
+  const onLoadHandlerMatch = text.match(/\b([A-Za-z][A-Za-z0-9_]*_OnLoad)\b/);
+  const onChangeHandlerMatch = text.match(/\b([A-Za-z][A-Za-z0-9_]*_OnChange)\b/);
+  if (onLoadHandlerMatch || onChangeHandlerMatch) {
+    assumptions.push('Handler function names taken literally from the task description.');
+  }
+
+  const hasOnLoad = /\bon[-\s]?load\b/i.test(text);
+  const eventFieldMatch =
+    text.match(/on[-\s]?change\s+of\s+`?([A-Za-z][A-Za-z0-9_]*)`?/i) ||
+    text.match(/`?([A-Za-z][A-Za-z0-9_]*)`?\s+on[-\s]?change/i);
+  const eventFieldName = eventFieldMatch ? eventFieldMatch[1] : null;
+  const eventName = eventFieldName ? 'onChange' : (hasOnLoad ? 'onLoad' : null);
+
+  const onLoadFunctionName = onLoadHandlerMatch ? onLoadHandlerMatch[1] : (hasOnLoad ? `${targetEntity}_OnLoad` : null);
+  const onChangeFunctionName = onChangeHandlerMatch ? onChangeHandlerMatch[1] : (eventFieldName ? `${eventFieldName}_OnChange` : null);
+
+  const actionType = /\b(update|modify|extend)\s+(the\s+)?existing\s+script\b/i.test(text)
+    ? 'update-existing-script'
+    : 'create-new-script';
+
+  return {
+    workKind: 'script',
+    actionType,
+    targetEntity,
+    eventName,
+    eventFieldName,
+    scriptsFolderRelative,
+    desiredScriptFile,
+    onLoadFunctionName,
+    onChangeFunctionName,
+    confidence: (onLoadHandlerMatch || onChangeHandlerMatch) ? 'high' : 'medium',
+    assumptions,
+  };
+}
+
+/** Snapshot of the setup fields relevant to the caller-facing proposedSetup/appliedSetup summary. */
+function snapshotProposedSetup(setup) {
+  return {
+    workKind: setup.devTargetKind ?? null,
+    actionType: setup.actionType ?? null,
+    targetEntity: setup.primaryEntityLogicalName ?? null,
+    eventName: setup.eventName ?? null,
+    eventField: setup.eventFieldName ?? null,
+    targetFile: setup.artifactPath ?? setup.desiredScriptFile ?? null,
+    handlers: {
+      onLoad: setup.onLoadFunctionName ?? null,
+      onChange: setup.onChangeFunctionName ?? null,
+    },
+  };
+}
+
 function prepareDeveloperTaskInMemory(task, { customerDevDefaults = null, confirmSetup = true, createTechnicalPlan = true } = {}) {
   const appliedActions = [];
   const skippedActions = [{
@@ -3288,7 +3477,9 @@ function prepareDeveloperTaskInMemory(task, { customerDevDefaults = null, confir
   const warnings = [];
   const missingInputs = [];
   const approvalGates = [];
-  const template = matchTaskTemplate(task.title || '');
+  const assumptions = [];
+  let confidence = 'none';
+  const template = matchTaskTemplate(task.title || '', task.originalMessage || '');
   const now = new Date().toISOString();
 
   if (template) {
@@ -3314,6 +3505,36 @@ function prepareDeveloperTaskInMemory(task, { customerDevDefaults = null, confir
     task.crmDeveloperWorkflow.detectedWorkKind = template.workKind;
     task.crmDeveloperWorkflow.updatedAt = now;
     appliedActions.push('applied_template', 'set_task_mode', 'set_task_work_classification');
+    confidence = 'high';
+    assumptions.push(`Setup proposed from built-in template "${template.id}" matched against the task title/description.`);
+  } else {
+    // No built-in template matched. Fall back to a best-effort inference from explicit facts
+    // in the task text (explicit nvr_ table name, event/field, target file, handler names),
+    // so an explicit assignment does not force a hard "set it manually" blocker. Never applied
+    // over an already-set value.
+    const inferred = genericScriptSetupInference(task);
+    if (inferred) {
+      task.taskMode = task.taskMode || 'developer';
+      if (!task.workflowSetup || typeof task.workflowSetup !== 'object') task.workflowSetup = {};
+      if (!task.crmDeveloperWorkflow || typeof task.crmDeveloperWorkflow !== 'object') task.crmDeveloperWorkflow = { createdAt: now };
+      const s = task.workflowSetup;
+      if (!s.devTargetKind) s.devTargetKind = 'script';
+      if (!s.workIntent) s.workIntent = workActionFromActionType(inferred.actionType);
+      if (!s.actionType) s.actionType = inferred.actionType;
+      if (!s.primaryEntityLogicalName) s.primaryEntityLogicalName = inferred.targetEntity;
+      if (!s.eventName && inferred.eventName) s.eventName = inferred.eventName;
+      if (!s.eventFieldName && inferred.eventFieldName) s.eventFieldName = inferred.eventFieldName;
+      if (!s.scriptPath) s.scriptPath = inferred.scriptsFolderRelative;
+      if (!s.desiredScriptFile) s.desiredScriptFile = inferred.desiredScriptFile;
+      if (!s.namingSource) s.namingSource = 'Scripts_Naming';
+      if (!s.onLoadFunctionName && inferred.onLoadFunctionName) s.onLoadFunctionName = inferred.onLoadFunctionName;
+      if (!s.onChangeFunctionName && inferred.onChangeFunctionName) s.onChangeFunctionName = inferred.onChangeFunctionName;
+      if (!task.crmDeveloperWorkflow.detectedWorkKind) task.crmDeveloperWorkflow.detectedWorkKind = 'script';
+      task.crmDeveloperWorkflow.updatedAt = now;
+      appliedActions.push('applied_generic_inference', 'set_task_mode', 'set_task_work_classification');
+      confidence = inferred.confidence;
+      assumptions.push(...inferred.assumptions);
+    }
   }
 
   if (customerDevDefaults) {
@@ -3362,7 +3583,18 @@ function prepareDeveloperTaskInMemory(task, { customerDevDefaults = null, confir
   if (!workKind || workKind === 'unknown') missingInputs.push('workKind');
   if (!setup.actionType) missingInputs.push('actionType');
   if (!setup.primaryEntityLogicalName) missingInputs.push('targetEntity');
-  if (setup.devTargetKind === 'script' && setup.actionType === 'create-new-script' && (!setup.scriptPath || !setup.desiredScriptFile || !setup.artifactPath)) missingInputs.push('script target path');
+  if (setup.devTargetKind === 'script' && setup.actionType === 'create-new-script') {
+    // Mirrors computeImplementationReadiness's OR-based script-target check below: a specific
+    // artifactPath alone is sufficient, it does not also require the separate bare scriptPath
+    // (folder) field. A customer without an explicit scriptFolder (only crmBaseDirectory +
+    // folderName) never populates workflowSetup.scriptPath, even once artifactPath/desiredScriptFile
+    // are correctly resolved from the template/naming step — the old AND-of-three-fields check
+    // treated that as a hard blocker despite the target already being fully known.
+    const isSpecificFile = (p) => !!p && /\.[jt]sx?$/.test(p);
+    const hasDir = !!(setup.scriptPath || setup.artifactPath);
+    const hasFileName = isSpecificFile(setup.artifactPath) || isSpecificFile(setup.scriptPath) || !!setup.desiredScriptFile;
+    if (!hasDir || !hasFileName) missingInputs.push('script target path');
+  }
   if (setup.devTargetKind === 'plugin' && !setup.pluginProject) missingInputs.push('plugin project');
   if (missingInputs.length) hardBlockers.push(`Missing required setup input(s): ${missingInputs.join(', ')}.`);
 
@@ -3397,7 +3629,29 @@ function prepareDeveloperTaskInMemory(task, { customerDevDefaults = null, confir
     : approvalGates.length
       ? 'stopped_at_approval_gate'
       : readiness.isImplementationReady ? 'ready_for_implementation' : 'blocked';
-  return { taskId: task.id, status, appliedActions: [...new Set(appliedActions)], skippedActions, hardBlockers, approvalGates, warnings, missingInputs, implementationReadiness: readiness };
+  const appliedSetup = snapshotProposedSetup(asObject(task.workflowSetup));
+  const wasInferredThisCall = appliedActions.includes('applied_template') || appliedActions.includes('applied_generic_inference');
+  return {
+    taskId: task.id,
+    status,
+    appliedActions: [...new Set(appliedActions)],
+    skippedActions,
+    hardBlockers,
+    approvalGates,
+    warnings,
+    missingInputs,
+    implementationReadiness: readiness,
+    // proposedSetup and appliedSetup are the same snapshot here — inference is applied
+    // directly to task.workflowSetup in-memory before this point, there is no separate
+    // draft-vs-applied state. Both are returned so callers/tests have a stable contract
+    // even if a future change introduces a draft-only proposal step.
+    proposedSetup: appliedSetup,
+    appliedSetup,
+    confidence,
+    assumptions,
+    requiresUserConfirmation: wasInferredThisCall,
+    businessRules: Array.isArray(template?.businessRules) ? template.businessRules : [],
+  };
 }
 
 function nextRecommendedStep(task) {
@@ -3986,7 +4240,7 @@ async function callToolFallback(name, args = {}) {
       const workKindVal =
         task.crmDeveloperWorkflow?.detectedWorkKind || task.workflowSetup?.devTargetKind;
       if (workKindVal === 'script' || workKindVal === 'ribbon') {
-        const template = matchTaskTemplate(task.title || '');
+        const template = matchTaskTemplate(task.title || '', task.originalMessage || '');
         const scriptNaming = computeScriptNaming(template, devDefaults, task.workflowSetup);
         if (scriptNaming) detail.developerWorkPacket = { scriptNaming };
       }
@@ -4174,7 +4428,7 @@ async function callToolFallback(name, args = {}) {
       let matchedTemplate = null;
       if (args.taskId) {
         const task = getTaskById(tasks, args.taskId);
-        if (task) matchedTemplate = matchTaskTemplate(task.title);
+        if (task) matchedTemplate = matchTaskTemplate(task.title, task.originalMessage);
       }
       return {
         ...common,
@@ -4405,7 +4659,7 @@ async function callToolFallback(name, args = {}) {
         if (isPlugin) {
           checks.push({ name: 'Local Static/Business-Rule Verification', status: 'skipped', findings: ['Not applicable — static rule templates currently cover JS/TS script tasks only.'] });
         } else if (readiness && readiness.fileContent) {
-          const template = matchTaskTemplate(task.title);
+          const template = matchTaskTemplate(task.title, task.originalMessage);
           staticResult = runStaticBusinessRuleChecks(template, readiness.fileContent);
           checks.push({ name: staticResult.name, status: staticResult.status, findings: staticResult.findings });
           fixableFindings.push(...staticResult.fixableFindings);

@@ -257,14 +257,17 @@ const FIELD_EXCLUSION_WORDS = new Set([
  * Extract the most likely Dataverse entity logical name from task text.
  *
  * Priority order:
- * 1. Standard entity names (word-boundary match, longest first)
- * 2. Czech / English keyword → entity mapping (longest keyword first)
- * 3. Explicit nvr_<entity> tokens (excluding known field names and section/field context)
+ * 1. Explicit nvr_<entity> tokens (excluding known field names and section/field context) —
+ *    an explicit logical name named in the text always wins over a generic word-based guess.
+ * 2. Standard entity names (word-boundary match, longest first)
+ * 3. Czech / English keyword → entity mapping (longest keyword first)
  * 4. File name hints in the text (e.g. nvr_account_events.js)
  * 5. Default fallback: 'account'
  *
  * Note: nvr_ tokens preceded by section/field context words (sekci, pole, field…)
  * are skipped to prevent section/field names from being mistaken for entity names.
+ * Czech generic words (e.g. "případ") must never override an explicit nvr_ table name
+ * that is also present in the same text — a translation guess is not "explicit".
  */
 export function extractEntityFromText(text: string): string {
   const lower = text.toLowerCase();
@@ -279,24 +282,10 @@ export function extractEntityFromText(text: string): string {
   // Trigger/event words that must never form part of an entity logical name.
   const TRIGGER_SUFFIXES = /[_](onchange|onload|onsave|handler|events)$/i;
 
-  // 1. Standard entity names — checked first to catch "AccountU", "Contactu" etc.
-  //    via keyword mapping before nvr_ scanning can grab a section/field name.
-  for (const entity of STANDARD_ENTITIES) {
-    if (new RegExp(`\\b${entity}\\b`, 'i').test(text)) {
-      return entity;
-    }
-  }
-
-  // 2. Czech / English keyword mapping (longest keyword first).
-  //    Catches Czech inflections like "accountu", "contactu", "projektu".
-  for (const [keyword, entity] of ENTITY_KEYWORDS) {
-    if (lower.includes(keyword)) {
-      return entity;
-    }
-  }
-
-  // 3. nvr_ prefixed tokens — skip context-excluded tokens (section/field names)
+  // 1. nvr_ prefixed tokens — skip context-excluded tokens (section/field names)
   //    and well-known field name exclusions; limit segment count to avoid compound fields.
+  //    Checked first: an explicit custom table name in the text outranks any
+  //    generic keyword/translation guess below.
   for (const m of lower.matchAll(/\bnvr_([a-z][a-z0-9]*(?:_[a-z0-9]+)*)\b/g)) {
     const bare = m[1].replace(TRIGGER_SUFFIXES, '');
     const full = `nvr_${bare}`;
@@ -305,6 +294,22 @@ export function extractEntityFromText(text: string): string {
     const segmentCount = bare.split('_').length;
     if (segmentCount > 3) continue; // likely a compound field, not an entity
     return full;
+  }
+
+  // 2. Standard entity names — literal English word match (e.g. "AccountU", "Contactu",
+  //    or the literal word "incident"/"account" appearing in the text).
+  for (const entity of STANDARD_ENTITIES) {
+    if (new RegExp(`\\b${entity}\\b`, 'i').test(text)) {
+      return entity;
+    }
+  }
+
+  // 3. Czech / English keyword mapping (longest keyword first).
+  //    Catches Czech inflections like "accountu", "contactu", "projektu".
+  for (const [keyword, entity] of ENTITY_KEYWORDS) {
+    if (lower.includes(keyword)) {
+      return entity;
+    }
   }
 
   // 4. File name hints

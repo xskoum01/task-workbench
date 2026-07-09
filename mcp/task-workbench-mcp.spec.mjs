@@ -2141,6 +2141,184 @@ describe('callToolFallback prepare_developer_task', () => {
 });
 
 // ---------------------------------------------------------------------------
+// 11b. prepare_developer_task â€” inference for explicit-but-untemplated script tasks
+// (NVR Training Automation Lab: high-priority servicecase description gate)
+// ---------------------------------------------------------------------------
+
+describe('callToolFallback prepare_developer_task â€” explicit-assignment inference', () => {
+  const LAB_TITLE = '[TEST] Script: Povinný popis pro vysokou prioritu servisního případu';
+  const LAB_DESCRIPTION =
+    'Create a JavaScript form script for the NVR Training Automation Lab table `nvr_labservicecase`. ' +
+    'Target file: Scripts\\nvr_labservicecase_events.js. ' +
+    'Events: Form OnLoad, OnChange of `nvr_priority`. ' +
+    'Handlers: `nvr_labservicecase_OnLoad`, `nvr_priority_OnChange`. ' +
+    'Logic: if nvr_priority is High (100000002), make nvr_description required and show a notification, ' +
+    'otherwise make nvr_description not required and clear the notification.';
+
+  async function withTasksFixture(tasks, customers, fn) {
+    const os = await import('node:os');
+    const fs = await import('node:fs/promises');
+    const path = await import('node:path');
+    const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'tw-mcp-lab-'));
+    await fs.writeFile(path.join(tmpDir, 'tasks.json'), JSON.stringify(tasks));
+    if (customers) await fs.writeFile(path.join(tmpDir, 'customers.json'), JSON.stringify(customers));
+    const origArgv = process.argv;
+    process.argv = [...process.argv, '--data-dir', tmpDir];
+    try {
+      await fn(tmpDir, fs, path);
+    } finally {
+      process.argv = origArgv;
+      await fs.rm(tmpDir, { recursive: true });
+    }
+  }
+
+  it('matches the built-in lab template from title+description markers and infers script setup, not incident', async () => {
+    const matched = matchTaskTemplate(LAB_TITLE, LAB_DESCRIPTION);
+    expect(matched).toBeTruthy();
+    expect(matched.id).toBe('nvr-training-automation-lab-servicecase-priority-description');
+    expect(matched.targetEntity).toBe('nvr_labservicecase');
+    expect(matched.targetEntity).not.toBe('incident');
+  });
+
+  it('is not a hard blocker for missing workKind/actionType/targetEntity when the template matches', async () => {
+    await withTasksFixture(
+      [makeTask({
+        id: 'task-lab-001',
+        title: LAB_TITLE,
+        originalMessage: LAB_DESCRIPTION,
+        taskMode: 'general',
+        customerId: 'cust-lab',
+        workflowSetup: {},
+      })],
+      [{ id: 'cust-lab', repositoryRoot: 'C:\\Repo\\Lab', scriptFolder: 'C:\\Repo\\Lab\\Scripts' }],
+      async () => {
+        const result = await callToolFallback('prepare_developer_task', { taskId: 'task-lab-001' });
+        expect(result.hardBlockers).toEqual([]);
+        expect(result.missingInputs).toEqual([]);
+        expect(result.appliedActions).toContain('applied_template');
+        expect(result.task.workflowSetup.devTargetKind).toBe('script');
+        expect(result.task.workflowSetup.actionType).toBe('create-new-script');
+        expect(result.task.workflowSetup.primaryEntityLogicalName).toBe('nvr_labservicecase');
+        expect(result.task.workflowSetup.eventFieldName).toBe('nvr_priority');
+        expect(result.task.workflowSetup.onLoadFunctionName).toBe('nvr_labservicecase_OnLoad');
+        expect(result.task.workflowSetup.onChangeFunctionName).toBe('nvr_priority_OnChange');
+      },
+    );
+  });
+
+  it('returns proposedSetup/appliedSetup/confidence/assumptions/requiresUserConfirmation and business rules', async () => {
+    await withTasksFixture(
+      [makeTask({
+        id: 'task-lab-002',
+        title: LAB_TITLE,
+        originalMessage: LAB_DESCRIPTION,
+        taskMode: 'general',
+        customerId: 'cust-lab',
+        workflowSetup: {},
+      })],
+      [{ id: 'cust-lab', repositoryRoot: 'C:\\Repo\\Lab', scriptFolder: 'C:\\Repo\\Lab\\Scripts' }],
+      async () => {
+        const result = await callToolFallback('prepare_developer_task', { taskId: 'task-lab-002' });
+        expect(result.requiresUserConfirmation).toBe(true);
+        expect(result.confidence).toBe('high');
+        expect(Array.isArray(result.assumptions)).toBe(true);
+        expect(result.assumptions.length).toBeGreaterThan(0);
+        expect(result.proposedSetup.workKind).toBe('script');
+        expect(result.proposedSetup.actionType).toBe('create-new-script');
+        expect(result.proposedSetup.targetEntity).toBe('nvr_labservicecase');
+        expect(result.proposedSetup.eventField).toBe('nvr_priority');
+        expect(result.proposedSetup.handlers.onLoad).toBe('nvr_labservicecase_OnLoad');
+        expect(result.proposedSetup.handlers.onChange).toBe('nvr_priority_OnChange');
+        expect(result.appliedSetup).toEqual(result.proposedSetup);
+        expect(result.businessRules.join(' ')).toContain('Xrm.Page');
+        expect(result.businessRules.join(' ')).toContain('setValue on nvr_description');
+      },
+    );
+  });
+
+  it('keeps canWriteCode false until the technical plan is approved, then true after approval', async () => {
+    await withTasksFixture(
+      [makeTask({
+        id: 'task-lab-003',
+        title: LAB_TITLE,
+        originalMessage: LAB_DESCRIPTION,
+        taskMode: 'general',
+        customerId: 'cust-lab',
+        workflowSetup: {},
+      })],
+      [{ id: 'cust-lab', repositoryRoot: 'C:\\Repo\\Lab', scriptFolder: 'C:\\Repo\\Lab\\Scripts' }],
+      async () => {
+        await callToolFallback('prepare_developer_task', { taskId: 'task-lab-003' });
+        const packetBefore = await callToolFallback('get_developer_work_packet', { taskId: 'task-lab-003' });
+        expect(packetBefore.canWriteCode).toBe(false);
+
+        const approval = await callToolFallback('approve_technical_plan_if_safe', { taskId: 'task-lab-003' });
+        expect(approval.canApprove).toBe(true);
+
+        const packetAfter = await callToolFallback('get_developer_work_packet', { taskId: 'task-lab-003' });
+        expect(packetAfter.canWriteCode).toBe(true);
+        expect(packetAfter.writeTarget.targetEntity).toBe('nvr_labservicecase');
+        expect(packetAfter.writeTarget.eventFieldName).toBe('nvr_priority');
+        expect(packetAfter.writeTarget.handlers.onLoad).toBe('nvr_labservicecase_OnLoad');
+        expect(packetAfter.writeTarget.handlers.onChange).toBe('nvr_priority_OnChange');
+      },
+    );
+  });
+
+  it('title-only "servisní případu" wording does not override the explicit table name when no template matches', async () => {
+    // A near-miss title (only 2 of the 6 markers) so the built-in template does NOT match,
+    // exercising the generic fallback inference path directly.
+    await withTasksFixture(
+      [makeTask({
+        id: 'task-lab-004',
+        title: '[TEST] Oprava chyby ve servisním případu',
+        originalMessage: 'JavaScript form script: onChange of `nvr_priority` on the `nvr_labservicecase` table.',
+        taskMode: 'general',
+        customerId: 'cust-lab',
+        workflowSetup: {},
+      })],
+      [{ id: 'cust-lab', repositoryRoot: 'C:\\Repo\\Lab', scriptFolder: 'C:\\Repo\\Lab\\Scripts' }],
+      async () => {
+        const matched = matchTaskTemplate('[TEST] Oprava chyby ve servisním případu', 'JavaScript form script: onChange of `nvr_priority` on the `nvr_labservicecase` table.');
+        expect(matched).toBeNull();
+
+        const result = await callToolFallback('prepare_developer_task', { taskId: 'task-lab-004' });
+        expect(result.appliedActions).toContain('applied_generic_inference');
+        expect(result.task.workflowSetup.primaryEntityLogicalName).toBe('nvr_labservicecase');
+        expect(result.task.workflowSetup.primaryEntityLogicalName).not.toBe('incident');
+        expect(result.hardBlockers).toEqual([]);
+      },
+    );
+  });
+
+  it('does not hard-block on "script target path" when the customer has no explicit scriptFolder (only repositoryRoot)', async () => {
+    // Regression: a customer configured only with repositoryRoot (e.g. derived from
+    // crmBaseDirectory + folderName, no explicit scriptFolder) never gets workflowSetup.scriptPath
+    // populated by the customerDevDefaults step. artifactPath/desiredScriptFile are still resolved
+    // correctly from the template + naming step, so this must not be treated as a hard blocker —
+    // found via a live-data replay against a real customer record shaped exactly like this.
+    await withTasksFixture(
+      [makeTask({
+        id: 'task-lab-005',
+        title: LAB_TITLE,
+        originalMessage: LAB_DESCRIPTION,
+        taskMode: 'general',
+        customerId: 'cust-lab-no-scriptfolder',
+        workflowSetup: {},
+      })],
+      [{ id: 'cust-lab-no-scriptfolder', repositoryRoot: 'C:\\Repo\\Lab' }],
+      async () => {
+        const result = await callToolFallback('prepare_developer_task', { taskId: 'task-lab-005' });
+        expect(result.hardBlockers).toEqual([]);
+        expect(result.missingInputs).toEqual([]);
+        expect(result.status).toBe('stopped_at_approval_gate');
+        expect(result.task.workflowSetup.artifactPath).toBe('Scripts\\nvr_labservicecase_events.js');
+      },
+    );
+  });
+});
+
+// ---------------------------------------------------------------------------
 // 12. callToolFallback get_task_full_context â€” developerWorkPacket.scriptNaming
 // ---------------------------------------------------------------------------
 
