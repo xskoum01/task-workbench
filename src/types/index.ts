@@ -1436,7 +1436,14 @@ export interface CrmVerificationReport {
   pluginChecks: CrmPluginCheck[];
   inspectedEntities: string[];
   inspectedAttributesByEntity: Record<string, string[]>;
+  /** Genuine metadata-inspection gaps (schema incomplete, entity uninspectable, ambiguous binding) — these block the Dataverse Metadata Check gate. */
   unableToVerifyReasons: string[];
+  /**
+   * Notes describing assumed form/plugin registration context (e.g. "Primary form entity: X.") —
+   * expected for a script that has not yet been uploaded/registered, and never blocking on their
+   * own. See is_non_blocking_registration_note in src-tauri/src/lib.rs. Display-only.
+   */
+  formRegistrationNotes?: string[];
   compileReadiness?: CrmCompileReadiness;
   metadataInspected: CrmMetadataInspection;
   rawExtractedReferences?: CrmRawExtractedReferences;

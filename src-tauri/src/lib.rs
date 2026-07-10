@@ -14003,6 +14003,51 @@ async fn try_exact_column_lookup(
     (None, "none".to_string(), "No dedicated exact-attribute tool or filterable search tool found in Primarch tool list".to_string())
 }
 
+/// True for local-scanner notes that describe how the primary entity/context was assumed (form,
+/// plugin, or manual override) or that record scan mechanics — not an unresolved Dataverse
+/// metadata question. A script that has not yet been uploaded as a web resource and registered on
+/// a form has no live "primary form entity" to check against runtime, so a note like
+/// "Primary form entity: X." is expected at this stage and must not, by itself, downgrade the
+/// Dataverse Metadata Check to warnings. Genuine metadata-inspection gaps (schema
+/// incomplete/unknown, entity could not be inspected, timed out, statically-unbound attributes)
+/// are not matched here and continue to count toward metadata_verdict.
+/// Deliberately distinguishes "Primary plugin entity: X (...)" (entity known, colon-prefixed —
+/// non-blocking) from "Primary plugin entity could not be inferred..." (no colon — entity
+/// genuinely unknown, still blocking).
+fn is_non_blocking_registration_note(note: &str) -> bool {
+    note.starts_with("Primary form entity:")
+        || note.starts_with("Primary plugin entity:")
+        || note.starts_with("Primary entity override used for verification:")
+        || note.starts_with("No explicit WebApi entity found")
+}
+
+/// Pure decision for the Dataverse Metadata Check's `metadataVerdict` (and therefore, via the
+/// verdict/summary match in run_crm_verification_for_scan, the "warnings" vs "pass" outcome the
+/// hard gate normalizes in task_mcp_normalize_dataverse_gate). `runtime_risk_count` folds
+/// `runtimeRisks` into this same decision — there is no separate blocking gate for runtime risk
+/// anywhere in the codebase (implementationGate.ts / task_mcp_compute_progression_gate only ever
+/// read `verdict`/`metadataVerdict`, never `runtimeRisks`/`runtimeReadiness`), so a detected risk
+/// must warn here or it would silently never block progression to Code Review.
+/// `unable_to_verify_count` must already exclude non-blocking registration notes (see
+/// is_non_blocking_registration_note) — callers partition before calling this.
+fn compute_metadata_verdict(
+    missing_count: usize,
+    ambiguous_count: usize,
+    blocking_unable_to_verify_count: usize,
+    runtime_risk_count: usize,
+    confirmed_count: usize,
+) -> &'static str {
+    if missing_count > 0 {
+        "fail"
+    } else if ambiguous_count > 0 || blocking_unable_to_verify_count > 0 || runtime_risk_count > 0 {
+        "warnings"
+    } else if confirmed_count == 0 {
+        "unknown"
+    } else {
+        "pass"
+    }
+}
+
 /// Verifies CRM references extracted from a source file against Primarch MCP metadata.
 /// Core Dataverse metadata verification logic, shared by the Tauri command and the MCP tool.
 /// Takes a pre-parsed CrmScanResult and its original JSON representation (for embedding in output).
@@ -14060,6 +14105,7 @@ async fn run_crm_verification_for_scan(
             "inspectedEntities": [],
             "inspectedAttributesByEntity": {},
             "unableToVerifyReasons": ["Dataverse metadata was not inspected. This is not a CRM verification result."],
+            "formRegistrationNotes": [],
             "compileReadiness": { "status": "not_checked", "detail": "Compile readiness was not checked during metadata verification." },
             "metadataInspected": {"entityLogicalNames":[],"attributeLogicalNames":{},"entityDetails":[],"toolsUsed":[]},
             "rawExtractedReferences": raw_scan_result,
@@ -14776,15 +14822,20 @@ async fn run_crm_verification_for_scan(
         unable_to_verify_reasons.sort();
         unable_to_verify_reasons.dedup();
 
-        let mut metadata_verdict = if !missing_references.is_empty() {
-            "fail"
-        } else if !ambiguous_references.is_empty() || !unable_to_verify_reasons.is_empty() {
-            "warnings"
-        } else if confirmed_references.is_empty() {
-            "unknown"
-        } else {
-            "pass"
-        };
+        // Split out notes that only describe assumed form/plugin registration context (not an
+        // unresolved Dataverse metadata question) — see is_non_blocking_registration_note. These
+        // are surfaced separately as formRegistrationNotes and must not, on their own, count
+        // toward metadata_verdict.
+        let (blocking_unable_to_verify_reasons, form_registration_notes): (Vec<String>, Vec<String>) =
+            unable_to_verify_reasons.into_iter().partition(|n| !is_non_blocking_registration_note(n));
+
+        let mut metadata_verdict = compute_metadata_verdict(
+            missing_references.len(),
+            ambiguous_references.len(),
+            blocking_unable_to_verify_reasons.len(),
+            runtime_risks.len(),
+            confirmed_references.len(),
+        );
 
         if inspected_entity_details.iter().all(|item| item["schemaCompleteness"].as_str() != Some("complete")) {
             if metadata_verdict == "fail" {
@@ -14792,7 +14843,7 @@ async fn run_crm_verification_for_scan(
                 // unless a complete schema was returned. (Exact-lookup refs are handled separately.)
                 missing_references.clear();
                 issues.retain(|issue| issue["code"].as_str() != Some("ATTRIBUTE_NOT_FOUND"));
-                metadata_verdict = if !ambiguous_references.is_empty() || !unable_to_verify_reasons.is_empty() {
+                metadata_verdict = if !ambiguous_references.is_empty() || !blocking_unable_to_verify_reasons.is_empty() || !runtime_risks.is_empty() {
                     "warnings"
                 } else {
                     "unknown"
@@ -14857,7 +14908,8 @@ async fn run_crm_verification_for_scan(
             "pluginChecks": plugin_checks,
             "inspectedEntities": inspected_entities,
             "inspectedAttributesByEntity": inspected_attrs,
-            "unableToVerifyReasons": unable_to_verify_reasons,
+            "unableToVerifyReasons": blocking_unable_to_verify_reasons,
+            "formRegistrationNotes": form_registration_notes,
             "compileReadiness": { "status": "not_checked", "detail": "Compile readiness was not checked during metadata verification." },
             "metadataInspected": {
                 "entityLogicalNames": inspected_entities,
@@ -16913,6 +16965,106 @@ mod tests {
         reasons.sort();
         reasons.dedup();
         assert_eq!(reasons.len(), 2);
+    }
+
+    // ── is_non_blocking_registration_note / compute_metadata_verdict ─────────────────────────
+    // Regression coverage for: a new ui-business-rule form script (e.g. nvr_labservicecase with
+    // nvr_priority/nvr_description confirmed clean) was reported as Dataverse Metadata Check
+    // WARNINGS solely because "Primary form entity: nvr_labservicecase" was unconditionally
+    // merged into unableToVerifyReasons â€” even though the entity/fields were already confirmed
+    // and the note only describes scan mechanics, not an unresolved metadata question.
+
+    #[test]
+    fn non_blocking_note_classifies_primary_form_entity_as_non_blocking() {
+        assert!(is_non_blocking_registration_note("Primary form entity: nvr_labservicecase."));
+    }
+
+    #[test]
+    fn non_blocking_note_classifies_primary_entity_override_as_non_blocking() {
+        assert!(is_non_blocking_registration_note("Primary entity override used for verification: account."));
+    }
+
+    #[test]
+    fn non_blocking_note_classifies_no_explicit_webapi_entity_as_non_blocking() {
+        assert!(is_non_blocking_registration_note("No explicit WebApi entity found; used fallback entity from workflow setup."));
+    }
+
+    #[test]
+    fn non_blocking_note_classifies_confirmed_plugin_entity_as_non_blocking() {
+        assert!(is_non_blocking_registration_note("Primary plugin entity: account (source: manual override)."));
+    }
+
+    #[test]
+    fn non_blocking_note_does_not_classify_unresolved_plugin_entity_as_non_blocking() {
+        // No colon after "entity" here: the entity is genuinely unknown, not just unregistered —
+        // this must still block the gate, unlike the confirmed "Primary plugin entity: X" case.
+        assert!(!is_non_blocking_registration_note(
+            "Primary plugin entity could not be inferred. Configure primary entity in task setup or provide a manual override for verification."
+        ));
+    }
+
+    #[test]
+    fn non_blocking_note_does_not_classify_real_metadata_gaps_as_non_blocking() {
+        assert!(!is_non_blocking_registration_note("Column metadata for entity 'account' was incomplete; only 5 columns were returned."));
+        assert!(!is_non_blocking_registration_note("Entity 'nvr_labservicecase' could not be inspected: connection refused"));
+        assert!(!is_non_blocking_registration_note("Some attributes could not be bound to a specific entity statically: nvr_foo."));
+    }
+
+    #[test]
+    fn metadata_verdict_a_clean_ui_business_rule_script_passes() {
+        // A: confirmed entity + fields, no missing/ambiguous/blocking-unable-to-verify/runtime-risk
+        // — the sole "Primary form entity: nvr_labservicecase" note has already been filtered out
+        // by the caller before this count is passed in.
+        let verdict = compute_metadata_verdict(0, 0, 0, 0, 3);
+        assert_eq!(verdict, "pass");
+    }
+
+    #[test]
+    fn metadata_verdict_b_missing_field_still_fails() {
+        // B: a real missing reference (e.g. nvr_description not found) must still fail, regardless
+        // of how many confirmed references or non-blocking notes exist.
+        let verdict = compute_metadata_verdict(1, 0, 0, 0, 2);
+        assert_eq!(verdict, "fail");
+    }
+
+    #[test]
+    fn metadata_verdict_c_ambiguous_reference_still_warns() {
+        // C: an ambiguous reference must still warn and require explicit accept/fix.
+        let verdict = compute_metadata_verdict(0, 1, 0, 0, 3);
+        assert_eq!(verdict, "warnings");
+    }
+
+    #[test]
+    fn metadata_verdict_d_runtime_risk_alone_still_warns_and_blocks_progression() {
+        // D: a real runtime risk must still warn even when entity/fields are otherwise clean and
+        // the only unable-to-verify note is the non-blocking "Primary form entity" registration
+        // note (already filtered out, so blocking_unable_to_verify_count is 0 here). There is no
+        // separate gate for runtimeRisks anywhere (implementationGate.ts /
+        // task_mcp_compute_progression_gate only ever read verdict/metadataVerdict), so this must
+        // be folded into metadata_verdict or a runtime risk would silently never block anything.
+        let verdict = compute_metadata_verdict(0, 0, 0, 1, 3);
+        assert_eq!(verdict, "warnings");
+
+        // And the hard gate must not silently let this proceed to Code Review — same
+        // "warnings_unaccepted" mechanism as any other Dataverse Metadata Check warning, requiring
+        // an explicit accept_dataverse_warnings call before task_mcp_compute_progression_gate
+        // reports canProceed=true.
+        assert_eq!(task_mcp_normalize_dataverse_gate("warnings", false), "warnings_unaccepted");
+        assert_eq!(task_mcp_normalize_dataverse_gate("warnings", true), "passed");
+    }
+
+    #[test]
+    fn metadata_verdict_genuine_metadata_gap_still_warns() {
+        // A real gap (e.g. "Entity could not be inspected", schema incomplete/unknown, or timeout)
+        // is not a registration note and must still warn.
+        let verdict = compute_metadata_verdict(0, 0, 1, 0, 3);
+        assert_eq!(verdict, "warnings");
+    }
+
+    #[test]
+    fn metadata_verdict_no_confirmed_references_is_unknown_not_pass() {
+        let verdict = compute_metadata_verdict(0, 0, 0, 0, 0);
+        assert_eq!(verdict, "unknown");
     }
 
     #[test]

@@ -353,6 +353,23 @@ export default function CrmVerificationReportView({ report }: CrmVerificationRep
         </details>
       )}
 
+      {/* === Runtime / form registration — informational only, never a Dataverse metadata warning === */}
+      {(report.formRegistrationNotes?.length ?? 0) > 0 && (
+        <details className="analysis-subsection" style={{ marginTop: 8 }}>
+          <summary className="analysis-subsection-label" style={{ cursor: 'pointer' }}>
+            Runtime / form registration: Not checked
+          </summary>
+          <div className="settings-field-hint" style={{ marginTop: 8 }}>
+            Form registration/runtime context was not checked. This is expected before web resource upload and form event registration.
+          </div>
+          <ul className="detail-analysis-points" style={{ marginTop: 8 }}>
+            {(report.formRegistrationNotes ?? []).map((note, idx) => (
+              <li key={`${note}-${idx}`}>{note}</li>
+            ))}
+          </ul>
+        </details>
+      )}
+
       {/* === Detailed issues — collapsed by default === */}
       {(report.issues?.length ?? 0) > 0 && (
         <details className="analysis-subsection" style={{ marginTop: 8 }}>
