@@ -660,6 +660,36 @@ export interface WorkflowSetup {
   mainHelperSuggestion?: string;
   /** Absolute path of the target script file, derived from repositoryRoot + scriptFolder + desiredScriptFile. Persisted when known before file creation. */
   absoluteScriptPath?: string;
+
+  // ── Persisted MCP/developer workflow semantics ──────────────────────────
+  // Set by prepare_developer_task (or copied from a matched template) and consumed by
+  // get_developer_work_packet (mcp/task-workbench-mcp.mjs, src-tauri/src/lib.rs) to classify
+  // the script and avoid re-deriving this from template matching on every subsequent call.
+  /**
+   * Which script contract this task implements.
+   * 'field-mapping': source->target field mapping script — requiresFieldMappings is typically true.
+   * 'ui-business-rule': form UI logic (required level, visibility, notifications, locking,
+   * option filtering) driven by referencedFields/triggerFields/affectedFields/uiRules — no
+   * field mapping by design.
+   * 'ribbon-action': ribbon/command-bar button logic — same non-mapping contract as ui-business-rule.
+   */
+  implementationPattern?: 'field-mapping' | 'ui-business-rule' | 'ribbon-action';
+  /** Whether this task's implementation must be built from workPacket.implementation.fieldMappings. False for ui-business-rule/ribbon-action tasks by design. */
+  requiresFieldMappings?: boolean;
+  /** Fields read by the script's logic (entity.field form), for ui-business-rule/ribbon-action tasks. */
+  referencedFields?: string[];
+  /** Fields whose onChange/onLoad event triggers the script logic. */
+  triggerFields?: string[];
+  /** Fields the script is allowed to modify (visibility, required level, notifications, locking, etc.) — never a fabricated mapping target. */
+  affectedFields?: string[];
+  /** Human-readable UI behavior rules (e.g. required-level or visibility rules) the script must implement. */
+  uiRules?: string[];
+  /** Option-set value lookups needed by the script, keyed by entity.field then label -> numeric/string value. */
+  optionSetValues?: Record<string, Record<string, number | string>>;
+  /** Form notification IDs the script sets/clears. */
+  notificationIds?: string[];
+  /** Operations the script must NOT perform (e.g. no Web API call, no setValue on a specific field). */
+  forbiddenOperations?: string[];
 }
 
 /**

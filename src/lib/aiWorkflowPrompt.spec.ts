@@ -449,8 +449,21 @@ describe('buildAiWorkflowPrompt — implementation prompt (ready task)', () => {
     expect(prompt).toContain('do not add, infer, or substitute fields');
   });
 
-  it('states validationFields are read-only and never written to target fields', () => {
-    expect(buildAiWorkflowPrompt(makeReadyTask())).toContain('validationFields are read-only source context');
+  it('states validationFields are read-only and never written as target fields', () => {
+    expect(buildAiWorkflowPrompt(makeReadyTask())).toContain('validationFields are read-only validation/source context');
+  });
+
+  it('requires fieldMappings only when requiresFieldMappings is true, and stops on missingRequiredMappings when empty', () => {
+    const prompt = buildAiWorkflowPrompt(makeReadyTask());
+    expect(prompt).toContain('If workPacket.implementation.requiresFieldMappings is true, implement only the provided workPacket.implementation.fieldMappings');
+    expect(prompt).toContain('If fieldMappings is empty, stop and report missingRequiredMappings');
+  });
+
+  it('does not require fieldMappings for ui-business-rule/ribbon-action tasks and lists their non-mapping contract fields', () => {
+    const prompt = buildAiWorkflowPrompt(makeReadyTask());
+    expect(prompt).toContain('If workPacket.implementation.implementationPattern is "ui-business-rule" or "ribbon-action", do not require fieldMappings');
+    expect(prompt).toContain('referencedFields, triggerFields, affectedFields, uiRules, businessRules, acceptanceCriteria, and forbiddenOperations');
+    expect(prompt).toContain('do not fabricate a source->target field mapping for these tasks');
   });
 
   it('forbids TODO/scaffold code in the final file', () => {
@@ -480,10 +493,12 @@ describe('buildAiWorkflowPrompt — implementation prompt (ready task)', () => {
 });
 
 describe('buildAiWorkflowPrompt — post-file-write loop', () => {
-  it('step 1: re-read and self-check against fieldMappings/validationFields/businessRules/acceptanceCriteria', () => {
+  it('step 1: re-read and self-check per implementationPattern (field-mapping vs ui-business-rule/ribbon-action)', () => {
     const prompt = buildAiWorkflowPrompt(makeReadyTask());
     expect(prompt).toContain('Re-read the file');
-    expect(prompt).toContain('fieldMappings, validationFields, businessRules, and acceptanceCriteria');
+    expect(prompt).toContain('Verify it against workPacket.implementation.implementationPattern');
+    expect(prompt).toContain('for field-mapping tasks, verify every fieldMapping and validationField rule');
+    expect(prompt).toContain('for ui-business-rule/ribbon-action tasks, verify referencedFields, triggerFields, affectedFields, uiRules, forbiddenOperations, businessRules, and acceptanceCriteria');
   });
 
   it('step 2: record_ai_implementation_completed', () => {

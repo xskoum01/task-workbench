@@ -315,8 +315,10 @@ export function buildAiWorkflowPrompt(task: Task, customer?: Customer): string {
     '* For all other blockers, report decisionReason/blockingUserAction and stop, unless the packet recommends `prepare_developer_task`.',
     '',
     'If workPacket.canWriteCode is true:',
-    '* Implement only files in workPacket.writeTarget/targetFiles, using only workPacket.implementation.fieldMappings — do not add, infer, or substitute fields or paths. If requiresFieldMappings is true and fieldMappings is empty, stop and report missingRequiredMappings; do not write scaffold/TODO code as a substitute.',
-    '* workPacket.implementation.validationFields are read-only source context — never write them to target fields.',
+    '* Implement only files in workPacket.writeTarget/targetFiles.',
+    '* If workPacket.implementation.requiresFieldMappings is true, implement only the provided workPacket.implementation.fieldMappings — do not add, infer, or substitute fields or paths. If fieldMappings is empty, stop and report missingRequiredMappings; do not write scaffold/TODO code as a substitute.',
+    '* If workPacket.implementation.implementationPattern is "ui-business-rule" or "ribbon-action", do not require fieldMappings. Implement only the provided referencedFields, triggerFields, affectedFields, uiRules, businessRules, acceptanceCriteria, and forbiddenOperations — do not fabricate a source->target field mapping for these tasks.',
+    '* workPacket.implementation.validationFields are read-only validation/source context — never write them as target fields.',
     '* No TODO/FIXME/placeholder/scaffold code in the final file. Replace it using packet data, or stop and report the blocker if the packet does not provide enough information.',
     '* Do not perform external writes (Dataverse, web resource upload, plugin registration, GitHub/ADO actions, deployments) without explicit user approval.',
   );
@@ -324,7 +326,7 @@ export function buildAiWorkflowPrompt(task: Task, customer?: Customer): string {
   lines.push(
     '',
     'After every file write:',
-    '1. Re-read the file. Verify it against workPacket.implementation.fieldMappings, validationFields, businessRules, and acceptanceCriteria. Fix any violation before continuing.',
+    '1. Re-read the file. Verify it against workPacket.implementation.implementationPattern: for field-mapping tasks, verify every fieldMapping and validationField rule; for ui-business-rule/ribbon-action tasks, verify referencedFields, triggerFields, affectedFields, uiRules, forbiddenOperations, businessRules, and acceptanceCriteria. Fix any violation before continuing.',
     '2. Call `record_ai_implementation_completed` (taskId, filesChanged, one-sentence summary). Do not call record_local_test for script/ribbon tasks.',
     '3. Call `continue_developer_workflow`.',
     '4. After any "tool not found" or "bridge is not running" error, call `get_task_workbench_mcp_capabilities` again if it is available. If it is not available at all, report that the Task Workbench MCP toolset itself is not connected — do not fall back to old manual-modal instructions and do not fabricate calling record_ai_kit_review_result. Retry only after the user confirms the app is running and the MCP server has been reloaded.',
