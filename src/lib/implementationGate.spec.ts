@@ -4,6 +4,7 @@ import {
   deriveDataverseRawStatus,
   dataverseWarningsAccepted,
   getAiKitReviewGate,
+  hasAiReviewDetail,
   computeProgressionGate,
 } from './implementationGate';
 import type { Task, CrmVerificationReport, ImplCheckRecord } from '../types';
@@ -144,6 +145,42 @@ describe('getAiKitReviewGate', () => {
 
   it('unrecognized status -> not_run', () => {
     expect(getAiKitReviewGate(fullReview({ status: 'skipped' })).status).toBe('not_run');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// hasAiReviewDetail
+// ---------------------------------------------------------------------------
+
+describe('hasAiReviewDetail', () => {
+  it('undefined/null -> false', () => {
+    expect(hasAiReviewDetail(undefined)).toBe(false);
+    expect(hasAiReviewDetail(null)).toBe(false);
+  });
+
+  it('status only, no detail fields -> false (genuinely missing details)', () => {
+    expect(hasAiReviewDetail({ status: 'failed' })).toBe(false);
+  });
+
+  it('passed review recorded via record_ai_kit_review_result with full detail -> true', () => {
+    // Regression: an AI-Kit-recorded review has no task.aiFileReviews entry (that array is only
+    // written by the legacy/Settings-reviewer path), so a check keyed off aiFileReviews wrongly
+    // reports "no details" even though reviewedFiles/rulesFiles/etc. are all present and already
+    // rendered inline in the modal.
+    expect(hasAiReviewDetail(fullReview())).toBe(true);
+  });
+
+  it('any single non-empty detail field is enough — does not require all four like getAiKitReviewGate', () => {
+    expect(hasAiReviewDetail({ status: 'passed', reviewedFiles: ['Scripts/foo.js'] })).toBe(true);
+    expect(hasAiReviewDetail({ status: 'passed', checkedItems: ['No Xrm.Page usage'] })).toBe(true);
+    expect(hasAiReviewDetail({ status: 'passed', summary: 'Reviewed against AI Kit rules.' })).toBe(true);
+  });
+
+  it('empty arrays and empty summary -> false', () => {
+    expect(hasAiReviewDetail({
+      status: 'passed',
+      reviewedFiles: [], rulesFiles: [], checklistFiles: [], knownPrReviewFiles: [], checkedItems: [], summary: '',
+    })).toBe(false);
   });
 });
 

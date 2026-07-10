@@ -27,6 +27,7 @@ import {
   normalizeDataverseGate,
   deriveDataverseRawStatus,
   getAiKitReviewGate,
+  hasAiReviewDetail,
   computeProgressionGate,
 } from '../lib/implementationGate';
 import Modal from './Modal';
@@ -944,7 +945,7 @@ export default function ImplementationVerificationModal({
           {aiStatus === 'skipped' && iv?.aiCodeReview?.skippedReason && (
             <div style={hintStyle}>Reason: {iv.aiCodeReview.skippedReason}</div>
           )}
-          {aiStatus !== 'not-run' && aiStatus !== 'skipped' && aiStatus !== 'manually-verified' && !latestAiReview && (
+          {aiStatus !== 'not-run' && aiStatus !== 'skipped' && aiStatus !== 'manually-verified' && !hasAiReviewDetail(iv?.aiCodeReview) && (
             <div style={{ fontSize: 11.5, color: 'var(--color-warning, #d29922)', marginBottom: 6 }}>
               Review details are missing. Run AI Code Review again.
             </div>

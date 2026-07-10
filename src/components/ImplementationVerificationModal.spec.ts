@@ -5,7 +5,7 @@ import {
 } from './ImplementationVerificationModal';
 import { formatTaskActivityNote, isTaskActivityLine } from '../lib/taskActivityFormatter';
 import { mergeWithDefaults, selectReviewer, inferReviewSource } from '../lib/aiReviewers';
-import { computeProgressionGate, getAiKitReviewGate, normalizeDataverseGate } from '../lib/implementationGate';
+import { computeProgressionGate, getAiKitReviewGate, hasAiReviewDetail, normalizeDataverseGate } from '../lib/implementationGate';
 import type { Task, CrmVerificationReport, AiReviewerConfig, AiFileReviewResult, ImplCheckRecord } from '../types';
 
 function makeTask(overrides: Partial<Task> = {}): Task {
@@ -316,7 +316,7 @@ describe('Reset — data model after AI code review reset', () => {
   });
 
   it('failed AI review without details — Open review is hidden, warning should be shown', () => {
-    // aiCodeReview.status is failed but no reviewId and no aiFileReviews
+    // aiCodeReview.status is failed but no reviewId, no aiFileReviews, and no detail fields at all
     const task = makeTask({
       implementationVerification: { aiCodeReview: { status: 'failed' } },
     });
@@ -327,9 +327,42 @@ describe('Reset — data model after AI code review reset', () => {
       if (reviewId) return task.aiFileReviews?.find((r) => r.id === reviewId);
       return task.aiFileReviews?.[0];
     })();
-    // Open review hidden; warning condition: aiStatus !== 'not-run' && !latestAiReview
+    // Open review (legacy aiFileReviews popup) is hidden — nothing to open there.
     expect(latestAiReview).toBeUndefined();
-    expect(aiStatus !== 'not-run' && !latestAiReview).toBe(true);
+    // The "Review details are missing" warning is driven by hasAiReviewDetail(iv.aiCodeReview),
+    // not by latestAiReview — here there is genuinely no detail, so it must still show.
+    expect(aiStatus !== 'not-run' && !hasAiReviewDetail(task.implementationVerification?.aiCodeReview)).toBe(true);
+  });
+
+  it('REGRESSION: passed AI-Kit review with full detail but no aiFileReviews entry — warning must NOT show', () => {
+    // record_ai_kit_review_result only ever writes implementationVerification.aiCodeReview; it
+    // never appends to task.aiFileReviews (that array is written only by the legacy/Settings
+    // reviewer path). Before the fix, the "Review details are missing" warning was keyed off
+    // latestAiReview (derived from aiFileReviews), so it wrongly showed here even though
+    // reviewedFiles/rulesFiles/checklistFiles/knownPrReviewFiles/checkedItems/summary are all
+    // present and already rendered inline in the same section.
+    const task = makeTask({
+      aiFileReviews: undefined,
+      implementationVerification: {
+        aiCodeReview: {
+          status: 'passed',
+          reviewedFiles: ['Scripts/nvr_labservicecase_events.js'],
+          rulesFiles: ['ai-kit/rules/client-api.md'],
+          checklistFiles: ['ai-kit/checklist.md'],
+          knownPrReviewFiles: ['ai-kit/known-pr-comments.md'],
+          checkedItems: ['No Xrm.Page usage', 'No autosave'],
+          summary: 'AI Kit review passed. No blocking issues found.',
+        },
+      },
+    });
+    const aiStatus = task.implementationVerification?.aiCodeReview?.status ?? 'not-run';
+    const latestAiReview = task.aiFileReviews?.[0];
+    // The legacy lookup is undefined (no separate popup content) ...
+    expect(latestAiReview).toBeUndefined();
+    // ... but the detail actually rendered inline in the modal comes from aiCodeReview directly,
+    // so the warning must not show.
+    expect(hasAiReviewDetail(task.implementationVerification?.aiCodeReview)).toBe(true);
+    expect(aiStatus !== 'not-run' && !hasAiReviewDetail(task.implementationVerification?.aiCodeReview)).toBe(false);
   });
 
   it('aiStatus was failed before reset — passes visibility condition for Reset button', () => {

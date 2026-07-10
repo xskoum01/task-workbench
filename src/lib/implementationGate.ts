@@ -117,6 +117,29 @@ export function getAiKitReviewGate(review: ImplCheckRecord | undefined | null): 
   }
 }
 
+/**
+ * True when a persisted AI Kit review record (implementationVerification.aiCodeReview) has at
+ * least one non-empty detail field worth rendering — reviewedFiles, rulesFiles, checklistFiles,
+ * knownPrReviewFiles, checkedItems, or summary. Used only to decide whether the Implementation
+ * Verification modal's "Review details are missing" warning should show; it is deliberately an
+ * OR (any one field is enough), unlike the strict hard gate in getAiKitReviewGate, which still
+ * requires ALL of reviewedFiles/rulesFiles/checklistFiles/knownPrReviewFiles to consider a
+ * "passed" review complete. A review can be worth displaying (e.g. it has a summary and checked
+ * items) without yet satisfying the stricter completeness bar the hard gate enforces.
+ */
+export function hasAiReviewDetail(review: ImplCheckRecord | undefined | null): boolean {
+  if (!review || typeof review !== 'object') return false;
+  const hasItems = (arr: unknown[] | undefined): boolean => Array.isArray(arr) && arr.length > 0;
+  return (
+    hasItems(review.reviewedFiles) ||
+    hasItems(review.rulesFiles) ||
+    hasItems(review.checklistFiles) ||
+    hasItems(review.knownPrReviewFiles) ||
+    hasItems(review.checkedItems) ||
+    !!review.summary
+  );
+}
+
 // ---------------------------------------------------------------------------
 // Combined progression gate
 // ---------------------------------------------------------------------------
