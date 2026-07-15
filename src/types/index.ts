@@ -278,6 +278,8 @@ export interface CrmDeveloperWorkflowState {
   pullRequestFixProposal?: CrmPullRequestFixProposal;
   /** Local-only record that the user manually updated the PR outside the app. */
   pullRequestFixUpdateTracking?: CrmPullRequestFixUpdateTracking;
+  /** Written by record_ai_implementation_completed when the AI-managed workflow finishes writing code. */
+  lastAiImplementation?: { filesChanged?: string[]; summary?: string; completedAt?: string };
   createdAt?: string;
   updatedAt?: string;
 }
@@ -324,7 +326,11 @@ export interface DataverseWarningsAccepted {
 /** Single optional verification check record — Dataverse check or AI code review. */
 export interface ImplCheckRecord {
   status: ImplCheckStatus;
-  /** References the id of the associated aiFileReviews entry for this result. */
+  /**
+   * References the id of the associated aiFileReviews entry for this result, when one exists.
+   * Absent for Claude/MCP reviews (record_ai_kit_review_result), which never create an
+   * aiFileReviews entry — the fields below are the sole detail source in that case.
+   */
   reviewId?: string;
   runAt?: string;
   skippedAt?: string;
@@ -386,10 +392,96 @@ export interface ImplementationVerification {
   buildCheck?: ImplCheckRecord;
   /** Manual override for Dataverse check status (skipped / manually-verified), plus gate detail. */
   dataverseCheck?: DataverseCheckOverride;
-  /** AI internal code review result. */
+  /**
+   * AI internal code review result — the canonical gate result and common report data. Written by
+   * both native UI reviewers (AI Kit / Settings buttons — reviewSource "ai-kit"/"settings") and by
+   * Claude through MCP record_ai_kit_review_result (reviewSource "claude-ai-kit"). reviewId, when
+   * present, links to the matching entry in task.aiFileReviews for reviews that have one; Claude/MCP
+   * reviews never create an aiFileReviews entry and rely on this record alone. See
+   * src/lib/aiCodeReviewReport.ts (buildAiCodeReviewReport) for the merged read-only report used by
+   * the Implementation Verification modal's "Open report" action.
+   */
   aiCodeReview?: ImplCheckRecord;
-  /** Local test record. */
+  /**
+   * Legacy pre-deployment local test record. Historically the only "test" signal before the
+   * dedicated Deployment & Testing phase existed; the CRM artifact was never actually deployed at
+   * this point in the workflow, so a 'not-needed'/'passed' value here must never be treated as
+   * evidence of a real deployed browser/application test — see deploymentTesting.test (Task,
+   * src/lib/deploymentTestingGate.ts) for the canonical post-deployment test gate. Still written by
+   * record_ai_implementation_completed for backward compatibility with tasks/tooling that read it,
+   * and still rendered in this modal, but it no longer satisfies any deployment-test requirement.
+   */
   localTest?: ImplLocalTestRecord;
+  updatedAt?: string;
+}
+
+// ── Deployment & Testing (post-verification, pre-commit phase) ───────────────
+
+/**
+ * Status of the manual CRM deployment step. The app never deploys anything itself — these values
+ * record what the user reports having done manually (Dataverse/Power Apps upload, solution import,
+ * web resource publish, etc.).
+ */
+export type ManualDeploymentStatus = 'not-run' | 'deployed' | 'failed' | 'not-needed';
+
+/** Status of the post-deployment browser/model-driven app test — a real test performed by a human. */
+export type DeploymentTestStatus = 'not-run' | 'passed' | 'failed' | 'not-needed';
+
+/** Manual confirmation checklist for a script deployment. Purely a record of user attestation. */
+export interface ManualDeploymentChecklist {
+  webResourceCreatedOrUpdated?: boolean;
+  webResourceInSolution?: boolean;
+  customizationsPublished?: boolean;
+  scriptAddedToForm?: boolean;
+  handlersRegistered?: boolean;
+}
+
+/**
+ * Record of a manual CRM deployment. Written only by the user (via the Deployment & Testing UI) or
+ * by Claude through MCP record_manual_deployment strictly recording a deployment the user already
+ * performed. The app/MCP never calls Primarch, the Dataverse Web API, PAC CLI, or Power Apps here.
+ */
+export interface ManualDeploymentRecord {
+  status: ManualDeploymentStatus;
+  recordedAt?: string;
+  recordedBy?: 'user' | 'ai';
+  /** Optional for 'deployed' (one-click success). Required for 'not-needed' — a meaningful explanation, not a placeholder. Optional for 'failed'. */
+  notes?: string;
+  environmentId?: string;
+  environmentName?: string;
+  solutionUniqueName?: string;
+  artifactType?: 'script' | 'plugin';
+  artifactPath?: string;
+  webResourceName?: string;
+  entityLogicalName?: string;
+  formName?: string;
+  checklist?: ManualDeploymentChecklist;
+}
+
+/**
+ * Record of a real browser/model-driven app test performed after manual deployment. Distinct from
+ * the legacy pre-deployment implementationVerification.localTest — see the doc comment there.
+ * 'not-needed' must always carry a user-provided reason; it is never derived automatically.
+ */
+export interface DeploymentTestRecord {
+  status: DeploymentTestStatus;
+  recordedAt?: string;
+  recordedBy?: 'user' | 'ai';
+  /** Optional for 'passed' (one-click success). Required for 'not-needed'. Optional for 'failed'. */
+  notes?: string;
+  testedEnvironment?: string;
+  testedAcceptanceCriteria?: string[];
+}
+
+/**
+ * Canonical Deployment & Testing phase state — sits between Implementation Verification and
+ * Commit & Push in the developer workflow. Both sub-records are independent manual attestations;
+ * neither is satisfied by the pre-deployment implementationVerification.localTest or the legacy
+ * consultantTestRecord field (kept for backward-compat display only — see their doc comments).
+ */
+export interface DeploymentTestingState {
+  deployment?: ManualDeploymentRecord;
+  test?: DeploymentTestRecord;
   updatedAt?: string;
 }
 
@@ -438,8 +530,12 @@ export interface Task {
   /** Persisted selected plugin project folder name for dev work (shared between InlineTaskPanel and TaskDetail). */
   selectedPluginProject?: string;
   /**
-   * Persisted AI code review results, newest first.
-   * Capped at 5 entries. Stored without API keys or prompts.
+   * Optional richer review history produced only by native app reviewers (AI Kit / Settings
+   * buttons) — structured comments, line references, markdown/raw answer, general suggestions.
+   * Newest first, capped at 5 entries. Stored without API keys or prompts. Claude/MCP reviews
+   * (record_ai_kit_review_result) never append here — implementationVerification.aiCodeReview is
+   * the canonical result for those. See src/lib/aiCodeReviewReport.ts for how the two are merged
+   * into a single displayable report.
    */
   aiFileReviews?: AiFileReviewResult[];
 
@@ -540,10 +636,27 @@ export interface Task {
    */
   implementationVerification?: ImplementationVerification;
 
+  /**
+   * Canonical Deployment & Testing phase state (manual deployment + real browser/application
+   * test), entered only after Implementation Verification (Dataverse + AI Kit review) passes.
+   * See src/lib/deploymentTestingGate.ts for the gate that reads this field.
+   */
+  deploymentTesting?: DeploymentTestingState;
+
   // ── MCP local workflow fields ─────────────────────────────────────────────
-  /** Local test record written by MCP record_local_test tool. */
+  /**
+   * Legacy pre-deployment local test record written by MCP record_local_test tool. Predates the
+   * Deployment & Testing phase and the artifact was never actually deployed at the time this was
+   * recorded — never read by computeDeploymentTestingGate. Kept only for backward-compat display
+   * and the AI-managed record_ai_implementation_completed 'not-needed' compatibility note (see
+   * implementationVerification.localTest below).
+   */
   localTestRecord?: { status: string; updatedAt: string; note?: string };
-  /** Consultant test record written by MCP record_consultant_testing tool. */
+  /**
+   * Legacy consultant-testing confirmation record predating the dedicated deploymentTesting.test
+   * field. Kept for backward-compat display (existing "consultant testing" status badges) only —
+   * the Deployment & Testing gate reads deploymentTesting.test exclusively, never this field.
+   */
   consultantTestRecord?: { status: string; updatedAt: string; note?: string };
   /** Per-item checklist overrides set by MCP update_task_checklist_item tool. */
   mcpChecklistOverrides?: Record<string, string>;

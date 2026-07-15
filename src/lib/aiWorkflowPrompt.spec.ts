@@ -589,11 +589,30 @@ describe('buildAiWorkflowPrompt — post-file-write loop', () => {
     expect(prompt).toContain("a status:'passed' call alone is not sufficient");
   });
 
-  it('stops only once both the Dataverse gate and the AI Kit review gate resolve via nextAction=continue_workflow', () => {
+  it('REGRESSION: nextAction=continue_workflow from run_implementation_verification is never described as a stopping point', () => {
+    // Root cause of the reported bug: the prompt previously said "Stop when run_implementation_
+    // verification returns nextAction=continue_workflow", which caused Claude to stop instead of
+    // calling continue_developer_workflow. It must now explicitly say not to stop here.
     const prompt = buildAiWorkflowPrompt(makeReadyTask());
-    expect(prompt).toContain('Stop when run_implementation_verification returns nextAction=continue_workflow');
-    expect(prompt).toContain('meaning both the Dataverse gate and the AI Kit review gate are resolved');
+    expect(prompt).not.toContain('Stop when run_implementation_verification returns nextAction=continue_workflow');
+    expect(prompt).toContain('nextAction=continue_workflow');
+    expect(prompt).toContain('is NOT a stopping point');
+    expect(prompt).toContain('Do NOT stop here');
+    expect(prompt).toContain('this means the Dataverse gate and the AI Kit review gate are resolved');
     expect(prompt).toContain('review_dataverse_warnings');
+  });
+
+  it('requires an explicit second call to continue_developer_workflow after run_implementation_verification returns continue_workflow', () => {
+    const prompt = buildAiWorkflowPrompt(makeReadyTask());
+    expect(prompt).toContain('Immediately proceed to step 11a');
+    expect(prompt).toContain('Call `continue_developer_workflow` (a different tool from run_implementation_verification)');
+    expect(prompt).toContain('the task does not advance out of Development until this call runs');
+  });
+
+  it('does not instruct Claude to wait for a manual Local Test — it is already recorded as not-needed', () => {
+    const prompt = buildAiWorkflowPrompt(makeReadyTask());
+    expect(prompt).toContain('Local Test is already recorded as not-needed');
+    expect(prompt.toLowerCase()).not.toContain('browser local test');
   });
 
   it('reports tooling_error distinctly from a manual-review requirement', () => {
@@ -607,6 +626,116 @@ describe('buildAiWorkflowPrompt — post-file-write loop', () => {
     expect(prompt).not.toContain('If it returns status=tooling_error');
     expect(prompt).toContain('If run_implementation_verification or continue_developer_workflow returns status=tooling_error or nextAction=reload_mcp_or_start_app');
     expect(prompt).toContain('Report missingRequiredTools/recommendedAction');
+  });
+});
+
+describe('buildAiWorkflowPrompt — Deployment & Testing / Commit & Push / Pull Request contract', () => {
+  it('states Implementation Verification does not include real deployed application testing', () => {
+    const prompt = buildAiWorkflowPrompt(makeReadyTask());
+    expect(prompt).toContain('does NOT mean the artifact has been deployed or tested');
+    expect(prompt).toContain('Implementation Verification is a pre-deployment code/metadata quality gate only');
+  });
+
+  it('defines an explicit loop rule based on requiresUserApproval, not on nextAction=continue_workflow', () => {
+    const prompt = buildAiWorkflowPrompt(makeReadyTask());
+    expect(prompt).toContain('THE LOOP RULE');
+    expect(prompt).toContain('If requiresUserApproval=false, you must act');
+    expect(prompt).toContain('never stop and never report to the user on a requiresUserApproval=false result');
+    expect(prompt).toContain('Stop calling `continue_developer_workflow` only when it returns requiresUserApproval=true');
+  });
+
+  it('includes a loop-safety guard against calling continue_developer_workflow without an intervening action', () => {
+    const prompt = buildAiWorkflowPrompt(makeReadyTask());
+    expect(prompt).toContain('Loop-safety guard');
+    expect(prompt).toContain('never call `continue_developer_workflow` twice in a row with no intervening tool call');
+    expect(prompt).toContain('stop and report a tooling/state error');
+  });
+
+  it('does not describe manual deployment as a Pull Request step and forbids commit/push/PR mentions while it is unresolved', () => {
+    const prompt = buildAiWorkflowPrompt(makeReadyTask());
+    expect(prompt).toContain('Manual deployment is never a Pull Request step');
+    const deploymentStepIndex = prompt.indexOf('12. Manual deployment');
+    const deploymentStepText = prompt.slice(deploymentStepIndex, prompt.indexOf('\n', deploymentStepIndex + 1) + 400);
+    expect(deploymentStepText).toContain('do not mention commit, push, or PR while this step is unresolved');
+  });
+
+  it('names the full canonical sequence after verification passes', () => {
+    const prompt = buildAiWorkflowPrompt(makeReadyTask());
+    expect(prompt).toContain('Deployment & Testing -> Commit & Push -> Pull Request -> Code Review (waiting for colleague review) -> Done');
+  });
+
+  it('instructs Claude to stop for manual deployment and never claim deployment occurred', () => {
+    const prompt = buildAiWorkflowPrompt(makeReadyTask());
+    expect(prompt).toContain('wait_for_manual_deployment');
+    expect(prompt).toContain("call \`record_manual_deployment\` immediately with { taskId, status: 'deployed' }");
+    expect(prompt).toContain('Never claim that you performed the deployment yourself');
+  });
+
+  it('instructs Claude to never record a deployment test unless the user confirms it was performed', () => {
+    const prompt = buildAiWorkflowPrompt(makeReadyTask());
+    expect(prompt).toContain('wait_for_deployment_test');
+    expect(prompt).toContain('Never infer a passed test from automated verification, AI Kit review, or any static/code check');
+  });
+
+  it('does not ask for or wait on deployment/test notes on the successful confirmation path', () => {
+    const prompt = buildAiWorkflowPrompt(makeReadyTask());
+    expect(prompt).toContain('Do not ask for deployment notes and do not wait for them');
+    expect(prompt).toContain("status: 'passed' } — no notes required or requested");
+    expect(prompt).toContain("required only for status='not-needed'");
+  });
+
+  it('never infers deployment or a passed test from automated checks', () => {
+    const prompt = buildAiWorkflowPrompt(makeReadyTask());
+    expect(prompt).toContain('never infer deployment from code creation, metadata verification, AI Kit review, file existence, or commit state');
+  });
+
+  it('records deployment before test when both are confirmed in one message', () => {
+    const prompt = buildAiWorkflowPrompt(makeReadyTask());
+    expect(prompt).toContain('If the user reports both the deployment and a passed test in the same message, record deployment first (`record_manual_deployment`), then re-check/continue the workflow state, then record the test (`record_deployment_test`)');
+    expect(prompt).toContain('never record a test before deployment is recorded');
+  });
+
+  it('never treats a recorded deployment/test confirmation as approval to commit or push', () => {
+    const prompt = buildAiWorkflowPrompt(makeReadyTask());
+    expect(prompt).toContain('Recording deployment and/or a passed test is never itself approval to commit or push');
+    expect(prompt).toContain('Do not create a commit, push, or pull request automatically after recording deployment/test confirmations');
+  });
+
+  it('forbids commit/push before the deployment and deployment-test gates resolve', () => {
+    const prompt = buildAiWorkflowPrompt(makeReadyTask());
+    expect(prompt).toContain('do not call `commit_task_changes`, `push_task_branch`, or `commit_and_push_task_changes` before the deployment and deployment-test gates both resolve');
+  });
+
+  it('requires a separate explicit approval for commit/push, distinct from deployment/test approval', () => {
+    const prompt = buildAiWorkflowPrompt(makeReadyTask());
+    expect(prompt).toContain('ask for a SEPARATE explicit user approval of the commit itself');
+    expect(prompt).toContain('Recording deployment and/or a passed test is never itself approval to commit or push');
+  });
+
+  it('requires preparing the PR only after a verified push, with its own separate approval', () => {
+    const prompt = buildAiWorkflowPrompt(makeReadyTask());
+    expect(prompt).toContain('only after the push is verified, call `prepare_pull_request_for_task`');
+    expect(prompt).toContain('Ask for a SEPARATE explicit user approval before creating or recording a pull request');
+    expect(prompt).toContain('approval to commit/push is never approval to create a PR');
+  });
+
+  it('supports a manual PR fallback and forbids fabricating a PR reference', () => {
+    const prompt = buildAiWorkflowPrompt(makeReadyTask());
+    expect(prompt).toContain('give the user manual PR-creation instructions');
+    expect(prompt).toContain('never fabricate one');
+  });
+
+  it('stops after PR creation/recording and reports colleague review as pending, without calling AI/Claude review an independent colleague review', () => {
+    const prompt = buildAiWorkflowPrompt(makeReadyTask());
+    expect(prompt).toContain('wait_for_colleague_code_review');
+    expect(prompt).toContain("waiting for a colleague's code review");
+    expect(prompt).toContain('Never call this AI/Claude-performed work an independent colleague review');
+  });
+
+  it('appears in both the setup prompt is unaffected (deployment/PR contract only in the implementation prompt)', () => {
+    const setupPrompt = buildAiWorkflowPrompt(makeTask());
+    expect(setupPrompt).not.toContain('wait_for_manual_deployment');
+    expect(setupPrompt).not.toContain('prepare_pull_request_for_task');
   });
 });
 

@@ -1595,6 +1595,22 @@ fn task_mcp_related_implementation_files(task: &Value) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// Parses commit_task_changes / commit_and_push_task_changes MCP args into the fields
+/// git_commit_impl needs. Pure — no task/app I/O — so the MCP JSON argument-forwarding boundary
+/// (confirmUnrelatedFiles, forceAddFiles) is unit-testable without a full task_mcp_execute_tool
+/// dispatch. Both match arms call this so their argument handling can never drift apart.
+fn task_mcp_parse_commit_args(args: &Value) -> (String, Vec<String>, Vec<String>, bool) {
+    let message = args["message"].as_str().unwrap_or("").trim().to_string();
+    let files: Vec<String> = args["files"].as_array()
+        .map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
+        .unwrap_or_default();
+    let force_add_files: Vec<String> = args["forceAddFiles"].as_array()
+        .map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
+        .unwrap_or_default();
+    let confirm_unrelated = args["confirmUnrelatedFiles"].as_bool().unwrap_or(false);
+    (message, files, force_add_files, confirm_unrelated)
+}
+
 /// Core logic for committing selected files â€” shared by Tauri command and MCP handler.
 ///
 /// Safety rules (all hard — none of these can be bypassed except via the named opt-ins):
@@ -6833,11 +6849,15 @@ fn task_mcp_read_only_tool_definitions() -> Vec<Value> {
         serde_json::json!({"name":"get_implementation_verification_state", "description":"Return the implementation verification state for a task: build check, Dataverse check override, AI code review, local test, consultant testing.","readOnly":true}),
         serde_json::json!({"name":"get_implementation_readiness",          "description":"Return implementation readiness for a developer plugin/script task: isImplementationReady, blockers, warnings, recommendedNextStep.","readOnly":true}),
         serde_json::json!({"name":"get_developer_work_packet",              "description":"Return a simplified AI-facing developer work packet: canWriteCode, reason, target, implementation, conventions, Dataverse verification, and review/test/commit guidance.","readOnly":true}),
-        serde_json::json!({"name":"continue_developer_workflow",           "description":"Return the next required post-implementation workflow step: record results, Dataverse verification, AI Kit review, or branch creation. Call after every file write until it returns wait_for_user or mark_done.","readOnly":true}),
+        serde_json::json!({"name":"continue_developer_workflow",           "description":"Return the next required post-implementation workflow step: Dataverse verification, AI Kit review, Deployment & Testing, Commit & Push, or Pull Request. Always call this again after run_implementation_verification returns nextAction=continue_workflow — that is not a stopping point. Also persists the local Development -> Deployment & Testing transition (waitingState only) the first time verification resolves; never Git, filesystem, Dataverse, deployment, commit, push, or PR. Call after every file write until it returns a genuine user-action stop.","readOnly":true}),
         serde_json::json!({"name":"get_task_templates",                    "description":"Return built-in task setup templates and the matched template for a task title, when any.","readOnly":true}),
         serde_json::json!({"name":"run_implementation_verification",       "description":"Orchestrates the same Verify Implementation checks/state as ImplementationVerificationModal for a script/ribbon task: runs Script File Readiness and Local Static/Business-Rule Verification directly; runs Dataverse Metadata Check for real (Primarch, read-only) when configured; reports AI Internal Code Review as needs_ai_kit_review (call record_ai_kit_review_result) until a result is recorded; Local Test remains a read-only passthrough (genuinely manual/browser step). Never reports status=passed while a required row is still unresolved. No external writes. Returns status, checks, fixableFindings, nextAction (continue_workflow/fix_code/run_ai_kit_review/needs_configuration/wait_for_user), implementationVerification (modal-truth summary), unresolvedRequiredRows, nextRecommendedStep.","readOnly":true}),
         serde_json::json!({"name":"get_implementation_verification_summary","description":"Read-only. Returns the same normalized, modal-truth Implementation Verification summary as run_implementation_verification and get_task_workflow_overview, from currently persisted state only (does not re-run any check).","readOnly":true}),
         serde_json::json!({"name":"get_task_workbench_mcp_capabilities", "description":"Read-only health/capability check for the current MCP session. Call this before relying on automated Dataverse Metadata Check / AI Kit review, or after a \"tool not found\"/\"bridge is not running\" error. Returns bridgeMode (live-rust/js-fallback/offline), which developer-workflow tools are actually available right now, missingRequiredTools, and a recommendedAction. Does NOT write anything.","readOnly":true}),
+        serde_json::json!({"name":"get_deployment_testing_state", "description":"Read-only. Returns the canonical Deployment & Testing state for a task: manual deployment status, browser/model-driven app test status, unresolved required rows, whether commit preparation is allowed, and the exact next recommended action. Never reads implementationVerification.localTest, localTestRecord, or consultantTestRecord as evidence. Does NOT deploy, test, or write anything.","readOnly":true}),
+        serde_json::json!({"name":"get_pull_request_state", "description":"Read-only. Returns whether a pull request has been created/recorded for a task, its URL, and whether the Code Review readiness gate (commit verified + push verified + PR recorded) is satisfied. Does NOT call any external provider.","readOnly":true}),
+        serde_json::json!({"name":"prepare_pull_request_for_task", "description":"Read-only PR preview. Returns the detected provider/repository, source and target branch, a draft title/description, the commits/files that would be included, and any existing recorded pull request. Does NOT create a pull request and does NOT call GitHub/Azure DevOps.","readOnly":true}),
+        serde_json::json!({"name":"reconcile_task_git_state", "description":"Read-only Git inspection + local tracking-state repair. Inspects the current branch, HEAD, and the configured remote branch, and verifies whether the task's expected commit SHA is present on the remote. May repair ONLY Task Workbench's local gitWorkflow tracking fields. Never modifies Git history, stages files, commits, pushes, deletes lock files, or runs destructive reset operations.","readOnly":true}),
     ]
 }
 
@@ -6856,6 +6876,12 @@ fn task_mcp_required_developer_workflow_tools() -> &'static [&'static str] {
         "get_implementation_verification_summary",
         "continue_developer_workflow",
         "get_task_workflow_overview",
+        "get_deployment_testing_state",
+        "record_manual_deployment",
+        "record_deployment_test",
+        "prepare_pull_request_for_task",
+        "record_pull_request_created",
+        "get_pull_request_state",
     ]
 }
 
@@ -6954,7 +6980,7 @@ fn task_mcp_local_write_tool_definitions() -> Vec<Value> {
         serde_json::json!({"name":"set_task_developer_target",           "description":"Set developer target: repository root, plugin project, script path, or customer. Does not scan or write any repository files.","readOnly":false}),
         serde_json::json!({"name":"prepare_developer_task",              "description":"Safe high-level orchestration: apply templates/defaults, derive developer target, draft a technical plan, and stop at the first approval gate or hard blocker. No code, repo, or external writes.","readOnly":false}),
         serde_json::json!({"name":"confirm_task_setup",                  "description":"Record local setup confirmation timestamp. Advances status from new to analyzed.","readOnly":false}),
-        serde_json::json!({"name":"set_task_phase",                      "description":"Set task phase: new/analyzed/development/testing/review/done. Maps to internal status+waitingState model.","readOnly":false}),
+        serde_json::json!({"name":"set_task_phase",                      "description":"Set task phase: new/analyzed/development/testing/review/done. phase='new' on a task with existing workflow state performs a full reset (analysis, setup, plans, verification, reviews, tests, Git tracking) — requires confirmReset=true unless the task is already clean.","readOnly":false}),
         serde_json::json!({"name":"record_ai_implementation_completed",   "description":"Record that AI has finished writing implementation files. Sets implementation-done and advances past local-test to wait_for_user (manual Dataverse upload/verify). Use instead of record_local_test for script/ribbon tasks after AI file write.","readOnly":false}),
         serde_json::json!({"name":"record_local_test",                   "description":"Record local test result: not-started/passed/failed/not-needed. Updates checklist only.","readOnly":false}),
         serde_json::json!({"name":"record_consultant_testing",           "description":"Record consultant testing status: requested/confirmed/failed/not-needed. Updates local workflow state only.","readOnly":false}),
@@ -6975,6 +7001,9 @@ fn task_mcp_local_write_tool_definitions() -> Vec<Value> {
         serde_json::json!({"name":"mark_testing_confirmed_prepare_commit","description":"WRITE (local task state only) â€” marks consultant testing as confirmed and sets the next step to Prepare commit and push. Does NOT commit, push, or move the task to Code Review.","readOnly":false}),
         serde_json::json!({"name":"record_external_action_completed",     "description":"WRITE (local task state only) â€” records that the developer manually completed an external action (plugin registration, web resource upload, etc.). Does not call any external system.","readOnly":false}),
         serde_json::json!({"name":"record_ai_kit_review_result",          "description":"WRITE (local task state only) â€” records the result of an AI Kit / Client-API code review performed by the calling AI agent itself (reviewSource=claude-ai-kit). Requires reviewedFiles, rulesFiles, checklistFiles, and knownPrReviewFiles to be non-empty for the review to pass the hard gate â€” a status='passed' call with those fields empty is recorded as gateStatus='incomplete', not passed. Persists to implementationVerification.aiCodeReview (the same field the modal reads) and task.aiKitReview. Does not call any external LLM, API, or system â€” the caller supplies its own verdict after reading the AI Kit rules, the CRM code review checklist, known PR review comments, and the target file directly.","readOnly":false}),
+        serde_json::json!({"name":"record_manual_deployment",              "description":"WRITE (local task state only) — records that the user manually deployed the CRM artifact. Does NOT deploy anything, does NOT call Dataverse/Primarch/PAC CLI/Power Apps. status='deployed' is a one-click confirmation and does not require notes; status='not-needed' is rejected without meaningful notes. Never call speculatively — only after the user explicitly confirms deployment actually happened.","readOnly":false}),
+        serde_json::json!({"name":"record_deployment_test",                "description":"WRITE (local task state only) — records the result of a real browser/model-driven app test performed after manual deployment. Does NOT run a test or call any external system. status='passed' is a one-click confirmation and does not require notes; status='not-needed' is rejected without meaningful notes. A failed test blocks commit preparation.","readOnly":false}),
+        serde_json::json!({"name":"record_pull_request_created",           "description":"WRITE (local task state only) â€” records that a pull request was created, either manually by the user or by Claude only after a SEPARATE explicit approval distinct from any commit/push approval. Does NOT create a pull request on any provider â€” only records one that already exists.","readOnly":false}),
     ]
 }
 
@@ -8649,6 +8678,96 @@ fn task_mcp_set_status_phase(task: &mut Value, phase: &str) {
     }
 }
 
+/// Task fields representing generated analysis, setup confirmation, approvals, implementation,
+/// verification, testing, PR/review, external-action, or workflow-progression state. Cleared by a
+/// full reset to NEW (see task_mcp_reset_task_workflow_to_new below). Deliberately excludes
+/// status/waitingState/attentionState/suggestedActions — those are unconditionally reset to their
+/// NEW-equivalent value regardless of whether any of the keys below are set.
+/// Mirrors RESETTABLE_WORKFLOW_KEYS in src/lib/taskWorkflowReset.ts and mcp/task-workbench-mcp.mjs
+/// — keep all three in sync.
+const TASK_MCP_RESETTABLE_WORKFLOW_KEYS: &[&str] = &[
+    "completedAt",
+    "estimatedEffort",
+    "planningBucket",
+    "suggestedPlanningBucket",
+    "priorityScore",
+    "priorityReason",
+    "isPlanningLocked",
+    "analysisResult",
+    "generatedReply",
+    "scriptAnalysis",
+    "selectedPluginProject",
+    "aiFileReviews",
+    "crmSkeletons",
+    "crmVerificationReports",
+    "crmDeveloperWorkflow",
+    "workflowSetup",
+    "taskMode",
+    "implementationVerification",
+    "deploymentTesting",
+    "localTestRecord",
+    "consultantTestRecord",
+    "mcpChecklistOverrides",
+    "mcpNextStep",
+    "gitWorkflow",
+];
+
+/// True for any value that represents real, meaningful workflow state worth warning about —
+/// false for null and for empty arrays/objects (nothing was actually recorded there).
+fn task_mcp_is_non_empty_workflow_value(value: &Value) -> bool {
+    match value {
+        Value::Null => false,
+        Value::Array(a) => !a.is_empty(),
+        Value::Object(o) => !o.is_empty(),
+        _ => true,
+    }
+}
+
+/// True when the task carries any generated/derived workflow state that a reset to NEW would
+/// discard. Used to decide whether resetting requires explicit confirmation (set_task_phase's
+/// confirmReset) — a task with none of this state is already effectively clean, and resetting it
+/// is a safe no-op. Mirrors JS taskHasResettableWorkflowState.
+fn task_mcp_task_has_resettable_workflow_state(task: &Value) -> bool {
+    TASK_MCP_RESETTABLE_WORKFLOW_KEYS.iter().any(|key| task_mcp_is_non_empty_workflow_value(&task[key]))
+}
+
+/// Resets a task's local workflow/execution state to the equivalent of a fresh NEW task, in
+/// place. Preserves identity, original assignment, user notes, and import/tracking metadata —
+/// only status/waitingState/attentionState/suggestedActions and the
+/// TASK_MCP_RESETTABLE_WORKFLOW_KEYS fields are touched. Removes (rather than nulling) the
+/// resettable keys so no stale nested object/array lingers in the persisted JSON. Never touches
+/// the filesystem, Git, Dataverse, or any external system — this is a pure in-memory mutation.
+/// Decides whether set_task_phase's phase="new" reset may proceed: rejects with the confirmation-
+/// required message when the task carries resettable state and confirmReset was not explicitly
+/// set, otherwise allows it (idempotent no-op case and explicit-confirmation case both return Ok).
+/// Pure — no I/O — so the confirmReset gate is unit-testable without a full task_mcp_execute_tool
+/// dispatch. The "set_task_phase" match arm calls this before task_mcp_reset_task_workflow_to_new.
+fn task_mcp_decide_new_phase_reset(task: &Value, confirm_reset: bool, task_id: &str) -> Result<(), String> {
+    if task_mcp_task_has_resettable_workflow_state(task) && !confirm_reset {
+        return Err(format!(
+            "Resetting task '{task_id}' to NEW will clear saved analysis, developer setup, technical plans and \
+            approvals, implementation verification, AI reviews, test/checklist results, next-step state, and local \
+            Git workflow tracking. The original assignment, customer, notes, tracking links, and repository files \
+            will not be changed — this does not touch Git or any external system. Explicit user approval is \
+            required before this reset can proceed. Ask the user to confirm, then retry with confirmReset=true."
+        ));
+    }
+    Ok(())
+}
+
+/// Mirrors JS resetTaskWorkflowToNew.
+fn task_mcp_reset_task_workflow_to_new(task: &mut Value) {
+    task["status"] = serde_json::json!("new");
+    task["waitingState"] = Value::Null;
+    task["attentionState"] = Value::Null;
+    task["suggestedActions"] = serde_json::json!([]);
+    if let Some(obj) = task.as_object_mut() {
+        for key in TASK_MCP_RESETTABLE_WORKFLOW_KEYS {
+            obj.remove(*key);
+        }
+    }
+}
+
 /// Canonical developer workflow transition service. Both MCP write tools and (in future) UI
 /// actions must call this instead of writing `status`/`waitingState`/helper fields ad hoc, so
 /// the app-visible phase never drifts from what MCP tools recorded.
@@ -8932,10 +9051,13 @@ fn task_mcp_normalize_dataverse_gate(raw_status: &str, warnings_accepted: bool) 
 }
 
 /// Evaluates whether a persisted AI Kit review payload (implementationVerification.aiCodeReview)
-/// satisfies the hard-gate requirements: status must be "passed", fixableFindings must be empty,
-/// and reviewedFiles/rulesFiles/checklistFiles/knownPrReviewFiles must all be non-empty — a
-/// "passed" status with missing details is treated as incomplete, not passed. Returns
-/// (gate_status, missing_detail_reasons) where gate_status is one of
+/// satisfies the hard-gate requirements. There are two independent ways to resolve the gate:
+///   1. An automated review with status "passed", empty fixableFindings, and non-empty
+///      reviewedFiles/rulesFiles/checklistFiles/knownPrReviewFiles — a "passed" status with
+///      missing details is treated as incomplete, not passed.
+///   2. An explicit manual UI override ("manually-verified" or "skipped") — these represent an
+///      explicit user decision and resolve the gate without requiring the automated detail payload.
+/// Returns (gate_status, missing_detail_reasons) where gate_status is one of
 /// "passed" | "incomplete" | "failed" | "pending" | "not_run".
 fn task_mcp_ai_kit_review_gate(review: &Value) -> (&'static str, Vec<String>) {
     if review.is_null() || !review.is_object() {
@@ -8944,6 +9066,9 @@ fn task_mcp_ai_kit_review_gate(review: &Value) -> (&'static str, Vec<String>) {
     let status = review["status"].as_str().unwrap_or("");
     if status.is_empty() {
         return ("not_run", vec![]);
+    }
+    if matches!(status, "manually-verified" | "skipped") {
+        return ("passed", vec![]);
     }
     let has_items = |key: &str| review[key].as_array().map(|a| !a.is_empty()).unwrap_or(false);
     let mut missing = Vec::new();
@@ -9012,14 +9137,54 @@ fn task_mcp_ai_internal_code_review_passthrough(task: &Value) -> (String, String
 
 /// Read-only passthrough for the "Local Test" modal row (task.implementationVerification.
 /// localTest — distinct from the top-level task.localTestRecord used by continue_developer_
-/// workflow's step 1 gate). MCP must never write this field for scripts.
+/// workflow's step 1 gate). record_ai_implementation_completed now writes this field directly
+/// for new AI-managed completions; for tasks completed before that write existed, backfill the
+/// same derivation here so every read path (modal, workflow overview, run_implementation_
+/// verification, get_implementation_verification_summary) agrees.
 fn task_mcp_local_test_impl_passthrough(task: &Value) -> (String, String) {
     let status = task["implementationVerification"]["localTest"]["status"].as_str().unwrap_or("");
     if status == "passed" || status == "not-needed" || status == "failed" {
-        (status.to_string(), format!("Existing Local Test status: {status}."))
-    } else {
-        ("needs_manual_action".to_string(), "Record Local Test in the Implementation Verification modal after manual/browser CRM testing (or mark it not-needed there).".to_string())
+        return (status.to_string(), format!("Existing Local Test status: {status}."));
     }
+    if task_mcp_is_legacy_ai_managed_local_test_not_needed(task) {
+        return (
+            "not-needed".to_string(),
+            "Skipped for AI-managed workflow; no browser/model-driven app test was performed.".to_string(),
+        );
+    }
+    ("needs_manual_action".to_string(), "Record Local Test in the Implementation Verification modal after manual/browser CRM testing (or mark it not-needed there).".to_string())
+}
+
+/// Called by record_ai_implementation_completed to write the canonical Local Test result for
+/// an AI-managed workflow — no browser/model-driven app test was performed, so it is recorded
+/// as not-needed, never as passed. Never overwrites an explicit passed/failed result already
+/// recorded via the Implementation Verification modal.
+fn task_mcp_record_ai_managed_local_test_not_needed(task: &mut Value, now: &str) {
+    if !task["implementationVerification"].is_object() {
+        task["implementationVerification"] = serde_json::json!({});
+    }
+    let existing_status = task["implementationVerification"]["localTest"]["status"].as_str().unwrap_or("");
+    if existing_status == "passed" || existing_status == "failed" {
+        return;
+    }
+    task["implementationVerification"]["localTest"] = serde_json::json!({
+        "status":     "not-needed",
+        "recordedAt": now,
+        "notes":      "Skipped for AI-managed workflow; no browser/model-driven app test was performed.",
+    });
+}
+
+/// Compatibility/backfill condition: an AI implementation was completed AND the legacy
+/// localTestRecord already marks Local Test as not-needed, but the canonical
+/// implementationVerification.localTest field predates record_ai_implementation_completed
+/// writing it directly. Ordinary manually managed tasks (no completed AI implementation) never
+/// match this and must still show Local Test as not-run/needs_manual_action.
+fn task_mcp_is_legacy_ai_managed_local_test_not_needed(task: &Value) -> bool {
+    let ai_completed = task["crmDeveloperWorkflow"]["lastAiImplementation"]["completedAt"].as_str()
+        .map(|s| !s.is_empty())
+        .unwrap_or(false);
+    let legacy_not_needed = task["localTestRecord"]["status"].as_str() == Some("not-needed");
+    ai_completed && legacy_not_needed
 }
 
 /// Normalized, modal-truth verification summary — the same shape regardless of which MCP tool
@@ -9158,28 +9323,177 @@ fn task_mcp_compose_manual_verification_step(summary: &Value) -> String {
     let needs = |row: &Value| matches!(row["status"].as_str(), Some("needs_manual_action") | Some("not-run"));
     let dv_needs = needs(&summary["dataverseCheck"]);
     let ai_needs = needs(&summary["aiCodeReview"]);
-    let local_needs = needs(&summary["localTest"]);
 
     let mut modal_names: Vec<&str> = Vec::new();
     if dv_needs { modal_names.push("Dataverse Metadata Check"); }
     if ai_needs { modal_names.push("AI Kit/Settings Review"); }
 
-    let mut parts: Vec<String> = Vec::new();
-    if !modal_names.is_empty() {
-        parts.push(format!("Run {} in the Implementation Verification modal.", modal_names.join(" and ")));
-    }
-    if local_needs {
-        parts.push(if parts.is_empty() {
-            "Upload/register the web resource manually and record Local Test/browser validation.".to_string()
-        } else {
-            "Then upload/register the web resource manually and record Local Test/browser validation.".to_string()
-        });
-    }
-    if parts.is_empty() {
+    if modal_names.is_empty() {
         "All Implementation Verification checks are resolved.".to_string()
     } else {
-        parts.join(" ")
+        format!("Run {} in the Implementation Verification modal.", modal_names.join(" and "))
     }
+}
+
+// ---------------------------------------------------------------------------
+// Deployment & Testing gate — mirrors src/lib/deploymentTestingGate.ts
+// (computeDeploymentTestingGate, computeCodeReviewReadinessGate) and
+// computeDeploymentTestingGate/computeCodeReviewReadinessGate in mcp/task-workbench-mcp.mjs.
+// Deliberately never reads implementationVerification.localTest, localTestRecord, or
+// consultantTestRecord — those predate the artifact ever being deployed.
+// ---------------------------------------------------------------------------
+
+fn task_mcp_derive_manual_deployment_status(task: &Value) -> String {
+    task["deploymentTesting"]["deployment"]["status"].as_str().unwrap_or("not-run").to_string()
+}
+
+fn task_mcp_derive_deployment_test_status(task: &Value) -> String {
+    task["deploymentTesting"]["test"]["status"].as_str().unwrap_or("not-run").to_string()
+}
+
+/// Single source of truth for "can this task proceed to Commit & Push". Pure — no I/O.
+fn task_mcp_compute_deployment_testing_gate(task: &Value) -> Value {
+    let deployment_status = task_mcp_derive_manual_deployment_status(task);
+    let test_status = task_mcp_derive_deployment_test_status(task);
+    let mut blocking_checks: Vec<Value> = Vec::new();
+
+    let deployment_resolved = deployment_status == "deployed" || deployment_status == "not-needed";
+    if !deployment_resolved {
+        blocking_checks.push(serde_json::json!({
+            "check": "deployment", "status": deployment_status,
+            "reason": if deployment_status == "failed" {
+                "Manual deployment was recorded as failed. Redeploy and record the result before testing."
+            } else {
+                "Manual deployment has not been recorded yet."
+            },
+        }));
+    }
+    if deployment_resolved {
+        if test_status == "failed" {
+            blocking_checks.push(serde_json::json!({
+                "check": "test", "status": test_status,
+                "reason": "Deployment test failed. Fix the code or redeploy, then record a new test result.",
+            }));
+        } else if test_status == "not-run" {
+            blocking_checks.push(serde_json::json!({
+                "check": "test", "status": test_status,
+                "reason": "Browser/model-driven app test has not been recorded yet.",
+            }));
+        }
+    }
+
+    let can_proceed_to_commit = blocking_checks.is_empty();
+    let next_recommended_action = if can_proceed_to_commit {
+        "prepare_commit"
+    } else if !deployment_resolved {
+        "wait_for_manual_deployment"
+    } else if test_status == "failed" {
+        "fix_code_or_redeploy"
+    } else {
+        "wait_for_deployment_test"
+    };
+
+    serde_json::json!({
+        "canProceedToCommit": can_proceed_to_commit,
+        "deploymentStatus": deployment_status,
+        "testStatus": test_status,
+        "blockingChecks": blocking_checks,
+        "nextRecommendedAction": next_recommended_action,
+    })
+}
+
+/// Shared record_manual_deployment/record_deployment_test validation: a successful outcome
+/// ('deployed'/'passed') or 'failed' is a one-click confirmation and never requires notes; only
+/// the 'not-needed' override requires a real, non-empty user-provided reason. Pure — no I/O.
+fn task_mcp_validate_not_needed_requires_notes(status: &str, notes: &str) -> Result<(), String> {
+    if status == "not-needed" && notes.trim().is_empty() {
+        Err(format!("notes is required and must be meaningful when recording status='{status}'"))
+    } else {
+        Ok(())
+    }
+}
+
+/// Blocks commit/push tools from advancing the workflow when the Deployment & Testing gate is
+/// unresolved. Read-only Git diagnostics (prepare_commit_for_task, reconcile_task_git_state) are
+/// still allowed — only actual commit/push mutations are rejected here.
+fn task_mcp_require_deployment_testing_gate_resolved(task: &Value) -> Result<(), String> {
+    let gate = task_mcp_compute_deployment_testing_gate(task);
+    if gate["canProceedToCommit"].as_bool().unwrap_or(false) {
+        Ok(())
+    } else {
+        let reason = gate["blockingChecks"][0]["reason"].as_str()
+            .unwrap_or("Deployment & Testing is not resolved yet.");
+        Err(format!(
+            "Cannot commit/push: {reason} Record manual deployment and a browser/application test \
+             result (record_manual_deployment, record_deployment_test) before committing."
+        ))
+    }
+}
+
+/// Single source of truth for "can this task enter Code Review / waiting for colleague review".
+/// Requires a verified local commit, a verified push of that same branch, and an explicitly
+/// created/recorded pull request — never satisfied by an AI/Claude code review alone.
+fn task_mcp_compute_code_review_readiness_gate(task: &Value) -> Value {
+    let gw = &task["gitWorkflow"];
+    let commit_verified = gw["lastCommitHash"].as_str().map(|s| !s.is_empty()).unwrap_or(false);
+    let last_pushed_branch = gw["lastPushedBranch"].as_str().filter(|s| !s.is_empty());
+    let last_commit_branch = gw["lastCommitBranch"].as_str().filter(|s| !s.is_empty());
+    let push_verified = last_pushed_branch.is_some()
+        && !gw["lastPushedAt"].is_null()
+        && (last_commit_branch.is_none() || last_pushed_branch == last_commit_branch);
+
+    let pr_tracking = &task["crmDeveloperWorkflow"]["pullRequestTracking"];
+    let pr_recorded = pr_tracking["createdManually"].as_bool().unwrap_or(false)
+        && pr_tracking["prUrl"].as_str().map(|s| !s.is_empty()).unwrap_or(false)
+        && pr_tracking["invalidatedAt"].is_null();
+
+    let can_enter_code_review = commit_verified && push_verified && pr_recorded;
+    let next_recommended_action = if can_enter_code_review {
+        "wait_for_colleague_code_review"
+    } else if !commit_verified || !push_verified {
+        "commit_and_push"
+    } else {
+        "prepare_pull_request"
+    };
+
+    serde_json::json!({
+        "canEnterCodeReview": can_enter_code_review,
+        "commitVerified": commit_verified,
+        "pushVerified": push_verified,
+        "prRecorded": pr_recorded,
+        "nextRecommendedAction": next_recommended_action,
+    })
+}
+
+/// continue_developer_workflow nextAction values that mean "the task is now (or already) in the
+/// Deployment & Testing phase". Kept in sync with DEPLOYMENT_TESTING_NEXT_ACTIONS in
+/// mcp/task-workbench-mcp.mjs.
+const DEPLOYMENT_TESTING_NEXT_ACTIONS: &[&str] = &["wait_for_manual_deployment", "wait_for_deployment_test", "fix_code_or_redeploy"];
+
+/// Pure decision: should this continue_developer_workflow call persist the Development ->
+/// Deployment & Testing transition? True exactly when the computed nextAction indicates the
+/// Deployment & Testing phase and the task has not already transitioned (idempotent — a repeated
+/// call while still waiting on manual deployment/testing, or once past it to commit/push/PR, is a
+/// no-op here). Pure — no I/O.
+fn task_mcp_should_transition_to_deployment_testing(task: &Value, next_action: &str) -> bool {
+    DEPLOYMENT_TESTING_NEXT_ACTIONS.contains(&next_action) && task["waitingState"].as_str() != Some("consultant-testing")
+}
+
+/// Applies the Development -> Deployment & Testing transition to `task` in place, when
+/// task_mcp_should_transition_to_deployment_testing says to. This is the SAME local-only mutation
+/// the "Continue to Deployment & Testing" UI button performs (waitingState only; status untouched)
+/// — never Git, filesystem, Dataverse, deployment, commit, push, or PR. Pure with respect to
+/// everything except `task` — no AppHandle, no task-list lookup, no save; the
+/// "continue_developer_workflow" tool arm is the only caller that persists the change afterward.
+/// Returns true when the transition was actually applied.
+fn task_mcp_apply_deployment_testing_transition(task: &mut Value, next_action: &str) -> bool {
+    if !task_mcp_should_transition_to_deployment_testing(task, next_action) {
+        return false;
+    }
+    task["waitingState"] = serde_json::json!("consultant-testing");
+    task["attentionState"] = Value::Null;
+    task_mcp_append_audit_note(task, &format!("continue_developer_workflow -> transitioned to Deployment & Testing ({next_action})"));
+    true
 }
 
 fn task_mcp_compute_continue_workflow_step(task: &Value) -> Value {
@@ -9191,23 +9505,10 @@ fn task_mcp_compute_continue_workflow_step(task: &Value) -> Value {
     let is_script = task_mcp_is_verifiable_dev_task(task);
     let _ = work_kind;
 
-    // 1. Local test must be recorded
-    let local_test_status = task["localTestRecord"]["status"].as_str().unwrap_or("");
-    let local_test_done = local_test_status == "passed" || local_test_status == "not-needed";
-    if !local_test_done {
-        return serde_json::json!({
-            "nextAction": "record_results",
-            "canProceed": false,
-            "requiresUserApproval": false,
-            "blockingUserAction": null,
-            "recommendedTool": "record_local_test",
-            "instructionForAI": "Record local build/test results using record_local_test before proceeding. Do not commit or push without a recorded test result.",
-            "allowedWrites": ["record_local_test"],
-            "forbiddenWrites": ["commit_task_changes", "push_task_branch", "commit_and_push_task_changes"],
-        });
-    }
-
-    // 2. Dataverse verification
+    // 1. Dataverse verification. (Local Test is NOT part of Implementation Verification — the
+    // legacy localTestRecord/implementationVerification.localTest fields are never read as a gate
+    // here; see task_mcp_compute_deployment_testing_gate below for the canonical post-deployment
+    // test gate.)
     let dv_check = &task["implementationVerification"]["dataverseCheck"];
     let first_verdict = task["crmVerificationReports"].as_array()
         .and_then(|a| a.first())
@@ -9332,9 +9633,11 @@ fn task_mcp_compute_continue_workflow_step(task: &Value) -> Value {
     // 3. AI Kit review — hard gate. Reads implementationVerification.aiCodeReview (the canonical
     // field the modal reads), NOT the looser task.aiKitReview.completedAt flag: recording ANY
     // verdict (including "failed") always sets completedAt, so gating on completedAt alone would
-    // let a failed/incomplete review through. task_mcp_ai_kit_review_gate requires status=="passed"
-    // AND fixableFindings empty AND reviewedFiles/rulesFiles/checklistFiles/knownPrReviewFiles all
-    // non-empty.
+    // let a failed/incomplete review through. task_mcp_ai_kit_review_gate resolves via either an
+    // automated status=="passed" review with fixableFindings empty AND reviewedFiles/rulesFiles/
+    // checklistFiles/knownPrReviewFiles all non-empty, OR an explicit manual UI override
+    // (status=="manually-verified" or "skipped", which record_ai_kit_review_result itself cannot
+    // set — see its input schema status enum).
     let ai_review = &task["implementationVerification"]["aiCodeReview"];
     let (ai_gate, ai_missing) = task_mcp_ai_kit_review_gate(ai_review);
     if ai_gate != "passed" {
@@ -9356,7 +9659,93 @@ fn task_mcp_compute_continue_workflow_step(task: &Value) -> Value {
         });
     }
 
-    // 4. Propose/confirm branch, then commit — each step requires its OWN explicit user
+    // 4. Deployment & Testing — local Task Workbench state only (record_manual_deployment /
+    // record_deployment_test never call Dataverse/Git/PAC CLI). Resolved only via the canonical
+    // deploymentTesting field — never the legacy localTestRecord/implementationVerification.
+    // localTest/consultantTestRecord fields.
+    let deployment_gate = task_mcp_compute_deployment_testing_gate(task);
+    if !deployment_gate["canProceedToCommit"].as_bool().unwrap_or(false) {
+        let next = deployment_gate["nextRecommendedAction"].as_str().unwrap_or("");
+        if next == "wait_for_manual_deployment" {
+            return serde_json::json!({
+                "nextAction": "wait_for_manual_deployment",
+                "canProceed": false,
+                "requiresUserApproval": true,
+                "blockingUserAction": "Ask the user to manually deploy the CRM artifact (Dataverse/Power Apps import, web resource publish, form registration, etc.), then record it with record_manual_deployment.",
+                "recommendedTool": null,
+                "instructionForAI": "Implementation Verification passed, but this is a local-only code/metadata gate — the artifact has not been deployed yet. Stop and ask the user to deploy it manually. Never call record_manual_deployment speculatively or because static verification passed; only after the user confirms the deployment actually happened, with meaningful notes describing what was done.",
+                "allowedWrites": ["record_manual_deployment"],
+                "forbiddenWrites": ["commit_task_changes", "push_task_branch", "commit_and_push_task_changes", "record_deployment_test"],
+            });
+        }
+        if next == "fix_code_or_redeploy" {
+            return serde_json::json!({
+                "nextAction": "fix_code_or_redeploy",
+                "canProceed": true,
+                "requiresUserApproval": false,
+                "blockingUserAction": null,
+                "recommendedTool": null,
+                "instructionForAI": "The deployment test was recorded as failed. Fix the code, or ask the user to redeploy, then wait for a new test result via record_deployment_test — do not proceed to commit/push.",
+                "allowedWrites": [],
+                "forbiddenWrites": ["commit_task_changes", "push_task_branch", "commit_and_push_task_changes"],
+            });
+        }
+        return serde_json::json!({
+            "nextAction": "wait_for_deployment_test",
+            "canProceed": false,
+            "requiresUserApproval": true,
+            "blockingUserAction": "Ask the user to perform a real browser/model-driven app test of the deployed artifact, then record it with record_deployment_test.",
+            "recommendedTool": null,
+            "instructionForAI": "Manual deployment is recorded. Stop and ask the user to test the deployed artifact in the browser/model-driven app. Never call record_deployment_test unless the user confirms a real test was actually performed.",
+            "allowedWrites": ["record_deployment_test"],
+            "forbiddenWrites": ["commit_task_changes", "push_task_branch", "commit_and_push_task_changes"],
+        });
+    }
+
+    // 5. Commit verified? Push verified? Pull request created/recorded? Each is a separate,
+    // explicit user approval — approving one is never approval for the next.
+    let review_readiness = task_mcp_compute_code_review_readiness_gate(task);
+    let commit_verified = review_readiness["commitVerified"].as_bool().unwrap_or(false);
+    let push_verified = review_readiness["pushVerified"].as_bool().unwrap_or(false);
+    let pr_recorded = review_readiness["prRecorded"].as_bool().unwrap_or(false);
+    if commit_verified && push_verified && pr_recorded {
+        return serde_json::json!({
+            "nextAction": "wait_for_colleague_code_review",
+            "canProceed": true,
+            "requiresUserApproval": true,
+            "blockingUserAction": "Waiting for a colleague to review the pull request.",
+            "recommendedTool": null,
+            "instructionForAI": "Commit, push, and pull request are all verified. Stop and report that the task is waiting for colleague code review. This is independent of any AI/Claude review performed earlier (record_ai_kit_review_result) — never call your own review an independent colleague review.",
+            "allowedWrites": [],
+            "forbiddenWrites": ["commit_task_changes", "push_task_branch", "commit_and_push_task_changes", "record_pull_request_created"],
+        });
+    }
+    if commit_verified && push_verified {
+        return serde_json::json!({
+            "nextAction": "prepare_pull_request",
+            "canProceed": true,
+            "requiresUserApproval": true,
+            "blockingUserAction": "Ask the user for a SEPARATE explicit approval before creating or recording a pull request — approval to commit/push is not approval to create a PR.",
+            "recommendedTool": "prepare_pull_request_for_task",
+            "instructionForAI": "Commit and push are verified. Call prepare_pull_request_for_task to preview the PR (branches, title, description, detected existing PR). Ask the user for a separate explicit approval before creating or recording a pull request. If automatic creation is unavailable for this provider, give manual instructions and record the result with record_pull_request_created only with a real PR URL the user (or you, after approval) actually created — never fabricate one.",
+            "allowedWrites": ["prepare_pull_request_for_task", "record_pull_request_created"],
+            "forbiddenWrites": ["commit_task_changes", "push_task_branch", "commit_and_push_task_changes"],
+        });
+    }
+    if commit_verified {
+        return serde_json::json!({
+            "nextAction": "commit_and_push",
+            "canProceed": true,
+            "requiresUserApproval": true,
+            "blockingUserAction": "Ask the user for a SEPARATE explicit approval before pushing.",
+            "recommendedTool": "push_task_branch",
+            "instructionForAI": "A commit is verified locally but not yet pushed. Ask the user for a separate explicit approval, then call push_task_branch or commit_and_push_task_changes.",
+            "allowedWrites": ["push_task_branch", "commit_and_push_task_changes"],
+            "forbiddenWrites": [],
+        });
+    }
+
+    // 6. Propose/confirm branch, then commit — each step requires its OWN explicit user
     // approval. Confirming a branch name does not imply the commit is approved, and vice versa.
     let confirmed_branch = task["gitWorkflow"]["confirmedBranch"].as_str().filter(|s| !s.is_empty());
     if let Some(branch) = confirmed_branch {
@@ -11216,8 +11605,16 @@ fn task_mcp_execute_tool(app: &tauri::AppHandle, tool_name: &str, args: &Value) 
             let index = task_mcp_find_task_index(&tasks, task_id)
                 .ok_or_else(|| format!("Task not found: {task_id}"))?;
             let task = &mut tasks[index];
-            task_mcp_set_status_phase(task, phase);
-            task_mcp_append_audit_note(task, &format!("set_task_phase -> {phase}"));
+
+            if phase == "new" {
+                let confirm_reset = args["confirmReset"].as_bool().unwrap_or(false);
+                task_mcp_decide_new_phase_reset(task, confirm_reset, task_id)?;
+                task_mcp_reset_task_workflow_to_new(task);
+                task_mcp_append_audit_note(task, "set_task_phase -> new (workflow reset to NEW)");
+            } else {
+                task_mcp_set_status_phase(task, phase);
+                task_mcp_append_audit_note(task, &format!("set_task_phase -> {phase}"));
+            }
             updated = true;
             serde_json::json!({"task": task_mcp_safe_task_summary(task)})
         }
@@ -11263,6 +11660,11 @@ fn task_mcp_execute_tool(app: &tauri::AppHandle, tool_name: &str, args: &Value) 
                 "note":      "Script implementation completed by AI — no local test required before Dataverse upload.",
             });
             task["mcpChecklistOverrides"]["local-test-done"] = serde_json::json!("optional");
+
+            // Also record the canonical modal-visible Local Test result so the Implementation
+            // Verification modal, workflow overview, and run_implementation_verification all
+            // agree with continue_developer_workflow's legacy localTestRecord gate.
+            task_mcp_record_ai_managed_local_test_not_needed(task, &now);
 
             let implemented_artifact_path = if task_mcp_is_script_workflow_task(task) {
                 let resolved = task_mcp_resolve_implemented_script_artifact(task, &files_changed);
@@ -11486,16 +11888,24 @@ fn task_mcp_execute_tool(app: &tauri::AppHandle, tool_name: &str, args: &Value) 
 
             // AI Internal Code Review: Claude (the calling MCP agent) performs this review itself
             // — read the AI Kit rules and target file, then call record_ai_kit_review_result. Only
-            // a passthrough when a result has already been recorded. Hard gate: a "passed" review
-            // with missing details (reviewedFiles/rulesFiles/checklistFiles/knownPrReviewFiles) is
-            // treated as incomplete, and any fixableFindings block the gate regardless of status —
-            // see task_mcp_ai_kit_review_gate.
+            // a passthrough when a result has already been recorded. Hard gate: an automated
+            // "passed" review with missing details (reviewedFiles/rulesFiles/checklistFiles/
+            // knownPrReviewFiles) is treated as incomplete, and any fixableFindings block the gate
+            // regardless of status — OR an explicit manual UI override ("manually-verified" /
+            // "skipped", which record_ai_kit_review_result itself cannot set) resolves the gate
+            // directly — see task_mcp_ai_kit_review_gate.
             if run_check("aiInternalCodeReview") {
                 let ai_review = tasks[index]["implementationVerification"]["aiCodeReview"].clone();
                 let (gate_status, missing_details) = task_mcp_ai_kit_review_gate(&ai_review);
                 match gate_status {
                     "passed" => {
-                        checks.push(serde_json::json!({ "name": "AI Internal Code Review", "status": "passed", "findings": ["AI Kit review passed with full review details recorded."], "review": ai_review }));
+                        let ai_raw_status = ai_review["status"].as_str().unwrap_or("");
+                        let passed_finding = match ai_raw_status {
+                            "manually-verified" => "AI Kit review gate resolved via explicit manual verification.",
+                            "skipped" => "AI Kit review gate resolved via explicit manual skip.",
+                            _ => "AI Kit review passed with full review details recorded.",
+                        };
+                        checks.push(serde_json::json!({ "name": "AI Internal Code Review", "status": "passed", "rawStatus": ai_raw_status, "findings": [passed_finding], "review": ai_review }));
                     }
                     "failed" => {
                         let ai_fixable = ai_review["fixableFindings"].as_array().cloned().unwrap_or_default();
@@ -11664,6 +12074,165 @@ fn task_mcp_execute_tool(app: &tauri::AppHandle, tool_name: &str, args: &Value) 
         }
 
         "get_task_workbench_mcp_capabilities" => task_mcp_capabilities(),
+
+        "get_deployment_testing_state" => {
+            let task_id = args["taskId"].as_str().unwrap_or("").trim();
+            if task_id.is_empty() { return Err("Missing required argument: taskId".to_string()); }
+            let task = task_mcp_get_task(&tasks, task_id)
+                .ok_or_else(|| format!("Task not found: {task_id}"))?;
+            let gate = task_mcp_compute_deployment_testing_gate(task);
+            let unresolved_required_rows: Vec<String> = gate["blockingChecks"].as_array()
+                .map(|a| a.iter().filter_map(|c| c["check"].as_str().map(str::to_string)).collect())
+                .unwrap_or_default();
+            serde_json::json!({
+                "taskId": task_id,
+                "deploymentStatus": gate["deploymentStatus"],
+                "testStatus": gate["testStatus"],
+                "unresolvedRequiredRows": unresolved_required_rows,
+                "canProceedToCommit": gate["canProceedToCommit"],
+                "nextRecommendedAction": gate["nextRecommendedAction"],
+                "blockingChecks": gate["blockingChecks"],
+            })
+        }
+
+        "get_pull_request_state" => {
+            let task_id = args["taskId"].as_str().unwrap_or("").trim();
+            if task_id.is_empty() { return Err("Missing required argument: taskId".to_string()); }
+            let task = task_mcp_get_task(&tasks, task_id)
+                .ok_or_else(|| format!("Task not found: {task_id}"))?;
+            let readiness = task_mcp_compute_code_review_readiness_gate(task);
+            serde_json::json!({
+                "taskId": task_id,
+                "prCreated": readiness["prRecorded"],
+                "prUrl": task["crmDeveloperWorkflow"]["pullRequestTracking"]["prUrl"],
+                "commitVerified": readiness["commitVerified"],
+                "pushVerified": readiness["pushVerified"],
+                "canEnterCodeReview": readiness["canEnterCodeReview"],
+                "nextRecommendedAction": readiness["nextRecommendedAction"],
+            })
+        }
+
+        "record_manual_deployment" => {
+            let task_id = args["taskId"].as_str().unwrap_or("").trim();
+            if task_id.is_empty() { return Err("Missing required argument: taskId".to_string()); }
+            let status = args["status"].as_str().unwrap_or("").trim().to_string();
+            if !matches!(status.as_str(), "deployed" | "failed" | "not-needed") {
+                return Err("status must be 'deployed', 'failed', or 'not-needed'".to_string());
+            }
+            let notes = args["notes"].as_str().unwrap_or("").trim().to_string();
+            task_mcp_validate_not_needed_requires_notes(&status, &notes)?;
+            let index = task_mcp_find_task_index(&tasks, task_id)
+                .ok_or_else(|| format!("Task not found: {task_id}"))?;
+            let now = chrono_now_iso();
+            {
+                let t = &mut tasks[index];
+                if t["deploymentTesting"].is_null() { t["deploymentTesting"] = serde_json::json!({}); }
+                let mut record = serde_json::json!({
+                    "status": status, "recordedAt": now, "recordedBy": "ai",
+                });
+                if !notes.is_empty() { record["notes"] = serde_json::json!(notes); }
+                for (key, arg_key) in [
+                    ("environmentId", "environmentId"), ("environmentName", "environmentName"),
+                    ("solutionUniqueName", "solutionUniqueName"), ("artifactType", "artifactType"),
+                    ("artifactPath", "artifactPath"), ("webResourceName", "webResourceName"),
+                    ("entityLogicalName", "entityLogicalName"), ("formName", "formName"),
+                ] {
+                    if let Some(v) = args[arg_key].as_str() { record[key] = serde_json::json!(v); }
+                }
+                t["deploymentTesting"]["deployment"] = record;
+                t["deploymentTesting"]["updatedAt"] = serde_json::json!(now);
+                if status == "failed" {
+                    t["waitingState"] = Value::Null;
+                    t["attentionState"] = Value::Null;
+                }
+                task_mcp_append_audit_note(t, &format!("record_manual_deployment -> {status}"));
+            }
+            updated = true;
+            let gate = task_mcp_compute_deployment_testing_gate(&tasks[index]);
+            serde_json::json!({
+                "taskId": task_id, "recorded": true, "deploymentStatus": status,
+                "nextRecommendedAction": gate["nextRecommendedAction"],
+            })
+        }
+
+        "record_deployment_test" => {
+            let task_id = args["taskId"].as_str().unwrap_or("").trim();
+            if task_id.is_empty() { return Err("Missing required argument: taskId".to_string()); }
+            let status = args["status"].as_str().unwrap_or("").trim().to_string();
+            if !matches!(status.as_str(), "passed" | "failed" | "not-needed") {
+                return Err("status must be 'passed', 'failed', or 'not-needed'".to_string());
+            }
+            let notes = args["notes"].as_str().unwrap_or("").trim().to_string();
+            task_mcp_validate_not_needed_requires_notes(&status, &notes)?;
+            let index = task_mcp_find_task_index(&tasks, task_id)
+                .ok_or_else(|| format!("Task not found: {task_id}"))?;
+            let pre_gate = task_mcp_compute_deployment_testing_gate(&tasks[index]);
+            let pre_deployment_status = pre_gate["deploymentStatus"].as_str().unwrap_or("not-run");
+            if pre_deployment_status != "deployed" && pre_deployment_status != "not-needed" {
+                return Err("Manual deployment must be recorded (record_manual_deployment) before a deployment test can be recorded.".to_string());
+            }
+            let now = chrono_now_iso();
+            {
+                let t = &mut tasks[index];
+                if t["deploymentTesting"].is_null() { t["deploymentTesting"] = serde_json::json!({}); }
+                let mut record = serde_json::json!({
+                    "status": status, "recordedAt": now, "recordedBy": "ai",
+                });
+                if !notes.is_empty() { record["notes"] = serde_json::json!(notes); }
+                if let Some(v) = args["testedEnvironment"].as_str() { record["testedEnvironment"] = serde_json::json!(v); }
+                if let Some(v) = args["testedAcceptanceCriteria"].as_array() { record["testedAcceptanceCriteria"] = serde_json::json!(v); }
+                t["deploymentTesting"]["test"] = record;
+                t["deploymentTesting"]["updatedAt"] = serde_json::json!(now);
+                if status == "failed" {
+                    t["waitingState"] = Value::Null;
+                    t["attentionState"] = Value::Null;
+                }
+                task_mcp_append_audit_note(t, &format!("record_deployment_test -> {status}"));
+            }
+            updated = true;
+            let gate = task_mcp_compute_deployment_testing_gate(&tasks[index]);
+            serde_json::json!({
+                "taskId": task_id, "recorded": true, "testStatus": status,
+                "canProceedToCommit": gate["canProceedToCommit"], "nextRecommendedAction": gate["nextRecommendedAction"],
+            })
+        }
+
+        "record_pull_request_created" => {
+            let task_id = args["taskId"].as_str().unwrap_or("").trim();
+            if task_id.is_empty() { return Err("Missing required argument: taskId".to_string()); }
+            let pr_url = args["prUrl"].as_str().unwrap_or("").trim().to_string();
+            if pr_url.is_empty() { return Err("Missing required argument: prUrl".to_string()); }
+            let index = task_mcp_find_task_index(&tasks, task_id)
+                .ok_or_else(|| format!("Task not found: {task_id}"))?;
+            let now = chrono_now_iso();
+            {
+                let t = &mut tasks[index];
+                if t["crmDeveloperWorkflow"].is_null() { t["crmDeveloperWorkflow"] = serde_json::json!({}); }
+                let mut tracking = serde_json::json!({ "createdManually": true, "createdAt": now, "prUrl": pr_url });
+                if let Some(v) = args["notes"].as_str() { tracking["notes"] = serde_json::json!(v); }
+                t["crmDeveloperWorkflow"]["pullRequestTracking"] = tracking;
+                task_mcp_append_audit_note(t, &format!("record_pull_request_created -> {pr_url}"));
+            }
+            let readiness = task_mcp_compute_code_review_readiness_gate(&tasks[index]);
+            let can_enter_code_review = readiness["canEnterCodeReview"].as_bool().unwrap_or(false);
+            if can_enter_code_review {
+                let t = &mut tasks[index];
+                t["status"] = serde_json::json!("ready-for-review");
+                t["waitingState"] = serde_json::json!("code-review");
+                t["attentionState"] = Value::Null;
+                t["mcpNextStep"] = serde_json::json!({
+                    "action": "Wait for colleague code review",
+                    "reason": "Pull request created and recorded. Waiting for colleague review — independent of any AI/Claude review.",
+                    "updatedAt": now,
+                });
+            }
+            updated = true;
+            serde_json::json!({
+                "taskId": task_id, "recorded": true,
+                "canEnterCodeReview": can_enter_code_review,
+                "nextRecommendedAction": readiness["nextRecommendedAction"],
+            })
+        }
 
         "record_local_test" => {
             let task_id = args["taskId"].as_str().unwrap_or("").trim();
@@ -12213,21 +12782,15 @@ fn task_mcp_execute_tool(app: &tauri::AppHandle, tool_name: &str, args: &Value) 
 
         "commit_task_changes" => {
             let task_id = args["taskId"].as_str().unwrap_or("").trim();
-            let message  = args["message"].as_str().unwrap_or("").trim();
-            let files: Vec<String> = args["files"].as_array()
-                .map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
-                .unwrap_or_default();
-            let force_add_files: Vec<String> = args["forceAddFiles"].as_array()
-                .map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
-                .unwrap_or_default();
-            let confirm_unrelated = args["confirmUnrelatedFiles"].as_bool().unwrap_or(false);
+            let (message, files, force_add_files, confirm_unrelated) = task_mcp_parse_commit_args(args);
             if task_id.is_empty() { return Err("Missing required argument: taskId".into()); }
             let task_idx = task_mcp_find_task_index(&tasks, task_id)
                 .ok_or_else(|| format!("Task not found: {task_id}"))?;
             let task_snap = tasks[task_idx].clone();
+            task_mcp_require_deployment_testing_gate_resolved(&task_snap)?;
             let repo_root = mcp_resolve_repo_root_for_task(app, &task_snap)?;
             let related_files = task_mcp_related_implementation_files(&task_snap);
-            let result = git_commit_impl(&repo_root, &files, message, &force_add_files, &related_files, confirm_unrelated)?;
+            let result = git_commit_impl(&repo_root, &files, &message, &force_add_files, &related_files, confirm_unrelated)?;
             let hash = result["commitHash"].as_str().unwrap_or("?").to_string();
             { let t = &mut tasks[task_idx];
               if t["gitWorkflow"].is_null() { t["gitWorkflow"] = serde_json::json!({}); }
@@ -12245,6 +12808,7 @@ fn task_mcp_execute_tool(app: &tauri::AppHandle, tool_name: &str, args: &Value) 
             let task_idx = task_mcp_find_task_index(&tasks, task_id)
                 .ok_or_else(|| format!("Task not found: {task_id}"))?;
             let task_snap = tasks[task_idx].clone();
+            task_mcp_require_deployment_testing_gate_resolved(&task_snap)?;
             let repo_root = mcp_resolve_repo_root_for_task(app, &task_snap)?;
             let result = git_push_impl(&repo_root)?;
             let branch = result["branch"].as_str().unwrap_or("?").to_string();
@@ -12261,19 +12825,13 @@ fn task_mcp_execute_tool(app: &tauri::AppHandle, tool_name: &str, args: &Value) 
 
         "commit_and_push_task_changes" => {
             let task_id = args["taskId"].as_str().unwrap_or("").trim();
-            let message  = args["message"].as_str().unwrap_or("").trim();
-            let files: Vec<String> = args["files"].as_array()
-                .map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
-                .unwrap_or_default();
-            let force_add_files: Vec<String> = args["forceAddFiles"].as_array()
-                .map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
-                .unwrap_or_default();
-            let confirm_unrelated = args["confirmUnrelatedFiles"].as_bool().unwrap_or(false);
+            let (message, files, force_add_files, confirm_unrelated) = task_mcp_parse_commit_args(args);
             let move_to_review = args["moveToReviewAfterPush"].as_bool().unwrap_or(false);
             if task_id.is_empty() { return Err("Missing required argument: taskId".into()); }
             let task_idx = task_mcp_find_task_index(&tasks, task_id)
                 .ok_or_else(|| format!("Task not found: {task_id}"))?;
             let task_snap = tasks[task_idx].clone();
+            task_mcp_require_deployment_testing_gate_resolved(&task_snap)?;
             let repo_root = mcp_resolve_repo_root_for_task(app, &task_snap)?;
             let related_files = task_mcp_related_implementation_files(&task_snap);
 
@@ -12291,7 +12849,7 @@ fn task_mcp_execute_tool(app: &tauri::AppHandle, tool_name: &str, args: &Value) 
                 }
             }
 
-            let commit = git_commit_impl(&repo_root, &files, message, &force_add_files, &related_files, confirm_unrelated)?;
+            let commit = git_commit_impl(&repo_root, &files, &message, &force_add_files, &related_files, confirm_unrelated)?;
             let hash   = commit["commitHash"].as_str().unwrap_or("?").to_string();
             let push   = git_push_impl(&repo_root)?;
             let branch = push["branch"].as_str().unwrap_or("?").to_string();
@@ -12306,26 +12864,121 @@ fn task_mcp_execute_tool(app: &tauri::AppHandle, tool_name: &str, args: &Value) 
                 t["gitWorkflow"]["lastPushedAt"] = serde_json::json!(now);
                 task_mcp_append_audit_note(t, &format!("commit_and_push_task_changes -> {hash} {branch}"));
             }
+            // Commit+push never jumps straight to Code Review — a pull request must still be
+            // created/recorded (see prepare_pull_request_for_task / record_pull_request_created).
+            // moveToReviewAfterPush is kept only to point the next step at preparing the PR.
             if move_to_review {
                 let now = chrono_now_iso();
                 let t = &mut tasks[task_idx];
-                t["status"]         = serde_json::json!("ready-for-review");
-                t["waitingState"]   = serde_json::json!("code-review");
-                t["attentionState"] = Value::Null;
-                t["mcpNextStep"]    = serde_json::json!({
-                    "action":    "Wait for code review",
-                    "reason":    "Changes committed and pushed. Task moved to code review.",
+                t["mcpNextStep"] = serde_json::json!({
+                    "action":    "Prepare pull request",
+                    "reason":    "Commit verified and pushed. Create a pull request before code review.",
                     "updatedAt": now,
                 });
-                task_mcp_append_audit_note(t, "set_task_phase -> review (after commit+push)");
+                task_mcp_append_audit_note(t, "commit_and_push_task_changes -> prepare pull request (not moved to review)");
             }
             updated = true;
-            let summary = if move_to_review {
-                format!("Commit {hash} created and branch '{branch}' pushed. Task moved to code review.")
-            } else {
-                format!("Commit {hash} created and branch '{branch}' pushed.")
+            let summary = format!("Commit {hash} created and branch '{branch}' pushed. A pull request is still required before code review.");
+            serde_json::json!({ "ok": true, "commitHash": hash, "branch": branch, "movedToReview": false, "summary": summary })
+        }
+
+        // Read-only PR preview — never creates a pull request or calls GitHub/Azure DevOps.
+        "prepare_pull_request_for_task" => {
+            let task_id = args["taskId"].as_str().unwrap_or("").trim();
+            if task_id.is_empty() { return Err("Missing required argument: taskId".into()); }
+            let task_idx = task_mcp_find_task_index(&tasks, task_id)
+                .ok_or_else(|| format!("Task not found: {task_id}"))?;
+            let task_snap = tasks[task_idx].clone();
+            let repo_root = mcp_resolve_repo_root_for_task(app, &task_snap)?;
+            let preview = git_commit_preview_impl(&repo_root, Some(&task_snap))?;
+
+            let source_branch = preview["branch"].as_str().unwrap_or("").to_string();
+            let target_branch = preview["baseBranch"].as_str().unwrap_or("main").to_string();
+            let remote_url = preview["remoteUrl"].as_str().map(str::to_string);
+            let provider = match &remote_url {
+                Some(u) if u.contains("dev.azure.com") || u.contains("visualstudio.com") => "azure-devops",
+                Some(u) if u.contains("github.com") => "github",
+                _ => "unknown",
             };
-            serde_json::json!({ "ok": true, "commitHash": hash, "branch": branch, "movedToReview": move_to_review, "summary": summary })
+            let title = task_snap["title"].as_str().unwrap_or("Task changes").to_string();
+            let existing_pr = task_snap["crmDeveloperWorkflow"]["pullRequestTracking"].clone();
+
+            serde_json::json!({
+                "taskId": task_id,
+                "provider": provider,
+                "remoteUrl": remote_url,
+                "sourceBranch": source_branch,
+                "targetBranch": target_branch,
+                "title": title,
+                "description": preview["suggestedCommitMessage"],
+                "changedFiles": preview["changedFiles"],
+                "existingPullRequest": if existing_pr.is_null() { Value::Null } else { existing_pr },
+                "canCreatePullRequest": preview["canCreatePullRequest"],
+            })
+        }
+
+        // Read-only Git inspection + local tracking-state repair. Never modifies Git history,
+        // stages files, commits, pushes, deletes lock files, or runs destructive reset operations.
+        "reconcile_task_git_state" => {
+            let task_id = args["taskId"].as_str().unwrap_or("").trim();
+            if task_id.is_empty() { return Err("Missing required argument: taskId".into()); }
+            let task_idx = task_mcp_find_task_index(&tasks, task_id)
+                .ok_or_else(|| format!("Task not found: {task_id}"))?;
+            let task_snap = tasks[task_idx].clone();
+            let repo_root = mcp_resolve_repo_root_for_task(app, &task_snap)?;
+
+            let current_branch = run_git_ro(&repo_root, &["rev-parse", "--abbrev-ref", "HEAD"]);
+            let head_sha = run_git_ro(&repo_root, &["rev-parse", "HEAD"]);
+            let upstream = run_git_ro(&repo_root, &["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"]);
+            // Remote branches that contain HEAD — a non-empty result means HEAD is present remotely.
+            let remote_branches_containing_head = run_git_ro(&repo_root, &["branch", "-r", "--contains", "HEAD"])
+                .map(|s| !s.trim().is_empty())
+                .unwrap_or(false);
+
+            let expected_hash = task_snap["gitWorkflow"]["lastCommitHash"].as_str().map(str::to_string);
+            let expected_branch = task_snap["gitWorkflow"]["lastCommitBranch"].as_str().map(str::to_string);
+            let head_matches_expected = matches!((&head_sha, &expected_hash), (Some(h), Some(e)) if h == e);
+
+            // Repair local tracking ONLY: if HEAD is verifiably present on a remote branch and the
+            // persisted gitWorkflow disagrees (missing or stale), correct it. Never touches Git itself.
+            let mut repaired = false;
+            let mut repair_notes: Vec<String> = Vec::new();
+            if remote_branches_containing_head {
+                if let (Some(sha), Some(branch)) = (&head_sha, &current_branch) {
+                    let t = &mut tasks[task_idx];
+                    if t["gitWorkflow"].is_null() { t["gitWorkflow"] = serde_json::json!({}); }
+                    if t["gitWorkflow"]["lastCommitHash"].as_str() != Some(sha.as_str()) {
+                        t["gitWorkflow"]["lastCommitHash"] = serde_json::json!(sha);
+                        t["gitWorkflow"]["lastCommitAt"] = serde_json::json!(chrono_now_iso());
+                        t["gitWorkflow"]["lastCommitBranch"] = serde_json::json!(branch);
+                        repaired = true;
+                        repair_notes.push(format!("Repaired gitWorkflow.lastCommitHash to {sha} (verified present on a remote branch)."));
+                    }
+                    if t["gitWorkflow"]["lastPushedBranch"].as_str() != Some(branch.as_str()) {
+                        t["gitWorkflow"]["lastPushedBranch"] = serde_json::json!(branch);
+                        t["gitWorkflow"]["lastPushedAt"] = serde_json::json!(chrono_now_iso());
+                        repaired = true;
+                        repair_notes.push(format!("Repaired gitWorkflow.lastPushedBranch to {branch} (verified present on a remote branch)."));
+                    }
+                    if repaired {
+                        task_mcp_append_audit_note(t, "reconcile_task_git_state -> repaired local tracking state");
+                    }
+                }
+            }
+            if repaired { updated = true; }
+
+            serde_json::json!({
+                "taskId": task_id,
+                "currentBranch": current_branch,
+                "headSha": head_sha,
+                "upstream": upstream,
+                "remoteBranchesContainHead": remote_branches_containing_head,
+                "expectedCommitHash": expected_hash,
+                "expectedCommitBranch": expected_branch,
+                "headMatchesExpected": head_matches_expected,
+                "repaired": repaired,
+                "repairNotes": repair_notes,
+            })
         }
 
         "create_branch_for_task" => {
@@ -12639,10 +13292,16 @@ fn task_mcp_execute_tool(app: &tauri::AppHandle, tool_name: &str, args: &Value) 
         "continue_developer_workflow" => {
             let task_id = args["taskId"].as_str().unwrap_or("").trim();
             if task_id.is_empty() { return Err("Missing required argument: taskId".to_string()); }
-            let task = task_mcp_get_task(&tasks, task_id)
+            let index = task_mcp_find_task_index(&tasks, task_id)
                 .ok_or_else(|| format!("Task not found: {task_id}"))?;
-            let mut result = task_mcp_compute_continue_workflow_step(task);
+            let step = task_mcp_compute_continue_workflow_step(&tasks[index]);
+            let next_action = step["nextAction"].as_str().unwrap_or("").to_string();
+            let transitioned = task_mcp_apply_deployment_testing_transition(&mut tasks[index], &next_action);
+            if transitioned { updated = true; }
+
+            let mut result = step;
             result["taskId"] = serde_json::json!(task_id);
+            result["transitionedToDeploymentTesting"] = serde_json::json!(transitioned);
             result
         }
 
@@ -17256,6 +17915,9 @@ mod tests {
 
     #[test]
     fn continue_developer_workflow_without_local_test_returns_record_results() {
+        // REGRESSION: Local Test was removed from Implementation Verification entirely. A fresh
+        // task with no localTestRecord and no implementationVerification must go straight to
+        // run_implementation_verification, never record_local_test/record_results.
         let task = serde_json::json!({
             "id": "task-test-cdw",
             "taskMode": "developer",
@@ -17263,9 +17925,10 @@ mod tests {
             "crmDeveloperWorkflow": { "detectedWorkKind": "script" },
         });
         let result = task_mcp_compute_continue_workflow_step(&task);
-        assert_eq!(result["nextAction"].as_str(), Some("record_results"));
-        assert_eq!(result["recommendedTool"].as_str(), Some("record_local_test"));
-        assert_eq!(result["canProceed"].as_bool(), Some(false));
+        assert_eq!(result["nextAction"].as_str(), Some("run_implementation_verification"));
+        assert_eq!(result["recommendedTool"].as_str(), Some("run_implementation_verification"));
+        assert_eq!(result["canProceed"].as_bool(), Some(true));
+        assert_ne!(result["nextAction"].as_str(), Some("record_results"));
     }
 
     #[test]
@@ -17288,6 +17951,10 @@ mod tests {
                 },
             },
             "aiKitReview": { "status": "passed", "completedAt": "2026-06-15T10:00:00.000Z" },
+            "deploymentTesting": {
+                "deployment": { "status": "not-needed", "notes": "No CRM-side deployment required for this test fixture." },
+                "test": { "status": "not-needed", "notes": "No deployed artifact to test in this fixture." },
+            },
         });
         let result = task_mcp_compute_continue_workflow_step(&task);
         assert_eq!(result["nextAction"].as_str(), Some("propose_branch"));
@@ -18370,10 +19037,7 @@ Business logika:
         assert_eq!(continue_step["nextAction"].as_str(), Some("wait_for_user"));
         assert_eq!(
             continue_step["blockingUserAction"].as_str(),
-            Some(
-                "Run Dataverse Metadata Check and AI Kit/Settings Review in the Implementation Verification modal. \
-                 Then upload/register the web resource manually and record Local Test/browser validation."
-            ),
+            Some("Run Dataverse Metadata Check and AI Kit/Settings Review in the Implementation Verification modal."),
         );
         // Blocked from reaching commit/push while verification rows are unresolved.
         assert!(continue_step["forbiddenWrites"].as_array().unwrap().iter().any(|v| v == "commit_task_changes"));
@@ -18565,9 +19229,10 @@ Business logika:
     }
 
     #[test]
-    fn local_test_impl_passthrough_does_not_read_top_level_local_test_record() {
-        // task.localTestRecord ('not-needed', the continue_developer_workflow gate) must not
-        // leak into implementationVerification.localTest (the modal row) as an auto-pass.
+    fn local_test_impl_passthrough_does_not_read_top_level_local_test_record_for_manual_tasks() {
+        // task.localTestRecord ('not-needed') alone, without a completed AI implementation, must
+        // not leak into implementationVerification.localTest (the modal row) as an auto-pass —
+        // ordinary manually managed tasks must still show Local Test as needing manual action.
         let mut task = make_template_task_no_plan_mappings();
         task["localTestRecord"] = serde_json::json!({"status": "not-needed"});
         let (status, _finding) = task_mcp_local_test_impl_passthrough(&task);
@@ -18580,6 +19245,46 @@ Business logika:
         task["implementationVerification"]["localTest"] = serde_json::json!({"status": "not-needed"});
         let (status, _finding) = task_mcp_local_test_impl_passthrough(&task);
         assert_eq!(status, "not-needed");
+    }
+
+    #[test]
+    fn local_test_impl_passthrough_backfills_not_needed_for_completed_ai_task_with_legacy_record() {
+        // Compatibility: tasks completed by the AI workflow before record_ai_implementation_
+        // completed started writing implementationVerification.localTest directly must still be
+        // reported as not-needed, derived from the legacy localTestRecord + completed AI implementation.
+        let mut task = make_template_task_no_plan_mappings();
+        task["crmDeveloperWorkflow"]["lastAiImplementation"] = serde_json::json!({"completedAt": "2026-01-01T00:00:00Z"});
+        task["localTestRecord"] = serde_json::json!({"status": "not-needed"});
+        let (status, finding) = task_mcp_local_test_impl_passthrough(&task);
+        assert_eq!(status, "not-needed");
+        assert!(finding.contains("Skipped for AI-managed workflow"));
+    }
+
+    #[test]
+    fn record_ai_managed_local_test_not_needed_sets_canonical_status() {
+        let mut task = make_template_task_no_plan_mappings();
+        task_mcp_record_ai_managed_local_test_not_needed(&mut task, "2026-01-01T00:00:00Z");
+        let local_test = &task["implementationVerification"]["localTest"];
+        assert_eq!(local_test["status"].as_str(), Some("not-needed"));
+        assert_eq!(local_test["recordedAt"].as_str(), Some("2026-01-01T00:00:00Z"));
+        assert!(local_test["notes"].as_str().unwrap_or("").contains("Skipped for AI-managed workflow"));
+    }
+
+    #[test]
+    fn record_ai_managed_local_test_not_needed_preserves_explicit_passed() {
+        let mut task = make_template_task_no_plan_mappings();
+        task["implementationVerification"]["localTest"] = serde_json::json!({"status": "passed", "recordedAt": "2025-01-01T00:00:00Z"});
+        task_mcp_record_ai_managed_local_test_not_needed(&mut task, "2026-01-01T00:00:00Z");
+        assert_eq!(task["implementationVerification"]["localTest"]["status"].as_str(), Some("passed"));
+        assert_eq!(task["implementationVerification"]["localTest"]["recordedAt"].as_str(), Some("2025-01-01T00:00:00Z"));
+    }
+
+    #[test]
+    fn record_ai_managed_local_test_not_needed_preserves_explicit_failed() {
+        let mut task = make_template_task_no_plan_mappings();
+        task["implementationVerification"]["localTest"] = serde_json::json!({"status": "failed", "recordedAt": "2025-01-01T00:00:00Z"});
+        task_mcp_record_ai_managed_local_test_not_needed(&mut task, "2026-01-01T00:00:00Z");
+        assert_eq!(task["implementationVerification"]["localTest"]["status"].as_str(), Some("failed"));
     }
 
     // ── Automated Dataverse Metadata Check + AI Kit review (run_implementation_verification) ────
@@ -18742,6 +19447,32 @@ Business logika:
     }
 
     #[test]
+    fn ai_kit_review_gate_manually_verified_resolves_without_automated_detail() {
+        let review = serde_json::json!({"status": "manually-verified"});
+        let (gate_status, missing) = task_mcp_ai_kit_review_gate(&review);
+        assert_eq!(gate_status, "passed");
+        assert!(missing.is_empty());
+    }
+
+    #[test]
+    fn ai_kit_review_gate_skipped_resolves_without_automated_detail() {
+        let review = serde_json::json!({"status": "skipped"});
+        let (gate_status, missing) = task_mcp_ai_kit_review_gate(&review);
+        assert_eq!(gate_status, "passed");
+        assert!(missing.is_empty());
+    }
+
+    #[test]
+    fn apply_ai_kit_review_result_rejects_manual_override_statuses_as_a_shortcut() {
+        // record_ai_kit_review_result must never let an AI agent call itself "manually-verified"
+        // or "skipped" in place of an honest automated verdict — those are manual UI overrides only.
+        let mut task = make_template_task_no_plan_mappings();
+        assert!(task_mcp_apply_ai_kit_review_result(&mut task, &serde_json::json!({"status": "manually-verified"}), "2026-07-01T00:00:00Z").is_err());
+        assert!(task_mcp_apply_ai_kit_review_result(&mut task, &serde_json::json!({"status": "skipped"}), "2026-07-01T00:00:00Z").is_err());
+        assert!(task["implementationVerification"]["aiCodeReview"].is_null());
+    }
+
+    #[test]
     fn dataverse_gate_warnings_blocks_until_accepted() {
         assert_eq!(task_mcp_normalize_dataverse_gate("warnings", false), "warnings_unaccepted");
         assert_eq!(task_mcp_normalize_dataverse_gate("warnings", true), "passed");
@@ -18847,6 +19578,201 @@ Business logika:
         let gate = task_mcp_compute_progression_gate(&task);
         assert_eq!(gate["canProceed"].as_bool(), Some(false));
         assert_eq!(gate["nextRecommendedAction"].as_str(), Some("run_ai_kit_review"));
+    }
+
+    #[test]
+    fn progression_gate_ai_review_failed_or_warnings_remain_blocking_without_manual_override() {
+        let failed = serde_json::json!({
+            "crmVerificationReports": [{"verdict": "pass"}],
+            "implementationVerification": {
+                "aiCodeReview": {
+                    "status": "failed",
+                    "reviewedFiles": ["a.js"], "rulesFiles": ["r.md"], "checklistFiles": ["c.md"], "knownPrReviewFiles": ["p.md"],
+                },
+            },
+        });
+        let gate = task_mcp_compute_progression_gate(&failed);
+        assert_eq!(gate["canProceed"].as_bool(), Some(false));
+        assert_eq!(gate["aiReviewGateStatus"].as_str(), Some("failed"));
+
+        let warnings = serde_json::json!({
+            "crmVerificationReports": [{"verdict": "pass"}],
+            "implementationVerification": {
+                "aiCodeReview": {
+                    "status": "warnings",
+                    "reviewedFiles": ["a.js"], "rulesFiles": ["r.md"], "checklistFiles": ["c.md"], "knownPrReviewFiles": ["p.md"],
+                },
+            },
+        });
+        let gate = task_mcp_compute_progression_gate(&warnings);
+        assert_eq!(gate["canProceed"].as_bool(), Some(false));
+        assert_eq!(gate["aiReviewGateStatus"].as_str(), Some("pending"));
+    }
+
+    #[test]
+    fn progression_gate_reported_modal_state_manually_verified_or_skipped_allows_proceed() {
+        // Exact reported state: Script File Readiness passed, Dataverse skipped, AI Internal Code
+        // Review manually-verified, Local Test passed — canProceed must be true.
+        let manually_verified = serde_json::json!({
+            "implementationVerification": {
+                "dataverseCheck": { "status": "skipped" },
+                "aiCodeReview": { "status": "manually-verified" },
+                "localTest": { "status": "passed" },
+            },
+        });
+        let gate = task_mcp_compute_progression_gate(&manually_verified);
+        assert_eq!(gate["canProceed"].as_bool(), Some(true));
+        assert_eq!(gate["dataverseGateStatus"].as_str(), Some("passed"));
+        assert_eq!(gate["aiReviewGateStatus"].as_str(), Some("passed"));
+
+        // Same state with AI Code Review "skipped" instead of "manually-verified" must also proceed.
+        let skipped = serde_json::json!({
+            "implementationVerification": {
+                "dataverseCheck": { "status": "skipped" },
+                "aiCodeReview": { "status": "skipped" },
+                "localTest": { "status": "passed" },
+            },
+        });
+        let gate = task_mcp_compute_progression_gate(&skipped);
+        assert_eq!(gate["canProceed"].as_bool(), Some(true));
+    }
+
+    /// A task that has been through the full developer workflow — analyzed, developed, verified,
+    /// tested, reviewed, and marked done — used to exercise "reset a fully-worked task" scenarios.
+    /// Mirrors makeFullyWorkedTask() in src/lib/taskWorkflowReset.spec.ts.
+    fn make_fully_worked_task_for_reset_tests() -> Value {
+        // Built from a raw JSON string (not the json! macro) — a single json! call with this many
+        // top-level keys exceeds the default macro recursion limit.
+        serde_json::from_str(r#"{
+            "id": "task-reset-1",
+            "title": "Fully worked task",
+            "source": "manual",
+            "customerId": "cust-1",
+            "taskType": "feature",
+            "status": "done",
+            "confidence": 80,
+            "originalMessage": "Original request text.",
+            "receivedAt": "2026-06-01T00:00:00Z",
+            "suggestedActions": [{"id": "a1", "label": "Do something"}],
+            "waitingState": null,
+            "attentionState": null,
+            "completedAt": "2026-06-10T00:00:00Z",
+            "estimatedEffort": 4,
+            "planningBucket": "today",
+            "suggestedPlanningBucket": "this_week",
+            "priorityScore": 72,
+            "priorityReason": "Due soon.",
+            "isPlanningLocked": true,
+            "analysisResult": {"summary": "Summary.", "suggestedActions": [], "confidence": 90},
+            "generatedReply": "Draft reply text.",
+            "scriptAnalysis": {"artifactType": "script", "entityLogicalName": "nvr_case"},
+            "selectedPluginProject": "MyPlugins",
+            "aiFileReviews": [{"reviewerName": "AI Kit", "filePath": "Scripts/foo.js"}],
+            "crmSkeletons": [{"mode": "script", "summary": "s"}],
+            "crmVerificationReports": [{"verdict": "pass"}],
+            "crmDeveloperWorkflow": {"detectedWorkKind": "script", "currentStep": "pull-request"},
+            "workflowSetup": {"devTargetKind": "script", "repositoryRoot": "C:/Repo"},
+            "taskMode": "developer",
+            "implementationVerification": {"aiCodeReview": {"status": "passed"}},
+            "localTestRecord": {"status": "passed", "updatedAt": "2026-06-05T00:00:00Z"},
+            "consultantTestRecord": {"status": "passed", "updatedAt": "2026-06-06T00:00:00Z"},
+            "mcpChecklistOverrides": {"diagnosis": "done"},
+            "mcpNextStep": {"action": "mark_done", "reason": "All resolved.", "updatedAt": "2026-06-09T00:00:00Z"},
+            "gitWorkflow": {"confirmedBranch": "feature/123-nvr", "lastCommitHash": "abc123"},
+            "dueAt": "2026-07-01T00:00:00Z",
+            "budget": 10,
+            "budgetHours": 8,
+            "budgetNote": "Fixed-price scope.",
+            "notes": "Manual note the user wrote.",
+            "ticketUrl": "https://helpdesk.example.com/tickets/1",
+            "mcpTestTask": true
+        }"#).unwrap()
+    }
+
+    #[test]
+    fn task_has_resettable_workflow_state_false_for_clean_new_task() {
+        let task = serde_json::json!({"id": "t1", "status": "new", "suggestedActions": []});
+        assert!(!task_mcp_task_has_resettable_workflow_state(&task));
+    }
+
+    #[test]
+    fn task_has_resettable_workflow_state_false_when_fields_present_but_empty() {
+        let task = serde_json::json!({
+            "id": "t1", "status": "new",
+            "aiFileReviews": [], "crmVerificationReports": [], "crmDeveloperWorkflow": {},
+            "workflowSetup": {}, "implementationVerification": {}, "mcpChecklistOverrides": {},
+        });
+        assert!(!task_mcp_task_has_resettable_workflow_state(&task));
+    }
+
+    #[test]
+    fn task_has_resettable_workflow_state_true_for_fully_worked_task() {
+        assert!(task_mcp_task_has_resettable_workflow_state(&make_fully_worked_task_for_reset_tests()));
+    }
+
+    #[test]
+    fn task_has_resettable_workflow_state_true_for_already_new_task_with_stale_legacy_state() {
+        // Reproduces the reported bug: status/waitingState/attentionState already reset to NEW,
+        // but crmDeveloperWorkflow/workflowSetup/etc. were never cleared by the old
+        // task_mcp_set_status_phase("new")-only reset.
+        let task = serde_json::json!({
+            "id": "t1", "status": "new", "waitingState": null, "attentionState": null,
+            "crmDeveloperWorkflow": {"detectedWorkKind": "script", "currentStep": "pull-request"},
+            "workflowSetup": {"devTargetKind": "script"},
+        });
+        assert!(task_mcp_task_has_resettable_workflow_state(&task));
+    }
+
+    #[test]
+    fn reset_task_workflow_to_new_clears_every_resettable_field_and_is_idempotent() {
+        let mut task = make_fully_worked_task_for_reset_tests();
+        task_mcp_reset_task_workflow_to_new(&mut task);
+
+        assert_eq!(task["status"].as_str(), Some("new"));
+        assert!(task["waitingState"].is_null());
+        assert!(task["attentionState"].is_null());
+        assert_eq!(task["suggestedActions"].as_array().map(|a| a.is_empty()), Some(true));
+        for key in TASK_MCP_RESETTABLE_WORKFLOW_KEYS {
+            assert!(task[*key].is_null(), "expected {key} to be removed after reset");
+        }
+        assert!(!task_mcp_task_has_resettable_workflow_state(&task));
+
+        // Idempotent: resetting again produces the same clean state.
+        let once = task.clone();
+        task_mcp_reset_task_workflow_to_new(&mut task);
+        assert_eq!(task, once);
+    }
+
+    #[test]
+    fn reset_task_workflow_to_new_preserves_identity_assignment_notes_and_tracking_metadata() {
+        let mut task = make_fully_worked_task_for_reset_tests();
+        task_mcp_reset_task_workflow_to_new(&mut task);
+
+        assert_eq!(task["id"].as_str(), Some("task-reset-1"));
+        assert_eq!(task["title"].as_str(), Some("Fully worked task"));
+        assert_eq!(task["customerId"].as_str(), Some("cust-1"));
+        assert_eq!(task["dueAt"].as_str(), Some("2026-07-01T00:00:00Z"));
+        assert_eq!(task["budget"].as_f64(), Some(10.0));
+        assert_eq!(task["budgetHours"].as_f64(), Some(8.0));
+        assert_eq!(task["budgetNote"].as_str(), Some("Fixed-price scope."));
+        assert_eq!(task["ticketUrl"].as_str(), Some("https://helpdesk.example.com/tickets/1"));
+        assert_eq!(task["notes"].as_str(), Some("Manual note the user wrote."));
+        assert_eq!(task["mcpTestTask"].as_bool(), Some(true));
+    }
+
+    #[test]
+    fn decide_new_phase_reset_blocks_without_confirmation_and_allows_with_it() {
+        let worked = make_fully_worked_task_for_reset_tests();
+        assert!(task_mcp_decide_new_phase_reset(&worked, false, "task-reset-1").is_err());
+        let err = task_mcp_decide_new_phase_reset(&worked, false, "task-reset-1").unwrap_err();
+        assert!(err.contains("confirmReset=true"));
+        assert!(task_mcp_decide_new_phase_reset(&worked, true, "task-reset-1").is_ok());
+    }
+
+    #[test]
+    fn decide_new_phase_reset_allows_clean_new_task_without_confirmation() {
+        let clean = serde_json::json!({"id": "t1", "status": "new", "suggestedActions": []});
+        assert!(task_mcp_decide_new_phase_reset(&clean, false, "t1").is_ok());
     }
 
     #[test]
@@ -19030,12 +19956,15 @@ Business logika:
         let rows = task_mcp_unresolved_modal_rows(&summary);
         assert_eq!(rows, vec!["dataverseCheck", "aiCodeReview", "localTest"]);
 
+        // Local Test is not part of Implementation Verification's manual-action message —
+        // task_mcp_unresolved_modal_rows still reports it (legacy display), but
+        // task_mcp_compose_manual_verification_step never mentions it.
         let message = task_mcp_compose_manual_verification_step(&summary);
         assert_eq!(
             message,
-            "Run Dataverse Metadata Check and AI Kit/Settings Review in the Implementation Verification modal. \
-             Then upload/register the web resource manually and record Local Test/browser validation.",
+            "Run Dataverse Metadata Check and AI Kit/Settings Review in the Implementation Verification modal.",
         );
+        assert!(!message.to_lowercase().contains("local test"));
     }
 
     #[test]
@@ -19043,12 +19972,14 @@ Business logika:
         let mut task = make_template_task_no_plan_mappings();
         task["crmVerificationReports"] = serde_json::json!([{"verdict": "pass"}]);
         task["implementationVerification"]["aiCodeReview"] = serde_json::json!({"status": "skipped"});
-        // Local Test remains unresolved — the only row still requiring manual action.
+        // Local Test remains unresolved (legacy display row), but it is not part of Implementation
+        // Verification's manual-action message — Dataverse/AI Kit review are the only rows that
+        // can appear here, and both are resolved in this fixture.
         let summary = task_mcp_build_modal_verification_summary(&task);
         assert_eq!(task_mcp_unresolved_modal_rows(&summary), vec!["localTest"]);
         assert_eq!(
             task_mcp_compose_manual_verification_step(&summary),
-            "Upload/register the web resource manually and record Local Test/browser validation.",
+            "All Implementation Verification checks are resolved.",
         );
     }
 
@@ -19089,9 +20020,10 @@ Business logika:
     }
 
     #[test]
-    fn workflow_overview_local_test_row_never_mentions_legacy_local_test_record() {
-        // Regression: task.localTestRecord ('not-needed', set by record_ai_implementation_completed)
-        // must never leak a contradictory note into the modal-visible localTest row.
+    fn workflow_overview_local_test_row_never_mentions_legacy_local_test_record_for_manual_tasks() {
+        // Regression: task.localTestRecord ('not-needed') alone, without a completed AI
+        // implementation, must never leak a contradictory note into the modal-visible localTest
+        // row for an ordinary manually managed task.
         let mut task = make_template_task_no_plan_mappings();
         task["crmVerificationReports"] = serde_json::json!([]);
         task["localTestRecord"] = serde_json::json!({
@@ -19107,6 +20039,38 @@ Business logika:
         );
         assert!(!local_test["message"].as_str().unwrap_or("").to_lowercase().contains("localtestrecord"));
         assert!(!local_test.as_object().unwrap().contains_key("note"));
+    }
+
+    #[test]
+    fn workflow_overview_backfills_local_test_not_needed_for_completed_ai_task() {
+        // An AI-managed task completed before record_ai_implementation_completed started writing
+        // implementationVerification.localTest directly must still report not-needed, not
+        // needs_manual_action, and must not appear in unresolvedRequiredRows.
+        let mut task = make_template_task_no_plan_mappings();
+        task["crmVerificationReports"] = serde_json::json!([]);
+        task["crmDeveloperWorkflow"]["lastAiImplementation"] = serde_json::json!({"completedAt": "2026-01-01T00:00:00Z"});
+        task["localTestRecord"] = serde_json::json!({"status": "not-needed"});
+        let overview = task_mcp_workflow_overview(&task);
+        let local_test = &overview["implementationVerification"]["localTest"];
+        assert_eq!(local_test["status"].as_str(), Some("not-needed"));
+        let rows: Vec<&str> = overview["unresolvedRequiredRows"].as_array().unwrap()
+            .iter().filter_map(|v| v.as_str()).collect();
+        assert!(!rows.contains(&"localTest"));
+    }
+
+    #[test]
+    fn workflow_overview_ai_managed_task_with_all_checks_resolved_never_waits_for_user_on_local_test() {
+        // run_implementation_verification / continue_developer_workflow must not return
+        // wait_for_user solely because of Local Test once Dataverse + AI review are resolved and
+        // the task is AI-managed with the legacy not-needed record.
+        let mut task = make_template_task_no_plan_mappings();
+        task["crmVerificationReports"] = serde_json::json!([{"verdict": "pass"}]);
+        task["implementationVerification"]["aiCodeReview"] = serde_json::json!({"status": "passed"});
+        task["crmDeveloperWorkflow"]["lastAiImplementation"] = serde_json::json!({"completedAt": "2026-01-01T00:00:00Z"});
+        task["localTestRecord"] = serde_json::json!({"status": "not-needed"});
+        let summary = task_mcp_build_modal_verification_summary(&task);
+        assert!(task_mcp_unresolved_modal_rows(&summary).is_empty());
+        assert_eq!(task_mcp_compose_manual_verification_step(&summary), "All Implementation Verification checks are resolved.");
     }
 
     #[test]
@@ -19794,6 +20758,103 @@ mod git_workflow_tests {
         assert!(forced.is_ok(), "{:?}", forced);
     }
 
+    // ── task_mcp_parse_commit_args: MCP JSON argument-forwarding boundary ──────────────────
+    //
+    // commit_task_changes and commit_and_push_task_changes already read args["confirmUnrelatedFiles"]
+    // and args["forceAddFiles"] correctly at the Rust dispatcher level, but the public MCP schema
+    // in mcp/task-workbench-mcp.mjs did not expose those properties (additionalProperties: false),
+    // so a real MCP caller's approval could never actually reach this parsing step. These tests
+    // exercise task_mcp_parse_commit_args with raw JSON shaped exactly like a real MCP tool call —
+    // the dispatcher boundary — rather than only git_commit_impl's already-covered Rust bools.
+
+    #[test]
+    fn parse_commit_args_reads_confirm_unrelated_and_force_add_files_from_raw_json() {
+        let args = serde_json::json!({
+            "taskId": "t1",
+            "message": "msg",
+            "files": ["a.txt", "b.txt"],
+            "forceAddFiles": ["b.txt"],
+            "confirmUnrelatedFiles": true,
+        });
+        let (message, files, force_add_files, confirm_unrelated) = task_mcp_parse_commit_args(&args);
+        assert_eq!(message, "msg");
+        assert_eq!(files, vec!["a.txt".to_string(), "b.txt".to_string()]);
+        assert_eq!(force_add_files, vec!["b.txt".to_string()]);
+        assert!(confirm_unrelated);
+    }
+
+    #[test]
+    fn parse_commit_args_defaults_are_safe_when_flags_absent() {
+        // A real MCP call that omits the new optional properties must not be silently treated as
+        // pre-approved — both flags must default to "not confirmed" / "nothing force-added".
+        let args = serde_json::json!({ "taskId": "t1", "message": "msg", "files": ["a.txt"] });
+        let (_, _, force_add_files, confirm_unrelated) = task_mcp_parse_commit_args(&args);
+        assert!(force_add_files.is_empty());
+        assert!(!confirm_unrelated);
+    }
+
+    #[test]
+    fn commit_dispatcher_boundary_confirm_unrelated_files_from_json_args_allows_previously_rejected_file() {
+        let dir = init_repo();
+        let root = dir.path().to_string_lossy().to_string();
+        checkout_or_create_task_branch_impl(&root, "feature/ok").expect("create");
+        std::fs::write(dir.path().join("a.txt"), "content\n").unwrap();
+        std::fs::write(dir.path().join("b.txt"), "content\n").unwrap();
+        let related = vec!["a.txt".to_string()];
+
+        // Without confirmUnrelatedFiles in the JSON args, the unrelated file is still rejected.
+        let args_no_confirm = serde_json::json!({
+            "taskId": "t1", "message": "msg", "files": ["a.txt", "b.txt"],
+        });
+        let (message, files, force_add_files, confirm_unrelated) = task_mcp_parse_commit_args(&args_no_confirm);
+        let blocked = git_commit_impl(&root, &files, &message, &force_add_files, &related, confirm_unrelated);
+        assert!(blocked.is_err());
+        assert!(blocked.unwrap_err().contains("b.txt"));
+
+        // With confirmUnrelatedFiles: true in the JSON args (as the user's explicit approval), it
+        // reaches the dispatcher and the commit is allowed.
+        let args_confirmed = serde_json::json!({
+            "taskId": "t1", "message": "msg", "files": ["a.txt", "b.txt"], "confirmUnrelatedFiles": true,
+        });
+        let (message, files, force_add_files, confirm_unrelated) = task_mcp_parse_commit_args(&args_confirmed);
+        let allowed = git_commit_impl(&root, &files, &message, &force_add_files, &related, confirm_unrelated);
+        assert!(allowed.is_ok(), "{:?}", allowed);
+    }
+
+    #[test]
+    fn commit_dispatcher_boundary_force_add_files_from_json_args_only_allows_specifically_approved_paths() {
+        let dir = init_repo();
+        let root = dir.path().to_string_lossy().to_string();
+        checkout_or_create_task_branch_impl(&root, "feature/ok").expect("create");
+        std::fs::write(dir.path().join(".gitignore"), "ignored1.txt\nignored2.txt\n").unwrap();
+        assert!(run(&root, &["add", ".gitignore"]).status.success());
+        assert!(run(&root, &["commit", "-m", "add gitignore"]).status.success());
+        std::fs::write(dir.path().join("ignored1.txt"), "shh1\n").unwrap();
+        std::fs::write(dir.path().join("ignored2.txt"), "shh2\n").unwrap();
+
+        // Approving only ignored1.txt must not force-add ignored2.txt too — the whole commit is
+        // still rejected, naming the path the user did not approve.
+        let args_partial = serde_json::json!({
+            "taskId": "t1", "message": "msg",
+            "files": ["ignored1.txt", "ignored2.txt"],
+            "forceAddFiles": ["ignored1.txt"],
+        });
+        let (message, files, force_add_files, confirm_unrelated) = task_mcp_parse_commit_args(&args_partial);
+        let blocked = git_commit_impl(&root, &files, &message, &force_add_files, &[], confirm_unrelated);
+        assert!(blocked.is_err());
+        assert!(blocked.unwrap_err().contains("ignored2.txt"));
+
+        // Approving both specific paths via forceAddFiles in the JSON args allows the commit.
+        let args_full = serde_json::json!({
+            "taskId": "t1", "message": "msg",
+            "files": ["ignored1.txt", "ignored2.txt"],
+            "forceAddFiles": ["ignored1.txt", "ignored2.txt"],
+        });
+        let (message, files, force_add_files, confirm_unrelated) = task_mcp_parse_commit_args(&args_full);
+        let allowed = git_commit_impl(&root, &files, &message, &force_add_files, &[], confirm_unrelated);
+        assert!(allowed.is_ok(), "{:?}", allowed);
+    }
+
     #[test]
     fn prepare_commit_for_task_reports_ignored_task_created_file() {
         let dir = init_repo();
@@ -19839,6 +20900,10 @@ mod git_workflow_tests {
                     "reviewedFiles": ["a.js"], "rulesFiles": ["r.md"], "checklistFiles": ["c.md"], "knownPrReviewFiles": ["p.md"],
                 },
             },
+            "deploymentTesting": {
+                "deployment": { "status": "not-needed", "notes": "No CRM-side deployment required for this test fixture." },
+                "test": { "status": "not-needed", "notes": "No deployed artifact to test in this fixture." },
+            },
             "gitWorkflow": { "confirmedBranch": "feature/123-thing" },
         });
         let step = task_mcp_compute_continue_workflow_step(&task);
@@ -19865,12 +20930,357 @@ mod git_workflow_tests {
                     "reviewedFiles": ["a.js"], "rulesFiles": ["r.md"], "checklistFiles": ["c.md"], "knownPrReviewFiles": ["p.md"],
                 },
             },
+            "deploymentTesting": {
+                "deployment": { "status": "not-needed", "notes": "No CRM-side deployment required for this test fixture." },
+                "test": { "status": "not-needed", "notes": "No deployed artifact to test in this fixture." },
+            },
         });
         let step = task_mcp_compute_continue_workflow_step(&task);
         assert_eq!(step["nextAction"].as_str(), Some("propose_branch"));
         assert_eq!(step["recommendedTool"].as_str(), Some("create_or_checkout_task_branch"));
         let forbidden: Vec<&str> = step["forbiddenWrites"].as_array().unwrap().iter().filter_map(|v| v.as_str()).collect();
         assert!(forbidden.contains(&"commit_task_changes"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Deployment & Testing / Commit & Push / Pull Request gates
+    // -----------------------------------------------------------------------
+
+    fn verified_dev_task(overrides: Value) -> Value {
+        let mut task = serde_json::json!({
+            "id": "task-deploy-test",
+            "taskMode": "developer",
+            "workflowSetup": { "devTargetKind": "script" },
+            "crmDeveloperWorkflow": { "detectedWorkKind": "script" },
+            "implementationVerification": {
+                "dataverseCheck": { "status": "skipped" },
+                "aiCodeReview": {
+                    "status": "passed",
+                    "reviewedFiles": ["a.js"], "rulesFiles": ["r.md"], "checklistFiles": ["c.md"], "knownPrReviewFiles": ["p.md"],
+                },
+            },
+        });
+        for (k, v) in overrides.as_object().unwrap() {
+            task[k] = v.clone();
+        }
+        task
+    }
+
+    #[test]
+    fn deployment_testing_gate_blocks_with_wait_for_manual_deployment_when_nothing_recorded() {
+        let task = serde_json::json!({});
+        let gate = task_mcp_compute_deployment_testing_gate(&task);
+        assert_eq!(gate["canProceedToCommit"].as_bool(), Some(false));
+        assert_eq!(gate["nextRecommendedAction"].as_str(), Some("wait_for_manual_deployment"));
+    }
+
+    #[test]
+    fn deployment_testing_gate_requires_deployment_before_test_can_resolve_it() {
+        // REGRESSION: deployment must be recorded before browser testing can complete, unless
+        // explicitly not needed — a passed test alone must not resolve the gate.
+        let task = serde_json::json!({
+            "deploymentTesting": { "test": { "status": "passed", "notes": "Tested." } },
+        });
+        let gate = task_mcp_compute_deployment_testing_gate(&task);
+        assert_eq!(gate["canProceedToCommit"].as_bool(), Some(false));
+        assert_eq!(gate["nextRecommendedAction"].as_str(), Some("wait_for_manual_deployment"));
+    }
+
+    #[test]
+    fn deployment_testing_gate_failed_deployment_blocks_testing_and_commit() {
+        let task = serde_json::json!({
+            "deploymentTesting": { "deployment": { "status": "failed", "notes": "Import failed." } },
+        });
+        let gate = task_mcp_compute_deployment_testing_gate(&task);
+        assert_eq!(gate["canProceedToCommit"].as_bool(), Some(false));
+        assert_eq!(gate["nextRecommendedAction"].as_str(), Some("wait_for_manual_deployment"));
+    }
+
+    #[test]
+    fn deployment_testing_gate_failed_test_blocks_commit() {
+        let task = serde_json::json!({
+            "deploymentTesting": {
+                "deployment": { "status": "deployed", "notes": "Deployed to dev." },
+                "test": { "status": "failed", "notes": "onChange did not fire." },
+            },
+        });
+        let gate = task_mcp_compute_deployment_testing_gate(&task);
+        assert_eq!(gate["canProceedToCommit"].as_bool(), Some(false));
+        assert_eq!(gate["nextRecommendedAction"].as_str(), Some("fix_code_or_redeploy"));
+    }
+
+    #[test]
+    fn deployment_testing_gate_passing_both_enables_commit_preparation() {
+        let task = serde_json::json!({
+            "deploymentTesting": {
+                "deployment": { "status": "deployed", "notes": "Deployed to dev." },
+                "test": { "status": "passed", "notes": "Verified in browser." },
+            },
+        });
+        let gate = task_mcp_compute_deployment_testing_gate(&task);
+        assert_eq!(gate["canProceedToCommit"].as_bool(), Some(true));
+        assert_eq!(gate["nextRecommendedAction"].as_str(), Some("prepare_commit"));
+    }
+
+    #[test]
+    fn validate_not_needed_requires_notes_accepts_successful_and_failed_outcomes_without_notes() {
+        assert!(task_mcp_validate_not_needed_requires_notes("deployed", "").is_ok());
+        assert!(task_mcp_validate_not_needed_requires_notes("passed", "").is_ok());
+        assert!(task_mcp_validate_not_needed_requires_notes("failed", "").is_ok());
+    }
+
+    #[test]
+    fn validate_not_needed_requires_notes_rejects_not_needed_without_a_meaningful_reason() {
+        assert!(task_mcp_validate_not_needed_requires_notes("not-needed", "").is_err());
+        assert!(task_mcp_validate_not_needed_requires_notes("not-needed", "   ").is_err());
+        assert!(task_mcp_validate_not_needed_requires_notes("not-needed", "No deployment required for this repo-only change.").is_ok());
+    }
+
+    #[test]
+    fn code_review_readiness_gate_requires_pr_even_with_verified_commit_and_push() {
+        // REGRESSION: AI Kit review never counts as colleague PR review, and PR
+        // creation/recording is required before entering Code Review even with a verified push.
+        let task = serde_json::json!({
+            "implementationVerification": {
+                "aiCodeReview": {
+                    "status": "passed",
+                    "reviewedFiles": ["a.js"], "rulesFiles": ["r.md"], "checklistFiles": ["c.md"], "knownPrReviewFiles": ["p.md"],
+                },
+            },
+            "gitWorkflow": {
+                "lastCommitHash": "abc123", "lastCommitBranch": "feature/x",
+                "lastPushedBranch": "feature/x", "lastPushedAt": "2026-06-15T10:00:00.000Z",
+            },
+        });
+        let gate = task_mcp_compute_code_review_readiness_gate(&task);
+        assert_eq!(gate["commitVerified"].as_bool(), Some(true));
+        assert_eq!(gate["pushVerified"].as_bool(), Some(true));
+        assert_eq!(gate["canEnterCodeReview"].as_bool(), Some(false));
+        assert_eq!(gate["nextRecommendedAction"].as_str(), Some("prepare_pull_request"));
+    }
+
+    #[test]
+    fn code_review_readiness_gate_resolves_once_pr_is_recorded() {
+        let task = serde_json::json!({
+            "gitWorkflow": {
+                "lastCommitHash": "abc123", "lastCommitBranch": "feature/x",
+                "lastPushedBranch": "feature/x", "lastPushedAt": "2026-06-15T10:00:00.000Z",
+            },
+            "crmDeveloperWorkflow": {
+                "pullRequestTracking": { "createdManually": true, "prUrl": "https://dev.azure.com/org/proj/_git/repo/pullrequest/1" },
+            },
+        });
+        let gate = task_mcp_compute_code_review_readiness_gate(&task);
+        assert_eq!(gate["canEnterCodeReview"].as_bool(), Some(true));
+        assert_eq!(gate["nextRecommendedAction"].as_str(), Some("wait_for_colleague_code_review"));
+    }
+
+    #[test]
+    fn continue_workflow_recommends_wait_for_manual_deployment_once_verification_passes() {
+        let task = verified_dev_task(serde_json::json!({}));
+        let step = task_mcp_compute_continue_workflow_step(&task);
+        assert_eq!(step["nextAction"].as_str(), Some("wait_for_manual_deployment"));
+        assert_eq!(step["requiresUserApproval"].as_bool(), Some(true));
+        let forbidden: Vec<&str> = step["forbiddenWrites"].as_array().unwrap().iter().filter_map(|v| v.as_str()).collect();
+        assert!(forbidden.contains(&"commit_task_changes"));
+    }
+
+    #[test]
+    fn continue_workflow_recommends_wait_for_deployment_test_once_deployment_recorded() {
+        let task = verified_dev_task(serde_json::json!({
+            "deploymentTesting": { "deployment": { "status": "deployed", "notes": "Deployed to dev." } },
+        }));
+        let step = task_mcp_compute_continue_workflow_step(&task);
+        assert_eq!(step["nextAction"].as_str(), Some("wait_for_deployment_test"));
+    }
+
+    #[test]
+    fn continue_workflow_recommends_fix_code_or_redeploy_when_test_failed() {
+        let task = verified_dev_task(serde_json::json!({
+            "deploymentTesting": {
+                "deployment": { "status": "deployed", "notes": "Deployed to dev." },
+                "test": { "status": "failed", "notes": "Did not fire." },
+            },
+        }));
+        let step = task_mcp_compute_continue_workflow_step(&task);
+        assert_eq!(step["nextAction"].as_str(), Some("fix_code_or_redeploy"));
+    }
+
+    #[test]
+    fn continue_workflow_recommends_commit_and_push_once_a_commit_exists_unpushed() {
+        let task = verified_dev_task(serde_json::json!({
+            "deploymentTesting": {
+                "deployment": { "status": "deployed", "notes": "Deployed to dev." },
+                "test": { "status": "passed", "notes": "Verified." },
+            },
+            "gitWorkflow": { "lastCommitHash": "abc123", "lastCommitBranch": "feature/x" },
+        }));
+        let step = task_mcp_compute_continue_workflow_step(&task);
+        assert_eq!(step["nextAction"].as_str(), Some("commit_and_push"));
+    }
+
+    #[test]
+    fn continue_workflow_recommends_prepare_pull_request_once_push_verified() {
+        let task = verified_dev_task(serde_json::json!({
+            "deploymentTesting": {
+                "deployment": { "status": "deployed", "notes": "Deployed to dev." },
+                "test": { "status": "passed", "notes": "Verified." },
+            },
+            "gitWorkflow": {
+                "lastCommitHash": "abc123", "lastCommitBranch": "feature/x",
+                "lastPushedBranch": "feature/x", "lastPushedAt": "2026-06-15T10:00:00.000Z",
+            },
+        }));
+        let step = task_mcp_compute_continue_workflow_step(&task);
+        assert_eq!(step["nextAction"].as_str(), Some("prepare_pull_request"));
+        assert_eq!(step["recommendedTool"].as_str(), Some("prepare_pull_request_for_task"));
+    }
+
+    #[test]
+    fn continue_workflow_recommends_wait_for_colleague_code_review_once_pr_recorded() {
+        let task = verified_dev_task(serde_json::json!({
+            "deploymentTesting": {
+                "deployment": { "status": "deployed", "notes": "Deployed to dev." },
+                "test": { "status": "passed", "notes": "Verified." },
+            },
+            "gitWorkflow": {
+                "lastCommitHash": "abc123", "lastCommitBranch": "feature/x",
+                "lastPushedBranch": "feature/x", "lastPushedAt": "2026-06-15T10:00:00.000Z",
+            },
+            "crmDeveloperWorkflow": {
+                "detectedWorkKind": "script",
+                "pullRequestTracking": { "createdManually": true, "prUrl": "https://dev.azure.com/org/proj/_git/repo/pullrequest/1" },
+            },
+        }));
+        let step = task_mcp_compute_continue_workflow_step(&task);
+        assert_eq!(step["nextAction"].as_str(), Some("wait_for_colleague_code_review"));
+        assert!(step["instructionForAI"].as_str().unwrap().to_lowercase().contains("independent"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Deployment & Testing transition persistence (bug fix regression coverage)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn should_transition_to_deployment_testing_true_for_all_three_deployment_testing_actions() {
+        for action in ["wait_for_manual_deployment", "wait_for_deployment_test", "fix_code_or_redeploy"] {
+            let task = serde_json::json!({});
+            assert!(task_mcp_should_transition_to_deployment_testing(&task, action), "expected true for {action}");
+        }
+    }
+
+    #[test]
+    fn should_transition_to_deployment_testing_false_for_other_actions() {
+        for action in ["run_ai_kit_review", "propose_branch", "prepare_commit", "commit_and_push", "prepare_pull_request", "wait_for_colleague_code_review", "needs_configuration"] {
+            let task = serde_json::json!({});
+            assert!(!task_mcp_should_transition_to_deployment_testing(&task, action), "expected false for {action}");
+        }
+    }
+
+    #[test]
+    fn should_transition_to_deployment_testing_false_once_already_transitioned() {
+        let task = serde_json::json!({ "waitingState": "consultant-testing" });
+        assert!(!task_mcp_should_transition_to_deployment_testing(&task, "wait_for_manual_deployment"));
+    }
+
+    #[test]
+    fn apply_deployment_testing_transition_sets_waiting_state_and_clears_attention_state() {
+        let mut task = serde_json::json!({ "id": "t1", "status": "in-progress", "attentionState": "pr-comments", "notes": "" });
+        let applied = task_mcp_apply_deployment_testing_transition(&mut task, "wait_for_manual_deployment");
+        assert!(applied);
+        assert_eq!(task["waitingState"].as_str(), Some("consultant-testing"));
+        assert_eq!(task["status"].as_str(), Some("in-progress")); // status itself is untouched
+        assert!(task["attentionState"].is_null());
+        assert!(task["notes"].as_str().unwrap().contains("transitioned to Deployment & Testing"));
+    }
+
+    #[test]
+    fn apply_deployment_testing_transition_is_idempotent() {
+        let mut task = serde_json::json!({ "id": "t1", "status": "in-progress", "notes": "" });
+        assert!(task_mcp_apply_deployment_testing_transition(&mut task, "wait_for_manual_deployment"));
+        // Second call: already transitioned, must be a no-op (does not re-append a note).
+        let applied_again = task_mcp_apply_deployment_testing_transition(&mut task, "wait_for_manual_deployment");
+        assert!(!applied_again);
+        let transition_notes = task["notes"].as_str().unwrap().split('\n').filter(|l| l.contains("transitioned to Deployment & Testing")).count();
+        assert_eq!(transition_notes, 1);
+    }
+
+    #[test]
+    fn apply_deployment_testing_transition_does_not_touch_deployment_test_or_git_state() {
+        let mut task = serde_json::json!({ "id": "t1", "status": "in-progress", "notes": "" });
+        task_mcp_apply_deployment_testing_transition(&mut task, "wait_for_manual_deployment");
+        // Deployment/test remain unresolved after the transition — this is a local phase marker
+        // only, never a Dataverse/Git/deployment/commit/push/PR operation.
+        assert!(task["deploymentTesting"].is_null());
+        assert!(task["gitWorkflow"].is_null());
+        let gate = task_mcp_compute_deployment_testing_gate(&task);
+        assert_eq!(gate["canProceedToCommit"].as_bool(), Some(false));
+    }
+
+    #[test]
+    fn regression_full_sequence_transitions_from_development_to_deployment_testing_without_resetting_verification() {
+        // Simulates the tool arm's logic end-to-end at the pure-function level (no AppHandle
+        // needed): compute the step, then decide/apply the transition from it — exactly what
+        // src-tauri's "continue_developer_workflow" tool arm and mcp/task-workbench-mcp.mjs's
+        // case both do. Also covers the legacy-task backward-compatibility requirement: no
+        // deploymentTesting field yet, status/waitingState still plain Development.
+        let mut task = verified_dev_task(serde_json::json!({ "status": "in-progress", "waitingState": Value::Null, "notes": "" }));
+        assert!(task["deploymentTesting"].is_null());
+
+        let step = task_mcp_compute_continue_workflow_step(&task);
+        assert_eq!(step["nextAction"].as_str(), Some("wait_for_manual_deployment"));
+        let next_action = step["nextAction"].as_str().unwrap().to_string();
+        let transitioned = task_mcp_apply_deployment_testing_transition(&mut task, &next_action);
+
+        assert!(transitioned);
+        assert_eq!(task["waitingState"].as_str(), Some("consultant-testing"));
+        assert_eq!(task["status"].as_str(), Some("in-progress"));
+        // Passed verification results are untouched — no reset performed.
+        assert_eq!(task["implementationVerification"]["dataverseCheck"]["status"].as_str(), Some("skipped"));
+        assert_eq!(task["implementationVerification"]["aiCodeReview"]["status"].as_str(), Some("passed"));
+
+        // A second call while still waiting on manual deployment must not re-transition or loop.
+        let step2 = task_mcp_compute_continue_workflow_step(&task);
+        assert_eq!(step2["nextAction"].as_str(), Some("wait_for_manual_deployment"));
+        let transitioned2 = task_mcp_apply_deployment_testing_transition(&mut task, step2["nextAction"].as_str().unwrap());
+        assert!(!transitioned2);
+    }
+
+    #[test]
+    fn require_deployment_testing_gate_resolved_rejects_commit_when_unresolved() {
+        let task = serde_json::json!({});
+        let err = task_mcp_require_deployment_testing_gate_resolved(&task).unwrap_err();
+        assert!(err.contains("Record manual deployment"));
+    }
+
+    #[test]
+    fn require_deployment_testing_gate_resolved_allows_commit_when_resolved() {
+        let task = serde_json::json!({
+            "deploymentTesting": {
+                "deployment": { "status": "not-needed", "notes": "No deployment needed." },
+                "test": { "status": "not-needed", "notes": "Nothing to test." },
+            },
+        });
+        assert!(task_mcp_require_deployment_testing_gate_resolved(&task).is_ok());
+    }
+
+    #[test]
+    fn resettable_workflow_keys_includes_deployment_testing() {
+        assert!(TASK_MCP_RESETTABLE_WORKFLOW_KEYS.contains(&"deploymentTesting"));
+    }
+
+    #[test]
+    fn reset_task_workflow_to_new_clears_deployment_testing_state() {
+        let mut task = serde_json::json!({
+            "id": "task-reset-deploy",
+            "status": "done",
+            "deploymentTesting": {
+                "deployment": { "status": "deployed", "notes": "Deployed." },
+                "test": { "status": "passed", "notes": "Verified." },
+            },
+        });
+        task_mcp_reset_task_workflow_to_new(&mut task);
+        assert!(task["deploymentTesting"].is_null());
     }
 }
 

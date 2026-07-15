@@ -157,4 +157,91 @@ describe('getAiKitWorkflowState', () => {
     // Again — this is advisory, not primary.
     expect(state.isConfigured).toBe(true);
   });
+
+  // ---------------------------------------------------------------------------
+  // MCP/Claude-driven tasks — canonical fields, no native notes/aiFileReviews
+  // ---------------------------------------------------------------------------
+
+  describe('MCP/Claude-driven implementation (no native UI note markers or aiFileReviews)', () => {
+    it('REGRESSION: recognizes crmDeveloperWorkflow.lastAiImplementation.completedAt as implementation activity', () => {
+      // record_ai_implementation_completed never writes the "UI: ai-kit-*" note markers this
+      // module used to require — without the fallback, hasImplementationActivity stays false
+      // forever for an MCP-driven task, even after implementation is fully done.
+      const task = makeTask({
+        crmDeveloperWorkflow: { lastAiImplementation: { completedAt: '2026-06-01T10:00:00.000Z', filesChanged: ['a.js'], summary: 'Done.' } },
+      });
+      const state = getAiKitWorkflowState(task, AI_KIT_PATH, ARTIFACT_PATH);
+      expect(state.hasImplementationActivity).toBe(true);
+    });
+
+    it('REGRESSION: a passed canonical AI Kit review (record_ai_kit_review_result) is recognized without an aiFileReviews entry', () => {
+      // Claude/MCP's record_ai_kit_review_result only ever writes implementationVerification.
+      // aiCodeReview — it never creates an aiFileReviews entry. Before the fix, statusText fell
+      // back to "AI Kit implementation is available." (as if nothing had happened) instead of
+      // reflecting the passed review.
+      const task = makeTask({
+        crmDeveloperWorkflow: { lastAiImplementation: { completedAt: '2026-06-01T10:00:00.000Z', filesChanged: ['a.js'], summary: 'Done.' } },
+        implementationVerification: {
+          aiCodeReview: {
+            status: 'passed', reviewSource: 'claude-ai-kit',
+            reviewedFiles: ['a.js'], rulesFiles: ['r.md'], checklistFiles: ['c.md'], knownPrReviewFiles: ['p.md'],
+          },
+        },
+      });
+      const state = getAiKitWorkflowState(task, AI_KIT_PATH, ARTIFACT_PATH);
+      expect(state.latestReviewIsAiKit).toBe(true);
+      expect(state.latestReviewVerdict).toBe('pass');
+      expect(state.recommendedAction).toBe('verify-implementation');
+      expect(state.statusText.toLowerCase()).not.toContain('implementation is available');
+    });
+
+    it('a failed canonical AI Kit review maps to needs_changes / apply-ai-review-fixes', () => {
+      const task = makeTask({
+        crmDeveloperWorkflow: { lastAiImplementation: { completedAt: '2026-06-01T10:00:00.000Z', filesChanged: ['a.js'], summary: 'Done.' } },
+        implementationVerification: {
+          aiCodeReview: { status: 'failed', reviewSource: 'claude-ai-kit', fixableFindings: [{ id: 'f1', description: 'Fix this.' }] },
+        },
+      });
+      const state = getAiKitWorkflowState(task, AI_KIT_PATH, ARTIFACT_PATH);
+      expect(state.latestReviewVerdict).toBe('needs_changes');
+      expect(state.recommendedAction).toBe('apply-ai-review-fixes');
+    });
+
+    it('a warnings canonical AI Kit review maps to comment / apply-ai-review-fixes', () => {
+      const task = makeTask({
+        crmDeveloperWorkflow: { lastAiImplementation: { completedAt: '2026-06-01T10:00:00.000Z', filesChanged: ['a.js'], summary: 'Done.' } },
+        implementationVerification: { aiCodeReview: { status: 'warnings', reviewSource: 'claude-ai-kit' } },
+      });
+      const state = getAiKitWorkflowState(task, AI_KIT_PATH, ARTIFACT_PATH);
+      expect(state.latestReviewVerdict).toBe('comment');
+      expect(state.recommendedAction).toBe('apply-ai-review-fixes');
+    });
+
+    it('a not-run canonical AI Kit review does not count as a resolved review', () => {
+      const task = makeTask({
+        crmDeveloperWorkflow: { lastAiImplementation: { completedAt: '2026-06-01T10:00:00.000Z', filesChanged: ['a.js'], summary: 'Done.' } },
+        implementationVerification: { aiCodeReview: { status: 'not-run' } },
+      });
+      const state = getAiKitWorkflowState(task, AI_KIT_PATH, ARTIFACT_PATH);
+      expect(state.latestReviewIsAiKit).toBe(false);
+      expect(state.recommendedAction).toBe('review-diff-with-ai-kit');
+    });
+
+    it('a native aiFileReviews AI Kit entry still wins over the canonical field when both exist', () => {
+      const task = makeTask({
+        notes: '[2026-06-01T10:00:00.000Z] UI: ai-kit-diff-reviewed -> PASS',
+        aiFileReviews: [
+          {
+            id: 'r1', reviewerId: 'ai-kit-diff-review', reviewerName: 'AI Kit Script Review',
+            filePath: ARTIFACT_PATH, reviewedAt: '2026-06-01T10:00:00.000Z', reviewMode: 'change',
+            structured: { verdict: 'pass', comments: [], generalSuggestions: [] },
+          },
+        ] as unknown as Task['aiFileReviews'],
+        implementationVerification: { aiCodeReview: { status: 'failed', reviewSource: 'claude-ai-kit' } },
+      });
+      const state = getAiKitWorkflowState(task, AI_KIT_PATH, ARTIFACT_PATH);
+      // Native entry (pass) wins over the canonical field (failed) — native review is authoritative.
+      expect(state.latestReviewVerdict).toBe('pass');
+    });
+  });
 });

@@ -65,8 +65,13 @@ const S_ANA_DONE: WorkflowStage = { id: 'analyzed', label: 'Analyzed', actionLab
 const S_IN_PROGRESS: WorkflowStage = { id: 'in-progress', label: 'Development', actionLabel: 'Mark Waiting for Code Review', next: 'ready-for-review' };
 /** Development stage for confirmed plugin tasks — primary action opens verification checks modal. */
 const S_IN_PROGRESS_PLUGIN: WorkflowStage = { id: 'in-progress', label: 'Development', actionLabel: 'Verify Implementation', next: 'ready-for-review' };
-/** Virtual Testing stage — active when displayPhase === 'testing' (any status with consultant-testing waitingState). */
-const S_TESTING: WorkflowStage = { id: 'testing', label: 'Testing', actionLabel: 'Testing in progress', next: null };
+/**
+ * Virtual Deployment & Testing stage — active when displayPhase === 'testing' (any status with
+ * consultant-testing waitingState). The stage id and the underlying persisted waitingState value
+ * ('consultant-testing') are unchanged — only the label is renamed to reflect the canonical manual
+ * deployment + browser/application test phase (see src/lib/deploymentTestingGate.ts).
+ */
+const S_TESTING: WorkflowStage = { id: 'testing', label: 'Deployment & Testing', actionLabel: 'Deployment & testing in progress', next: null };
 /** Display-only Development stage used in the general stage array (not actionable via the stepper). */
 const S_IN_PROGRESS_GEN: WorkflowStage = { id: 'in-progress', label: 'Development', actionLabel: '', next: null };
 const S_FOR_REVIEW: WorkflowStage = { id: 'ready-for-review', label: 'Code Review', actionLabel: 'Mark Done', next: 'done' };
@@ -123,7 +128,7 @@ export function buildTaskWorkflowPlan(task: Task, heuristicKind?: DevKind): Task
   // The timeline is a lifecycle map; tools live in the side panel.
   let stages: WorkflowStage[];
   if (isGeneral) {
-    // Include Development, Testing, and Review so any status shows an active step.
+    // Include Development, Deployment & Testing, and Review so any status shows an active step.
     stages = [S_NEW, S_ANA_DONE, S_IN_PROGRESS_GEN, S_TESTING, S_FOR_REVIEW, S_DONE];
   } else {
     const devStage = ((devKind === 'plugin' || devKind === 'script') && !!confirmedKind) ? S_IN_PROGRESS_PLUGIN : S_IN_PROGRESS;
@@ -135,8 +140,14 @@ export function buildTaskWorkflowPlan(task: Task, heuristicKind?: DevKind): Task
   const displayPhase: DisplayPhase =
     task.waitingState === 'consultant-testing' ? 'testing' : task.status;
 
+  // currentAction/currentActionLabel are keyed on displayPhase, NOT raw task.status — status alone
+  // does not change when a task moves from Development into Deployment & Testing (only waitingState
+  // does), so keying on status here would keep recommending "Verify Implementation" forever after
+  // the transition, even though verification has already passed. See continue_developer_workflow /
+  // handleContinueToDeploymentTesting, which set waitingState='consultant-testing' without touching
+  // status.
   let currentAction: PlanAction = 'none';
-  switch (task.status) {
+  switch (displayPhase) {
     case 'new':
       // Developer tasks awaiting setup: Confirm Setup action opens the setup modal.
       // All other tasks: Analyze action runs analysis (may include re-confirm for edge cases).
@@ -147,6 +158,11 @@ export function buildTaskWorkflowPlan(task: Task, heuristicKind?: DevKind): Task
       // Edge case: task reached Analyzed without confirmed plugin/script (e.g. legacy data).
       else if (isDeveloperAwaitingSetup)   currentAction = 'confirm-setup';
       else                                 currentAction = 'start-development';
+      break;
+    case 'testing':
+      // Deployment & Testing has its own dedicated entry point (the WorkflowStepper's Testing
+      // step, wired to open the Deployment & Testing actions modal) — no separate primary action.
+      currentAction = 'none';
       break;
     case 'in-progress':
       if (isCode) {
@@ -168,7 +184,7 @@ export function buildTaskWorkflowPlan(task: Task, heuristicKind?: DevKind): Task
   // For the edge-case analyzed+awaiting state, override the stage label so it reads 'Setup Required'.
   const currentStage = (isDeveloperAwaitingSetup && task.status === 'analyzed')
     ? S_ANA_SETUP_REQ
-    : stages.find((s) => s.id === task.status);
+    : stages.find((s) => s.id === displayPhase);
   const currentActionLabel = currentStage?.actionLabel ?? 'Analyze';
 
   return {

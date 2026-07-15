@@ -57,7 +57,7 @@ export function WorkflowStepper({ displayPhase, stages, onRunCurrentAction, isRu
                 ? isRunning
                   ? `Running: ${displayLabel}…`
                   : isTestingStep
-                    ? 'Click to view testing actions'
+                    ? 'Click to view deployment & testing actions'
                     : `Click to run: ${displayLabel}`
                 : isCompleted
                   ? stage.label

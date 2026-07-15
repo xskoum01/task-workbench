@@ -14,6 +14,42 @@ const DEFAULT_BRIDGE_URL = process.env.TASK_WORKBENCH_BRIDGE_URL || 'http://127.
 
 let cachedBridgeToken = null;
 
+/**
+ * Bridge error classification. bridgeRequestJson/callTool must distinguish these so a valid
+ * business rejection from a reachable bridge is never reported as "the bridge is not running":
+ *
+ * - BridgeUnavailableError: transport/connection failure (connection refused, timeout, DNS, etc.)
+ *   — the bridge process itself could not be reached. This is the only case that should trigger
+ *   the existing bridge-unavailable / capability-fallback behavior.
+ * - BridgeToolError: the bridge was reached and responded with a valid `{ ok: false }` JSON body —
+ *   a normal application/tool-level rejection (e.g. a safety-gate guard). Surface the original
+ *   message directly; never wrap it and never fall back.
+ * - BridgeProtocolError: the bridge was reached but returned a response that could not be parsed
+ *   as JSON — a bridge protocol/response bug, not proof the bridge is not running.
+ */
+class BridgeUnavailableError extends Error {
+  constructor(message, cause) {
+    super(message);
+    this.name = 'BridgeUnavailableError';
+    if (cause !== undefined) this.cause = cause;
+  }
+}
+
+class BridgeToolError extends Error {
+  constructor(message) {
+    super(message);
+    this.name = 'BridgeToolError';
+  }
+}
+
+class BridgeProtocolError extends Error {
+  constructor(message, cause) {
+    super(message);
+    this.name = 'BridgeProtocolError';
+    if (cause !== undefined) this.cause = cause;
+  }
+}
+
 const READ_ONLY_TOOL_NAMES = new Set([
   'list_tasks',
   'get_task',
@@ -45,6 +81,13 @@ const READ_ONLY_TOOL_NAMES = new Set([
   'run_implementation_verification',
   'get_implementation_verification_summary',
   'get_task_workbench_mcp_capabilities',
+  // Deployment & Testing / Pull Request read-only tools (see section 5/8 of the workflow spec)
+  'get_deployment_testing_state',
+  'get_pull_request_state',
+  // Requires the live git-enabled bridge (like prepare_commit_for_task) — no JS fallback case.
+  'prepare_pull_request_for_task',
+  // Read-only Git inspection + local tracking-state reconciliation — never mutates Git.
+  'reconcile_task_git_state',
 ]);
 
 /** Tool names the developer workflow (post-plan-approval through Implementation Verification)
@@ -61,6 +104,13 @@ const REQUIRED_DEVELOPER_WORKFLOW_TOOLS = [
   'get_implementation_verification_summary',
   'continue_developer_workflow',
   'get_task_workflow_overview',
+  // Deployment & Testing -> Commit & Push -> Pull Request -> Code Review sequence
+  'get_deployment_testing_state',
+  'record_manual_deployment',
+  'record_deployment_test',
+  'prepare_pull_request_for_task',
+  'record_pull_request_created',
+  'get_pull_request_state',
 ];
 
 /** Write tool names the standalone MCP fallback (no live app bridge) may execute, and only when
@@ -71,6 +121,11 @@ const FALLBACK_WRITE_ALLOWED_TOOL_NAMES = new Set([
   'approve_technical_plan_if_safe',
   'record_ai_implementation_completed',
   'record_ai_kit_review_result',
+  'set_task_phase',
+  // Pure local JSON reads/writes — no Dataverse/Git/external call, safe without a live bridge.
+  'record_manual_deployment',
+  'record_deployment_test',
+  'record_pull_request_created',
 ]);
 
 /**
@@ -697,12 +752,28 @@ const TOOL_DEFINITIONS = [
   },
   {
     name: 'set_task_phase',
-    description: 'Set task phase: new/analyzed/development/testing/review/done. Maps to internal status+waitingState model safely.',
+    description:
+      'Set task phase: new/analyzed/development/testing/review/done. Maps to internal status+waitingState model safely. ' +
+      "phase='new' on a task that already carries workflow state (analysis, developer setup, technical plan/approvals, " +
+      'implementation verification, AI reviews, test/checklist results, next-step state, or local Git workflow tracking) ' +
+      'performs a COMPLETE reset of that state back to a fresh NEW task, not just a status change — see confirmReset. ' +
+      'Never deletes/edits repository files, changes the current Git branch, deletes branches/commits, stages/commits/' +
+      'pushes/resets Git, or touches Dataverse/any external system. Preserves task identity, original assignment, notes, ' +
+      'and import/tracking metadata.',
     inputSchema: {
       type: 'object',
       properties: {
         taskId: { type: 'string' },
         phase:  { type: 'string', enum: ['new', 'analyzed', 'development', 'testing', 'review', 'done'] },
+        confirmReset: {
+          type: 'boolean',
+          description:
+            "Required (true) to reset phase='new' on a task that already carries workflow state — an explicit signal " +
+            'that the user approved discarding that state. Not required when the task is already a clean NEW task ' +
+            '(idempotent no-op) or when phase is not "new". An AI agent must never set this to true on its own initiative ' +
+            "— only after the user has explicitly confirmed the reset (see the tool's rejection message for the exact " +
+            'wording to relay to the user).',
+        },
       },
       required: ['taskId', 'phase'],
       additionalProperties: false,
@@ -1034,6 +1105,9 @@ const TOOL_DEFINITIONS = [
       'WRITE â€” stages the specified files and creates a Git commit in the task repository. ' +
       'All file paths must be relative to the repository root. ' +
       'Noise files (bin/, obj/, .vs/, copilot-instructions, etc.) are automatically rejected. ' +
+      'Files outside this task\'s recorded implementation are rejected unless confirmUnrelatedFiles ' +
+      'is set after explicit user approval. Files matched by .gitignore are rejected unless listed ' +
+      'in forceAddFiles after explicit user approval. ' +
       'Does NOT push. Use push_task_branch or commit_and_push_task_changes to push afterwards. ' +
       'Only call this when the user has explicitly requested a commit.',
     inputSchema: {
@@ -1045,6 +1119,20 @@ const TOOL_DEFINITIONS = [
           type: 'array',
           items: { type: 'string' },
           description: 'Relative file paths (from repo root) to stage and commit.',
+        },
+        confirmUnrelatedFiles: {
+          type: 'boolean',
+          description:
+            'May only be true after the user explicitly approves committing files outside this ' +
+            'task\'s recorded implementation. Without it, unrelated files are rejected.',
+        },
+        forceAddFiles: {
+          type: 'array',
+          items: { type: 'string' },
+          description:
+            'Repository-relative paths that may be force-added after the user explicitly approves ' +
+            'including files ignored by .gitignore. Only the listed paths are force-added; any other ' +
+            'ignored file among "files" is still rejected.',
         },
       },
       required: ['taskId', 'message', 'files'],
@@ -1071,6 +1159,9 @@ const TOOL_DEFINITIONS = [
     description:
       'WRITE â€” stages files, creates a Git commit, and then pushes the current branch in one step. ' +
       'Equivalent to commit_task_changes followed by push_task_branch. ' +
+      'Files outside this task\'s recorded implementation are rejected unless confirmUnrelatedFiles ' +
+      'is set after explicit user approval. Files matched by .gitignore are rejected unless listed ' +
+      'in forceAddFiles after explicit user approval. ' +
       'Push to main/master is blocked. No force push. No PR creation. ' +
       'Only call this when the user has explicitly requested a commit and push. ' +
       'Set moveToReviewAfterPush=true to also move the task to Code Review / Waiting for code review ' +
@@ -1084,6 +1175,20 @@ const TOOL_DEFINITIONS = [
           type: 'array',
           items: { type: 'string' },
           description: 'Relative file paths (from repo root) to stage and commit.',
+        },
+        confirmUnrelatedFiles: {
+          type: 'boolean',
+          description:
+            'May only be true after the user explicitly approves committing files outside this ' +
+            'task\'s recorded implementation. Without it, unrelated files are rejected.',
+        },
+        forceAddFiles: {
+          type: 'array',
+          items: { type: 'string' },
+          description:
+            'Repository-relative paths that may be force-added after the user explicitly approves ' +
+            'including files ignored by .gitignore. Only the listed paths are force-added; any other ' +
+            'ignored file among "files" is still rejected.',
         },
         moveToReviewAfterPush: {
           type: 'boolean',
@@ -1112,16 +1217,150 @@ const TOOL_DEFINITIONS = [
   {
     name: 'mark_testing_confirmed_prepare_commit',
     description:
-      'WRITE (local task state only) â€” marks consultant testing as confirmed and sets the next step ' +
-      'to "Prepare commit and push". Does NOT commit, push, or move the task to Code Review. ' +
-      'Use this when the consultant has confirmed the change and the developer needs to prepare a commit ' +
-      'before requesting code review. ' +
-      'To commit+push and move to Code Review in one step, use commit_and_push_task_changes with moveToReviewAfterPush=true.',
+      'LEGACY (local task state only) â€” marks the old consultantTestRecord as confirmed. Does NOT satisfy ' +
+      'the canonical Deployment & Testing gate (see get_deployment_testing_state, record_manual_deployment, ' +
+      'record_deployment_test) and does NOT commit, push, or move the task to Code Review. Prefer ' +
+      'record_manual_deployment + record_deployment_test for new workflows; this tool is kept only for ' +
+      'backward compatibility with existing consultant-testing displays.',
     inputSchema: {
       type: 'object',
       properties: {
         taskId: { type: 'string', description: 'ID of the task.' },
         note: { type: 'string', description: 'Optional note about the testing result.' },
+      },
+      required: ['taskId'],
+      additionalProperties: false,
+    },
+  },
+  // â”€â”€ Deployment & Testing -> Commit & Push -> Pull Request -> Code Review â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+  {
+    name: 'get_deployment_testing_state',
+    description:
+      'Read-only. Returns the canonical Deployment & Testing state for a task: manual deployment status, ' +
+      'browser/model-driven app test status, unresolved required rows, whether commit preparation is ' +
+      'allowed (deploymentTestingGate.canProceedToCommit), and the exact next recommended action. Never ' +
+      'reads implementationVerification.localTest, localTestRecord, or consultantTestRecord as evidence — ' +
+      'those predate the artifact ever being deployed. Does NOT deploy, test, or write anything.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        taskId: { type: 'string', description: 'ID of the task.' },
+      },
+      required: ['taskId'],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: 'record_manual_deployment',
+    description:
+      'WRITE (local task state only) â€” records that the user manually deployed the CRM artifact. ' +
+      'This tool does NOT deploy anything, does NOT call Dataverse/Primarch/PAC CLI/Power Apps, and does ' +
+      'NOT perform any external write. It only records a manual action the user already completed. ' +
+      "status='deployed' is a one-click user confirmation and does NOT require notes. status='not-needed' is " +
+      'rejected without meaningful notes (a real explanation, not a placeholder). Never call this speculatively ' +
+      'or because static verification/AI Kit review passed — only call it after the user explicitly states in ' +
+      'chat that they performed the deployment. Never claim Claude performed the deployment itself.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        taskId: { type: 'string', description: 'ID of the task.' },
+        status: { type: 'string', enum: ['deployed', 'failed', 'not-needed'], description: 'Deployment result.' },
+        notes: { type: 'string', description: "Optional for 'deployed'/'failed'. Required for 'not-needed' — what was actually done." },
+        environmentId: { type: 'string' },
+        environmentName: { type: 'string' },
+        solutionUniqueName: { type: 'string' },
+        artifactType: { type: 'string', enum: ['script', 'plugin'] },
+        artifactPath: { type: 'string' },
+        webResourceName: { type: 'string' },
+        entityLogicalName: { type: 'string' },
+        formName: { type: 'string' },
+      },
+      required: ['taskId', 'status'],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: 'record_deployment_test',
+    description:
+      'WRITE (local task state only) — records the result of a real browser/model-driven app test performed ' +
+      'after manual deployment. Does NOT run a test, does NOT open a browser, does NOT call any external ' +
+      "system. status='passed' is a one-click user confirmation and does NOT require notes. status='not-needed' " +
+      'is rejected without meaningful notes. Do not call this merely because static verification/AI Kit review ' +
+      'passed — it records a real test the user performed after deployment. Only call it after the user ' +
+      'explicitly states in chat that the test passed. A failed test blocks commit preparation.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        taskId: { type: 'string', description: 'ID of the task.' },
+        status: { type: 'string', enum: ['passed', 'failed', 'not-needed'], description: 'Test result.' },
+        notes: { type: 'string', description: "Optional for 'passed'/'failed'. Required for 'not-needed' — what was actually tested." },
+        testedEnvironment: { type: 'string' },
+        testedAcceptanceCriteria: { type: 'array', items: { type: 'string' } },
+      },
+      required: ['taskId', 'status'],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: 'reconcile_task_git_state',
+    description:
+      'Read-only Git inspection + local tracking-state repair. Inspects the current branch, HEAD, and the ' +
+      "configured remote branch, and verifies whether the task's expected commit SHA is present on the " +
+      "remote. May repair ONLY Task Workbench's local gitWorkflow tracking fields (e.g. when a commit/push " +
+      'actually succeeded but a later diagnostic falsely reported failure). Never modifies Git history, ' +
+      'stages files, commits, pushes, deletes lock files, or runs destructive reset operations.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        taskId: { type: 'string', description: 'ID of the task.' },
+      },
+      required: ['taskId'],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: 'prepare_pull_request_for_task',
+    description:
+      'Read-only PR preview. Returns the detected provider/repository, source and target branch, a draft ' +
+      'title/description, the commits/files that would be included, and any existing recorded pull request. ' +
+      'Does NOT create a pull request and does NOT call GitHub/Azure DevOps. Use before record_pull_request_created.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        taskId: { type: 'string', description: 'ID of the task.' },
+      },
+      required: ['taskId'],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: 'record_pull_request_created',
+    description:
+      'WRITE (local task state only) â€” records that a pull request was created, either manually by the ' +
+      'user or by Claude only after a SEPARATE explicit user approval distinct from any commit/push approval. ' +
+      'This tool does NOT create a pull request on GitHub/Azure DevOps/any provider â€” it only records a PR ' +
+      'that already exists. Never call this with a fabricated URL/number.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        taskId: { type: 'string', description: 'ID of the task.' },
+        prUrl: { type: 'string', description: 'URL of the pull request that was actually created.' },
+        notes: { type: 'string' },
+      },
+      required: ['taskId', 'prUrl'],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: 'get_pull_request_state',
+    description:
+      'Read-only. Returns the current pull request state for a task: whether one has been created/recorded, ' +
+      'its URL, and whether the Code Review readiness gate (commit verified + push verified + PR recorded) ' +
+      'is satisfied. Does NOT call any external provider.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        taskId: { type: 'string', description: 'ID of the task.' },
       },
       required: ['taskId'],
       additionalProperties: false,
@@ -1270,9 +1509,13 @@ const TOOL_DEFINITIONS = [
   {
     name: 'continue_developer_workflow',
     description:
-      'Read-only. Returns the next required workflow step after implementation. ' +
-      'Always call this after creating or modifying files — do not stop just because a file was created. ' +
-      'Returns nextAction, canProceed, requiresUserApproval, blockingUserAction, recommendedTool, instructionForAI, allowedWrites, forbiddenWrites.',
+      'Returns the next required workflow step after implementation. ' +
+      'Always call this after creating or modifying files, and always call it again after run_implementation_verification ' +
+      'returns nextAction=continue_workflow — that result is not a stopping point, it means call this tool next. ' +
+      'When verification has just resolved, this call also persists the local transition from Development into ' +
+      'Deployment & Testing (sets waitingState only; never Git, filesystem, Dataverse, deployment, commit, push, or PR). ' +
+      'Returns nextAction, canProceed, requiresUserApproval, blockingUserAction, recommendedTool, instructionForAI, ' +
+      'allowedWrites, forbiddenWrites, transitionedToDeploymentTesting.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -2357,16 +2600,21 @@ function normalizeDataverseGate(rawStatus, warningsAccepted) {
 
 /**
  * Evaluates whether a persisted AI Kit review payload (implementationVerification.aiCodeReview)
- * satisfies the hard-gate requirements: status must be "passed", fixableFindings must be empty,
- * and reviewedFiles/rulesFiles/checklistFiles/knownPrReviewFiles must all be non-empty — a
- * "passed" status with missing details is treated as incomplete, not passed. Returns
- * [gateStatus, missingDetailReasons] where gateStatus is one of
+ * satisfies the hard-gate requirements. There are two independent ways to resolve the gate:
+ *   1. An automated review with status "passed", empty fixableFindings, and non-empty
+ *      reviewedFiles/rulesFiles/checklistFiles/knownPrReviewFiles — a "passed" status with
+ *      missing details is treated as incomplete, not passed.
+ *   2. An explicit manual UI override ("manually-verified" or "skipped") — these represent an
+ *      explicit user decision and resolve the gate without requiring the automated detail payload.
+ * Returns [gateStatus, missingDetailReasons] where gateStatus is one of
  * "passed" | "incomplete" | "failed" | "pending" | "not_run". Mirrors Rust task_mcp_ai_kit_review_gate.
  */
 function aiKitReviewGate(review) {
   if (!review || typeof review !== 'object') return ['not_run', []];
   const status = review.status || '';
   if (!status) return ['not_run', []];
+
+  if (status === 'manually-verified' || status === 'skipped') return ['passed', []];
 
   const hasItems = (key) => Array.isArray(review[key]) && review[key].length > 0;
   const missing = [];
@@ -2707,18 +2955,56 @@ function aiInternalCodeReviewPassthrough(task) {
 /**
  * Read-only passthrough for the "Local Test" modal row (task.implementationVerification.
  * localTest — distinct from the top-level task.localTestRecord used by continue_developer_
- * workflow's step 1 gate). MCP must never write this field for scripts: it can only be
- * genuinely satisfied by a manual/browser CRM test after upload.
+ * workflow's step 1 gate). record_ai_implementation_completed now writes this field directly
+ * for new AI-managed completions; for tasks completed before that write existed, backfill the
+ * same derivation here so every read path agrees.
  */
 function localTestImplPassthrough(task) {
   const status = asObject(asObject(task.implementationVerification).localTest).status;
   if (status === 'passed' || status === 'not-needed' || status === 'failed') {
     return { name: 'Local Test', status, findings: [`Existing Local Test status: ${status}.`] };
   }
+  if (isLegacyAiManagedLocalTestNotNeeded(task)) {
+    return {
+      name: 'Local Test',
+      status: 'not-needed',
+      findings: ['Skipped for AI-managed workflow; no browser/model-driven app test was performed.'],
+    };
+  }
   return {
     name: 'Local Test',
     status: 'needs_manual_action',
     findings: ['Record Local Test in the Implementation Verification modal after manual/browser CRM testing (or mark it not-needed there).'],
+  };
+}
+
+/**
+ * Compatibility/backfill condition: an AI implementation was completed AND the legacy
+ * localTestRecord already marks Local Test as not-needed, but the canonical
+ * implementationVerification.localTest field predates record_ai_implementation_completed
+ * writing it directly. Ordinary manually managed tasks (no completed AI implementation) never
+ * match this and must still show Local Test as not-run/needs_manual_action.
+ */
+function isLegacyAiManagedLocalTestNotNeeded(task) {
+  const aiCompleted = Boolean(asObject(task.crmDeveloperWorkflow?.lastAiImplementation).completedAt);
+  const legacyNotNeeded = asObject(task.localTestRecord).status === 'not-needed';
+  return aiCompleted && legacyNotNeeded;
+}
+
+/**
+ * Called by record_ai_implementation_completed to write the canonical Local Test result for an
+ * AI-managed workflow — no browser/model-driven app test was performed, so it is recorded as
+ * not-needed, never as passed. Never overwrites an explicit passed/failed result already
+ * recorded via the Implementation Verification modal.
+ */
+function recordAiManagedLocalTestNotNeeded(task, now) {
+  task.implementationVerification = asObject(task.implementationVerification);
+  const existingStatus = asObject(task.implementationVerification.localTest).status;
+  if (existingStatus === 'passed' || existingStatus === 'failed') return;
+  task.implementationVerification.localTest = {
+    status: 'not-needed',
+    recordedAt: now,
+    notes: 'Skipped for AI-managed workflow; no browser/model-driven app test was performed.',
   };
 }
 
@@ -2865,25 +3151,98 @@ function computeProgressionGate(task) {
  * Composes the single, complete manual-action message used by continue_developer_workflow,
  * get_task_workflow_overview.nextRecommendedStep, run_implementation_verification, and the
  * Implementation Verification modal footer — so all four always say the same thing. Only
- * mentions the checks that are actually still unresolved.
+ * mentions the checks that are actually still unresolved. Deliberately covers only Dataverse/AI
+ * Kit review — deployment/browser testing is a later, separate phase (see
+ * computeDeploymentTestingGate below and src/lib/deploymentTestingGate.ts).
  */
 function composeManualVerificationStep(summary) {
   const dvNeeds = summary.dataverseCheck.status === 'needs_manual_action' || summary.dataverseCheck.status === 'not-run';
   const aiNeeds = summary.aiCodeReview.status === 'needs_manual_action' || summary.aiCodeReview.status === 'not-run';
-  const localNeeds = summary.localTest.status === 'needs_manual_action' || summary.localTest.status === 'not-run';
 
   const modalNames = [];
   if (dvNeeds) modalNames.push('Dataverse Metadata Check');
   if (aiNeeds) modalNames.push('AI Kit/Settings Review');
 
-  const parts = [];
-  if (modalNames.length > 0) parts.push(`Run ${modalNames.join(' and ')} in the Implementation Verification modal.`);
-  if (localNeeds) {
-    parts.push(parts.length > 0
-      ? 'Then upload/register the web resource manually and record Local Test/browser validation.'
-      : 'Upload/register the web resource manually and record Local Test/browser validation.');
+  return modalNames.length > 0
+    ? `Run ${modalNames.join(' and ')} in the Implementation Verification modal.`
+    : 'All Implementation Verification checks are resolved.';
+}
+
+// ---------------------------------------------------------------------------
+// Deployment & Testing gate — mirrors src/lib/deploymentTestingGate.ts
+// (computeDeploymentTestingGate, computeCodeReviewReadinessGate) and
+// task_mcp_compute_deployment_testing_gate / task_mcp_compute_code_review_readiness_gate in
+// src-tauri/src/lib.rs. Deliberately never reads implementationVerification.localTest, the legacy
+// localTestRecord, or consultantTestRecord — those predate the artifact ever being deployed.
+// ---------------------------------------------------------------------------
+
+function deriveManualDeploymentStatus(task) {
+  return asObject(asObject(task.deploymentTesting).deployment).status || 'not-run';
+}
+
+function deriveDeploymentTestStatus(task) {
+  return asObject(asObject(task.deploymentTesting).test).status || 'not-run';
+}
+
+/** Single source of truth for "can this task proceed to Commit & Push". Pure — no I/O. */
+function computeDeploymentTestingGate(task) {
+  const deploymentStatus = deriveManualDeploymentStatus(task);
+  const testStatus = deriveDeploymentTestStatus(task);
+  const blockingChecks = [];
+
+  const deploymentResolved = deploymentStatus === 'deployed' || deploymentStatus === 'not-needed';
+  if (!deploymentResolved) {
+    blockingChecks.push({
+      check: 'deployment', status: deploymentStatus,
+      reason: deploymentStatus === 'failed'
+        ? 'Manual deployment was recorded as failed. Redeploy and record the result before testing.'
+        : 'Manual deployment has not been recorded yet.',
+    });
   }
-  return parts.length > 0 ? parts.join(' ') : 'All Implementation Verification checks are resolved.';
+  if (deploymentResolved) {
+    if (testStatus === 'failed') {
+      blockingChecks.push({ check: 'test', status: testStatus, reason: 'Deployment test failed. Fix the code or redeploy, then record a new test result.' });
+    } else if (testStatus === 'not-run') {
+      blockingChecks.push({ check: 'test', status: testStatus, reason: 'Browser/model-driven app test has not been recorded yet.' });
+    }
+  }
+
+  const canProceedToCommit = blockingChecks.length === 0;
+  let nextRecommendedAction;
+  if (canProceedToCommit) nextRecommendedAction = 'prepare_commit';
+  else if (!deploymentResolved) nextRecommendedAction = 'wait_for_manual_deployment';
+  else if (testStatus === 'failed') nextRecommendedAction = 'fix_code_or_redeploy';
+  else nextRecommendedAction = 'wait_for_deployment_test';
+
+  return { canProceedToCommit, deploymentStatus, testStatus, blockingChecks, nextRecommendedAction };
+}
+
+/**
+ * Single source of truth for "can this task enter Code Review / waiting for colleague review".
+ * Requires a verified local commit, a verified push of that same branch, and an explicitly
+ * created/recorded pull request — never satisfied by an AI/Claude code review alone.
+ */
+function computeCodeReviewReadinessGate(task) {
+  const gw = asObject(task.gitWorkflow);
+  const commitVerified = !!gw.lastCommitHash;
+  const pushVerified = !!gw.lastPushedBranch && !!gw.lastPushedAt
+    && (!gw.lastCommitBranch || gw.lastPushedBranch === gw.lastCommitBranch);
+
+  const prTracking = asObject(asObject(task.crmDeveloperWorkflow).pullRequestTracking);
+  const prRecorded = !!(prTracking.createdManually && prTracking.prUrl && !prTracking.invalidatedAt);
+
+  const blockingReasons = [];
+  if (!commitVerified) blockingReasons.push('No verified commit is recorded for this task yet.');
+  if (commitVerified && !pushVerified) blockingReasons.push('Commit is not yet verified as pushed to the remote branch.');
+  if (pushVerified && !prRecorded) blockingReasons.push('No pull request has been created or recorded for this task yet.');
+
+  const canEnterCodeReview = commitVerified && pushVerified && prRecorded;
+  let nextRecommendedAction;
+  if (canEnterCodeReview) nextRecommendedAction = 'wait_for_colleague_code_review';
+  else if (!commitVerified || !pushVerified) nextRecommendedAction = 'commit_and_push';
+  else nextRecommendedAction = 'prepare_pull_request';
+
+  return { canEnterCodeReview, commitVerified, pushVerified, prRecorded, blockingReasons, nextRecommendedAction };
 }
 
 function safeString(value) {
@@ -4076,6 +4435,14 @@ function computeImplementationReadiness(task) {
   return { isImplementationReady: isReady, blockers, warnings, recommendedNextStep };
 }
 
+/**
+ * continue_developer_workflow nextAction values that mean "the task is now (or already) in the
+ * Deployment & Testing phase" — used by the tool dispatcher (not this pure function) to decide
+ * whether to persist the Development -> Deployment & Testing waitingState transition. Kept in sync
+ * with DEPLOYMENT_TESTING_NEXT_ACTIONS in src-tauri/src/lib.rs.
+ */
+const DEPLOYMENT_TESTING_NEXT_ACTIONS = new Set(['wait_for_manual_deployment', 'wait_for_deployment_test', 'fix_code_or_redeploy']);
+
 function computeContinueWorkflowStep(task) {
   // 0. Scaffold/TODO guard — block all workflow advancement if required field mappings are absent.
   // This prevents AI from calling record_local_test or proceeding to verification on stub code.
@@ -4098,23 +4465,9 @@ function computeContinueWorkflowStep(task) {
   // run_dataverse_check_for_task branch further down.
   const isScript = isVerifiableDevTask(task);
 
-  // 1. Local test must be recorded first.
-  const localTestRecord = asObject(task.localTestRecord);
-  const localTestDone = localTestRecord.status === 'passed' || localTestRecord.status === 'not-needed';
-  if (!localTestDone) {
-    return {
-      nextAction: 'record_results',
-      canProceed: false,
-      requiresUserApproval: false,
-      blockingUserAction: null,
-      recommendedTool: 'record_local_test',
-      instructionForAI: 'Record local build/test results before proceeding. Use record_local_test with status: passed, failed, or not-needed.',
-      allowedWrites: ['record_local_test'],
-      forbiddenWrites: ['commit_task_changes', 'push_task_branch', 'commit_and_push_task_changes'],
-    };
-  }
-
-  // 2. Dataverse verification.
+  // 1. Dataverse verification. (Local Test is NOT part of Implementation Verification — the
+  // legacy localTestRecord/implementationVerification.localTest fields are never read as a gate
+  // here; see computeDeploymentTestingGate below for the canonical post-deployment test gate.)
   const dvCheck = asObject(asObject(task.implementationVerification).dataverseCheck);
   const crmReports = Array.isArray(task.crmVerificationReports) ? task.crmVerificationReports : [];
   const dvDone = !!dvCheck.skippedAt || !!dvCheck.manuallyVerifiedAt
@@ -4228,9 +4581,11 @@ function computeContinueWorkflowStep(task) {
   // 3. AI Kit review — hard gate. Reads implementationVerification.aiCodeReview (the canonical
   // field the modal reads), NOT the looser task.aiKitReview.completedAt flag: recording ANY
   // verdict (including "failed") always sets completedAt, so gating on completedAt alone would
-  // let a failed/incomplete review through. aiKitReviewGate requires status=="passed" AND
-  // fixableFindings empty AND reviewedFiles/rulesFiles/checklistFiles/knownPrReviewFiles all
-  // non-empty.
+  // let a failed/incomplete review through. aiKitReviewGate resolves via either an automated
+  // status=="passed" review with fixableFindings empty AND reviewedFiles/rulesFiles/
+  // checklistFiles/knownPrReviewFiles all non-empty, OR an explicit manual UI override
+  // (status=="manually-verified" or "skipped", which record_ai_kit_review_result itself cannot
+  // set — see its inputSchema status enum).
   const aiReview = asObject(asObject(task.implementationVerification).aiCodeReview);
   const [aiGate, aiMissing] = aiKitReviewGate(aiReview);
   if (aiGate !== 'passed') {
@@ -4253,9 +4608,92 @@ function computeContinueWorkflowStep(task) {
     };
   }
 
-  // 4. Propose/confirm branch, then commit — each step requires its OWN explicit user
+  // 4. Deployment & Testing — local Task Workbench state only (record_manual_deployment /
+  // record_deployment_test never call Dataverse/Git/PAC CLI). Resolved only via the canonical
+  // deploymentTesting field — never the legacy localTestRecord/implementationVerification.
+  // localTest/consultantTestRecord fields. Mirrors computeDeploymentTestingGate above.
+  const deploymentGate = computeDeploymentTestingGate(task);
+  if (!deploymentGate.canProceedToCommit) {
+    if (deploymentGate.nextRecommendedAction === 'wait_for_manual_deployment') {
+      return {
+        nextAction: 'wait_for_manual_deployment',
+        canProceed: false,
+        requiresUserApproval: true,
+        blockingUserAction: 'Ask the user to manually deploy the CRM artifact (Dataverse/Power Apps import, web resource publish, form registration, etc.), then record it with record_manual_deployment.',
+        recommendedTool: null,
+        instructionForAI: 'Implementation Verification passed, but this is a local-only code/metadata gate — the artifact has not been deployed yet. Stop and ask the user to deploy it manually. Never call record_manual_deployment speculatively or because static verification passed; only after the user confirms the deployment actually happened, with meaningful notes describing what was done.',
+        allowedWrites: ['record_manual_deployment'],
+        forbiddenWrites: ['commit_task_changes', 'push_task_branch', 'commit_and_push_task_changes', 'record_deployment_test'],
+      };
+    }
+    if (deploymentGate.nextRecommendedAction === 'fix_code_or_redeploy') {
+      return {
+        nextAction: 'fix_code_or_redeploy',
+        canProceed: true,
+        requiresUserApproval: false,
+        blockingUserAction: null,
+        recommendedTool: null,
+        instructionForAI: 'The deployment test was recorded as failed. Fix the code, or ask the user to redeploy, then wait for a new test result via record_deployment_test — do not proceed to commit/push.',
+        allowedWrites: [],
+        forbiddenWrites: ['commit_task_changes', 'push_task_branch', 'commit_and_push_task_changes'],
+      };
+    }
+    return {
+      nextAction: 'wait_for_deployment_test',
+      canProceed: false,
+      requiresUserApproval: true,
+      blockingUserAction: 'Ask the user to perform a real browser/model-driven app test of the deployed artifact, then record it with record_deployment_test.',
+      recommendedTool: null,
+      instructionForAI: 'Manual deployment is recorded. Stop and ask the user to test the deployed artifact in the browser/model-driven app. Never call record_deployment_test unless the user confirms a real test was actually performed.',
+      allowedWrites: ['record_deployment_test'],
+      forbiddenWrites: ['commit_task_changes', 'push_task_branch', 'commit_and_push_task_changes'],
+    };
+  }
+
+  // 5. Commit verified? Push verified? Pull request created/recorded? Each is a separate,
+  // explicit user approval — approving one is never approval for the next. Mirrors
+  // computeCodeReviewReadinessGate above.
+  const reviewReadiness = computeCodeReviewReadinessGate(task);
+  if (reviewReadiness.commitVerified && reviewReadiness.pushVerified && reviewReadiness.prRecorded) {
+    return {
+      nextAction: 'wait_for_colleague_code_review',
+      canProceed: true,
+      requiresUserApproval: true,
+      blockingUserAction: 'Waiting for a colleague to review the pull request.',
+      recommendedTool: null,
+      instructionForAI: 'Commit, push, and pull request are all verified. Stop and report that the task is waiting for colleague code review. This is independent of any AI/Claude review performed earlier (record_ai_kit_review_result) — never call your own review an independent colleague review.',
+      allowedWrites: [],
+      forbiddenWrites: ['commit_task_changes', 'push_task_branch', 'commit_and_push_task_changes', 'record_pull_request_created'],
+    };
+  }
+  if (reviewReadiness.commitVerified && reviewReadiness.pushVerified) {
+    return {
+      nextAction: 'prepare_pull_request',
+      canProceed: true,
+      requiresUserApproval: true,
+      blockingUserAction: 'Ask the user for a SEPARATE explicit approval before creating or recording a pull request — approval to commit/push is not approval to create a PR.',
+      recommendedTool: 'prepare_pull_request_for_task',
+      instructionForAI: 'Commit and push are verified. Call prepare_pull_request_for_task to preview the PR (branches, title, description, detected existing PR). Ask the user for a separate explicit approval before creating or recording a pull request. If automatic creation is unavailable for this provider, give manual instructions and record the result with record_pull_request_created only with a real PR URL the user (or you, after approval) actually created — never fabricate one.',
+      allowedWrites: ['prepare_pull_request_for_task', 'record_pull_request_created'],
+      forbiddenWrites: ['commit_task_changes', 'push_task_branch', 'commit_and_push_task_changes'],
+    };
+  }
+  if (reviewReadiness.commitVerified) {
+    return {
+      nextAction: 'commit_and_push',
+      canProceed: true,
+      requiresUserApproval: true,
+      blockingUserAction: 'Ask the user for a SEPARATE explicit approval before pushing.',
+      recommendedTool: 'push_task_branch',
+      instructionForAI: 'A commit is verified locally but not yet pushed. Ask the user for a separate explicit approval, then call push_task_branch or commit_and_push_task_changes.',
+      allowedWrites: ['push_task_branch', 'commit_and_push_task_changes'],
+      forbiddenWrites: [],
+    };
+  }
+
+  // 6. Propose/confirm branch, then commit — each step requires its OWN explicit user
   // approval. Confirming a branch name does not imply the commit is approved, and vice versa.
-  // Mirrors Rust task_mcp_compute_continue_workflow_step's "4. Propose/confirm branch" section
+  // Mirrors Rust task_mcp_compute_continue_workflow_step's "6. Propose/confirm branch" section
   // in src-tauri/src/lib.rs — keep in sync.
   const confirmedBranch = asObject(task.gitWorkflow).confirmedBranch;
   if (typeof confirmedBranch === 'string' && confirmedBranch !== '') {
@@ -4325,6 +4763,78 @@ function setStatusPhase(task, phase) {
     default:
       break;
   }
+}
+
+/**
+ * Task fields representing generated analysis, setup confirmation, approvals, implementation,
+ * verification, testing, PR/review, external-action, or workflow-progression state. Cleared by a
+ * full reset to NEW (see resetTaskWorkflowToNew below). Deliberately excludes status/
+ * waitingState/attentionState/suggestedActions — those are unconditionally reset to their
+ * NEW-equivalent value regardless of whether any of the keys below are set.
+ * Mirrors RESETTABLE_WORKFLOW_KEYS in src/lib/taskWorkflowReset.ts and
+ * TASK_MCP_RESETTABLE_WORKFLOW_KEYS in src-tauri/src/lib.rs — keep all three in sync.
+ */
+const RESETTABLE_WORKFLOW_KEYS = [
+  'completedAt',
+  'estimatedEffort',
+  'planningBucket',
+  'suggestedPlanningBucket',
+  'priorityScore',
+  'priorityReason',
+  'isPlanningLocked',
+  'analysisResult',
+  'generatedReply',
+  'scriptAnalysis',
+  'selectedPluginProject',
+  'aiFileReviews',
+  'crmSkeletons',
+  'crmVerificationReports',
+  'crmDeveloperWorkflow',
+  'workflowSetup',
+  'taskMode',
+  'implementationVerification',
+  'deploymentTesting',
+  'localTestRecord',
+  'consultantTestRecord',
+  'mcpChecklistOverrides',
+  'mcpNextStep',
+  'gitWorkflow',
+];
+
+/** True for any value that represents real, meaningful workflow state worth warning about —
+ *  false for undefined/null and for empty arrays/objects (nothing was actually recorded there). */
+function isNonEmptyWorkflowValue(value) {
+  if (value === undefined || value === null) return false;
+  if (Array.isArray(value)) return value.length > 0;
+  if (typeof value === 'object') return Object.keys(value).length > 0;
+  return true;
+}
+
+/**
+ * True when the task carries any generated/derived workflow state that a reset to NEW would
+ * discard. Used to decide whether resetting requires explicit confirmation (set_task_phase's
+ * confirmReset) — a task with none of this state is already effectively clean, and resetting it
+ * is a safe no-op. Mirrors Rust task_mcp_task_has_resettable_workflow_state.
+ */
+function taskHasResettableWorkflowState(task) {
+  return RESETTABLE_WORKFLOW_KEYS.some((key) => isNonEmptyWorkflowValue(task[key]));
+}
+
+/**
+ * Resets a task's local workflow/execution state to the equivalent of a fresh NEW task, in place.
+ * Preserves identity, original assignment, user notes, and import/tracking metadata — only
+ * status/waitingState/attentionState/suggestedActions and the RESETTABLE_WORKFLOW_KEYS fields are
+ * touched. Deletes (rather than nulling) the resettable keys so no stale nested object/array
+ * lingers in the persisted JSON. Never touches the filesystem, Git, Dataverse, or any external
+ * system — this is a pure in-memory mutation of the parsed task object.
+ * Mirrors Rust task_mcp_reset_task_workflow_to_new.
+ */
+function resetTaskWorkflowToNew(task) {
+  task.status = 'new';
+  task.waitingState = null;
+  task.attentionState = null;
+  task.suggestedActions = [];
+  for (const key of RESETTABLE_WORKFLOW_KEYS) delete task[key];
 }
 
 /**
@@ -4596,6 +5106,40 @@ async function callToolFallback(name, args = {}) {
         matchedTemplate: matchedTemplate ?? undefined,
       };
     }
+    case 'set_task_phase': {
+      const taskId = String(args.taskId ?? '').trim();
+      if (!taskId) return { ...common, error: 'Missing required argument: taskId' };
+      const phase = String(args.phase ?? '').trim();
+      const allowedPhases = ['new', 'analyzed', 'development', 'testing', 'review', 'done'];
+      if (!allowedPhases.includes(phase)) {
+        return { ...common, error: `Invalid phase '${phase}'. Allowed: ${allowedPhases.join(', ')}` };
+      }
+      const index = tasks.findIndex((t) => t.id === taskId);
+      if (index < 0) return { ...common, error: `Task not found: ${taskId}` };
+      const task = tasks[index];
+
+      if (phase === 'new') {
+        const confirmReset = args.confirmReset === true;
+        if (taskHasResettableWorkflowState(task) && !confirmReset) {
+          return {
+            ...common,
+            error:
+              `Resetting task '${taskId}' to NEW will clear saved analysis, developer setup, technical plans and ` +
+              'approvals, implementation verification, AI reviews, test/checklist results, next-step state, and local ' +
+              'Git workflow tracking. The original assignment, customer, notes, tracking links, and repository files ' +
+              'will not be changed — this does not touch Git or any external system. Explicit user approval is ' +
+              'required before this reset can proceed. Ask the user to confirm, then retry with confirmReset=true.',
+          };
+        }
+        resetTaskWorkflowToNew(task);
+        appendMcpAuditNote(task, 'set_task_phase -> new (workflow reset to NEW)');
+      } else {
+        setStatusPhase(task, phase);
+        appendMcpAuditNote(task, `set_task_phase -> ${phase}`);
+      }
+      await saveTasks(tasks);
+      return { ...common, task: safeTaskSummary(task) };
+    }
     case 'prepare_developer_task': {
       const taskId = String(args.taskId ?? '').trim();
       if (!taskId) return { ...common, error: 'Missing required argument: taskId' };
@@ -4629,9 +5173,26 @@ async function callToolFallback(name, args = {}) {
     case 'continue_developer_workflow': {
       const taskId = String(args.taskId ?? '').trim();
       if (!taskId) return { ...common, error: 'Missing required argument: taskId' };
-      const task = getTaskById(tasks, taskId);
-      if (!task) return { ...common, error: `Task not found: ${taskId}` };
-      return { ...common, taskId, ...computeContinueWorkflowStep(task) };
+      const index = tasks.findIndex((t) => t.id === taskId);
+      if (index < 0) return { ...common, error: `Task not found: ${taskId}` };
+      const task = tasks[index];
+      const step = computeContinueWorkflowStep(task);
+
+      // Persist the Development -> Deployment & Testing transition the first time verification
+      // has resolved and the task is waiting on manual deployment/testing — this is the SAME
+      // local-only mutation the "Continue to Deployment & Testing" UI button performs
+      // (waitingState='consultant-testing', status untouched). Local write only: no Git,
+      // filesystem, Dataverse, deployment, commit, push, or PR operation. Idempotent — once
+      // waitingState is already set, later calls (including fix_code_or_redeploy) do not re-fire it.
+      const transitioned = DEPLOYMENT_TESTING_NEXT_ACTIONS.has(step.nextAction) && task.waitingState !== 'consultant-testing';
+      if (transitioned) {
+        task.waitingState = 'consultant-testing';
+        task.attentionState = null;
+        appendMcpAuditNote(task, `continue_developer_workflow -> transitioned to Deployment & Testing (${step.nextAction})`);
+        await saveTasks(tasks);
+      }
+
+      return { ...common, taskId, ...step, transitionedToDeploymentTesting: transitioned };
     }
     case 'approve_technical_plan_if_safe': {
       const taskId = String(args.taskId ?? '').trim();
@@ -4724,6 +5285,11 @@ async function callToolFallback(name, args = {}) {
         note: 'Script implementation completed by AI — no local test required before Dataverse upload.',
       };
       task.mcpChecklistOverrides['local-test-done'] = 'optional';
+
+      // Also record the canonical modal-visible Local Test result so the Implementation
+      // Verification modal, workflow overview, and run_implementation_verification all agree
+      // with continue_developer_workflow's legacy localTestRecord gate.
+      recordAiManagedLocalTestNotNeeded(task, now);
 
       let implementedArtifactPath = null;
       if (isScriptWorkflowTask(task)) {
@@ -4892,16 +5458,24 @@ async function callToolFallback(name, args = {}) {
 
       // AI Internal Code Review: Claude (the calling MCP agent) performs this review itself —
       // read the AI Kit rules and target file, then call record_ai_kit_review_result. Hard gate:
-      // a "passed" review with missing details (reviewedFiles/rulesFiles/checklistFiles/
-      // knownPrReviewFiles) is treated as incomplete, and any fixableFindings block the gate
-      // regardless of status — see aiKitReviewGate.
+      // an automated "passed" review with missing details (reviewedFiles/rulesFiles/
+      // checklistFiles/knownPrReviewFiles) is treated as incomplete, and any fixableFindings block
+      // the gate regardless of status — OR an explicit manual UI override ("manually-verified" /
+      // "skipped", which record_ai_kit_review_result itself cannot set) resolves the gate directly
+      // — see aiKitReviewGate.
       if (runCheck('aiInternalCodeReview')) {
         const aiReview = asObject(asObject(task.implementationVerification).aiCodeReview);
         const [gateStatus, missingDetails] = aiKitReviewGate(aiReview);
         switch (gateStatus) {
-          case 'passed':
-            checks.push({ name: 'AI Internal Code Review', status: 'passed', findings: ['AI Kit review passed with full review details recorded.'], review: aiReview });
+          case 'passed': {
+            const passedFinding = aiReview.status === 'manually-verified'
+              ? 'AI Kit review gate resolved via explicit manual verification.'
+              : aiReview.status === 'skipped'
+                ? 'AI Kit review gate resolved via explicit manual skip.'
+                : 'AI Kit review passed with full review details recorded.';
+            checks.push({ name: 'AI Internal Code Review', status: 'passed', rawStatus: aiReview.status, findings: [passedFinding], review: aiReview });
             break;
+          }
           case 'failed': {
             const aiFixable = Array.isArray(aiReview.fixableFindings) ? aiReview.fixableFindings : [];
             if (aiFixable.length === 0) {
@@ -5079,6 +5653,140 @@ async function callToolFallback(name, args = {}) {
       const capabilities = computeMcpCapabilities();
       return { ...common, ...capabilities };
     }
+    case 'get_deployment_testing_state': {
+      const taskId = String(args.taskId ?? '').trim();
+      if (!taskId) return { ...common, error: 'Missing required argument: taskId' };
+      const task = getTaskById(tasks, taskId);
+      if (!task) return { ...common, error: `Task not found: ${taskId}` };
+
+      const gate = computeDeploymentTestingGate(task);
+      return {
+        ...common, taskId,
+        deploymentStatus: gate.deploymentStatus,
+        testStatus: gate.testStatus,
+        unresolvedRequiredRows: gate.blockingChecks.map((c) => c.check),
+        canProceedToCommit: gate.canProceedToCommit,
+        nextRecommendedAction: gate.nextRecommendedAction,
+        blockingChecks: gate.blockingChecks,
+      };
+    }
+    case 'record_manual_deployment': {
+      const taskId = String(args.taskId ?? '').trim();
+      if (!taskId) return { ...common, error: 'Missing required argument: taskId' };
+      const status = String(args.status ?? '').trim();
+      if (!['deployed', 'failed', 'not-needed'].includes(status)) {
+        return { ...common, error: "status must be 'deployed', 'failed', or 'not-needed'" };
+      }
+      const notes = String(args.notes ?? '').trim();
+      if (status === 'not-needed' && !notes) {
+        return { ...common, error: `notes is required and must be meaningful when recording status='${status}'` };
+      }
+      const index = tasks.findIndex((t) => t.id === taskId);
+      if (index < 0) return { ...common, error: `Task not found: ${taskId}` };
+      const task = tasks[index];
+      const now = new Date().toISOString();
+      task.deploymentTesting = asObject(task.deploymentTesting);
+      task.deploymentTesting.deployment = {
+        status, recordedAt: now, recordedBy: 'ai',
+        ...(notes ? { notes } : {}),
+        ...(args.environmentId ? { environmentId: String(args.environmentId) } : {}),
+        ...(args.environmentName ? { environmentName: String(args.environmentName) } : {}),
+        ...(args.solutionUniqueName ? { solutionUniqueName: String(args.solutionUniqueName) } : {}),
+        ...(args.artifactType ? { artifactType: String(args.artifactType) } : {}),
+        ...(args.artifactPath ? { artifactPath: String(args.artifactPath) } : {}),
+        ...(args.webResourceName ? { webResourceName: String(args.webResourceName) } : {}),
+        ...(args.entityLogicalName ? { entityLogicalName: String(args.entityLogicalName) } : {}),
+        ...(args.formName ? { formName: String(args.formName) } : {}),
+      };
+      task.deploymentTesting.updatedAt = now;
+      if (status === 'failed') {
+        task.waitingState = null;
+        task.attentionState = null;
+      }
+      appendMcpAuditNote(task, `record_manual_deployment -> ${status}`);
+      await saveTasks(tasks);
+      const gate = computeDeploymentTestingGate(task);
+      return { ...common, taskId, recorded: true, deploymentStatus: status, nextRecommendedAction: gate.nextRecommendedAction };
+    }
+    case 'record_deployment_test': {
+      const taskId = String(args.taskId ?? '').trim();
+      if (!taskId) return { ...common, error: 'Missing required argument: taskId' };
+      const status = String(args.status ?? '').trim();
+      if (!['passed', 'failed', 'not-needed'].includes(status)) {
+        return { ...common, error: "status must be 'passed', 'failed', or 'not-needed'" };
+      }
+      const notes = String(args.notes ?? '').trim();
+      if (status === 'not-needed' && !notes) {
+        return { ...common, error: `notes is required and must be meaningful when recording status='${status}'` };
+      }
+      const index = tasks.findIndex((t) => t.id === taskId);
+      if (index < 0) return { ...common, error: `Task not found: ${taskId}` };
+      const task = tasks[index];
+      const preGate = computeDeploymentTestingGate(task);
+      const deploymentResolved = preGate.deploymentStatus === 'deployed' || preGate.deploymentStatus === 'not-needed';
+      if (!deploymentResolved) {
+        return { ...common, error: 'Manual deployment must be recorded (record_manual_deployment) before a deployment test can be recorded.' };
+      }
+      const now = new Date().toISOString();
+      task.deploymentTesting = asObject(task.deploymentTesting);
+      task.deploymentTesting.test = {
+        status, recordedAt: now, recordedBy: 'ai',
+        ...(notes ? { notes } : {}),
+        ...(args.testedEnvironment ? { testedEnvironment: String(args.testedEnvironment) } : {}),
+        ...(Array.isArray(args.testedAcceptanceCriteria) ? { testedAcceptanceCriteria: args.testedAcceptanceCriteria } : {}),
+      };
+      task.deploymentTesting.updatedAt = now;
+      if (status === 'failed') {
+        task.waitingState = null;
+        task.attentionState = null;
+      }
+      appendMcpAuditNote(task, `record_deployment_test -> ${status}`);
+      await saveTasks(tasks);
+      const gate = computeDeploymentTestingGate(task);
+      return { ...common, taskId, recorded: true, testStatus: status, canProceedToCommit: gate.canProceedToCommit, nextRecommendedAction: gate.nextRecommendedAction };
+    }
+    case 'get_pull_request_state': {
+      const taskId = String(args.taskId ?? '').trim();
+      if (!taskId) return { ...common, error: 'Missing required argument: taskId' };
+      const task = getTaskById(tasks, taskId);
+      if (!task) return { ...common, error: `Task not found: ${taskId}` };
+      const readiness = computeCodeReviewReadinessGate(task);
+      const tracking = asObject(asObject(task.crmDeveloperWorkflow).pullRequestTracking);
+      return {
+        ...common, taskId,
+        prCreated: readiness.prRecorded,
+        prUrl: tracking.prUrl ?? null,
+        commitVerified: readiness.commitVerified,
+        pushVerified: readiness.pushVerified,
+        canEnterCodeReview: readiness.canEnterCodeReview,
+        nextRecommendedAction: readiness.nextRecommendedAction,
+      };
+    }
+    case 'record_pull_request_created': {
+      const taskId = String(args.taskId ?? '').trim();
+      if (!taskId) return { ...common, error: 'Missing required argument: taskId' };
+      const prUrl = String(args.prUrl ?? '').trim();
+      if (!prUrl) return { ...common, error: 'Missing required argument: prUrl' };
+      const index = tasks.findIndex((t) => t.id === taskId);
+      if (index < 0) return { ...common, error: `Task not found: ${taskId}` };
+      const task = tasks[index];
+      const now = new Date().toISOString();
+      task.crmDeveloperWorkflow = asObject(task.crmDeveloperWorkflow);
+      task.crmDeveloperWorkflow.pullRequestTracking = {
+        createdManually: true, createdAt: now, prUrl,
+        ...(args.notes ? { notes: String(args.notes) } : {}),
+      };
+      const readiness = computeCodeReviewReadinessGate(task);
+      if (readiness.canEnterCodeReview) {
+        task.status = 'ready-for-review';
+        task.waitingState = 'code-review';
+        task.attentionState = null;
+        task.mcpNextStep = { action: 'Wait for colleague code review', reason: 'Pull request created and recorded. Waiting for colleague review — independent of any AI/Claude review.', updatedAt: now };
+      }
+      appendMcpAuditNote(task, `record_pull_request_created -> ${prUrl}`);
+      await saveTasks(tasks);
+      return { ...common, taskId, recorded: true, canEnterCodeReview: readiness.canEnterCodeReview, nextRecommendedAction: readiness.nextRecommendedAction };
+    }
     default:
       throw new Error(`Tool '${name}' is not available in read-only fallback mode.`);
   }
@@ -5105,25 +5813,39 @@ function bridgeRequestJson(baseUrl, routePath, body, extraHeaders = {}) {
       response.setEncoding('utf8');
       response.on('data', (chunk) => { raw += chunk; });
       response.on('end', () => {
+        let parsed;
         try {
-          const parsed = raw ? JSON.parse(raw) : {};
-          if (parsed?.ok === false) {
-            // Clear cached token on auth failure so next call refetches
-            if (String(parsed.error ?? '').toLowerCase().includes('token')) {
-              cachedBridgeToken = null;
-            }
-            reject(new Error(String(parsed.error ?? 'Bridge call failed.')));
-            return;
-          }
-          resolve(parsed?.result ?? parsed);
+          parsed = raw ? JSON.parse(raw) : {};
         } catch (error) {
-          reject(new Error(`Bridge returned invalid JSON: ${error instanceof Error ? error.message : String(error)}`));
+          // The bridge is reachable and responded, but the response body is not valid JSON — a
+          // bridge protocol/response bug, not evidence the bridge is not running.
+          reject(new BridgeProtocolError(
+            `Bridge returned invalid JSON: ${error instanceof Error ? error.message : String(error)}`,
+            error,
+          ));
+          return;
         }
+        if (parsed?.ok === false) {
+          // Clear cached token on auth failure so next call refetches
+          if (String(parsed.error ?? '').toLowerCase().includes('token')) {
+            cachedBridgeToken = null;
+          }
+          // The bridge is reachable and responded with a valid ok:false result — a normal
+          // application/tool-level rejection (e.g. a safety-gate guard), not a transport failure.
+          reject(new BridgeToolError(String(parsed.error ?? 'Bridge call failed.')));
+          return;
+        }
+        resolve(parsed?.result ?? parsed);
       });
     });
-    request.on('error', (error) => reject(error));
+    request.on('error', (error) => {
+      if (error instanceof BridgeUnavailableError) { reject(error); return; }
+      reject(new BridgeUnavailableError(
+        `Bridge request failed: ${error instanceof Error ? error.message : String(error)}`, error,
+      ));
+    });
     request.on('timeout', () => {
-      request.destroy(new Error('Bridge request timed out.'));
+      request.destroy(new BridgeUnavailableError('Bridge request timed out.'));
     });
     if (payload) request.write(payload);
     request.end();
@@ -5152,6 +5874,17 @@ async function callTool(name, args = {}) {
       },
     };
   } catch (error) {
+    // A reachable bridge that rejected the call with a business/tool error, or replied with a
+    // malformed response, is not the same condition as "the bridge is not running" — surface it
+    // directly with its original message instead of masking it as a bridge-unavailable fallback.
+    if (error instanceof BridgeToolError || error instanceof BridgeProtocolError) {
+      throw error;
+    }
+
+    // From here on, `error` is a genuine transport/unavailability failure (BridgeUnavailableError,
+    // or an unclassified low-level error) — preserve the existing bridge-unavailable / capability-
+    // fallback behavior unchanged.
+
     // get_task_workbench_mcp_capabilities must always be answerable, even with no bridge and no
     // --data-dir/--fallback-readonly flags — that is exactly the condition it exists to diagnose.
     // Erroring out here (like every other tool does) would defeat its purpose as a health check.
@@ -5296,6 +6029,7 @@ if (!process.env.VITEST) {
 export {
   READ_ONLY_TOOL_NAMES, TOOL_DEFINITIONS, TASK_TEMPLATES, matchTaskTemplate, callToolFallback, applyDeveloperWorkflowTransition,
   REQUIRED_DEVELOPER_WORKFLOW_TOOLS, FALLBACK_WRITE_ALLOWED_TOOL_NAMES, computeMcpCapabilitiesFromToolNames,
-  applyToolingAvailabilityGuard,
+  applyToolingAvailabilityGuard, callTool, bridgeRequestJson,
+  BridgeUnavailableError, BridgeToolError, BridgeProtocolError,
 };
 

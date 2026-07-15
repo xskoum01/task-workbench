@@ -90,18 +90,37 @@ export function getAiKitWorkflowState(
   }
 
   const idx = parseNoteIndices(task.notes);
-  const hasImplementationActivity = idx.lastImpl >= 0 || idx.lastDraftGen >= 0;
+  // Native UI activity notes, OR the canonical MCP-written completion marker — Claude/MCP's
+  // record_ai_implementation_completed never writes the "UI: ai-kit-*" note markers this parser
+  // looks for, so without this fallback an MCP-driven task always reports "nothing started yet"
+  // even after implementation, AI Kit review, and Dataverse verification have all passed.
+  const hasImplementationActivity = idx.lastImpl >= 0 || idx.lastDraftGen >= 0
+    || !!task.crmDeveloperWorkflow?.lastAiImplementation?.completedAt;
   // Any write (impl, draft gen, or fix application) after the last review means the diff
   // has changed and a new review is needed.
   const lastWrite = Math.max(idx.lastImpl, idx.lastFixes, idx.lastDraftGen);
   const hasChangesAfterLatestReview = idx.lastReview < 0 ? false : lastWrite > idx.lastReview;
 
-  // Latest AI Kit review from stored review entries (most authoritative).
+  // Latest AI Kit review from stored review entries (most authoritative for native reviews).
   const latestAiKitReview = task.aiFileReviews?.find(
     (r) => r.reviewerName?.startsWith('AI Kit') || r.reviewerName?.includes('AI Kit'),
   );
-  const latestReviewVerdict = latestAiKitReview?.structured?.verdict ?? null;
-  const latestReviewIsAiKit = !!latestAiKitReview;
+
+  // Canonical review fallback: implementationVerification.aiCodeReview is written by both native
+  // reviewers and Claude/MCP's record_ai_kit_review_result, which never creates an aiFileReviews
+  // entry (see src/lib/aiCodeReviewReport.ts). Only consulted when no native AI Kit entry exists,
+  // so it never overrides a real structured native review.
+  const canonicalReview = task.implementationVerification?.aiCodeReview;
+  const canonicalReviewResolved = !!canonicalReview?.status && canonicalReview.status !== 'not-run';
+  const canonicalVerdict: 'pass' | 'comment' | 'needs_changes' | null = !canonicalReviewResolved ? null
+    : canonicalReview!.status === 'failed' ? 'needs_changes'
+    : canonicalReview!.status === 'warnings' ? 'comment'
+    : 'pass'; // passed / manually-verified / skipped
+
+  const latestReviewVerdict = latestAiKitReview
+    ? (latestAiKitReview.structured?.verdict ?? null)
+    : canonicalVerdict;
+  const latestReviewIsAiKit = !!latestAiKitReview || canonicalReviewResolved;
 
   let recommendedAction: AiKitRecommendedAction | null = null;
   let statusText = '';

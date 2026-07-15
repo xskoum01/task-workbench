@@ -2,7 +2,9 @@ import { useState } from 'react';
 import type { Task, TaskSource, TaskType } from '../types';
 import { useApp } from '../context/AppContext';
 import Modal from './Modal';
+import ResetWorkflowConfirmModal from './ResetWorkflowConfirmModal';
 import { type TaskPhase, PHASE_OPTIONS, getTaskPhase, applyTaskPhase } from '../lib/taskPhase';
+import { taskHasResettableWorkflowState, resetTaskWorkflowToNew } from '../lib/taskWorkflowReset';
 
 interface TaskFormProps {
   onClose: () => void;
@@ -83,22 +85,14 @@ export default function TaskForm({ onClose, initialTask }: TaskFormProps) {
   );
   const [saving, setSaving]               = useState(false);
   const [validationError, setValidationError] = useState('');
+  const [showResetConfirm, setShowResetConfirm] = useState(false);
 
   function set<K extends keyof FormState>(key: K, value: FormState[K]) {
     setForm((prev) => ({ ...prev, [key]: value }));
     setValidationError('');
   }
 
-  async function handleSubmit() {
-    if (!form.title.trim()) {
-      setValidationError('Title is required.');
-      return;
-    }
-    if (!form.customerId) {
-      setValidationError('Please select a customer.');
-      return;
-    }
-
+  async function performSave() {
     const confidence  = Math.min(100, Math.max(0, parseInt(form.confidence, 10) || 0));
     const budgetHours = form.budgetHours !== '' ? parseFloat(form.budgetHours) : undefined;
 
@@ -111,13 +105,18 @@ export default function TaskForm({ onClose, initialTask }: TaskFormProps) {
 
     setSaving(true);
     try {
-      if (isEditing) {
+      if (initialTask) {
+        // Selecting NEW on an existing task must fully reset its workflow state, not just
+        // status — see src/lib/taskWorkflowReset.ts.
+        const phasePatch = form.status === 'new'
+          ? resetTaskWorkflowToNew(initialTask)
+          : applyTaskPhase(form.status);
         await updateTask(initialTask.id, {
           title:           form.title.trim(),
           customerId:      form.customerId,
           taskType:        form.taskType,
           source:          form.source,
-          ...applyTaskPhase(form.status),
+          ...phasePatch,
           confidence,
           originalMessage: form.originalMessage.trim(),
           ...trackingFields,
@@ -140,6 +139,28 @@ export default function TaskForm({ onClose, initialTask }: TaskFormProps) {
     }
   }
 
+  async function handleSubmit() {
+    if (!form.title.trim()) {
+      setValidationError('Title is required.');
+      return;
+    }
+    if (!form.customerId) {
+      setValidationError('Please select a customer.');
+      return;
+    }
+
+    if (initialTask && form.status === 'new' && taskHasResettableWorkflowState(initialTask)) {
+      setShowResetConfirm(true);
+      return;
+    }
+    await performSave();
+  }
+
+  async function handleConfirmReset() {
+    setShowResetConfirm(false);
+    await performSave();
+  }
+
   const footer = (
     <>
       <button className="btn btn-ghost" onClick={onClose} disabled={saving}>Cancel</button>
@@ -150,6 +171,7 @@ export default function TaskForm({ onClose, initialTask }: TaskFormProps) {
   );
 
   return (
+    <>
     <Modal title={isEditing ? 'Edit Task' : 'New Task'} onClose={onClose} footer={footer} size="lg">
       {/* Title */}
       <div className="form-group">
@@ -310,5 +332,13 @@ export default function TaskForm({ onClose, initialTask }: TaskFormProps) {
         </div>
       )}
     </Modal>
+    {showResetConfirm && (
+      <ResetWorkflowConfirmModal
+        onConfirm={handleConfirmReset}
+        onCancel={() => setShowResetConfirm(false)}
+        busy={saving}
+      />
+    )}
+    </>
   );
 }

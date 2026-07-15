@@ -1,17 +1,24 @@
 /**
  * ImplementationVerificationModal
  *
- * Development-phase quality gates for plugin tasks (four sections):
- *   1. Build / Project Readiness       — soft check, non-blocking
+ * Development-phase code/metadata quality gates only (three sections) — this modal never covers
+ * real deployed application testing:
+ *   1. Script File / Build Readiness   — soft check, non-blocking
  *   2. Dataverse Metadata Check        — HARD GATE (via Primarch, read-only)
  *   3. AI Internal Code Review         — HARD GATE
- *   4. Local Test Record               — soft check, non-blocking
  *
- * Build and Local Test stay non-blocking — the task can move to Consultant Testing regardless of
- * their results. Dataverse Metadata Check and AI Internal Code Review are hard gates computed by
- * computeProgressionGate (src/lib/implementationGate.ts): moving the task to Code Review /
- * Waiting for PR is blocked unless both gates cleanly pass or the user explicitly accepts
- * Dataverse warnings. See the footer's hard-block panel and Section 2/3 below.
+ * Build stays non-blocking. Dataverse Metadata Check and AI Internal Code Review are hard gates
+ * computed by computeProgressionGate (src/lib/implementationGate.ts): continuing to Deployment &
+ * Testing is blocked unless both gates cleanly pass or the user explicitly accepts Dataverse
+ * warnings. See the footer's hard-block panel and Section 2/3 below.
+ *
+ * There is deliberately no Local Test / consultant-testing section here and no direct path to Code
+ * Review — the canonical workflow is:
+ *   Implementation Verification passed -> Deployment & Testing (manual deployment + a real
+ *   browser/model-driven app test, see src/lib/deploymentTestingGate.ts and the Deployment &
+ *   Testing actions in TaskDetail) -> Commit & Push -> Pull Request -> Code Review.
+ * The legacy implementationVerification.localTest field (see its doc comment in src/types/index.ts)
+ * predates the artifact ever being deployed and must never be read as evidence of a real test.
  */
 
 import { useState } from 'react';
@@ -19,6 +26,7 @@ import type {
   Task,
   Customer,
   ImplCheckStatus,
+  ImplCheckRecord,
   LocalTestImplStatus,
   ImplementationVerification,
 } from '../types';
@@ -30,6 +38,7 @@ import {
   hasAiReviewDetail,
   computeProgressionGate,
 } from '../lib/implementationGate';
+import { buildAiCodeReviewReport } from '../lib/aiCodeReviewReport';
 import Modal from './Modal';
 import Icon from './Icon';
 
@@ -52,35 +61,69 @@ export function deriveDataverseCheckStatus(task: Task): ImplCheckStatus | 'needs
 }
 
 /**
+ * Effective Local Test status for the modal — mirrors task_mcp_local_test_impl_passthrough
+ * (src-tauri/src/lib.rs) and localTestImplPassthrough (mcp/task-workbench-mcp.mjs; keep all
+ * three in sync). An explicit result recorded in the modal always wins. Otherwise, backfills
+ * 'not-needed' for AI-managed tasks completed before record_ai_implementation_completed started
+ * writing implementationVerification.localTest directly — derived from the legacy
+ * localTestRecord field, never for ordinary manually managed tasks.
+ */
+export function deriveLocalTestStatus(task: Task): LocalTestImplStatus {
+  const explicit = task.implementationVerification?.localTest?.status;
+  if (explicit === 'passed' || explicit === 'failed' || explicit === 'not-needed') return explicit;
+  const aiCompleted = !!task.crmDeveloperWorkflow?.lastAiImplementation?.completedAt;
+  const legacyNotNeeded = task.localTestRecord?.status === 'not-needed';
+  return aiCompleted && legacyNotNeeded ? 'not-needed' : 'not-run';
+}
+
+/**
  * Composes the same manual-action message as MCP's continue_developer_workflow /
  * get_task_workflow_overview.nextRecommendedStep / run_implementation_verification (see
  * composeManualVerificationStep in mcp/task-workbench-mcp.mjs and
  * task_mcp_compose_manual_verification_step in src-tauri/src/lib.rs — keep all three in sync).
  * The modal omits "in the Implementation Verification modal" since the user is already in it.
+ * Deliberately covers only Dataverse/AI Kit review — deployment/browser testing is a later,
+ * separate phase (see src/lib/deploymentTestingGate.ts).
  */
-function composeManualVerificationStep(dvNeeds: boolean, aiNeeds: boolean, localNeeds: boolean): string {
+function composeManualVerificationStep(dvNeeds: boolean, aiNeeds: boolean): string {
   const modalNames: string[] = [];
   if (dvNeeds) modalNames.push('Dataverse Metadata Check');
   if (aiNeeds) modalNames.push('AI Kit/Settings Review');
 
-  const parts: string[] = [];
-  if (modalNames.length > 0) parts.push(`Run ${modalNames.join(' and ')}.`);
-  if (localNeeds) {
-    parts.push(parts.length > 0
-      ? 'Then upload/register the web resource manually and record Local Test/browser validation.'
-      : 'Upload/register the web resource manually and record Local Test/browser validation.');
-  }
-  return parts.length > 0 ? parts.join(' ') : 'All Implementation Verification checks are resolved.';
+  return modalNames.length > 0
+    ? `Run ${modalNames.join(' and ')}.`
+    : 'All Implementation Verification checks are resolved.';
+}
+
+/**
+ * Builds the implementationVerification.aiCodeReview patch for "Mark manually reviewed" —
+ * preserves any previously stored review history (reviewedFiles, summary, findings, etc.) and
+ * clears a stale skip override so the record never carries both a skip and a manual-verify reason
+ * at once. Exported so the history-preservation contract is unit-testable independent of the
+ * modal's onUpdate wiring.
+ */
+export function buildAiManualVerifyPatch(existing: ImplCheckRecord | undefined, now: string): ImplCheckRecord {
+  const { skippedAt, skippedReason, ...preserved } = existing ?? {};
+  return { ...preserved, status: 'manually-verified', manuallyVerifiedAt: now };
+}
+
+/**
+ * Builds the implementationVerification.aiCodeReview patch for "Skip" — preserves any previously
+ * stored review history and clears a stale manual-verify override for the same reason as
+ * buildAiManualVerifyPatch above.
+ */
+export function buildAiSkipPatch(existing: ImplCheckRecord | undefined, reason: string, now: string): ImplCheckRecord {
+  const { manuallyVerifiedAt, ...preserved } = existing ?? {};
+  return { ...preserved, status: 'skipped', skippedAt: now, skippedReason: reason || 'Skipped by user.' };
 }
 
 export function computeImplVerifyNextStep(task: Task): string {
   const bld = deriveBuildCheckStatus(task);
   const dv  = deriveDataverseCheckStatus(task);
-  const ai: ImplCheckStatus        = task.implementationVerification?.aiCodeReview?.status ?? 'not-run';
-  const local: LocalTestImplStatus = task.implementationVerification?.localTest?.status ?? 'not-run';
+  const ai: ImplCheckStatus = task.implementationVerification?.aiCodeReview?.status ?? 'not-run';
 
   if (bld === 'failed' || dv === 'failed' || ai === 'failed') {
-    return 'Fix implementation blockers before testing or review';
+    return 'Fix implementation blockers before continuing to Deployment & Testing';
   }
   if (dv === 'needs_configuration') {
     return 'Configure the Primarch/Dataverse connection (Settings -> CRM Metadata) before proceeding';
@@ -88,21 +131,15 @@ export function computeImplVerifyNextStep(task: Task): string {
   if (bld === 'warnings' || dv === 'warnings' || ai === 'warnings') {
     return 'Review implementation warnings before proceeding';
   }
-  if (local === 'failed') {
-    return 'Fix local test failures before sending for review';
-  }
-  if (local === 'passed' || local === 'not-needed') {
-    return 'Send to consultant testing or request code review';
-  }
   const allAccountedFor =
     ['passed', 'warnings', 'skipped', 'manually-verified'].includes(bld) &&
     ['passed', 'warnings', 'skipped', 'manually-verified'].includes(dv) &&
     ['passed', 'warnings', 'skipped', 'manually-verified'].includes(ai);
   if (allAccountedFor) {
-    return 'Run local test or continue to consultant testing';
+    return 'Continue to Deployment & Testing';
   }
   // Same wording MCP uses for needs_manual_action: only mention the rows still unresolved.
-  return composeManualVerificationStep(dv === 'not-run', ai === 'not-run', true);
+  return composeManualVerificationStep(dv === 'not-run', ai === 'not-run');
 }
 
 // ---------------------------------------------------------------------------
@@ -223,8 +260,12 @@ interface Props {
   onRunAiCodeReview: () => Promise<void>;
   onRunSettingsReviewer: () => Promise<void>;
   onUpdate: (iv: ImplementationVerification) => Promise<void>;
-  onContinueToTesting: () => Promise<void>;
-  onProceedToReview: () => Promise<void>;
+  /**
+   * Local Task Workbench transition only — moves the task into the Deployment & Testing phase.
+   * Performs no Dataverse or Git writes. Gated on progressionGate.canProceed (Dataverse + AI Kit
+   * review resolved); there is no direct path from this modal to Code Review.
+   */
+  onContinueToDeploymentTesting: () => Promise<void>;
   onUpdateNextStepAndClose: (nextStep: string) => Promise<void>;
   onOpenAiReview?: () => void;
   /** Opens the stored Dataverse metadata check result. Present when a result exists. */
@@ -245,18 +286,16 @@ export default function ImplementationVerificationModal({
   resolvedArtifactPath, artifactInferred,
   buildCheckRunning, dataverseCheckRunning, aiCodeReviewRunning,
   onRunBuildCheck, onRunDataverseCheck, onRunAiCodeReview, onRunSettingsReviewer,
-  onUpdate, onContinueToTesting, onProceedToReview, onUpdateNextStepAndClose,
+  onUpdate, onContinueToDeploymentTesting, onUpdateNextStepAndClose,
   onOpenAiReview, onOpenDvReview, onResetDvCheck, onResetAiReview, onClose,
 }: Props) {
   const [busy,               setBusy]               = useState(false);
   const [skipTarget,         setSkipTarget]         = useState<SkipTarget | null>(null);
   const [skipReason,         setSkipReason]         = useState('Skipped by user.');
   const [confirmResetTarget, setConfirmResetTarget] = useState<'dataverse' | 'aiReview' | null>(null);
-  const [testingBusy,        setTestingBusy]        = useState(false);
-  const [reviewBusy,         setReviewBusy]         = useState(false);
+  const [deploymentTestingBusy, setDeploymentTestingBusy] = useState(false);
   const [continueBusy,       setContinueBusy]       = useState(false);
-  const [reviewConfirmPending, setReviewConfirmPending] = useState(false);
-  const [testingConfirmPending, setTestingConfirmPending] = useState(false);
+  const [deploymentTestingConfirmPending, setDeploymentTestingConfirmPending] = useState(false);
   const [reviewRunKind, setReviewRunKind] = useState<'ai-kit' | 'settings' | null>(null);
   const [dvAcceptReasonOpen, setDvAcceptReasonOpen] = useState(false);
   const [dvAcceptReason,     setDvAcceptReason]     = useState('');
@@ -270,21 +309,17 @@ export default function ImplementationVerificationModal({
   const dvEnv        = iv?.dataverseCheck?.environment;
   const dvCheckedRefs = getDataverseCheckedReferences(task);
   const aiStatus: ImplCheckStatus        = iv?.aiCodeReview?.status ?? 'not-run';
-  const localStatus: LocalTestImplStatus = iv?.localTest?.status ?? 'not-run';
   const aiGate       = getAiKitReviewGate(iv?.aiCodeReview);
   // Never show a "Passed" badge for an AI Kit review recorded as passed but missing required
   // detail — render it as pending_ai_kit_review instead (hardening requirement).
   const aiDisplayStatus: DisplayStatus = aiGate.status === 'incomplete' ? 'pending_ai_kit_review' : aiStatus;
   const progressionGate = computeProgressionGate(task);
   const latestReport = task.crmVerificationReports?.[0];
-  // Active AI review: look up by reviewId when present; fall back to aiFileReviews[0] for
-  // older records; return undefined when status is not-run so Open review is hidden after reset.
-  const latestAiReview = (() => {
-    if (aiStatus === 'not-run') return undefined;
-    const reviewId = iv?.aiCodeReview?.reviewId;
-    if (reviewId) return task.aiFileReviews?.find((r) => r.id === reviewId);
-    return task.aiFileReviews?.[0];
-  })();
+  // Canonical AI Code Review report — merges implementationVerification.aiCodeReview (written by
+  // both native reviewers and Claude/MCP's record_ai_kit_review_result) with the matching
+  // aiFileReviews entry when one exists. null when status is not-run (including after a reset) or
+  // when neither canonical detail nor a native entry exists — see buildAiCodeReviewReport.
+  const aiCodeReviewReport = buildAiCodeReviewReport(task);
   // Use the resolved path (which includes inferred paths) for display and guard checks.
   const artifactPath = resolvedArtifactPath ?? task.workflowSetup?.artifactPath;
   const entity       = task.workflowSetup?.primaryEntityLogicalName
@@ -293,16 +328,11 @@ export default function ImplementationVerificationModal({
   const nextStep     = computeImplVerifyNextStep(task);
   const currentNext  = task.mcpNextStep?.action;
 
-  const anyBusy = busy || buildCheckRunning || dataverseCheckRunning || aiCodeReviewRunning || testingBusy || reviewBusy || continueBusy;
+  const anyBusy = busy || buildCheckRunning || dataverseCheckRunning || aiCodeReviewRunning || deploymentTestingBusy || continueBusy;
 
-  // Check if any of the four gates are still untouched (not-run). Soft confirmation only —
-  // does not apply to the hard Dataverse/AI Kit gate, which is enforced separately below.
-  const hasUntouchedChecks = (
-    bldStatus === 'not-run' ||
-    dvStatus  === 'not-run' ||
-    aiStatus  === 'not-run' ||
-    localStatus === 'not-run'
-  );
+  // Soft confirmation only for the non-blocking Build/Script Readiness check — Dataverse and AI
+  // Kit review are hard-gated separately via progressionGate.canProceed below.
+  const hasUntouchedChecks = bldStatus === 'not-run';
 
   const aiReviewMessage = (() => {
     switch (aiStatus) {
@@ -324,15 +354,20 @@ export default function ImplementationVerificationModal({
   })();
 
   const aiReviewMeta = (() => {
-    if (!latestAiReview) return '';
+    if (!aiCodeReviewReport) return '';
     const parts: string[] = [];
-    const commentCount = latestAiReview.structured?.comments?.length;
-    if (commentCount != null) {
-      parts.push(`${commentCount} comment${commentCount === 1 ? '' : 's'}`);
+    const native = aiCodeReviewReport.native;
+    if (native) {
+      const commentCount = native.structured?.comments?.length;
+      if (commentCount != null) {
+        parts.push(`${commentCount} comment${commentCount === 1 ? '' : 's'}`);
+      }
+      const filePath = native.structured?.filePath ?? native.filePath;
+      const fileName = filePath?.replace(/\\/g, '/').split('/').filter(Boolean).pop();
+      if (fileName) parts.push(fileName);
+    } else if (aiCodeReviewReport.reviewedFiles.length > 0) {
+      parts.push(aiCodeReviewReport.reviewedFiles.join(', '));
     }
-    const filePath = latestAiReview.structured?.filePath ?? latestAiReview.filePath;
-    const fileName = filePath?.replace(/\\/g, '/').split('/').filter(Boolean).pop();
-    if (fileName) parts.push(fileName);
     return parts.join(' | ');
   })();
 
@@ -452,13 +487,13 @@ export default function ImplementationVerificationModal({
 
   async function handleAiManualVerify() {
     setBusy(true);
-    await applyUpdate({ aiCodeReview: { ...iv?.aiCodeReview, status: 'manually-verified', manuallyVerifiedAt: new Date().toISOString() } });
+    await applyUpdate({ aiCodeReview: buildAiManualVerifyPatch(iv?.aiCodeReview, new Date().toISOString()) });
     setBusy(false);
   }
 
   async function handleAiSkipConfirm() {
     setBusy(true);
-    await applyUpdate({ aiCodeReview: { status: 'skipped', skippedAt: new Date().toISOString(), skippedReason: skipReason || 'Skipped by user.' } });
+    await applyUpdate({ aiCodeReview: buildAiSkipPatch(iv?.aiCodeReview, skipReason, new Date().toISOString()) });
     setSkipTarget(null); setSkipReason('Skipped by user.');
     setBusy(false);
   }
@@ -475,56 +510,33 @@ export default function ImplementationVerificationModal({
 
   // ---------------------------------------------------------------------------
 
-  async function handleLocalTest(status: LocalTestImplStatus) {
-    setBusy(true);
-    await applyUpdate({ localTest: { status, recordedAt: new Date().toISOString() } });
-    setBusy(false);
-  }
-
-  // ---------------------------------------------------------------------------
-
   async function handleContinue() {
     setContinueBusy(true);
     await onUpdateNextStepAndClose(nextStep);
     setContinueBusy(false);
   }
 
-  async function handleTesting() {
-    setTestingBusy(true);
-    await onContinueToTesting();
-    setTestingBusy(false);
+  async function handleContinueToDeploymentTesting() {
+    setDeploymentTestingBusy(true);
+    await onContinueToDeploymentTesting();
+    setDeploymentTestingBusy(false);
   }
 
-  function handleTestingClick() {
-    if (hasUntouchedChecks && !testingConfirmPending) {
-      setTestingConfirmPending(true);
-    } else {
-      void handleTestingConfirmed();
-    }
-  }
-
-  async function handleTestingConfirmed() {
-    setTestingConfirmPending(false);
-    await handleTesting();
-  }
-
-  function handleReviewClick() {
+  function handleContinueToDeploymentTestingClick() {
     // Hard gate: Dataverse Metadata Check and AI Internal Code Review must both resolve before
-    // the task can move to Code Review / Waiting for PR. There is no confirm-through path here.
+    // continuing to Deployment & Testing. There is no confirm-through path for this gate.
     if (!progressionGate.canProceed) return;
-    if (hasUntouchedChecks && !reviewConfirmPending) {
-      setReviewConfirmPending(true);
+    if (hasUntouchedChecks && !deploymentTestingConfirmPending) {
+      setDeploymentTestingConfirmPending(true);
     } else {
-      void handleReviewConfirmed();
+      void handleContinueToDeploymentTestingConfirmed();
     }
   }
 
-  async function handleReviewConfirmed() {
+  async function handleContinueToDeploymentTestingConfirmed() {
     if (!progressionGate.canProceed) return;
-    setReviewConfirmPending(false);
-    setReviewBusy(true);
-    await onProceedToReview();
-    setReviewBusy(false);
+    setDeploymentTestingConfirmPending(false);
+    await handleContinueToDeploymentTesting();
   }
 
   // ---------------------------------------------------------------------------
@@ -629,7 +641,7 @@ export default function ImplementationVerificationModal({
               border: '1px solid var(--color-blocked, #e05555)', borderRadius: 4,
               padding: '8px 10px', display: 'flex', flexDirection: 'column', gap: 6,
             }}>
-              <div style={{ fontWeight: 600 }}>Cannot move to Code Review yet:</div>
+              <div style={{ fontWeight: 600 }}>Cannot continue to Deployment &amp; Testing yet:</div>
               <ul style={{ margin: 0, paddingLeft: 16 }}>
                 {progressionGate.blockingChecks.map((c, i) => (
                   <li key={`check-${i}`}>{c.reason}</li>
@@ -654,37 +666,20 @@ export default function ImplementationVerificationModal({
               )}
             </div>
           )}
-          {/* Confirmation prompt  shown when some soft checks are untouched (build/local test) */}
-          {reviewConfirmPending && (
+          {/* Confirmation prompt  shown when the soft Build/Script Readiness check is untouched */}
+          {deploymentTestingConfirmPending && (
             <div style={{
               fontSize: 12, color: 'var(--color-warning, #d29922)',
               border: '1px solid var(--color-warning, #d29922)', borderRadius: 4,
               padding: '6px 10px', display: 'flex', alignItems: 'center', gap: 10,
             }}>
               <span style={{ flex: 1 }}>
-                Some implementation checks are not completed. Move to Code Review anyway?
+                Build / Script File Readiness has not been checked. Continue to Deployment &amp; Testing anyway?
               </span>
-              <button className="btn btn-danger btn-sm" onClick={handleReviewConfirmed} disabled={reviewBusy} type="button">
-                {reviewBusy ? <><span className="btn-spinner" /> Moving</> : 'Move to Code Review'}
+              <button className="btn btn-danger btn-sm" onClick={() => void handleContinueToDeploymentTestingConfirmed()} disabled={deploymentTestingBusy} type="button">
+                {deploymentTestingBusy ? <><span className="btn-spinner" /> Moving</> : 'Continue to Deployment & Testing'}
               </button>
-              <button className="btn btn-ghost btn-sm" onClick={() => setReviewConfirmPending(false)} type="button">
-                Cancel
-              </button>
-            </div>
-          )}
-          {testingConfirmPending && (
-            <div style={{
-              fontSize: 12, color: 'var(--color-warning, #d29922)',
-              border: '1px solid var(--color-warning, #d29922)', borderRadius: 4,
-              padding: '6px 10px', display: 'flex', alignItems: 'center', gap: 10,
-            }}>
-              <span style={{ flex: 1 }}>
-                Some implementation checks are not completed. Continue to Consultant Testing anyway?
-              </span>
-              <button className="btn btn-danger btn-sm" onClick={() => void handleTestingConfirmed()} disabled={testingBusy} type="button">
-                {testingBusy ? <><span className="btn-spinner" /> Moving</> : 'Continue to Consultant Testing'}
-              </button>
-              <button className="btn btn-ghost btn-sm" onClick={() => setTestingConfirmPending(false)} type="button">
+              <button className="btn btn-ghost btn-sm" onClick={() => setDeploymentTestingConfirmPending(false)} type="button">
                 Cancel
               </button>
             </div>
@@ -701,24 +696,15 @@ export default function ImplementationVerificationModal({
               {continueBusy ? <><span className="btn-spinner" /> Saving</> : 'Continue in Development'}
             </button>
             <button
-              className="btn btn-secondary btn-sm"
-              onClick={handleTestingClick}
-              disabled={anyBusy || testingConfirmPending}
-              title="Move task to Consultant Testing phase"
-              type="button"
-            >
-              {testingBusy ? <><span className="btn-spinner" /> Moving</> : <><Icon name="play" size={13} /> Continue to Consultant Testing</>}
-            </button>
-            <button
               className="btn btn-primary btn-sm"
-              onClick={handleReviewClick}
-              disabled={anyBusy || reviewConfirmPending || !progressionGate.canProceed}
+              onClick={handleContinueToDeploymentTestingClick}
+              disabled={anyBusy || deploymentTestingConfirmPending || !progressionGate.canProceed}
               title={progressionGate.canProceed
-                ? 'Mark task as Waiting for PR / Code Review'
+                ? 'Local Task Workbench transition only  moves the task to Deployment & Testing. No Dataverse or Git writes.'
                 : 'Blocked: resolve the Dataverse Metadata Check and AI Internal Code Review gates first'}
               type="button"
             >
-              {reviewBusy ? <><span className="btn-spinner" /> Moving</> : <><Icon name="check" size={13} /> Move to Code Review / Waiting for PR</>}
+              {deploymentTestingBusy ? <><span className="btn-spinner" /> Moving</> : <><Icon name="play" size={13} /> Continue to Deployment & Testing</>}
             </button>
           </div>
         </div>
@@ -1002,10 +988,10 @@ export default function ImplementationVerificationModal({
                   </button>
                 </>
               )}
-              {latestAiReview && onOpenAiReview && (
+              {aiCodeReviewReport && onOpenAiReview && (
                 <button className="btn btn-secondary btn-sm" onClick={onOpenAiReview}
                   disabled={anyBusy} type="button">
-                  <Icon name="search" size={12} /> Open review
+                  <Icon name="search" size={12} /> Open report
                 </button>
               )}
               {(aiStatus === 'not-run' || aiStatus === 'passed' || aiStatus === 'warnings' || aiStatus === 'failed') && (
@@ -1022,34 +1008,6 @@ export default function ImplementationVerificationModal({
               )}
             </div>
           )}
-        </section>
-
-        {/* 4. Local Test */}
-        <section style={sectionStyle}>
-          <SectionHeader num="4" title="Local Test" status={localStatus} />
-
-          {iv?.localTest?.notes && <div style={hintStyle}>{iv.localTest.notes}</div>}
-
-          <div style={btnRow}>
-            <button
-              className={`btn btn-sm ${localStatus === 'passed' ? 'btn-primary' : 'btn-secondary'}`}
-              onClick={() => handleLocalTest('passed')} disabled={anyBusy} type="button">
-              <Icon name="check" size={12} /> Record passed
-            </button>
-            <button
-              className={`btn btn-sm ${localStatus === 'failed' ? 'btn-danger' : 'btn-secondary'}`}
-              onClick={() => handleLocalTest('failed')} disabled={anyBusy} type="button">
-              Record failed
-            </button>
-            <button
-              className={`btn btn-sm ${localStatus === 'not-needed' ? 'btn-secondary' : 'btn-ghost'}`}
-              onClick={() => handleLocalTest('not-needed')} disabled={anyBusy} type="button">
-              Mark not needed
-            </button>
-            {localStatus !== 'not-run' && (
-              <button className="btn btn-ghost btn-sm" onClick={() => handleLocalTest('not-run')} disabled={anyBusy} type="button">Reset</button>
-            )}
-          </div>
         </section>
 
         {/* Suggested next step */}

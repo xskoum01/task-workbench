@@ -9,6 +9,8 @@ import type {
   CrmVerificationReport,
   CrmPullRequestFixUpdateTracking,
   ImplementationVerification,
+  ManualDeploymentStatus,
+  DeploymentTestStatus,
 } from '../types';
 import TaskEmailContent from './TaskEmailContent';
 import TaskDevModePanel, { type TaskDevModePanelHandle } from './TaskDevModePanel';
@@ -32,14 +34,21 @@ import CrmSkeletonResultView from './CrmSkeletonResultView';
 import CrmVerificationReportView from './CrmVerificationReportView';
 import CrmDeveloperWorkflowPanel from './CrmDeveloperWorkflowPanel';
 import PrimarchVerificationModal, { type PrimarchVerifyStep } from './PrimarchVerificationModal';
-import ImplementationVerificationModal from './ImplementationVerificationModal';
+import ImplementationVerificationModal, { deriveBuildCheckStatus } from './ImplementationVerificationModal';
+import AiCodeReviewReportModal from './AiCodeReviewReportModal';
+import PullRequestModal from './PullRequestModal';
 import * as tauriApi from '../lib/tauriCommands';
 import { openReviewTarget } from '../lib/openReviewTarget';
-import { formatTaskActivityNotes, splitTaskNotes } from '../lib/taskActivityFormatter';
+import { buildAiCodeReviewReport } from '../lib/aiCodeReviewReport';
+import { formatTaskActivityNotes, splitTaskNotes, appendActivityNote } from '../lib/taskActivityFormatter';
 import { WorkflowStepper } from './WorkflowStepper';
 import CopyAiWorkflowPromptButton from './CopyAiWorkflowPromptButton';
 import { getDeveloperReadiness } from '../lib/developerReadiness';
 import { computeProgressionGate } from '../lib/implementationGate';
+import {
+  computeDeploymentTestingGate,
+  computeCodeReviewReadinessGate,
+} from '../lib/deploymentTestingGate';
 import GitCommitModal from './GitCommitModal';
 import { generateBranchName } from '../lib/gitBranchName';
 import { buildTaskWorkflowPlan } from '../lib/workflowPlan';
@@ -433,7 +442,9 @@ const CHECKLIST_KEY_MAP: Record<string, string> = {
   'Technical plan':       'technical-plan-ready',
   'Implementation':       'implementation-done',
   'Local test':           'local-test-done',
-  'Consultant testing':   'consultant-testing',
+  // Row label renamed to 'Deployment & testing'; the MCP override key stays 'consultant-testing'
+  // (persisted identifier, unchanged — see src/lib/deploymentTestingGate.ts for the new canonical gate).
+  'Deployment & testing': 'consultant-testing',
   'Pull request':         'pull-request',
   'Code review':          'code-review',
   'Done':                 'done',
@@ -460,7 +471,8 @@ function buildWorkflowChecklist(task: Task, effectiveMode: string): CheckRow[] {
   const planApproved     = !!(wf?.planApproval?.approved && !wf.planApproval.invalidatedAt);
   const diffApproved     = !!(wf?.diffApproval?.approved && !wf.diffApproval.invalidatedAt);
   const consultantDone   = !!(wf?.externalExecution?.completed && !wf.externalExecution.invalidatedAt)
-                         || task.consultantTestRecord?.status === 'confirmed';
+                         || task.consultantTestRecord?.status === 'confirmed'
+                         || computeDeploymentTestingGate(task).canProceedToCommit;
   const prTracked        = !!(wf?.pullRequestTracking?.createdManually && !wf.pullRequestTracking.invalidatedAt);
   const reviewDone       = !!(wf?.pullRequestReview && !wf.pullRequestReview.invalidatedAt);
   const reviewNeedsAttention = !!wf?.pullRequestReview?.attentionRequired;
@@ -490,7 +502,7 @@ function buildWorkflowChecklist(task: Task, effectiveMode: string): CheckRow[] {
     { label: 'Technical plan',       status: planApproved ? 'done' : wf?.technicalPlan ? 'partial' : 'pending' },
     { label: 'Implementation',       status: diffApproved ? 'done' : (isInProgress && !isTesting) ? 'active' : 'pending' },
     { label: 'Local test',           status: localTestDerived },
-    { label: 'Consultant testing',   status: consultantDerived },
+    { label: 'Deployment & testing', status: consultantDerived },
     { label: 'Pull request',         status: prTracked ? 'done' : isReview ? 'active' : 'pending' },
     { label: 'Code review',          status: reviewDone ? (reviewNeedsAttention ? 'partial' : 'done') : 'pending' },
     { label: 'Done',                 status: isDone ? 'done' : 'pending' },
@@ -552,15 +564,6 @@ function deriveNextStep(task: Task, plan: TaskWorkflowPlan, effectiveMode: strin
   }
 
   return null;
-}
-
-/**
- * Appends a timestamped activity note line to the task's notes string.
- * Format: `[ISO-timestamp] body` — matched by the activity formatter.
- */
-function appendActivityNote(existing: string | undefined, body: string): string {
-  const line = `[${new Date().toISOString()}] ${body}`;
-  return existing?.trim() ? `${existing.trim()}\n${line}` : line;
 }
 
 /**
@@ -748,8 +751,18 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
   } | null>(null);
   // Git commit modal
   const [showGitCommitModal, setShowGitCommitModal] = useState(false);
-  // When true, GitCommitModal was opened from the Testing → Prepare commit guided flow
+  // When true, GitCommitModal was opened from the Deployment & Testing → Prepare commit guided flow
   const [gitCommitGuidedMode, setGitCommitGuidedMode] = useState(false);
+  // Pull Request modal — opened after a verified commit+push, before the task may enter Code Review
+  const [showPullRequestModal, setShowPullRequestModal] = useState(false);
+  // Deployment & Testing actions modal — successful outcomes are one-click (no notes required);
+  // "failed"/"not-needed" reveal an inline reason box only once selected (deploymentExceptionTarget/
+  // testExceptionTarget), never a permanently-visible text field on the success path.
+  const [deploymentExceptionTarget, setDeploymentExceptionTarget] = useState<'failed' | 'not-needed' | null>(null);
+  const [deploymentExceptionReason, setDeploymentExceptionReason] = useState('');
+  const [testExceptionTarget, setTestExceptionTarget] = useState<'failed' | 'not-needed' | null>(null);
+  const [testExceptionReason, setTestExceptionReason] = useState('');
+  const [resetDeploymentTestingTarget, setResetDeploymentTestingTarget] = useState<'deployment' | 'test' | null>(null);
   // Compact Git Status section — live current branch + branch list, fetched once when expanded.
   const [gitStatusLoaded, setGitStatusLoaded]     = useState(false);
   const [gitStatusLoading, setGitStatusLoading]   = useState(false);
@@ -807,6 +820,8 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
   }, [task.id]);
   // AI Code Review — which saved review is open in the detail modal (null = closed)
   const [savedReviewModal, setSavedReviewModal] = useState<AiFileReviewResult | null>(null);
+  // Implementation Verification "Open report" — canonical AI Code Review report (native or Claude/MCP)
+  const [showAiCodeReviewReportModal, setShowAiCodeReviewReportModal] = useState(false);
   const [showCrmSkeletonModal, setShowCrmSkeletonModal] = useState(false);
   const [showCrmVerificationModal, setShowCrmVerificationModal] = useState(false);
   const [showPrimarchVerifyModal, setShowPrimarchVerifyModal] = useState(false);
@@ -1549,6 +1564,10 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
   const effectiveWorkflowAction = plan.currentAction;
 
   // Check whether the script artifact file exists on disk for script-create tasks in Development.
+  // Re-runs when Script File Readiness's persisted status changes (not just when the configured
+  // path changes) so a file Claude/MCP creates at an already-configured path is picked up on the
+  // next task refresh, instead of leaving this one-shot check permanently stale.
+  const scriptFileReadinessStatus = deriveBuildCheckStatus(task);
   useEffect(() => {
     const path = resolvedArtifactForAiKit?.trim();
     if (!plan.requiresScriptCreate || !path) {
@@ -1562,7 +1581,13 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
       if (!cancelled) setScriptArtifactExists(null);
     });
     return () => { cancelled = true; };
-  }, [plan.requiresScriptCreate, resolvedArtifactForAiKit]);
+  }, [plan.requiresScriptCreate, resolvedArtifactForAiKit, scriptFileReadinessStatus]);
+
+  // Canonical override: once Implementation Verification's Script File Readiness check has
+  // actually passed, trust that persisted result over the local one-shot filesystem check — it is
+  // the same readiness derivation the Implementation Verification modal uses, so the two can never
+  // visibly disagree ("script file does not exist" while the modal shows the check as passed).
+  const scriptArtifactConfirmedExists = scriptFileReadinessStatus === 'passed' ? true : scriptArtifactExists;
 
   async function handleCreateScriptFileInPanel() {
     const rawPath = resolvedArtifactForAiKit?.trim();
@@ -2092,19 +2117,19 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
     });
   }
 
-  /** Marks the task as awaiting consultant testing (status stays in-progress). */
-  async function handleMarkWaitingForConsultantTesting() {
+  /** Marks the task as entering Deployment & Testing (status stays in-progress). Local transition only. */
+  async function handleContinueToDeploymentTesting() {
     await updateTask(task.id, { waitingState: 'consultant-testing', attentionState: null });
     setShowImplVerifyModal(false);
-    setFeedback('Moved to consultant testing');
+    setFeedback('Moved to Deployment & Testing');
   }
 
   /**
-   * Gated version of handleMarkWaitingForConsultantTesting.
+   * Gated version of handleContinueToDeploymentTesting.
    * When AI Kit is configured and the latest review is missing, WARN, or FAIL,
    * shows a warning before proceeding.
    */
-  async function handleContinueToTestingWithGate() {
+  async function handleContinueToDeploymentTestingWithGate() {
     if (aiKitWorkflowState.isConfigured) {
       const v = aiKitWorkflowState.latestReviewVerdict;
       const noReview = !aiKitWorkflowState.latestReviewIsAiKit && aiKitWorkflowState.hasImplementationActivity;
@@ -2114,78 +2139,133 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
         noReview              ? 'no-review' :
         null;
       if (severity) {
-        setAiKitTestingGate({ severity, onConfirm: handleMarkWaitingForConsultantTesting });
+        setAiKitTestingGate({ severity, onConfirm: handleContinueToDeploymentTesting });
         return;
       }
     }
-    await handleMarkWaitingForConsultantTesting();
+    await handleContinueToDeploymentTesting();
   }
 
-  // --- Testing phase actions (from Testing step click) ---
+  // --- Deployment & Testing phase actions (from the Deployment & Testing step click) ---
 
-  /** Moves the task back to active development from consultant testing. */
+  const deploymentTestingGate = computeDeploymentTestingGate(task);
+  const codeReviewReadinessGate = computeCodeReviewReadinessGate(task);
+
+  /** Moves the task back to active development from Deployment & Testing. */
   async function handleTestingBackToDev() {
     const now = new Date().toISOString();
     await updateTask(task.id, {
       waitingState: null,
       attentionState: null,
-      mcpNextStep: { action: 'Continue development', reason: 'Moved back to development from consultant testing.', updatedAt: now },
+      mcpNextStep: { action: 'Continue development', reason: 'Moved back to development from Deployment & Testing.', updatedAt: now },
       notes: appendActivityNote(task.notes, 'UI: moved-back-to-development'),
     });
     setShowTestingActionsModal(false);
     setFeedback('Moved back to development.');
   }
 
-  /** Records that consultant testing failed; returns to development for fixes. */
-  async function handleTestingFailed() {
+  /**
+   * Records a manual deployment result. Local Task Workbench write only — never calls Primarch,
+   * the Dataverse Web API, PAC CLI, or Power Apps. `notes` is entirely optional for 'deployed' and
+   * 'failed' (a one-click confirmation) — only 'not-needed' requires a meaningful reason, enforced
+   * by the caller UI, which disables that action until a reason is entered. Omitted/empty notes are
+   * never persisted (the field is left absent, not written as an empty string) — never fabricate a
+   * description just to fill the field. A failed deployment returns the task to active Development.
+   */
+  async function handleRecordManualDeployment(status: ManualDeploymentStatus, notes?: string) {
     const now = new Date().toISOString();
-    await updateTask(task.id, {
-      waitingState: null,
-      attentionState: null,
-      consultantTestRecord: { status: 'failed', updatedAt: now, note: 'Consultant testing failed.' },
-      mcpNextStep: { action: 'Fix consultant testing findings', reason: 'Consultant testing failed or returned issues.', updatedAt: now },
-      notes: appendActivityNote(task.notes, 'UI: consultant-testing-failed'),
-    });
-    setShowTestingActionsModal(false);
-    setFeedback('Consultant testing failed — back to development.');
+    const trimmedNotes = notes?.trim();
+    const patch: Partial<Task> = {
+      deploymentTesting: {
+        ...task.deploymentTesting,
+        deployment: { status, recordedAt: now, recordedBy: 'user', ...(trimmedNotes ? { notes: trimmedNotes } : {}) },
+        updatedAt: now,
+      },
+      notes: appendActivityNote(task.notes, `UI: manual-deployment-${status}`),
+    };
+    if (status === 'failed') {
+      patch.waitingState = null;
+      patch.attentionState = null;
+      patch.mcpNextStep = { action: 'Redeploy and record the result', reason: 'Manual deployment was recorded as failed.', updatedAt: now };
+    }
+    await updateTask(task.id, patch);
+    setFeedback(`Manual deployment recorded: ${status}.`);
   }
 
   /**
-   * Primary guided action: marks consultant testing confirmed, then opens the Git commit modal.
-   * Does NOT move to Review yet — that happens only after a successful Commit + Push.
-   *
-   * If no Git repo is configured, the task is still marked confirmed (back in development)
-   * and the user receives feedback asking to configure the repository first.
+   * Records a real browser/model-driven app test performed after manual deployment. Local write
+   * only. `notes` is entirely optional for 'passed' and 'failed' (a one-click confirmation) — only
+   * 'not-needed' requires a meaningful reason, enforced by the caller UI. Omitted/empty notes are
+   * never persisted. A failed test returns the task to active Development.
    */
-  async function handleTestingConfirmedPreparePR() {
+  async function handleRecordDeploymentTest(status: DeploymentTestStatus, notes?: string) {
+    const now = new Date().toISOString();
+    const trimmedNotes = notes?.trim();
+    const patch: Partial<Task> = {
+      deploymentTesting: {
+        ...task.deploymentTesting,
+        test: { status, recordedAt: now, recordedBy: 'user', ...(trimmedNotes ? { notes: trimmedNotes } : {}) },
+        updatedAt: now,
+      },
+      notes: appendActivityNote(task.notes, `UI: deployment-test-${status}`),
+    };
+    if (status === 'failed') {
+      patch.waitingState = null;
+      patch.attentionState = null;
+      patch.mcpNextStep = { action: 'Fix the code or redeploy, then retest', reason: 'Deployment test failed.', updatedAt: now };
+    }
+    await updateTask(task.id, patch);
+    setFeedback(`Deployment test recorded: ${status}.`);
+  }
+
+  /** Resets the manual deployment record to not-run so it can be recorded again. */
+  async function handleResetManualDeployment() {
+    const now = new Date().toISOString();
+    await updateTask(task.id, {
+      deploymentTesting: { ...task.deploymentTesting, deployment: { status: 'not-run' }, updatedAt: now },
+      notes: appendActivityNote(task.notes, 'UI: manual-deployment-reset'),
+    });
+    setResetDeploymentTestingTarget(null);
+    setFeedback('Manual deployment reset.');
+  }
+
+  /** Resets the deployment test record to not-run so it can be recorded again. */
+  async function handleResetDeploymentTest() {
+    const now = new Date().toISOString();
+    await updateTask(task.id, {
+      deploymentTesting: { ...task.deploymentTesting, test: { status: 'not-run' }, updatedAt: now },
+      notes: appendActivityNote(task.notes, 'UI: deployment-test-reset'),
+    });
+    setResetDeploymentTestingTarget(null);
+    setFeedback('Deployment test reset.');
+  }
+
+  /**
+   * Primary guided action once deployment + testing are both resolved: opens the Git commit
+   * modal. Does NOT move to Review — that happens only after a verified Commit + Push AND a
+   * created/recorded pull request (see handleRecordPullRequestCreated).
+   */
+  async function handlePrepareCommitAndPush() {
+    if (!deploymentTestingGate.canProceedToCommit) return;
     const now = new Date().toISOString();
     if (!repoRootForGit) {
       await updateTask(task.id, {
-        waitingState: null,
-        attentionState: null,
-        consultantTestRecord: { status: 'confirmed', updatedAt: now, note: 'Consultant testing confirmed.' },
         mcpNextStep: {
           action: 'Configure repository and prepare commit',
-          reason: 'Consultant testing was confirmed, but Git repository was not detected. Configure repository before moving to Code Review.',
+          reason: 'Deployment and testing are resolved, but Git repository was not detected. Configure repository before committing.',
           updatedAt: now,
         },
-        notes: appendActivityNote(task.notes, 'UI: consultant-testing-confirmed'),
       });
       setShowTestingActionsModal(false);
-      setFeedback('Consultant testing confirmed, but Git repository was not detected. Configure repository before moving to Code Review.');
+      setFeedback('Deployment and testing resolved, but Git repository was not detected. Configure repository before committing.');
       return;
     }
-    // Mark testing confirmed — stays in-progress, NOT moved to Review yet.
     await updateTask(task.id, {
-      waitingState: null,
-      attentionState: null,
-      consultantTestRecord: { status: 'confirmed', updatedAt: now, note: 'Consultant testing confirmed.' },
       mcpNextStep: {
         action: 'Prepare commit and push',
-        reason: 'Consultant testing was confirmed. Commit and push are required before code review.',
+        reason: 'Deployment and testing are resolved. Commit and push, then create a pull request before code review.',
         updatedAt: now,
       },
-      notes: appendActivityNote(task.notes, 'UI: consultant-testing-confirmed'),
     });
     setShowTestingActionsModal(false);
     setGitCommitGuidedMode(true);
@@ -2194,101 +2274,127 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
 
   /**
    * Guided mode post-action: called by GitCommitModal after a successful Commit + Push.
-   * Moves the task to Review / Waiting for code review and opens Azure DevOps.
-   * Receives the pre-built commit note so both notes can be appended in a single updateTask call.
+   * Persists the verified commit/push state to gitWorkflow immediately, then opens the Pull
+   * Request modal — the task does NOT move to Code Review here. See handleRecordPullRequestCreated.
    */
-  async function handleGitCommitMoveToReview(
+  async function handleGitCommitAndPushDone(
     commitNote: string,
-    _hash: string | undefined,
-    _branch: string | undefined,
+    hash: string | undefined,
+    branch: string | undefined,
   ) {
     const now = new Date().toISOString();
     const notesWithCommit = appendActivityNote(task.notes, commitNote);
-    const notesWithBoth   = appendActivityNote(notesWithCommit, 'UI: testing-confirmed-commit-pushed-moved-to-review');
+    const notesWithBoth   = appendActivityNote(notesWithCommit, 'UI: commit-and-push-verified');
     await updateTask(task.id, {
-      status:         'ready-for-review',
-      waitingState:   'code-review',
-      attentionState: null,
+      gitWorkflow: {
+        ...task.gitWorkflow,
+        lastCommitHash:   hash,
+        lastCommitAt:     now,
+        lastCommitBranch: branch,
+        lastPushedBranch: branch,
+        lastPushedAt:     now,
+      },
       mcpNextStep: {
-        action:    'Wait for code review',
-        reason:    'Changes were committed and pushed. Task moved to code review.',
+        action:    'Prepare pull request',
+        reason:    'Commit verified and pushed. Create a pull request before code review.',
         updatedAt: now,
       },
       notes: notesWithBoth,
     });
     setShowGitCommitModal(false);
     setGitCommitGuidedMode(false);
-
-    const resolution = buildAzureDevOpsRepoUrl(task, customer ?? null);
-    if (resolution?.kind === 'repo') {
-      tauriApi.openExternalUrl(resolution.url).then(() => {
-        setFeedback('Committed and pushed — task moved to Code Review. Repository opened.');
-      }).catch(() => {
-        setFeedback('Committed and pushed — task moved to Code Review. Could not open repository.');
-      });
-    } else if (resolution?.kind === 'work-item') {
-      tauriApi.openExternalUrl(resolution.url).then(() => {
-        setFeedback('Committed and pushed — task moved to Code Review. Work item opened.');
-      }).catch(() => {
-        setFeedback('Committed and pushed — task moved to Code Review.');
-      });
-    } else {
-      setFeedback('Committed and pushed — task moved to Code Review. No Azure DevOps URL configured.');
-    }
+    setShowPullRequestModal(true);
   }
 
   /**
    * Guided mode post-action: called by GitCommitModal after a commit-only (no push).
-   * Stays in Development, updates next step to prompt a push before moving to Review.
+   * Persists the verified commit hash. Stays in Development; still needs a push before a PR.
    */
   async function handleGitCommitOnlyGuided(commitNote: string, hash: string | undefined) {
     const now = new Date().toISOString();
     await updateTask(task.id, {
+      gitWorkflow: {
+        ...task.gitWorkflow,
+        lastCommitHash: hash,
+        lastCommitAt:   now,
+      },
       mcpNextStep: {
-        action:    'Push branch before moving to Code Review',
-        reason:    'Commit created. Push the branch to proceed to code review.',
+        action:    'Push branch before preparing a pull request',
+        reason:    'Commit created. Push the branch, then create a pull request.',
         updatedAt: now,
       },
       notes: appendActivityNote(task.notes, commitNote),
     });
-    setFeedback(`Commit created (${hash ?? '?'}). Push the branch before moving to Code Review.`);
+    setFeedback(`Commit created (${hash ?? '?'}). Push the branch before preparing a pull request.`);
   }
 
   /**
-   * Guided mode post-action: called by GitCommitModal after a push-only operation.
-   * Moves the task to Code Review / Waiting for code review and opens Azure DevOps.
+   * Guided mode post-action: called by GitCommitModal after a push-only operation (an existing
+   * commit was pushed). Persists the verified push state, then opens the Pull Request modal —
+   * the task does NOT move to Code Review here. See handleRecordPullRequestCreated.
    */
-  async function handleGitPushOnlyMoveToReview(pushNote: string, branch: string | undefined) {
+  async function handleGitPushOnlyDone(pushNote: string, branch: string | undefined) {
     const now = new Date().toISOString();
     await updateTask(task.id, {
-      status:         'ready-for-review',
-      waitingState:   'code-review',
-      attentionState: null,
+      gitWorkflow: {
+        ...task.gitWorkflow,
+        lastCommitBranch: task.gitWorkflow?.lastCommitBranch ?? branch,
+        lastPushedBranch: branch,
+        lastPushedAt:     now,
+      },
       mcpNextStep: {
-        action:    'Wait for code review',
-        reason:    'Branch pushed. Task moved to code review.',
+        action:    'Prepare pull request',
+        reason:    'Branch pushed. Create a pull request before code review.',
         updatedAt: now,
       },
       notes: appendActivityNote(task.notes, pushNote),
     });
     setShowGitCommitModal(false);
     setGitCommitGuidedMode(false);
+    setShowPullRequestModal(true);
+  }
 
-    const resolution = buildAzureDevOpsRepoUrl(task, customer ?? null);
-    if (resolution?.kind === 'repo') {
-      tauriApi.openExternalUrl(resolution.url).then(() => {
-        setFeedback(`Branch ${branch ?? '?'} pushed — task moved to Code Review. Repository opened.`);
-      }).catch(() => {
-        setFeedback(`Branch ${branch ?? '?'} pushed — task moved to Code Review. Could not open repository.`);
+  /**
+   * Records that a pull request was created (manually by the user, or by Claude only after
+   * explicit separate approval) — local write only, never an automatic external PR creation.
+   * Once commit, push, and PR are all verified, moves the task to Code Review / waiting for
+   * colleague review and opens the repository/PR URL.
+   */
+  async function handleRecordPullRequestCreated(prUrl: string, notes: string) {
+    const now = new Date().toISOString();
+    const patchedTask: Task = {
+      ...task,
+      crmDeveloperWorkflow: {
+        ...task.crmDeveloperWorkflow,
+        pullRequestTracking: { createdManually: true, createdAt: now, prUrl, notes: notes || undefined },
+      },
+    };
+    const readiness = computeCodeReviewReadinessGate(patchedTask);
+    const basePatch: Partial<Task> = {
+      crmDeveloperWorkflow: patchedTask.crmDeveloperWorkflow,
+      notes: appendActivityNote(task.notes, 'UI: pull-request-recorded'),
+    };
+    if (readiness.canEnterCodeReview) {
+      await updateTask(task.id, {
+        ...basePatch,
+        status:         'ready-for-review',
+        waitingState:   'code-review',
+        attentionState: null,
+        mcpNextStep: {
+          action:    'Wait for colleague code review',
+          reason:    'Pull request created and recorded. Waiting for colleague review — this is independent of any AI/Claude review.',
+          updatedAt: now,
+        },
       });
-    } else if (resolution?.kind === 'work-item') {
-      tauriApi.openExternalUrl(resolution.url).then(() => {
-        setFeedback(`Branch ${branch ?? '?'} pushed — task moved to Code Review. Work item opened.`);
-      }).catch(() => {
-        setFeedback(`Branch ${branch ?? '?'} pushed — task moved to Code Review.`);
-      });
+      setFeedback('Pull request recorded — task moved to Code Review (waiting for colleague review).');
     } else {
-      setFeedback(`Branch ${branch ?? '?'} pushed — task moved to Code Review. No Azure DevOps URL configured.`);
+      await updateTask(task.id, basePatch);
+      setFeedback('Pull request recorded, but commit/push are not yet fully verified.');
+    }
+    setShowPullRequestModal(false);
+
+    if (prUrl) {
+      tauriApi.openExternalUrl(prUrl).catch(() => {});
     }
   }
 
@@ -3298,7 +3404,7 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
   /**
    * Hard gate: Dataverse Metadata Check and AI Internal Code Review must both resolve (cleanly
    * pass, or Dataverse warnings explicitly accepted) before the task may move to Code Review /
-   * Waiting for PR. Unlike handleContinueToTestingWithGate's dismissable warning banner, this
+   * Waiting for PR. Unlike handleContinueToDeploymentTestingWithGate's dismissable warning banner, this
    * gate cannot be clicked through — the only way past it is fixing the code, accepting
    * warnings, or configuring the connection in the Implementation Verification modal.
    */
@@ -4332,7 +4438,7 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
 
               {/* Script file create actions — shown for Script Create tasks when artifact doesn't exist */}
               {plan.requiresScriptCreate && task.status === 'in-progress' && (
-                scriptArtifactExists === false ? (
+                scriptArtifactConfirmedExists === false ? (
                   <div style={{ marginBottom: 8 }}>
                     <div style={{ color: 'var(--color-warning, #d29922)', fontSize: 11, marginBottom: 6 }}>
                       Script file does not exist yet. Create it to start working.
@@ -4367,7 +4473,7 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
                       )}
                     </div>
                   </div>
-                ) : scriptArtifactExists === null ? (
+                ) : scriptArtifactConfirmedExists === null ? (
                   <div style={{ fontSize: 11, color: 'var(--color-text-muted, #888)', marginBottom: 6 }}>
                     Checking script file…
                   </div>
@@ -4384,7 +4490,7 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
                   repoRootForGit={repoRootForGit}
                   defaultMode={devTarget.kind === 'plugin' ? 'plugin' : 'script'}
                   scriptOpenPath={
-                    (plan.requiresScriptCreate && scriptArtifactExists === false)
+                    (plan.requiresScriptCreate && scriptArtifactConfirmedExists === false)
                       ? undefined
                       : task.workflowSetup?.scriptPath ?? customer?.scriptFolder ?? effectiveVscodePath
                   }
@@ -4692,7 +4798,10 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
                 {/* AI Kit Actions */}
                 <div style={{ marginTop: 8 }}>
                   <div className="detail-action-group-label">AI Kit Actions</div>
-                  {aiKitWorkflowState.isConfigured && task.status === 'in-progress' && (
+                  {/* Hidden once the task has moved into Deployment & Testing (waitingState set) —
+                      this pre-verification dev-stage guidance would otherwise stay stale, e.g. still
+                      recommending an AI Kit review that has already passed. */}
+                  {aiKitWorkflowState.isConfigured && task.status === 'in-progress' && task.waitingState !== 'consultant-testing' && (
                     <div style={{
                       fontSize: 11.5,
                       color: aiKitWorkflowState.latestReviewVerdict === 'needs_changes'
@@ -4710,7 +4819,7 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
                   )}
 
                   {/* Non-blocking advisory when AI Kit review found issues */}
-                  {aiKitWorkflowState.isConfigured && task.status === 'in-progress'
+                  {aiKitWorkflowState.isConfigured && task.status === 'in-progress' && task.waitingState !== 'consultant-testing'
                     && (aiKitWorkflowState.latestReviewVerdict === 'needs_changes'
                         || aiKitWorkflowState.latestReviewVerdict === 'comment') && (
                     <div style={{
@@ -5136,7 +5245,7 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
                   className="btn btn-primary btn-sm"
                   onClick={async () => { await aiKitTestingGate.onConfirm(); setAiKitTestingGate(null); }}
                 >
-                  Continue to Testing
+                  Continue to Deployment & Testing
                 </button>
               )}
               <button
@@ -5157,20 +5266,20 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
           customer={customer ?? null}
           repoRoot={repoRootForGit}
           postCommitPushAction={gitCommitGuidedMode ? 'move-to-review-and-open-ado' : undefined}
-          onPostCommitPushSuccess={gitCommitGuidedMode ? handleGitCommitMoveToReview : undefined}
+          onPostCommitPushSuccess={gitCommitGuidedMode ? handleGitCommitAndPushDone : undefined}
           onCommitOnlySuccess={gitCommitGuidedMode ? handleGitCommitOnlyGuided : undefined}
-          onPushOnlySuccess={gitCommitGuidedMode ? handleGitPushOnlyMoveToReview : undefined}
+          onPushOnlySuccess={gitCommitGuidedMode ? handleGitPushOnlyDone : undefined}
           onClose={() => { setShowGitCommitModal(false); setGitCommitGuidedMode(false); }}
           onActivityNote={(note) => void handleGitActivityNote(note)}
         />
       )}
 
-      {/* Testing actions modal */}
+      {/* Deployment & Testing actions modal */}
       {showTestingActionsModal && (
         <div className="modal-overlay" onClick={() => setShowTestingActionsModal(false)}>
           <div className="modal" onClick={(e) => e.stopPropagation()} role="dialog" aria-modal="true" aria-labelledby="testing-modal-title">
             <div className="modal-header">
-              <h3 className="modal-title" id="testing-modal-title">Testing actions</h3>
+              <h3 className="modal-title" id="testing-modal-title">Deployment & Testing</h3>
               <button
                 type="button"
                 className="modal-close"
@@ -5182,7 +5291,8 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
             </div>
             <div className="modal-body" style={{ display: 'flex', flexDirection: 'column', gap: 'var(--gap-sm)' }}>
               <p style={{ margin: 0, fontSize: 13, color: 'var(--color-text-muted)' }}>
-                Testing in progress — waiting for consultant testing.
+                Manual deployment and application testing. Task Workbench only records what you have
+                done — it never deploys or tests the CRM artifact itself.
               </p>
               {/* Azure DevOps URL hint — shows customer name and what is/isn't configured */}
               {(() => {
@@ -5230,6 +5340,175 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
                   </div>
                 );
               })()}
+              {/* 1. Manual deployment */}
+              <div style={{ border: '1px solid var(--border-subtle)', borderRadius: 4, padding: '8px 10px', display: 'flex', flexDirection: 'column', gap: 6 }}>
+                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                  <strong style={{ fontSize: 12 }}>1. Manual deployment</strong>
+                  <span style={{
+                    fontSize: 11, fontWeight: 600,
+                    color: deploymentTestingGate.deploymentStatus === 'deployed' || deploymentTestingGate.deploymentStatus === 'not-needed'
+                      ? 'var(--color-done, #3fb950)'
+                      : deploymentTestingGate.deploymentStatus === 'failed' ? 'var(--color-blocked, #e05555)' : 'var(--color-text-muted)',
+                  }}>
+                    {deploymentTestingGate.deploymentStatus}
+                  </span>
+                </div>
+                <p style={{ margin: 0, fontSize: 11, color: 'var(--color-text-muted)' }}>
+                  Confirm what you deployed manually: web resource created/updated, included in the intended
+                  unmanaged solution, customizations published, script added to the form, and handlers registered.
+                </p>
+                {task.deploymentTesting?.deployment?.notes && (
+                  <p style={{ margin: 0, fontSize: 11, color: 'var(--color-text-secondary)' }}>{task.deploymentTesting.deployment.notes}</p>
+                )}
+                {resetDeploymentTestingTarget === 'deployment' ? (
+                  <div style={{ display: 'flex', gap: 6 }}>
+                    <span style={{ fontSize: 11, color: 'var(--color-text-muted)', flex: 1 }}>Reset the recorded deployment?</span>
+                    <button type="button" className="btn btn-danger btn-sm" onClick={() => void handleResetManualDeployment()}>Confirm Reset</button>
+                    <button type="button" className="btn btn-ghost btn-sm" onClick={() => setResetDeploymentTestingTarget(null)}>Cancel</button>
+                  </div>
+                ) : deploymentExceptionTarget ? (
+                  <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+                    <span style={{ fontSize: 11, color: 'var(--color-text-muted)' }}>
+                      {deploymentExceptionTarget === 'not-needed' ? 'Reason deployment is not needed (required):' : 'Reason deployment failed (optional):'}
+                    </span>
+                    <input
+                      className="form-input form-input-sm"
+                      autoFocus
+                      placeholder={deploymentExceptionTarget === 'not-needed' ? 'Required reason' : 'Optional reason'}
+                      value={deploymentExceptionReason}
+                      onChange={(e) => setDeploymentExceptionReason(e.target.value)}
+                    />
+                    <div style={{ display: 'flex', gap: 6 }}>
+                      <button type="button" className="btn btn-danger btn-sm"
+                        disabled={deploymentExceptionTarget === 'not-needed' && !deploymentExceptionReason.trim()}
+                        onClick={() => {
+                          const notes = deploymentExceptionTarget === 'failed'
+                            ? (deploymentExceptionReason.trim() || 'Manual deployment failed.')
+                            : deploymentExceptionReason.trim();
+                          void handleRecordManualDeployment(deploymentExceptionTarget, notes);
+                          setDeploymentExceptionTarget(null); setDeploymentExceptionReason('');
+                        }}>
+                        Confirm
+                      </button>
+                      <button type="button" className="btn btn-ghost btn-sm"
+                        onClick={() => { setDeploymentExceptionTarget(null); setDeploymentExceptionReason(''); }}>
+                        Cancel
+                      </button>
+                    </div>
+                  </div>
+                ) : (
+                  <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap' }}>
+                    <button type="button" className="btn btn-secondary btn-sm"
+                      onClick={() => void handleRecordManualDeployment('deployed')}
+                      title="One-click confirmation — no notes required">
+                      Confirm deployment completed
+                    </button>
+                    <button type="button" className="btn btn-ghost btn-sm" onClick={() => setDeploymentExceptionTarget('failed')}>
+                      Record deployment failed
+                    </button>
+                    <button type="button" className="btn btn-ghost btn-sm" onClick={() => setDeploymentExceptionTarget('not-needed')}>
+                      Mark not needed
+                    </button>
+                    {deploymentTestingGate.deploymentStatus !== 'not-run' && (
+                      <button type="button" className="btn btn-ghost btn-sm" onClick={() => setResetDeploymentTestingTarget('deployment')}>Reset</button>
+                    )}
+                  </div>
+                )}
+              </div>
+
+              {/* 2. Browser / model-driven app test — gated on deployment being resolved */}
+              {(() => {
+                const deploymentResolved = deploymentTestingGate.deploymentStatus === 'deployed' || deploymentTestingGate.deploymentStatus === 'not-needed';
+                return (
+                  <div style={{
+                    border: '1px solid var(--border-subtle)', borderRadius: 4, padding: '8px 10px',
+                    display: 'flex', flexDirection: 'column', gap: 6, opacity: deploymentResolved ? 1 : 0.55,
+                  }}>
+                    <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                      <strong style={{ fontSize: 12 }}>2. Browser / model-driven app test</strong>
+                      <span style={{
+                        fontSize: 11, fontWeight: 600,
+                        color: deploymentTestingGate.testStatus === 'passed' || deploymentTestingGate.testStatus === 'not-needed'
+                          ? 'var(--color-done, #3fb950)'
+                          : deploymentTestingGate.testStatus === 'failed' ? 'var(--color-blocked, #e05555)' : 'var(--color-text-muted)',
+                      }}>
+                        {deploymentTestingGate.testStatus}
+                      </span>
+                    </div>
+                    {!deploymentResolved && (
+                      <p style={{ margin: 0, fontSize: 11, color: 'var(--color-text-muted)' }}>Record manual deployment first.</p>
+                    )}
+                    {task.deploymentTesting?.test?.notes && (
+                      <p style={{ margin: 0, fontSize: 11, color: 'var(--color-text-secondary)' }}>{task.deploymentTesting.test.notes}</p>
+                    )}
+                    {resetDeploymentTestingTarget === 'test' ? (
+                      <div style={{ display: 'flex', gap: 6 }}>
+                        <span style={{ fontSize: 11, color: 'var(--color-text-muted)', flex: 1 }}>Reset the recorded test?</span>
+                        <button type="button" className="btn btn-danger btn-sm" onClick={() => void handleResetDeploymentTest()}>Confirm Reset</button>
+                        <button type="button" className="btn btn-ghost btn-sm" onClick={() => setResetDeploymentTestingTarget(null)}>Cancel</button>
+                      </div>
+                    ) : testExceptionTarget ? (
+                      <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+                        <span style={{ fontSize: 11, color: 'var(--color-text-muted)' }}>
+                          {testExceptionTarget === 'not-needed' ? 'Reason testing is not needed (required):' : 'Reason the test failed (optional):'}
+                        </span>
+                        <input
+                          className="form-input form-input-sm"
+                          autoFocus
+                          placeholder={testExceptionTarget === 'not-needed' ? 'Required reason' : 'Optional reason'}
+                          value={testExceptionReason}
+                          onChange={(e) => setTestExceptionReason(e.target.value)}
+                        />
+                        <div style={{ display: 'flex', gap: 6 }}>
+                          <button type="button" className="btn btn-danger btn-sm"
+                            disabled={testExceptionTarget === 'not-needed' && !testExceptionReason.trim()}
+                            onClick={() => {
+                              const notes = testExceptionTarget === 'failed'
+                                ? (testExceptionReason.trim() || 'Deployment test failed.')
+                                : testExceptionReason.trim();
+                              void handleRecordDeploymentTest(testExceptionTarget, notes);
+                              setTestExceptionTarget(null); setTestExceptionReason('');
+                            }}>
+                            Confirm
+                          </button>
+                          <button type="button" className="btn btn-ghost btn-sm"
+                            onClick={() => { setTestExceptionTarget(null); setTestExceptionReason(''); }}>
+                            Cancel
+                          </button>
+                        </div>
+                      </div>
+                    ) : (
+                      <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap' }}>
+                        <button type="button" className="btn btn-secondary btn-sm" disabled={!deploymentResolved}
+                          onClick={() => void handleRecordDeploymentTest('passed')}
+                          title="One-click confirmation — no notes required">
+                          Confirm test passed
+                        </button>
+                        <button type="button" className="btn btn-ghost btn-sm" disabled={!deploymentResolved}
+                          onClick={() => setTestExceptionTarget('failed')}>
+                          Record test failed
+                        </button>
+                        <button type="button" className="btn btn-ghost btn-sm" disabled={!deploymentResolved}
+                          onClick={() => setTestExceptionTarget('not-needed')}>
+                          Mark not needed
+                        </button>
+                        {deploymentTestingGate.testStatus !== 'not-run' && (
+                          <button type="button" className="btn btn-ghost btn-sm" onClick={() => setResetDeploymentTestingTarget('test')}>Reset</button>
+                        )}
+                      </div>
+                    )}
+                  </div>
+                );
+              })()}
+
+              {/* 3. Source control + Pull Request readiness summary */}
+              <div style={{ fontSize: 11, color: 'var(--color-text-muted)', display: 'flex', flexDirection: 'column', gap: 2 }}>
+                <div>Source control: {codeReviewReadinessGate.commitVerified ? 'commit verified' : 'no verified commit yet'}
+                  {codeReviewReadinessGate.commitVerified && (codeReviewReadinessGate.pushVerified ? ', push verified' : ', push not yet verified')}
+                </div>
+                <div>Pull request: {codeReviewReadinessGate.prRecorded ? 'created / recorded' : 'not yet created or recorded'}</div>
+              </div>
+
               <div style={{ display: 'flex', flexDirection: 'column', gap: 6, marginTop: 4 }}>
                 <button
                   type="button"
@@ -5240,20 +5519,16 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
                 </button>
                 <button
                   type="button"
-                  className="btn btn-secondary"
-                  onClick={handleTestingFailed}
-                >
-                  Testing failed
-                </button>
-                <button
-                  type="button"
                   className="btn btn-primary"
-                  onClick={() => void handleTestingConfirmedPreparePR()}
-                  title={repoRootForGit
-                    ? 'Marks testing confirmed and opens commit dialog — Commit + Push will move to Code Review and open Azure DevOps'
-                    : 'Marks testing confirmed — Git repository not configured, configure it before moving to Code Review'}
+                  disabled={!deploymentTestingGate.canProceedToCommit}
+                  onClick={() => void handlePrepareCommitAndPush()}
+                  title={deploymentTestingGate.canProceedToCommit
+                    ? (repoRootForGit
+                      ? 'Opens the commit dialog — Commit + Push verifies the push, then the Pull Request step opens'
+                      : 'Git repository not configured — configure it before committing')
+                    : 'Blocked: record manual deployment and a browser/application test result first'}
                 >
-                  Testing confirmed → Prepare commit / PR
+                  Prepare Commit &amp; Push
                 </button>
               </div>
             </div>
@@ -5268,6 +5543,16 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
             </div>
           </div>
         </div>
+      )}
+
+      {/* Pull Request modal — opened after a verified commit+push */}
+      {showPullRequestModal && (
+        <PullRequestModal
+          task={task}
+          customer={customer ?? null}
+          onRecordPullRequestCreated={(prUrl, notes) => handleRecordPullRequestCreated(prUrl, notes)}
+          onClose={() => setShowPullRequestModal(false)}
+        />
       )}
 
       {/* Implementation Verification modal */}
@@ -5287,15 +5572,7 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
           onRunAiCodeReview={handleRunAiCodeReviewForImpl}
           onRunSettingsReviewer={handleRunSettingsReviewerForImpl}
           onUpdate={handleUpdateImplVerification}
-          onContinueToTesting={handleContinueToTestingWithGate}
-          onProceedToReview={async () => {
-            // handleMarkWaitingForReview re-checks the hard gate itself; the modal also disables
-            // its own proceed button when blocked, but keep the modal open on a blocked result
-            // (defense in depth) so the user sees the error instead of the modal silently closing.
-            const gate = computeProgressionGate(task);
-            await handleMarkWaitingForReview();
-            if (gate.canProceed) setShowImplVerifyModal(false);
-          }}
+          onContinueToDeploymentTesting={handleContinueToDeploymentTestingWithGate}
           onUpdateNextStepAndClose={async (nextStep) => {
             await updateTask(task.id, {
               mcpNextStep: {
@@ -5307,13 +5584,7 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
             setFeedback(`Next step set: "${nextStep}"`);
             setShowImplVerifyModal(false);
           }}
-          onOpenAiReview={() => {
-            const reviewId = task.implementationVerification?.aiCodeReview?.reviewId;
-            const target = reviewId
-              ? task.aiFileReviews?.find((r) => r.id === reviewId)
-              : task.aiFileReviews?.[0];
-            if (target) setSavedReviewModal(target);
-          }}
+          onOpenAiReview={() => setShowAiCodeReviewReportModal(true)}
           onOpenDvReview={latestCrmVerification ? () => setShowCrmVerificationModal(true) : undefined}
           onResetDvCheck={handleResetDvCheck}
           onResetAiReview={handleResetAiReview}
@@ -5411,6 +5682,35 @@ export default function TaskDetail({ task, onClose }: TaskDetailProps) {
               </div>
             </div>
           </Modal>
+        );
+      })()}
+
+      {/* Implementation Verification "Open report" — canonical AI Code Review report, native or Claude/MCP */}
+      {showAiCodeReviewReportModal && (() => {
+        const report = buildAiCodeReviewReport(task);
+        if (!report) return null;
+
+        const reportFilePath = report.native?.filePath ?? report.native?.structured?.filePath ?? report.reviewedFiles[0] ?? '';
+        const lowerReportPath = reportFilePath.toLowerCase();
+        const reportKind: 'plugin' | 'script' = (() => {
+          if (lowerReportPath.endsWith('.cs')) return 'plugin';
+          if (lowerReportPath.endsWith('.js')) return 'script';
+          const devKind = task.workflowSetup?.devTargetKind;
+          if (devKind === 'plugin') return 'plugin';
+          return 'script';
+        })();
+
+        async function handleReportOpenFile(fp: string) {
+          const err = await openReviewTarget(fp, reportKind);
+          if (err) setFsError(err);
+        }
+
+        return (
+          <AiCodeReviewReportModal
+            report={report}
+            onOpenFile={reportFilePath ? handleReportOpenFile : undefined}
+            onClose={() => setShowAiCodeReviewReportModal(false)}
+          />
         );
       })()}
 

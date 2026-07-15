@@ -85,7 +85,7 @@ These tools update only local task-workbench state. No external system is called
 | `set_task_status` | Set status (enum validated). Prefer `set_task_phase` for workflow consistency |
 | `set_task_attention_state` | Set or clear attentionState (enum validated) |
 | `set_task_waiting_state` | Set or clear waitingState (enum validated) |
-| `set_task_phase` | Set phase: new / analyzed / development / testing / review / done |
+| `set_task_phase` | Set phase: new / analyzed / development / testing / review / done. `phase="new"` on a task that already carries workflow state (analysis, developer setup, technical plan/approvals, implementation verification, AI reviews, test/checklist results, next-step state, or local Git workflow tracking) performs a **complete reset** of that state back to a fresh NEW task — not just a status change. Requires `confirmReset: true` unless the task is already clean (idempotent no-op). Never touches repository files, Git, Dataverse, or any external system. Preserves identity, original assignment, notes, and import/tracking metadata. |
 | `set_task_estimate` | Set effort estimate in hours |
 | `set_task_next_step` | Set AI-recommended next action and reason |
 | `update_task_checklist_item` | Set status of a workflow checklist item |
@@ -127,9 +127,9 @@ These tools modify the local Git repository. No PR is created. No GitHub/Azure D
 | Tool | Safety constraints |
 |------|-------------------|
 | `prepare_commit_for_task` | Read-only preview — does not stage, commit, or push |
-| `commit_task_changes` | Stages files and creates a commit. Rejects noise files. Does NOT push. |
+| `commit_task_changes` | Stages files and creates a commit. Rejects noise files. Unrelated files require `confirmUnrelatedFiles`; `.gitignore`d files require `forceAddFiles`. Does NOT push. |
 | `push_task_branch` | Pushes current branch. Push to main/master blocked. No force push. |
-| `commit_and_push_task_changes` | Commit + push in one step. Same guards. Optional phase advance. |
+| `commit_and_push_task_changes` | Commit + push in one step. Same guards, including `confirmUnrelatedFiles`/`forceAddFiles`. Optional phase advance. |
 
 ### Guarded / test-only (2 tools)
 
@@ -152,6 +152,7 @@ These tools modify the local Git repository. No PR is created. No GitHub/Azure D
 - `record_external_action_completed` records completion locally — it does not call any external system
 - Git push to main/master is blocked; no force push
 - `delete_test_task` is scoped to `mcpTestTask=true` tasks only
+- `set_task_phase(phase="new")` cannot silently discard a task's workflow state — a populated task requires explicit `confirmReset: true`, and the rejection message describes exactly what would be cleared
 
 ## Tool count summary (v0.6.0)
 

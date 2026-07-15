@@ -49,8 +49,9 @@ interface GitCommitModalProps {
   postCommitPushAction?: 'move-to-review-and-open-ado';
   /**
    * Guided mode — called instead of onActivityNote after a successful commit+push.
-   * Receives the pre-built activity note, commit hash, and branch so the parent
-   * can append both notes and update task state in a single atomic updateTask call.
+   * Receives the pre-built activity note, commit hash, and branch so the parent can persist the
+   * verified commit/push state (gitWorkflow) and open the Pull Request step — it does not move
+   * the task to Code Review by itself; that requires a separately created/recorded pull request.
    */
   onPostCommitPushSuccess?: (
     commitNote: string,
@@ -70,7 +71,8 @@ interface GitCommitModalProps {
   /**
    * Guided mode — called after a push-only operation (no new commit).
    * Receives the pre-built activity note and branch name.
-   * When set, the push button label becomes "Push Branch and Move to Code Review".
+   * When set, the push button label becomes "Push → Pull Request" — the parent verifies the push
+   * and opens the Pull Request step next; it does not move the task to Code Review by itself.
    */
   onPushOnlySuccess?: (note: string, branch: string | undefined) => Promise<void>;
 }
@@ -328,8 +330,10 @@ export default function GitCommitModal({
               background: 'rgba(60,120,200,0.08)', border: '1px solid rgba(60,120,200,0.25)',
               borderRadius: 4, padding: '6px 10px', marginBottom: 10, fontSize: 12,
             }}>
-              Guided flow: Commit + Push will move the task to Code Review / Waiting for code review
-              and open Azure DevOps. Commit only will create the commit but leave the task in Development.
+              Guided flow: Commit + Push will verify the push and open the Pull Request step next —
+              it does not move the task to Code Review by itself. A pull request must be created or
+              recorded, and only then does the task move to Code Review / waiting for colleague
+              review. Commit only will create the commit but leave the task in Development.
             </div>
           )}
 
@@ -665,11 +669,11 @@ export default function GitCommitModal({
                   : noMergeBaseOnFeature
                     ? `Branch has no common history with ${baseBranch ?? 'remote base'} — PR compare will fail`
                     : postCommitPushAction
-                      ? 'Commit, push, move to Code Review, and open Azure DevOps'
+                      ? 'Commit, push, and verify — the Pull Request step opens next'
                       : 'Commit selected files and push branch'
               }
             >
-              {working ? 'Working…' : postCommitPushAction ? 'Commit + Push → Code Review' : 'Commit + Push'}
+              {working ? 'Working…' : postCommitPushAction ? 'Commit + Push → Pull Request' : 'Commit + Push'}
             </button>
             {pushableWithoutCommit && (
               <button
@@ -679,14 +683,14 @@ export default function GitCommitModal({
                 disabled={loading || working}
                 title={
                   onPushOnlySuccess
-                    ? 'Push the current branch and move the task to Code Review'
+                    ? 'Push the current branch and verify it — the Pull Request step opens next'
                     : `Push ${aheadCount} commit${aheadCount !== 1 ? 's' : ''} to origin`
                 }
               >
                 {working
                   ? 'Working…'
                   : onPushOnlySuccess
-                    ? 'Push → Code Review'
+                    ? 'Push → Pull Request'
                     : 'Push Branch'}
               </button>
             )}

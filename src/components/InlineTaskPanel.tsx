@@ -12,6 +12,8 @@ import TaskModeSwitch from './TaskModeSwitch';
 import { TYPE_LABELS } from './StatusBadge';
 import { formatTaskActivityNotes, splitTaskNotes } from '../lib/taskActivityFormatter';
 import { type TaskPhase, PHASE_OPTIONS, getTaskPhase, applyTaskPhase } from '../lib/taskPhase';
+import { taskHasResettableWorkflowState, resetTaskWorkflowToNew } from '../lib/taskWorkflowReset';
+import ResetWorkflowConfirmModal from './ResetWorkflowConfirmModal';
 
 interface Props {
   task: Task;
@@ -59,12 +61,15 @@ export default function InlineTaskPanel({ task, onOpenDetail }: Props) {
   const [analyzing, setAnalyzing]       = useState(false);
   const [confirmDelete, setConfirmDelete] = useState(false);
   const [linkError, setLinkError]       = useState<string | null>(null);
+  const [resetConfirmBusy, setResetConfirmBusy] = useState(false);
+  const [showResetConfirm, setShowResetConfirm] = useState(false);
 
   useEffect(() => {
     setNotes(task.notes ?? '');
     setMsgExpanded(false);
     setConfirmDelete(false);
     setLinkError(null);
+    setShowResetConfirm(false);
   }, [task.id]);
 
   useEffect(() => {
@@ -86,7 +91,23 @@ export default function InlineTaskPanel({ task, onOpenDetail }: Props) {
   }
 
   async function handleSetPhase(phase: TaskPhase) {
+    // Selecting NEW on a task that still carries workflow state requires explicit confirmation
+    // before the canonical reset (src/lib/taskWorkflowReset.ts) is applied — see handleConfirmReset.
+    if (phase === 'new' && taskHasResettableWorkflowState(task)) {
+      setShowResetConfirm(true);
+      return;
+    }
     await updateTask(task.id, applyTaskPhase(phase));
+  }
+
+  async function handleConfirmReset() {
+    setResetConfirmBusy(true);
+    try {
+      await updateTask(task.id, resetTaskWorkflowToNew(task));
+    } finally {
+      setResetConfirmBusy(false);
+      setShowResetConfirm(false);
+    }
   }
 
   async function handleOpenExternalUrl(url: string | undefined) {
@@ -118,6 +139,7 @@ export default function InlineTaskPanel({ task, onOpenDetail }: Props) {
   const isEmail = !!(task.emailBodyHtml || task.senderName || task.senderEmail);
 
   return (
+    <>
     <div className="tip-panel" onClick={(e) => e.stopPropagation()}>
       <div className="tip-columns">        {/* Left column: compact summary + collapsible message */}
         <div className="tip-col-main">
@@ -341,5 +363,13 @@ export default function InlineTaskPanel({ task, onOpenDetail }: Props) {
         </div>
       </div>
     </div>
+    {showResetConfirm && (
+      <ResetWorkflowConfirmModal
+        onConfirm={handleConfirmReset}
+        onCancel={() => setShowResetConfirm(false)}
+        busy={resetConfirmBusy}
+      />
+    )}
+    </>
   );
 }

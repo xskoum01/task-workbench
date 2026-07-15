@@ -27,8 +27,10 @@ export function StatusBadge({ status }: StatusBadgeProps) {
 
 export const WAITING_LABELS: Record<TaskWaitingState, string> = {
   'pricing-approval':    'Waiting for estimate approval',
-  'code-review':         'Waiting for code review',
-  'consultant-testing':  'Waiting for consultant testing',
+  'code-review':         'Waiting for colleague review',
+  // Persisted value stays 'consultant-testing' (see TaskWaitingState) — only the display label
+  // changed to reflect the renamed Deployment & Testing phase (see src/lib/deploymentTestingGate.ts).
+  'consultant-testing':  'Waiting for deployment & testing',
 };
 
 export const ATTENTION_LABELS: Record<TaskAttentionState, string> = {

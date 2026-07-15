@@ -44,7 +44,26 @@ const TEXT = {
   scriptFileCreated: 'Vytvo\u0159en pr\u00e1zdn\u00fd soubor skriptu.',
   dataverseMetadataCheckReset: 'Resetov\u00e1na kontrola Dataverse metadat.',
   aiCodeReviewReset: 'Resetov\u00e1na AI recenze k\u00f3du.',
+  workflowResetToNew: '\u00dakol vr\u00e1cen do stavu NEW a pracovn\u00ed postup byl resetov\u00e1n.',
+  manualDeploymentConfirmed: 'Manu\u00e1ln\u00ed nasazen\u00ed potvrzeno.',
+  manualDeploymentFailed: 'Manu\u00e1ln\u00ed nasazen\u00ed selhalo.',
+  manualDeploymentNotNeeded: 'Manu\u00e1ln\u00ed nasazen\u00ed ozna\u010deno jako nepot\u0159ebn\u00e9.',
+  manualDeploymentReset: 'Resetov\u00e1n z\u00e1znam manu\u00e1ln\u00edho nasazen\u00ed.',
+  deploymentTestPassed: 'Test nasazen\u00ed potvrzen jako \u00fasp\u011b\u0161n\u00fd.',
+  deploymentTestFailed: 'Test nasazen\u00ed nepro\u0161el.',
+  deploymentTestNotNeeded: 'Test nasazen\u00ed ozna\u010den jako nepot\u0159ebn\u00fd.',
+  deploymentTestReset: 'Resetov\u00e1n z\u00e1znam testu nasazen\u00ed.',
 };
+
+/**
+ * Appends a timestamped activity note line to a task's notes string.
+ * Format: `[ISO-timestamp] body` \u2014 matched by formatTaskActivityNote/isTaskActivityLine below.
+ * Canonical location for this helper \u2014 reuse it instead of re-deriving the same format elsewhere.
+ */
+export function appendActivityNote(existing: string | undefined, body: string): string {
+  const line = `[${new Date().toISOString()}] ${body}`;
+  return existing?.trim() ? `${existing.trim()}\n${line}` : line;
+}
 
 function formatTimestamp(rawTimestamp: string | undefined): string | undefined {
   if (!rawTimestamp) return undefined;
@@ -196,6 +215,34 @@ export function formatTaskActivityNote(rawNote: string, index = 0): FormattedTas
   if (body === 'UI: ai-code-review-reset') {
     return { id: `${index}-${raw}`, timestampLabel, source: 'Verification', message: TEXT.aiCodeReviewReset, raw };
   }
+  if (body === 'Developer workflow reset to NEW by user.' || /^MCP local write: set_task_phase -> new \(workflow reset to NEW\)$/i.test(body)) {
+    return { id: `${index}-${raw}`, timestampLabel, source: 'Workflow', message: TEXT.workflowResetToNew, raw };
+  }
+
+  // Deployment & Testing — recorded either from the UI (one-click confirmation) or by Claude
+  // through MCP record_manual_deployment/record_deployment_test after explicit user confirmation.
+  const manualDeploymentMatch = /^(?:UI: manual-deployment-(deployed|failed|not-needed)|MCP local write: record_manual_deployment -> (deployed|failed|not-needed))$/i.exec(body);
+  if (manualDeploymentMatch) {
+    const status = (manualDeploymentMatch[1] ?? manualDeploymentMatch[2]).toLowerCase();
+    const message = status === 'deployed' ? TEXT.manualDeploymentConfirmed
+      : status === 'failed' ? TEXT.manualDeploymentFailed
+      : TEXT.manualDeploymentNotNeeded;
+    return { id: `${index}-${raw}`, timestampLabel, source: body.startsWith('MCP') ? 'MCP / Deployment' : 'Deployment', message, raw };
+  }
+  if (body === 'UI: manual-deployment-reset') {
+    return { id: `${index}-${raw}`, timestampLabel, source: 'Deployment', message: TEXT.manualDeploymentReset, raw };
+  }
+  const deploymentTestMatch = /^(?:UI: deployment-test-(passed|failed|not-needed)|MCP local write: record_deployment_test -> (passed|failed|not-needed))$/i.exec(body);
+  if (deploymentTestMatch) {
+    const status = (deploymentTestMatch[1] ?? deploymentTestMatch[2]).toLowerCase();
+    const message = status === 'passed' ? TEXT.deploymentTestPassed
+      : status === 'failed' ? TEXT.deploymentTestFailed
+      : TEXT.deploymentTestNotNeeded;
+    return { id: `${index}-${raw}`, timestampLabel, source: body.startsWith('MCP') ? 'MCP / Deployment' : 'Deployment', message, raw };
+  }
+  if (body === 'UI: deployment-test-reset') {
+    return { id: `${index}-${raw}`, timestampLabel, source: 'Deployment', message: TEXT.deploymentTestReset, raw };
+  }
 
   return {
     id: `${index}-${raw}`,
@@ -237,7 +284,13 @@ export function isTaskActivityLine(line: string): boolean {
     /^UI: ai-kit-diff-reviewed -> (PASS|WARN|FAIL)$/i.test(body) ||
     body === 'UI: ai-kit-review-fixes-applied' ||
     body === 'UI: dataverse-metadata-check-reset' ||
-    body === 'UI: ai-code-review-reset'
+    body === 'UI: ai-code-review-reset' ||
+    body === 'Developer workflow reset to NEW by user.' ||
+    /^MCP local write: set_task_phase -> new \(workflow reset to NEW\)$/i.test(body) ||
+    /^UI: manual-deployment-(deployed|failed|not-needed|reset)$/i.test(body) ||
+    /^MCP local write: record_manual_deployment -> (deployed|failed|not-needed)$/i.test(body) ||
+    /^UI: deployment-test-(passed|failed|not-needed|reset)$/i.test(body) ||
+    /^MCP local write: record_deployment_test -> (passed|failed|not-needed)$/i.test(body)
   );
 }
 

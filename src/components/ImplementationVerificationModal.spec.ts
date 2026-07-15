@@ -1,7 +1,10 @@
 import { describe, it, expect } from 'vitest';
 import {
   deriveDataverseCheckStatus,
+  deriveLocalTestStatus,
   computeImplVerifyNextStep,
+  buildAiManualVerifyPatch,
+  buildAiSkipPatch,
 } from './ImplementationVerificationModal';
 import { formatTaskActivityNote, isTaskActivityLine } from '../lib/taskActivityFormatter';
 import { mergeWithDefaults, selectReviewer, inferReviewSource } from '../lib/aiReviewers';
@@ -110,6 +113,34 @@ describe('Open review button — data model conditions', () => {
 });
 
 // ---------------------------------------------------------------------------
+// deriveLocalTestStatus
+// ---------------------------------------------------------------------------
+
+describe('deriveLocalTestStatus', () => {
+  it('returns not-run for a manual task with no recorded result', () => {
+    expect(deriveLocalTestStatus(makeTask())).toBe('not-run');
+  });
+
+  it('returns the explicit status when recorded in the modal', () => {
+    const task = makeTask({ implementationVerification: { localTest: { status: 'passed' } } });
+    expect(deriveLocalTestStatus(task)).toBe('passed');
+  });
+
+  it('does not backfill for a manual task even when the legacy localTestRecord says not-needed', () => {
+    const task = makeTask({ localTestRecord: { status: 'not-needed', updatedAt: '2026-01-01T00:00:00.000Z' } });
+    expect(deriveLocalTestStatus(task)).toBe('not-run');
+  });
+
+  it('backfills not-needed for an AI-managed task completed before the canonical field was written', () => {
+    const task = makeTask({
+      crmDeveloperWorkflow: { lastAiImplementation: { completedAt: '2026-01-01T00:00:00.000Z' } },
+      localTestRecord: { status: 'not-needed', updatedAt: '2026-01-01T00:00:00.000Z' },
+    });
+    expect(deriveLocalTestStatus(task)).toBe('not-needed');
+  });
+});
+
+// ---------------------------------------------------------------------------
 // computeImplVerifyNextStep
 // ---------------------------------------------------------------------------
 
@@ -141,26 +172,22 @@ describe('computeImplVerifyNextStep', () => {
   // (see mcp/task-workbench-mcp.mjs composeManualVerificationStep and
   // task_mcp_compose_manual_verification_step in src-tauri/src/lib.rs — keep all three in sync)
 
-  it('footer message mentions Dataverse, AI review, and Local Test when all three are unresolved', () => {
+  it('footer message mentions Dataverse and AI review when both are unresolved — no Local Test wording', () => {
     const task = makeTask({ implementationVerification: { buildCheck: { status: 'passed' } } });
     const step = computeImplVerifyNextStep(task);
-    expect(step).toBe(
-      'Run Dataverse Metadata Check and AI Kit/Settings Review. '
-      + 'Then upload/register the web resource manually and record Local Test/browser validation.',
-    );
+    expect(step).toBe('Run Dataverse Metadata Check and AI Kit/Settings Review.');
+    expect(step.toLowerCase()).not.toContain('local test');
   });
 
-  it('footer message omits Dataverse once resolved — only mentions AI review and Local Test', () => {
-    // Dataverse passed, AI review still not-run, Local Test still not-run: the composer must
-    // not tell the user to re-run a check that already passed.
+  it('footer message omits Dataverse once resolved — only mentions AI review', () => {
+    // Dataverse passed, AI review still not-run: the composer must not tell the user to re-run a
+    // check that already passed.
     const task = makeTask({
       crmVerificationReports: [makeReport('pass')],
       implementationVerification: { buildCheck: { status: 'passed' } },
     });
     const step = computeImplVerifyNextStep(task);
-    expect(step).toBe(
-      'Run AI Kit/Settings Review. Then upload/register the web resource manually and record Local Test/browser validation.',
-    );
+    expect(step).toBe('Run AI Kit/Settings Review.');
   });
 
   it('footer message does not say "in the Implementation Verification modal" (user is already in it)', () => {
@@ -168,13 +195,57 @@ describe('computeImplVerifyNextStep', () => {
     expect(computeImplVerifyNextStep(task)).not.toContain('Implementation Verification modal');
   });
 
-  it('suggests consultant testing once Local Test is recorded even if Dataverse/AI review are not-run', () => {
-    // Existing behavior preserved: local === 'passed'/'not-needed' short-circuits before the
-    // manual-action composer, regardless of dv/ai state.
+  it('REGRESSION: suggests continuing to Deployment & Testing once Dataverse/AI review resolve — never mentions Local Test', () => {
+    // Local Test no longer exists in this modal/stage; reaching Deployment & Testing is driven
+    // solely by the Dataverse + AI Kit review gate (computeProgressionGate).
     const task = makeTask({
-      implementationVerification: { buildCheck: { status: 'passed' }, localTest: { status: 'not-needed' } },
+      crmVerificationReports: [makeReport('pass')],
+      implementationVerification: { buildCheck: { status: 'passed' }, aiCodeReview: { status: 'manually-verified' } },
     });
-    expect(computeImplVerifyNextStep(task)).toBe('Send to consultant testing or request code review');
+    const step = computeImplVerifyNextStep(task);
+    expect(step).toBe('Continue to Deployment & Testing');
+    expect(step.toLowerCase()).not.toContain('local test');
+    expect(step.toLowerCase()).not.toContain('consultant');
+  });
+
+  it('REGRESSION: an AI-managed task backfilled with legacy Local Test not-needed still reaches Continue to Deployment & Testing, not a Local Test action', () => {
+    const task = makeTask({
+      implementationVerification: { buildCheck: { status: 'passed' }, aiCodeReview: { status: 'manually-verified' } },
+      crmVerificationReports: [makeReport('pass')],
+      crmDeveloperWorkflow: { lastAiImplementation: { completedAt: '2026-01-01T00:00:00.000Z' } },
+      localTestRecord: { status: 'not-needed', updatedAt: '2026-01-01T00:00:00.000Z' },
+    });
+    const step = computeImplVerifyNextStep(task);
+    expect(step).toBe('Continue to Deployment & Testing');
+    expect(step.toLowerCase()).not.toContain('local test');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Local Test removed from this modal/stage (requirement 13 regression guards)
+// ---------------------------------------------------------------------------
+
+describe('Local Test is not part of Implementation Verification', () => {
+  it('deriveLocalTestStatus remains available for backward compatibility, but is not exported for modal gating use', () => {
+    // deriveLocalTestStatus is kept for MCP/legacy-display compatibility (see its doc comment),
+    // but computeImplVerifyNextStep and computeProgressionGate never call it.
+    const task = makeTask({ implementationVerification: { localTest: { status: 'passed' } } });
+    expect(deriveLocalTestStatus(task)).toBe('passed');
+  });
+
+  it('REGRESSION: a passed Local Test alone does not affect computeImplVerifyNextStep — Dataverse/AI review still drive it', () => {
+    const task = makeTask({ implementationVerification: { localTest: { status: 'passed' } } });
+    const step = computeImplVerifyNextStep(task);
+    expect(step).toBe('Run Dataverse Metadata Check and AI Kit/Settings Review.');
+  });
+
+  it('REGRESSION: computeProgressionGate never blocks or unblocks based on implementationVerification.localTest', () => {
+    const withPassedLocalTest = makeTask({
+      crmVerificationReports: [makeReport('pass')],
+      implementationVerification: { aiCodeReview: fullAiReview(), localTest: { status: 'failed' } },
+    });
+    // Dataverse + AI Kit review resolved; a failed legacy Local Test must not block this gate.
+    expect(computeProgressionGate(withPassedLocalTest).canProceed).toBe(true);
   });
 });
 
@@ -1013,6 +1084,90 @@ describe('Hard gate — Move to Code Review button', () => {
     expect(gate.blockingChecks.some((c) => c.check === 'dataverseCheck')).toBe(true);
     expect(gate.blockingFindings.length).toBeGreaterThan(0);
     expect(gate.nextRecommendedAction).toBe('fix_code');
+  });
+
+  it('REGRESSION: reported state (Dataverse skipped, AI Internal Code Review manually-verified, Local Test passed) -> canProceed true', () => {
+    // Before the fix, Section 3 displayed "AI Internal Code Review — Manually verified" while the
+    // footer still blocked with "AI Kit Code Review has not run yet." — getAiKitReviewGate mapped
+    // "manually-verified" to the default (not_run) branch instead of resolving it like
+    // normalizeDataverseGate already did for the Dataverse check.
+    const task = makeTask({
+      implementationVerification: {
+        dataverseCheck: { status: 'skipped' },
+        aiCodeReview: { status: 'manually-verified' },
+        localTest: { status: 'passed' },
+      },
+    });
+    const gate = computeProgressionGate(task);
+    expect(gate.canProceed).toBe(true);
+    expect(gate.blockingChecks).toEqual([]);
+  });
+
+  it('the same reported state with AI Internal Code Review "skipped" instead of "manually-verified" also allows progression', () => {
+    const task = makeTask({
+      implementationVerification: {
+        dataverseCheck: { status: 'skipped' },
+        aiCodeReview: { status: 'skipped' },
+        localTest: { status: 'passed' },
+      },
+    });
+    const gate = computeProgressionGate(task);
+    expect(gate.canProceed).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// buildAiManualVerifyPatch / buildAiSkipPatch — review-history preservation
+// ---------------------------------------------------------------------------
+
+describe('buildAiManualVerifyPatch / buildAiSkipPatch', () => {
+  it('handleAiManualVerify preserves prior review detail and clears a stale skip override', () => {
+    const existing: ImplCheckRecord = {
+      status: 'skipped',
+      skippedAt: '2026-07-01T00:00:00.000Z',
+      skippedReason: 'No AI Kit access at the time.',
+      reviewedFiles: ['Scripts/foo.js'],
+      rulesFiles: ['rules.md'],
+      summary: 'Prior AI Kit review summary.',
+    };
+    const patch = buildAiManualVerifyPatch(existing, '2026-07-13T00:00:00.000Z');
+    expect(patch.status).toBe('manually-verified');
+    expect(patch.manuallyVerifiedAt).toBe('2026-07-13T00:00:00.000Z');
+    expect(patch.skippedAt).toBeUndefined();
+    expect(patch.skippedReason).toBeUndefined();
+    // Review history is preserved, not discarded.
+    expect(patch.reviewedFiles).toEqual(['Scripts/foo.js']);
+    expect(patch.rulesFiles).toEqual(['rules.md']);
+    expect(patch.summary).toBe('Prior AI Kit review summary.');
+  });
+
+  it('handleAiSkipConfirm preserves prior review detail and clears a stale manual-verify override', () => {
+    const existing: ImplCheckRecord = {
+      status: 'manually-verified',
+      manuallyVerifiedAt: '2026-07-01T00:00:00.000Z',
+      reviewedFiles: ['Scripts/foo.js'],
+      checklistFiles: ['checklist.md'],
+      findings: ['No TODOs found.'],
+    };
+    const patch = buildAiSkipPatch(existing, 'Reviewer unavailable.', '2026-07-13T00:00:00.000Z');
+    expect(patch.status).toBe('skipped');
+    expect(patch.skippedAt).toBe('2026-07-13T00:00:00.000Z');
+    expect(patch.skippedReason).toBe('Reviewer unavailable.');
+    expect(patch.manuallyVerifiedAt).toBeUndefined();
+    // Review history is preserved, not discarded.
+    expect(patch.reviewedFiles).toEqual(['Scripts/foo.js']);
+    expect(patch.checklistFiles).toEqual(['checklist.md']);
+    expect(patch.findings).toEqual(['No TODOs found.']);
+  });
+
+  it('buildAiSkipPatch falls back to a default reason when none is provided', () => {
+    const patch = buildAiSkipPatch(undefined, '', '2026-07-13T00:00:00.000Z');
+    expect(patch.skippedReason).toBe('Skipped by user.');
+  });
+
+  it('buildAiManualVerifyPatch/buildAiSkipPatch results satisfy the hard gate without automated review details', () => {
+    expect(getAiKitReviewGate(buildAiManualVerifyPatch(undefined, '2026-07-13T00:00:00.000Z')).status).toBe('passed');
+    expect(getAiKitReviewGate(buildAiSkipPatch(undefined, '', '2026-07-13T00:00:00.000Z')).status).toBe('passed');
   });
 });
 

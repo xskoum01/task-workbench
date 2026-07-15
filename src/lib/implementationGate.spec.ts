@@ -143,8 +143,16 @@ describe('getAiKitReviewGate', () => {
     expect(getAiKitReviewGate(fullReview({ status: 'warnings' })).status).toBe('pending');
   });
 
+  it('manually-verified is an explicit manual override -> passed, without requiring detail arrays', () => {
+    expect(getAiKitReviewGate({ status: 'manually-verified' })).toEqual({ status: 'passed', missing: [] });
+  });
+
+  it('skipped is an explicit manual override -> passed, without requiring detail arrays', () => {
+    expect(getAiKitReviewGate({ status: 'skipped' })).toEqual({ status: 'passed', missing: [] });
+  });
+
   it('unrecognized status -> not_run', () => {
-    expect(getAiKitReviewGate(fullReview({ status: 'skipped' })).status).toBe('not_run');
+    expect(getAiKitReviewGate(fullReview({ status: 'not-run' })).status).toBe('not_run');
   });
 });
 
@@ -289,6 +297,71 @@ describe('computeProgressionGate', () => {
     expect(gate.blockingChecks).toEqual([]);
     expect(gate.blockingFindings).toEqual([]);
     expect(gate.nextRecommendedAction).toBe('continue_workflow');
+  });
+
+  it('AI review failed remains blocking without an explicit manual override', () => {
+    const task = makeTask({
+      crmVerificationReports: [makeReport('pass')],
+      implementationVerification: { aiCodeReview: fullReview({ status: 'failed' }) },
+    });
+    const gate = computeProgressionGate(task);
+    expect(gate.aiReviewGateStatus).toBe('failed');
+    expect(gate.canProceed).toBe(false);
+  });
+
+  it('AI review warnings remains blocking without an explicit manual override', () => {
+    const task = makeTask({
+      crmVerificationReports: [makeReport('pass')],
+      implementationVerification: { aiCodeReview: fullReview({ status: 'warnings' }) },
+    });
+    const gate = computeProgressionGate(task);
+    expect(gate.aiReviewGateStatus).toBe('pending');
+    expect(gate.canProceed).toBe(false);
+  });
+
+  it('a manual override can resolve a previously-reviewed result while preserving its stored details', () => {
+    const task = makeTask({
+      crmVerificationReports: [makeReport('pass')],
+      implementationVerification: {
+        aiCodeReview: {
+          ...fullReview({ status: 'failed' }),
+          summary: 'Found a null-check issue.',
+          manuallyVerifiedAt: '2026-07-10T00:00:00.000Z',
+          status: 'manually-verified',
+        },
+      },
+    });
+    const gate = computeProgressionGate(task);
+    expect(gate.aiReviewGateStatus).toBe('passed');
+    expect(gate.canProceed).toBe(true);
+    expect(task.implementationVerification?.aiCodeReview?.summary).toBe('Found a null-check issue.');
+    expect(task.implementationVerification?.aiCodeReview?.reviewedFiles).toEqual(['Scripts/foo.js']);
+  });
+
+  it('reported modal state (Dataverse skipped, AI manually-verified, Local Test passed) -> canProceed true', () => {
+    const task = makeTask({
+      implementationVerification: {
+        dataverseCheck: { status: 'skipped' },
+        aiCodeReview: { status: 'manually-verified' },
+        localTest: { status: 'passed' },
+      },
+    });
+    const gate = computeProgressionGate(task);
+    expect(gate.canProceed).toBe(true);
+    expect(gate.dataverseGateStatus).toBe('passed');
+    expect(gate.aiReviewGateStatus).toBe('passed');
+  });
+
+  it('the same state with AI Code Review skipped instead of manually-verified also allows progression', () => {
+    const task = makeTask({
+      implementationVerification: {
+        dataverseCheck: { status: 'skipped' },
+        aiCodeReview: { status: 'skipped' },
+        localTest: { status: 'passed' },
+      },
+    });
+    const gate = computeProgressionGate(task);
+    expect(gate.canProceed).toBe(true);
   });
 
   it('dataverseWarningsAccepted reads the persisted acceptance flag', () => {

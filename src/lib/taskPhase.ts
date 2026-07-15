@@ -23,8 +23,11 @@ export const PHASE_OPTIONS: { value: TaskPhase; label: string }[] = [
   { value: 'waiting-estimate-approval',  label: 'Waiting for estimate approval'  },
   { value: 'analyzed',                   label: 'Analyzed'                       },
   { value: 'development',                label: 'Development'                    },
-  { value: 'waiting-consultant-testing', label: 'Waiting for consultant testing' },
-  { value: 'waiting-review',             label: 'Waiting for code review'        },
+  // 'waiting-consultant-testing' TaskPhase value / 'consultant-testing' waitingState are
+  // unchanged (see taskPhase value below) — only the label reflects the renamed
+  // Deployment & Testing phase (src/lib/deploymentTestingGate.ts).
+  { value: 'waiting-consultant-testing', label: 'Waiting for deployment & testing' },
+  { value: 'waiting-review',             label: 'Waiting for colleague review'   },
   { value: 'pr-comments',                label: 'PR comments'                    },
   { value: 'blocked',                    label: 'Blocked'                        },
   { value: 'done',                       label: 'Done'                           },

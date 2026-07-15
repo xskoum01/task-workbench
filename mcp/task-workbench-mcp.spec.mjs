@@ -9,7 +9,8 @@ import { describe, it, expect } from 'vitest';
 import {
   READ_ONLY_TOOL_NAMES, TOOL_DEFINITIONS, TASK_TEMPLATES, matchTaskTemplate, callToolFallback, applyDeveloperWorkflowTransition,
   REQUIRED_DEVELOPER_WORKFLOW_TOOLS, FALLBACK_WRITE_ALLOWED_TOOL_NAMES, computeMcpCapabilitiesFromToolNames,
-  applyToolingAvailabilityGuard,
+  applyToolingAvailabilityGuard, callTool, bridgeRequestJson,
+  BridgeUnavailableError, BridgeToolError, BridgeProtocolError,
 } from './task-workbench-mcp.mjs';
 
 // ---------------------------------------------------------------------------
@@ -737,7 +738,10 @@ describe('callToolFallback get_developer_work_packet – derived target and fiel
 // ---------------------------------------------------------------------------
 
 describe('callToolFallback continue_developer_workflow', () => {
-  it('returns record_results when local test has not been recorded yet', async () => {
+  it('REGRESSION: does not gate on local test at all — Dataverse verification is the first checkpoint', async () => {
+    // Local Test was removed from Implementation Verification entirely. A fresh task with no
+    // localTestRecord, no implementationVerification, and no mcpVerification run yet must go
+    // straight to run_implementation_verification, never record_local_test.
     const os = await import('node:os');
     const fs = await import('node:fs/promises');
     const path = await import('node:path');
@@ -748,16 +752,17 @@ describe('callToolFallback continue_developer_workflow', () => {
       taskMode: 'developer',
       workflowSetup: { devTargetKind: 'script', repositoryRoot: 'C:\\Repo', artifactPath: 'Scripts\\nvr.js' },
       crmDeveloperWorkflow: { detectedWorkKind: 'script' },
-      // No localTestRecord
+      // No localTestRecord, no implementationVerification
     })]));
 
     const origArgv = process.argv;
     process.argv = [...process.argv, '--data-dir', tmpDir, '--fallback-readonly'];
     try {
       const result = await callToolFallback('continue_developer_workflow', { taskId: 'task-cdw-notest' });
-      expect(result.nextAction).toBe('record_results');
-      expect(result.canProceed).toBe(false);
-      expect(result.recommendedTool).toBe('record_local_test');
+      expect(result.nextAction).toBe('run_implementation_verification');
+      expect(result.canProceed).toBe(true);
+      expect(result.recommendedTool).toBe('run_implementation_verification');
+      expect(result.nextAction).not.toBe('record_results');
     } finally {
       process.argv = origArgv;
       await fs.rm(tmpDir, { recursive: true });
@@ -817,9 +822,9 @@ describe('callToolFallback continue_developer_workflow', () => {
       expect(result.nextAction).toBe('wait_for_user');
       expect(result.requiresUserApproval).toBe(true);
       expect(result.blockingUserAction).toBe(
-        'Run Dataverse Metadata Check and AI Kit/Settings Review in the Implementation Verification modal. '
-        + 'Then upload/register the web resource manually and record Local Test/browser validation.',
+        'Run Dataverse Metadata Check and AI Kit/Settings Review in the Implementation Verification modal.',
       );
+      expect(result.blockingUserAction.toLowerCase()).not.toContain('local test');
       // Blocked from reaching commit/push while verification rows are unresolved.
       expect(result.nextAction).not.toBe('propose_branch');
       expect(result.forbiddenWrites).toContain('commit_task_changes');
@@ -957,6 +962,11 @@ describe('callToolFallback continue_developer_workflow', () => {
         },
       },
       aiKitReview: { status: 'passed', completedAt: '2026-06-15T10:05:00.000Z' },
+      // Deployment & Testing resolved so the flow reaches branch/commit proposal.
+      deploymentTesting: {
+        deployment: { status: 'not-needed', notes: 'No CRM-side deployment required for this test fixture.' },
+        test: { status: 'not-needed', notes: 'No deployed artifact to test in this fixture.' },
+      },
       // No gitWorkflow.confirmedBranch yet.
     })]));
 
@@ -1003,6 +1013,10 @@ describe('callToolFallback continue_developer_workflow', () => {
         },
       },
       aiKitReview: { status: 'passed', completedAt: '2026-06-15T10:05:00.000Z' },
+      deploymentTesting: {
+        deployment: { status: 'not-needed', notes: 'No CRM-side deployment required for this test fixture.' },
+        test: { status: 'not-needed', notes: 'No deployed artifact to test in this fixture.' },
+      },
       gitWorkflow: { confirmedBranch: 'feature/123-add-thing', confirmedAt: '2026-06-15T10:06:00.000Z' },
     })]));
 
@@ -3294,8 +3308,9 @@ describe('callToolFallback continue_developer_workflow – scaffold guard blocks
     process.argv = [...process.argv, '--data-dir', tmpDir, '--fallback-readonly'];
     try {
       const result = await callToolFallback('continue_developer_workflow', { taskId: 'task-cdwf-ready' });
-      // Not blocked — should proceed to record_results since local test is not done
-      expect(result.nextAction).toBe('record_results');
+      // Not blocked by the scaffold guard — Dataverse is already skipped, so the next real gate is
+      // the AI Kit review (Local Test is no longer part of Implementation Verification at all).
+      expect(result.nextAction).toBe('run_ai_kit_review');
     } finally {
       process.argv = origArgv;
       await fs.rm(tmpDir, { recursive: true });
@@ -4362,6 +4377,34 @@ describe('record_ai_implementation_completed tool', () => {
       expect(saved.mcpChecklistOverrides?.['local-test-done']).toBe('optional');
       expect(saved.localTestRecord?.status).toBe('not-needed');
       expect(saved.crmDeveloperWorkflow.lastAiImplementation?.filesChanged).toEqual(['Scripts/nvr_servicecase_events.js']);
+      // The canonical modal-visible Local Test row is also recorded as not-needed, not passed.
+      expect(saved.implementationVerification.localTest.status).toBe('not-needed');
+      expect(saved.implementationVerification.localTest.recordedAt).toBeTruthy();
+      expect(saved.implementationVerification.localTest.notes).toContain('Skipped for AI-managed workflow');
+    } finally {
+      process.argv = origArgv;
+      await fs.rm(tmpDir, { recursive: true });
+    }
+  });
+
+  it('does not overwrite an explicit passed/failed canonical Local Test result', async () => {
+    const { os, fs, path } = await importHelpers();
+    const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'tw-mcp-raic-preserve-'));
+    const task = makeApprovedScriptTask('task-raic-preserve');
+    task.implementationVerification = { localTest: { status: 'passed', recordedAt: '2025-01-01T00:00:00.000Z' } };
+    await fs.writeFile(path.join(tmpDir, 'tasks.json'), JSON.stringify([task]));
+    const origArgv = process.argv;
+    process.argv = [...process.argv, '--data-dir', tmpDir];
+    try {
+      await callToolFallback('record_ai_implementation_completed', {
+        taskId: 'task-raic-preserve',
+        filesChanged: ['Scripts/nvr_servicecase_events.js'],
+        summary: 'Implemented onChange prefill handler.',
+      });
+      const raw = JSON.parse(await fs.readFile(path.join(tmpDir, 'tasks.json'), 'utf8'));
+      const saved = raw.find((t) => t.id === 'task-raic-preserve');
+      expect(saved.implementationVerification.localTest.status).toBe('passed');
+      expect(saved.implementationVerification.localTest.recordedAt).toBe('2025-01-01T00:00:00.000Z');
     } finally {
       process.argv = origArgv;
       await fs.rm(tmpDir, { recursive: true });
@@ -4818,15 +4861,16 @@ describe('run_implementation_verification tool', () => {
     }
   });
 
-  it('does not auto-pass the modal Local Test row — it stays not-run separate from task.localTestRecord', async () => {
+  it('does not auto-pass the modal Local Test row for a manual task — stays separate from task.localTestRecord', async () => {
     const { os, fs, path } = await importHelpers();
     const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'tw-mcp-riv-localtest-'));
     const scriptsDir = path.join(tmpDir, 'Scripts');
     await fs.mkdir(scriptsDir, { recursive: true });
     await fs.writeFile(path.join(scriptsDir, 'nvr_servicecase_events.js'), GOOD_SCRIPT);
     const task = makeVerificationTask('task-riv-localtest', { repositoryRoot: tmpDir, artifactPath: 'Scripts/nvr_servicecase_events.js' });
-    // Simulates record_ai_implementation_completed's effect: the workflow-gate field is
-    // 'not-needed', but the modal's own Local Test row must remain untouched by MCP.
+    // task.localTestRecord alone, without a completed AI implementation, must not leak into
+    // implementationVerification.localTest (the modal row) as an auto-pass — ordinary manually
+    // managed tasks must still show Local Test as needing manual action.
     task.localTestRecord = { status: 'not-needed' };
     await fs.writeFile(path.join(tmpDir, 'tasks.json'), JSON.stringify([task]));
 
@@ -4840,10 +4884,32 @@ describe('run_implementation_verification tool', () => {
 
       const raw = JSON.parse(await fs.readFile(path.join(tmpDir, 'tasks.json'), 'utf8'));
       const saved = raw.find((t) => t.id === 'task-riv-localtest');
-      // task.localTestRecord ('not-needed', the continue_developer_workflow gate) must not leak
-      // into implementationVerification.localTest (the modal row) as an auto-pass.
       expect(saved.implementationVerification.localTest).toBeUndefined();
       expect(saved.localTestRecord.status).toBe('not-needed');
+    } finally {
+      process.argv = origArgv;
+      await fs.rm(tmpDir, { recursive: true });
+    }
+  });
+
+  it('backfills the modal Local Test row as not-needed for an AI-managed task completed before the canonical write existed', async () => {
+    const { os, fs, path } = await importHelpers();
+    const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'tw-mcp-riv-localtest-backfill-'));
+    const scriptsDir = path.join(tmpDir, 'Scripts');
+    await fs.mkdir(scriptsDir, { recursive: true });
+    await fs.writeFile(path.join(scriptsDir, 'nvr_servicecase_events.js'), GOOD_SCRIPT);
+    const task = makeVerificationTask('task-riv-localtest-backfill', { repositoryRoot: tmpDir, artifactPath: 'Scripts/nvr_servicecase_events.js' });
+    task.crmDeveloperWorkflow.lastAiImplementation = { completedAt: '2026-01-01T00:00:00.000Z' };
+    task.localTestRecord = { status: 'not-needed' };
+    await fs.writeFile(path.join(tmpDir, 'tasks.json'), JSON.stringify([task]));
+
+    const origArgv = process.argv;
+    process.argv = [...process.argv, '--data-dir', tmpDir];
+    try {
+      const result = await callToolFallback('run_implementation_verification', { taskId: 'task-riv-localtest-backfill' });
+      const localTestCheck = result.checks.find((c) => c.name === 'Local Test');
+      expect(localTestCheck.status).toBe('not-needed');
+      expect(localTestCheck.findings[0]).toContain('Skipped for AI-managed workflow');
     } finally {
       process.argv = origArgv;
       await fs.rm(tmpDir, { recursive: true });
@@ -4922,11 +4988,12 @@ describe('run_implementation_verification tool', () => {
     }
   });
 
-  it('modal summary treats aiCodeReview="skipped" as resolved, but the hard gate still requires a genuine passed AI Kit review', async () => {
-    // "skipped" is a legitimate modal-display override (shown as resolved so the UI doesn't nag),
-    // but it is not one of the three real review verdicts (passed/failed/warnings) the hard gate
-    // accepts — aiKitReviewGate treats it as not_run, same as never having reviewed at all. This
-    // is intentional: the hardening closes exactly this kind of bypass.
+  it('modal summary treats aiCodeReview="skipped" as resolved, and the hard gate agrees — an explicit manual skip resolves the AI Kit review gate', async () => {
+    // "skipped" is an explicit manual UI override (Section 3's Skip action), distinct from an
+    // automated review verdict (passed/failed/warnings). aiKitReviewGate resolves it directly to
+    // "passed" without requiring the automated review-detail payload — record_ai_kit_review_result
+    // itself still cannot set status="skipped" (its inputSchema only allows passed/failed/warnings),
+    // so this override can only come from the modal's explicit user action, never fabricated by MCP.
     const { os, fs, path } = await importHelpers();
     const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'tw-mcp-riv-partial-'));
     const scriptsDir = path.join(tmpDir, 'Scripts');
@@ -4934,22 +5001,20 @@ describe('run_implementation_verification tool', () => {
     await fs.writeFile(path.join(scriptsDir, 'nvr_servicecase_events.js'), GOOD_SCRIPT);
     const task = makeVerificationTask('task-riv-partial', { repositoryRoot: tmpDir, artifactPath: 'Scripts/nvr_servicecase_events.js' });
     task.crmVerificationReports = [{ verdict: 'pass' }];
-    task.implementationVerification = { aiCodeReview: { status: 'skipped' } };
+    task.implementationVerification = { aiCodeReview: { status: 'skipped' }, localTest: { status: 'not-needed' } };
     await fs.writeFile(path.join(tmpDir, 'tasks.json'), JSON.stringify([task]));
 
     const origArgv = process.argv;
     process.argv = [...process.argv, '--data-dir', tmpDir];
     try {
       const result = await callToolFallback('run_implementation_verification', { taskId: 'task-riv-partial' });
-      // Modal-visible summary still shows aiCodeReview as resolved ("skipped") — only localTest
-      // is genuinely not-run from the modal's point of view.
-      expect(result.unresolvedRequiredRows).toEqual(['localTest']);
-      // But the tool-orchestration nextAction is driven by the hard gate, which does not accept
-      // "skipped" as a satisfying AI Kit review verdict.
-      expect(result.nextAction).toBe('run_ai_kit_review');
-      expect(result.nextRecommendedStep).toBe(
-        'Read the applicable AI Kit rules and the target file, then call record_ai_kit_review_result with your verdict, then call run_implementation_verification again.',
-      );
+      // Modal-visible summary shows aiCodeReview as resolved ("skipped") — with localTest also
+      // resolved here, nothing is left unresolved.
+      expect(result.unresolvedRequiredRows).toEqual([]);
+      // The tool-orchestration nextAction now agrees: the explicit manual skip resolves the hard
+      // gate too, so the workflow is free to continue.
+      expect(result.nextAction).toBe('continue_workflow');
+      expect(result.status).toBe('passed');
     } finally {
       process.argv = origArgv;
       await fs.rm(tmpDir, { recursive: true });
@@ -5173,6 +5238,33 @@ describe('record_ai_kit_review_result tool', () => {
     }
   });
 
+  it('cannot use "skipped" or "manually-verified" as a shortcut for an incomplete automated review — those are manual UI overrides only', async () => {
+    // getAiKitReviewGate/aiKitReviewGate now resolve "manually-verified"/"skipped" directly to
+    // "passed" without requiring the automated detail payload. record_ai_kit_review_result must
+    // still reject both values so an AI agent can never call itself "manually verified" or
+    // "skipped" in place of doing (or honestly failing) the real automated review.
+    const { os, fs, path } = await importHelpers();
+    const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'tw-mcp-aikit-no-manual-shortcut-'));
+    await fs.writeFile(path.join(tmpDir, 'tasks.json'), JSON.stringify([makeTask({ id: 'task-aikit-no-shortcut', taskMode: 'developer' })]));
+
+    const origArgv = process.argv;
+    process.argv = [...process.argv, '--data-dir', tmpDir];
+    try {
+      const skipped = await callToolFallback('record_ai_kit_review_result', { taskId: 'task-aikit-no-shortcut', status: 'skipped' });
+      expect(skipped.error).toContain('Invalid status');
+
+      const manuallyVerified = await callToolFallback('record_ai_kit_review_result', { taskId: 'task-aikit-no-shortcut', status: 'manually-verified' });
+      expect(manuallyVerified.error).toContain('Invalid status');
+
+      const raw = JSON.parse(await fs.readFile(path.join(tmpDir, 'tasks.json'), 'utf8'));
+      const saved = raw.find((t) => t.id === 'task-aikit-no-shortcut');
+      expect(saved.implementationVerification?.aiCodeReview).toBeUndefined();
+    } finally {
+      process.argv = origArgv;
+      await fs.rm(tmpDir, { recursive: true });
+    }
+  });
+
   it('persists the review to implementationVerification.aiCodeReview and task.aiKitReview without calling any external system', async () => {
     const { os, fs, path } = await importHelpers();
     const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'tw-mcp-aikit-record-'));
@@ -5221,6 +5313,10 @@ describe('record_ai_kit_review_result tool', () => {
       crmDeveloperWorkflow: { detectedWorkKind: 'script' },
       localTestRecord: { status: 'passed', updatedAt: '2026-06-15T10:00:00.000Z' },
       crmVerificationReports: [{ verdict: 'pass' }],
+      deploymentTesting: {
+        deployment: { status: 'not-needed', notes: 'No CRM-side deployment required for this test fixture.' },
+        test: { status: 'not-needed', notes: 'No deployed artifact to test in this fixture.' },
+      },
       // No aiKitReview yet.
     })]));
 
@@ -5244,6 +5340,44 @@ describe('record_ai_kit_review_result tool', () => {
       const after = await callToolFallback('continue_developer_workflow', { taskId: 'task-aikit-cdw' });
       expect(after.nextAction).not.toBe('run_ai_kit_review');
       expect(after.nextAction).toBe('propose_branch');
+    } finally {
+      process.argv = origArgv;
+      await fs.rm(tmpDir, { recursive: true });
+    }
+  });
+
+  it('a manual UI override (manually-verified/skipped) written directly to the task also resolves the gate for continue_developer_workflow — agreeing with the modal', async () => {
+    // record_ai_kit_review_result itself cannot produce these statuses (see the "cannot use
+    // skipped/manually-verified as a shortcut" test above) — this simulates the modal's own
+    // handleAiManualVerify/handleAiSkipConfirm writing the override directly to the task file.
+    const { os, fs, path } = await importHelpers();
+    const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'tw-mcp-aikit-manual-override-cdw-'));
+    const baseTask = {
+      taskMode: 'developer',
+      workflowSetup: { devTargetKind: 'script', repositoryRoot: 'C:\\Repo', artifactPath: 'Scripts\\nvr.js' },
+      crmDeveloperWorkflow: { detectedWorkKind: 'script' },
+      localTestRecord: { status: 'passed', updatedAt: '2026-06-15T10:00:00.000Z' },
+      crmVerificationReports: [{ verdict: 'pass' }],
+      deploymentTesting: {
+        deployment: { status: 'not-needed', notes: 'No CRM-side deployment required for this test fixture.' },
+        test: { status: 'not-needed', notes: 'No deployed artifact to test in this fixture.' },
+      },
+    };
+    await fs.writeFile(path.join(tmpDir, 'tasks.json'), JSON.stringify([
+      makeTask({ ...baseTask, id: 'task-aikit-manual-verified', implementationVerification: { aiCodeReview: { status: 'manually-verified' } } }),
+      makeTask({ ...baseTask, id: 'task-aikit-skipped', implementationVerification: { aiCodeReview: { status: 'skipped' } } }),
+    ]));
+
+    const origArgv = process.argv;
+    process.argv = [...process.argv, '--data-dir', tmpDir, '--fallback-readonly'];
+    try {
+      const verified = await callToolFallback('continue_developer_workflow', { taskId: 'task-aikit-manual-verified' });
+      expect(verified.nextAction).not.toBe('run_ai_kit_review');
+      expect(verified.nextAction).toBe('propose_branch');
+
+      const skipped = await callToolFallback('continue_developer_workflow', { taskId: 'task-aikit-skipped' });
+      expect(skipped.nextAction).not.toBe('run_ai_kit_review');
+      expect(skipped.nextAction).toBe('propose_branch');
     } finally {
       process.argv = origArgv;
       await fs.rm(tmpDir, { recursive: true });
@@ -5565,10 +5699,10 @@ describe('get_implementation_verification_summary tool', () => {
     }
   });
 
-  it('legacy task.localTestRecord cannot make the modal-visible localTest row appear resolved', async () => {
-    // Regression: record_ai_implementation_completed sets task.localTestRecord.status='not-needed'
-    // (the continue_developer_workflow step-1 gate) — that must never leak into or be conflated
-    // with implementationVerification.localTest (the modal's Local Test row).
+  it('legacy task.localTestRecord alone cannot make the modal-visible localTest row appear resolved for a manual task', async () => {
+    // Regression: task.localTestRecord.status='not-needed' (the continue_developer_workflow
+    // step-1 gate) must not leak into implementationVerification.localTest (the modal's Local
+    // Test row) for an ordinary manually managed task with no completed AI implementation.
     const { os, fs, path } = await importHelpers();
     const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'tw-mcp-givs-4-'));
     const task = makeTask({
@@ -5597,5 +5731,949 @@ describe('get_implementation_verification_summary tool', () => {
       process.argv = origArgv;
       await fs.rm(tmpDir, { recursive: true });
     }
+  });
+
+  it('backfills implementationVerification.localTest as not-needed for a completed AI-managed task with only the legacy record', async () => {
+    const { os, fs, path } = await importHelpers();
+    const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'tw-mcp-givs-5-'));
+    const task = makeTask({
+      id: 'task-givs-5',
+      taskMode: 'developer',
+      workflowSetup: { devTargetKind: 'script', repositoryRoot: 'C:\\Repo', artifactPath: 'Scripts\\nvr.js' },
+      crmDeveloperWorkflow: {
+        detectedWorkKind: 'script',
+        lastAiImplementation: { completedAt: '2026-01-01T00:00:00.000Z' },
+      },
+      localTestRecord: { status: 'not-needed' },
+    });
+    await fs.writeFile(path.join(tmpDir, 'tasks.json'), JSON.stringify([task]));
+
+    const origArgv = process.argv;
+    process.argv = [...process.argv, '--data-dir', tmpDir, '--fallback-readonly'];
+    try {
+      const result = await callToolFallback('get_implementation_verification_summary', { taskId: 'task-givs-5' });
+      expect(result.implementationVerification.localTest.status).toBe('not-needed');
+      expect(result.implementationVerification.localTest.message).toContain('Skipped for AI-managed workflow');
+    } finally {
+      process.argv = origArgv;
+      await fs.rm(tmpDir, { recursive: true });
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// set_task_phase — workflow reset to NEW
+// ---------------------------------------------------------------------------
+//
+// Changing an existing task's phase to NEW must fully reset its local workflow state (analysis,
+// developer setup, plans/approvals, verification, AI reviews, test/checklist results, next-step
+// state, Git workflow tracking) — not just status/waitingState/attentionState. See
+// src/lib/taskWorkflowReset.ts for the canonical TypeScript mirror and src-tauri/src/lib.rs for
+// the Rust mirror (task_mcp_reset_task_workflow_to_new / task_mcp_decide_new_phase_reset).
+
+describe('set_task_phase tool — workflow reset to NEW', () => {
+  async function importHelpers() {
+    const { default: os } = await import('node:os');
+    const { default: fs } = await import('node:fs/promises');
+    const { default: path } = await import('node:path');
+    return { os, fs, path };
+  }
+
+  function makeFullyWorkedTask(overrides = {}) {
+    return makeTask({
+      id: 'task-reset',
+      status: 'done',
+      waitingState: null,
+      attentionState: null,
+      completedAt: '2026-06-10T00:00:00.000Z',
+      estimatedEffort: 4,
+      planningBucket: 'today',
+      suggestedPlanningBucket: 'this_week',
+      priorityScore: 72,
+      priorityReason: 'Due soon.',
+      isPlanningLocked: true,
+      analysisResult: { summary: 'Summary.', suggestedActions: [], confidence: 90 },
+      generatedReply: 'Draft reply text.',
+      scriptAnalysis: { artifactType: 'script', entityLogicalName: 'nvr_case' },
+      selectedPluginProject: 'MyPlugins',
+      aiFileReviews: [{ reviewerName: 'AI Kit', filePath: 'Scripts/foo.js' }],
+      crmSkeletons: [{ mode: 'script', summary: 's' }],
+      crmVerificationReports: [{ verdict: 'pass' }],
+      crmDeveloperWorkflow: { detectedWorkKind: 'script', currentStep: 'pull-request' },
+      workflowSetup: { devTargetKind: 'script', repositoryRoot: 'C:\\Repo' },
+      taskMode: 'developer',
+      implementationVerification: { aiCodeReview: { status: 'passed' } },
+      localTestRecord: { status: 'passed', updatedAt: '2026-06-05T00:00:00.000Z' },
+      consultantTestRecord: { status: 'passed', updatedAt: '2026-06-06T00:00:00.000Z' },
+      mcpChecklistOverrides: { diagnosis: 'done' },
+      mcpNextStep: { action: 'mark_done', reason: 'All resolved.', updatedAt: '2026-06-09T00:00:00.000Z' },
+      gitWorkflow: { confirmedBranch: 'feature/123-nvr', lastCommitHash: 'abc123' },
+      // Preserved fields.
+      dueAt: '2026-07-01T00:00:00.000Z',
+      budget: 10,
+      budgetHours: 8,
+      budgetNote: 'Fixed-price scope.',
+      notes: 'Manual note the user wrote.',
+      ticketUrl: 'https://helpdesk.example.com/tickets/1',
+      mcpTestTask: true,
+      ...overrides,
+    });
+  }
+
+  const RESETTABLE_KEYS = [
+    'completedAt', 'estimatedEffort', 'planningBucket', 'suggestedPlanningBucket', 'priorityScore',
+    'priorityReason', 'isPlanningLocked', 'analysisResult', 'generatedReply', 'scriptAnalysis',
+    'selectedPluginProject', 'aiFileReviews', 'crmSkeletons', 'crmVerificationReports',
+    'crmDeveloperWorkflow', 'workflowSetup', 'taskMode', 'implementationVerification',
+    'localTestRecord', 'consultantTestRecord', 'mcpChecklistOverrides', 'mcpNextStep', 'gitWorkflow',
+  ];
+
+  it('tool definition exposes confirmReset and keeps additionalProperties: false', () => {
+    const tool = findTool('set_task_phase');
+    expect(tool).toBeDefined();
+    expect(tool.inputSchema.properties.confirmReset.type).toBe('boolean');
+    expect(tool.inputSchema.additionalProperties).toBe(false);
+    expect(tool.inputSchema.required).toEqual(['taskId', 'phase']);
+  });
+
+  it('rejects phase="new" on a populated task without confirmReset:true, and does not modify the task', async () => {
+    const { os, fs, path } = await importHelpers();
+    const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'tw-mcp-reset-noconfirm-'));
+    const before = makeFullyWorkedTask();
+    await fs.writeFile(path.join(tmpDir, 'tasks.json'), JSON.stringify([before]));
+
+    const origArgv = process.argv;
+    process.argv = [...process.argv, '--data-dir', tmpDir];
+    try {
+      const result = await callToolFallback('set_task_phase', { taskId: 'task-reset', phase: 'new' });
+      expect(result.error).toContain('confirmReset=true');
+      expect(result.error).toContain('will not be changed');
+
+      const raw = JSON.parse(await fs.readFile(path.join(tmpDir, 'tasks.json'), 'utf8'));
+      const saved = raw.find((t) => t.id === 'task-reset');
+      // Nothing was touched — the rejection happens before any write.
+      expect(saved).toEqual(before);
+    } finally {
+      process.argv = origArgv;
+      await fs.rm(tmpDir, { recursive: true });
+    }
+  });
+
+  it('resets a fully-worked task to a clean NEW state once confirmReset:true, preserving identity/notes/tracking', async () => {
+    const { os, fs, path } = await importHelpers();
+    const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'tw-mcp-reset-confirmed-'));
+    await fs.writeFile(path.join(tmpDir, 'tasks.json'), JSON.stringify([makeFullyWorkedTask()]));
+
+    const origArgv = process.argv;
+    process.argv = [...process.argv, '--data-dir', tmpDir];
+    try {
+      const result = await callToolFallback('set_task_phase', { taskId: 'task-reset', phase: 'new', confirmReset: true });
+      expect(result.error).toBeUndefined();
+
+      const raw = JSON.parse(await fs.readFile(path.join(tmpDir, 'tasks.json'), 'utf8'));
+      const saved = raw.find((t) => t.id === 'task-reset');
+
+      expect(saved.status).toBe('new');
+      expect(saved.waitingState).toBeNull();
+      expect(saved.attentionState).toBeNull();
+      expect(saved.suggestedActions).toEqual([]);
+      for (const key of RESETTABLE_KEYS) {
+        expect(saved).not.toHaveProperty(key);
+      }
+      // Preserved fields survive the reset untouched.
+      expect(saved.id).toBe('task-reset');
+      expect(saved.dueAt).toBe('2026-07-01T00:00:00.000Z');
+      expect(saved.budget).toBe(10);
+      expect(saved.budgetHours).toBe(8);
+      expect(saved.budgetNote).toBe('Fixed-price scope.');
+      expect(saved.ticketUrl).toBe('https://helpdesk.example.com/tickets/1');
+      expect(saved.mcpTestTask).toBe(true);
+      // Original note preserved, audit note appended (not lost, not overwritten).
+      expect(saved.notes).toContain('Manual note the user wrote.');
+      expect(saved.notes).toContain('MCP local write: set_task_phase -> new (workflow reset to NEW)');
+    } finally {
+      process.argv = origArgv;
+      await fs.rm(tmpDir, { recursive: true });
+    }
+  });
+
+  it('resetting an already-clean NEW task is an idempotent no-op that does not require confirmReset', async () => {
+    const { os, fs, path } = await importHelpers();
+    const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'tw-mcp-reset-clean-noop-'));
+    await fs.writeFile(path.join(tmpDir, 'tasks.json'), JSON.stringify([
+      makeTask({ id: 'task-clean', status: 'new', waitingState: null, attentionState: null, taskMode: undefined }),
+    ]));
+
+    const origArgv = process.argv;
+    process.argv = [...process.argv, '--data-dir', tmpDir];
+    try {
+      const result = await callToolFallback('set_task_phase', { taskId: 'task-clean', phase: 'new' });
+      expect(result.error).toBeUndefined();
+      const raw = JSON.parse(await fs.readFile(path.join(tmpDir, 'tasks.json'), 'utf8'));
+      expect(raw.find((t) => t.id === 'task-clean').status).toBe('new');
+    } finally {
+      process.argv = origArgv;
+      await fs.rm(tmpDir, { recursive: true });
+    }
+  });
+
+  it('other phase changes (e.g. development) do not clear workflow data', async () => {
+    const { os, fs, path } = await importHelpers();
+    const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'tw-mcp-reset-other-phase-'));
+    await fs.writeFile(path.join(tmpDir, 'tasks.json'), JSON.stringify([makeFullyWorkedTask()]));
+
+    const origArgv = process.argv;
+    process.argv = [...process.argv, '--data-dir', tmpDir];
+    try {
+      const result = await callToolFallback('set_task_phase', { taskId: 'task-reset', phase: 'development' });
+      expect(result.error).toBeUndefined();
+      const raw = JSON.parse(await fs.readFile(path.join(tmpDir, 'tasks.json'), 'utf8'));
+      const saved = raw.find((t) => t.id === 'task-reset');
+      expect(saved.status).toBe('in-progress');
+      expect(saved.crmDeveloperWorkflow).toBeDefined();
+      expect(saved.workflowSetup).toBeDefined();
+      expect(saved.implementationVerification).toBeDefined();
+      expect(saved.gitWorkflow).toBeDefined();
+    } finally {
+      process.argv = origArgv;
+      await fs.rm(tmpDir, { recursive: true });
+    }
+  });
+
+  it('reset does not execute any filesystem/Git/Dataverse/external action — only tasks.json is written', async () => {
+    const { os, fs, path } = await importHelpers();
+    const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'tw-mcp-reset-no-sideeffects-'));
+    await fs.writeFile(path.join(tmpDir, 'tasks.json'), JSON.stringify([makeFullyWorkedTask()]));
+    const filesBefore = (await fs.readdir(tmpDir)).sort();
+
+    const origArgv = process.argv;
+    process.argv = [...process.argv, '--data-dir', tmpDir];
+    try {
+      await callToolFallback('set_task_phase', { taskId: 'task-reset', phase: 'new', confirmReset: true });
+      const filesAfter = (await fs.readdir(tmpDir)).sort();
+      // Only tasks.json (and its own backup rotation, if any) may exist — no new files created by
+      // Git, filesystem, or external-action side effects.
+      expect(filesAfter.every((f) => f.startsWith('tasks'))).toBe(true);
+      expect(filesBefore).toEqual(['tasks.json']);
+    } finally {
+      process.argv = origArgv;
+      await fs.rm(tmpDir, { recursive: true });
+    }
+  });
+
+  it('after reset, get_developer_work_packet reports the initial "set task mode" step, not the fully-worked task\'s later step', async () => {
+    const { os, fs, path } = await importHelpers();
+    const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'tw-mcp-reset-overview-'));
+    await fs.writeFile(path.join(tmpDir, 'tasks.json'), JSON.stringify([makeFullyWorkedTask()]));
+
+    const origArgv = process.argv;
+    process.argv = [...process.argv, '--data-dir', tmpDir, '--fallback-readonly'];
+    try {
+      const before = await callToolFallback('get_developer_work_packet', { taskId: 'task-reset' });
+      // taskMode is already 'developer' on the fully-worked fixture, so the early "set task mode"
+      // blocker must not be the reason before the reset (whatever later blocker it has instead).
+      expect(before.decisionReason).not.toBe('Task mode is not set to Developer.');
+
+      await callToolFallback('set_task_phase', { taskId: 'task-reset', phase: 'new', confirmReset: true });
+
+      const after = await callToolFallback('get_developer_work_packet', { taskId: 'task-reset' });
+      expect(after.canWriteCode).toBe(false);
+      expect(after.decisionReason).toBe('Task mode is not set to Developer.');
+    } finally {
+      process.argv = origArgv;
+      await fs.rm(tmpDir, { recursive: true });
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// commit_task_changes / commit_and_push_task_changes — MCP argument-contract parity
+// ---------------------------------------------------------------------------
+//
+// Regression: the Rust bridge already reads args["confirmUnrelatedFiles"] / args["forceAddFiles"]
+// (see src-tauri/src/lib.rs task_mcp_parse_commit_args), but the public MCP schemas did not expose
+// those properties and used additionalProperties: false — so a caller's explicit approval could
+// never reliably reach the dispatcher. These tests lock the schema contract in place.
+
+describe('commit_task_changes / commit_and_push_task_changes — argument-contract parity', () => {
+  it('commit_task_changes schema exposes confirmUnrelatedFiles and forceAddFiles', () => {
+    const tool = findTool('commit_task_changes');
+    expect(tool).toBeDefined();
+    expect(tool.inputSchema.properties.confirmUnrelatedFiles).toEqual({ type: 'boolean', description: expect.any(String) });
+    expect(tool.inputSchema.properties.forceAddFiles).toMatchObject({ type: 'array', items: { type: 'string' } });
+    expect(tool.inputSchema.additionalProperties).toBe(false);
+    expect(tool.inputSchema.required).toEqual(['taskId', 'message', 'files']);
+  });
+
+  it('commit_and_push_task_changes schema exposes the same confirmUnrelatedFiles and forceAddFiles properties', () => {
+    const tool = findTool('commit_and_push_task_changes');
+    expect(tool).toBeDefined();
+    expect(tool.inputSchema.properties.confirmUnrelatedFiles).toEqual({ type: 'boolean', description: expect.any(String) });
+    expect(tool.inputSchema.properties.forceAddFiles).toMatchObject({ type: 'array', items: { type: 'string' } });
+    expect(tool.inputSchema.additionalProperties).toBe(false);
+    expect(tool.inputSchema.required).toEqual(['taskId', 'message', 'files']);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// callTool — bridge error classification
+// ---------------------------------------------------------------------------
+//
+// Regression: callTool used to catch ANY rejection from bridgeRequestJson (transport failures,
+// valid ok:false business rejections, and invalid-JSON protocol errors alike) and, when fallback
+// wasn't allowed for the tool, wrap it as "task-workbench local bridge is not running" — making a
+// valid safety-gate rejection from a reachable bridge look like a connection failure.
+
+describe('callTool — bridge error classification', () => {
+  async function importHttp() {
+    const { default: http } = await import('node:http');
+    return http;
+  }
+
+  function readBody(req) {
+    return new Promise((resolve, reject) => {
+      let data = '';
+      req.on('data', (chunk) => { data += chunk; });
+      req.on('end', () => resolve(data));
+      req.on('error', reject);
+    });
+  }
+
+  // Starts a fake bridge that answers /mcp/status with no token (so cachedBridgeToken is never
+  // set — preserves the module's existing token-cache behavior untouched across tests) and
+  // /mcp/tools/call via the given handler.
+  async function withFakeBridge(handleToolsCall) {
+    const http = await importHttp();
+    let capturedBody = null;
+    const server = http.createServer((req, res) => {
+      if (req.url === '/mcp/status') {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: true }));
+        return;
+      }
+      readBody(req).then((raw) => {
+        capturedBody = raw ? JSON.parse(raw) : null;
+        handleToolsCall(req, res, capturedBody);
+      });
+    });
+    await new Promise((resolve, reject) => {
+      server.listen(0, '127.0.0.1', resolve);
+      server.on('error', reject);
+    });
+    const { port } = server.address();
+    return {
+      url: `http://127.0.0.1:${port}`,
+      getCapturedBody: () => capturedBody,
+      close: () => new Promise((resolve) => server.close(resolve)),
+    };
+  }
+
+  async function withBridgeUrl(url, fn) {
+    const originalArgv = process.argv;
+    process.argv = [...process.argv, '--bridge-url', url];
+    try {
+      return await fn();
+    } finally {
+      process.argv = originalArgv;
+    }
+  }
+
+  it('forwards commit_task_changes arguments unchanged to the live bridge call', async () => {
+    const bridge = await withFakeBridge((req, res) => {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: true, result: { recorded: true } }));
+    });
+    try {
+      const args = {
+        taskId: 't1', message: 'Commit .gitignore', files: ['.gitignore'],
+        confirmUnrelatedFiles: true, forceAddFiles: ['bin/output.dll'],
+      };
+      await withBridgeUrl(bridge.url, () => callTool('commit_task_changes', args));
+      expect(bridge.getCapturedBody()).toEqual({ name: 'commit_task_changes', args });
+    } finally {
+      await bridge.close();
+    }
+  });
+
+  it('a valid ok:false response surfaces the original business error, not "local bridge is not running"', async () => {
+    const businessMessage = "These files are not part of this task's recorded implementation and require explicit confirmation: .gitignore. Pass confirmUnrelatedFiles=true after the user approves including them.";
+    const bridge = await withFakeBridge((req, res) => {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: false, error: businessMessage }));
+    });
+    try {
+      await expect(
+        withBridgeUrl(bridge.url, () => callTool('commit_task_changes', {
+          taskId: 't1', message: 'msg', files: ['.gitignore'],
+        })),
+      ).rejects.toMatchObject({ name: 'BridgeToolError', message: businessMessage });
+    } finally {
+      await bridge.close();
+    }
+  });
+
+  it('a valid ok:false response does not trigger read-only fallback mode', async () => {
+    const bridge = await withFakeBridge((req, res) => {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: false, error: 'Refusing to commit directly to main.' }));
+    });
+    try {
+      // Even with --data-dir set (which would normally permit read-only fallback), a business
+      // error from a reachable bridge must still be surfaced directly, not silently retried
+      // against the local JS fallback.
+      const originalArgv = process.argv;
+      process.argv = [...process.argv, '--data-dir', '/tmp/does-not-matter'];
+      try {
+        await expect(
+          withBridgeUrl(bridge.url, () => callTool('get_task', { id: 'does-not-exist' })),
+        ).rejects.toMatchObject({ name: 'BridgeToolError', message: 'Refusing to commit directly to main.' });
+      } finally {
+        process.argv = originalArgv;
+      }
+    } finally {
+      await bridge.close();
+    }
+  });
+
+  it('an invalid JSON response is classified as a bridge protocol error, not proof the bridge is not running', async () => {
+    const bridge = await withFakeBridge((req, res) => {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end('not valid json {{{');
+    });
+    try {
+      await expect(
+        withBridgeUrl(bridge.url, () => callTool('commit_task_changes', {
+          taskId: 't1', message: 'msg', files: ['a.txt'],
+        })),
+      ).rejects.toMatchObject({ name: 'BridgeProtocolError' });
+      // Re-run to inspect the message directly (rejects.toMatchObject already consumed the promise).
+      let caught;
+      try {
+        await withBridgeUrl(bridge.url, () => callTool('commit_task_changes', {
+          taskId: 't1', message: 'msg', files: ['a.txt'],
+        }));
+      } catch (error) {
+        caught = error;
+      }
+      expect(caught).toBeInstanceOf(BridgeProtocolError);
+      expect(caught.message).toContain('invalid JSON');
+      expect(caught.message.toLowerCase()).not.toContain('local bridge is not running');
+    } finally {
+      await bridge.close();
+    }
+  });
+
+  it('a genuine connection failure still produces the existing bridge-unavailable behavior', async () => {
+    // Start a server, grab its port, then close it immediately so nothing is listening there —
+    // a reliable, non-flaky way to force a connection-refused transport failure.
+    const bridge = await withFakeBridge((req, res) => { res.writeHead(200); res.end('{}'); });
+    const closedUrl = bridge.url;
+    await bridge.close();
+
+    await expect(
+      withBridgeUrl(closedUrl, () => callTool('commit_task_changes', {
+        taskId: 't1', message: 'msg', files: ['a.txt'],
+      })),
+    ).rejects.toThrow(/task-workbench local bridge is not running/);
+  });
+
+  it('a genuine connection failure still triggers capability fallback for get_task_workbench_mcp_capabilities', async () => {
+    const bridge = await withFakeBridge((req, res) => { res.writeHead(200); res.end('{}'); });
+    const closedUrl = bridge.url;
+    await bridge.close();
+
+    const result = await withBridgeUrl(closedUrl, () => callTool('get_task_workbench_mcp_capabilities', {}));
+    expect(result.bridge.mode).toBe('offline');
+    expect(result.bridge.reason).toBe('task-workbench bridge unavailable');
+    expect(typeof result.bridge.bridgeError).toBe('string');
+  });
+
+  it('bridgeRequestJson rejects with BridgeUnavailableError on connection refusal', async () => {
+    const bridge = await withFakeBridge((req, res) => { res.writeHead(200); res.end('{}'); });
+    const closedUrl = bridge.url;
+    await bridge.close();
+
+    await expect(bridgeRequestJson(closedUrl, '/mcp/tools/call', { name: 'x', args: {} }))
+      .rejects.toBeInstanceOf(BridgeUnavailableError);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Deployment & Testing / Commit & Push / Pull Request MCP tools
+// ---------------------------------------------------------------------------
+
+describe('Deployment & Testing / Pull Request tool surface', () => {
+  async function importHelpers() {
+    const { default: os } = await import('node:os');
+    const { default: fs } = await import('node:fs/promises');
+    const { default: path } = await import('node:path');
+    return { os, fs, path };
+  }
+
+  async function withTask(task, run) {
+    const { os, fs, path } = await importHelpers();
+    const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'tw-mcp-deploy-'));
+    await fs.writeFile(path.join(tmpDir, 'tasks.json'), JSON.stringify([task]));
+    const origArgv = process.argv;
+    process.argv = [...process.argv, '--data-dir', tmpDir, '--fallback-readonly'];
+    try {
+      return await run(tmpDir, fs, path);
+    } finally {
+      process.argv = origArgv;
+      await fs.rm(tmpDir, { recursive: true });
+    }
+  }
+
+  it('new tools are registered in TOOL_DEFINITIONS with the expected write/read-only classification', () => {
+    for (const name of ['get_deployment_testing_state', 'get_pull_request_state', 'prepare_pull_request_for_task', 'reconcile_task_git_state']) {
+      expect(findTool(name)).toBeDefined();
+      expect(READ_ONLY_TOOL_NAMES.has(name)).toBe(true);
+    }
+    for (const name of ['record_manual_deployment', 'record_deployment_test', 'record_pull_request_created']) {
+      expect(findTool(name)).toBeDefined();
+      expect(READ_ONLY_TOOL_NAMES.has(name)).toBe(false);
+      expect(FALLBACK_WRITE_ALLOWED_TOOL_NAMES.has(name)).toBe(true);
+    }
+  });
+
+  it('get_deployment_testing_state reports not-run/not-run and blocks commit preparation for a fresh task', async () => {
+    await withTask(makeTask({ id: 't-deploy-fresh' }), async () => {
+      const result = await callToolFallback('get_deployment_testing_state', { taskId: 't-deploy-fresh' });
+      expect(result.deploymentStatus).toBe('not-run');
+      expect(result.testStatus).toBe('not-run');
+      expect(result.canProceedToCommit).toBe(false);
+      expect(result.nextRecommendedAction).toBe('wait_for_manual_deployment');
+    });
+  });
+
+  it('record_manual_deployment/record_deployment_test schemas no longer declare notes as required', () => {
+    expect(findTool('record_manual_deployment').inputSchema.required).toEqual(['taskId', 'status']);
+    expect(findTool('record_deployment_test').inputSchema.required).toEqual(['taskId', 'status']);
+    expect(findTool('record_manual_deployment').inputSchema.additionalProperties).toBe(false);
+    expect(findTool('record_deployment_test').inputSchema.additionalProperties).toBe(false);
+  });
+
+  it('record_manual_deployment accepts a minimal deployed call with no notes at all', async () => {
+    await withTask(makeTask({ id: 't-deploy-minimal' }), async (tmpDir, fs, path) => {
+      const result = await callToolFallback('record_manual_deployment', { taskId: 't-deploy-minimal', status: 'deployed' });
+      expect(result.recorded).toBe(true);
+      expect(result.deploymentStatus).toBe('deployed');
+      const raw = JSON.parse(await fs.readFile(path.join(tmpDir, 'tasks.json'), 'utf8'));
+      const saved = raw.find((t) => t.id === 't-deploy-minimal');
+      expect(saved.deploymentTesting.deployment.status).toBe('deployed');
+      expect(saved.deploymentTesting.deployment.recordedAt).toBeDefined();
+      expect(saved.deploymentTesting.deployment.notes).toBeUndefined();
+    });
+  });
+
+  it('record_manual_deployment rejects not-needed without meaningful notes, but does not require notes for deployed/failed', async () => {
+    await withTask(makeTask({ id: 't-deploy-notes' }), async () => {
+      const acceptedDeployed = await callToolFallback('record_manual_deployment', { taskId: 't-deploy-notes', status: 'deployed', notes: '' });
+      expect(acceptedDeployed.error).toBeUndefined();
+      const acceptedFailed = await callToolFallback('record_manual_deployment', { taskId: 't-deploy-notes', status: 'failed' });
+      expect(acceptedFailed.error).toBeUndefined();
+      const rejectedNotNeeded = await callToolFallback('record_manual_deployment', { taskId: 't-deploy-notes', status: 'not-needed', notes: '   ' });
+      expect(rejectedNotNeeded.error).toBeDefined();
+    });
+  });
+
+  it('record_manual_deployment performs no Dataverse/external write — only persists to the local task file', async () => {
+    await withTask(makeTask({ id: 't-deploy-local' }), async (tmpDir, fs, path) => {
+      const result = await callToolFallback('record_manual_deployment', {
+        taskId: 't-deploy-local', status: 'deployed', notes: 'Solution imported and published to dev.',
+      });
+      expect(result.recorded).toBe(true);
+      const raw = JSON.parse(await fs.readFile(path.join(tmpDir, 'tasks.json'), 'utf8'));
+      const saved = raw.find((t) => t.id === 't-deploy-local');
+      expect(saved.deploymentTesting.deployment).toMatchObject({ status: 'deployed', notes: 'Solution imported and published to dev.' });
+      expect(saved.deploymentTesting.deployment.recordedAt).toBeDefined();
+    });
+  });
+
+  it('REGRESSION: record_deployment_test is rejected before deployment is resolved', async () => {
+    await withTask(makeTask({ id: 't-test-before-deploy' }), async () => {
+      const result = await callToolFallback('record_deployment_test', { taskId: 't-test-before-deploy', status: 'passed' });
+      expect(result.recorded).toBeUndefined();
+      expect(result.error).toBeDefined();
+      const gate = await callToolFallback('get_deployment_testing_state', { taskId: 't-test-before-deploy' });
+      expect(gate.canProceedToCommit).toBe(false);
+      expect(gate.nextRecommendedAction).toBe('wait_for_manual_deployment');
+    });
+  });
+
+  it('record_deployment_test succeeds once deployment is marked not-needed (not only "deployed")', async () => {
+    await withTask(makeTask({ id: 't-test-deploy-not-needed' }), async () => {
+      await callToolFallback('record_manual_deployment', { taskId: 't-test-deploy-not-needed', status: 'not-needed', notes: 'No deployment required for this repo-only change.' });
+      const result = await callToolFallback('record_deployment_test', { taskId: 't-test-deploy-not-needed', status: 'passed' });
+      expect(result.recorded).toBe(true);
+    });
+  });
+
+  it('record_deployment_test accepts a minimal passed call with no notes once deployment is resolved', async () => {
+    await withTask(makeTask({ id: 't-test-minimal' }), async (tmpDir, fs, path) => {
+      await callToolFallback('record_manual_deployment', { taskId: 't-test-minimal', status: 'deployed' });
+      const result = await callToolFallback('record_deployment_test', { taskId: 't-test-minimal', status: 'passed' });
+      expect(result.recorded).toBe(true);
+      expect(result.testStatus).toBe('passed');
+      expect(result.canProceedToCommit).toBe(true);
+      const raw = JSON.parse(await fs.readFile(path.join(tmpDir, 'tasks.json'), 'utf8'));
+      const saved = raw.find((t) => t.id === 't-test-minimal');
+      expect(saved.deploymentTesting.test.status).toBe('passed');
+      expect(saved.deploymentTesting.test.notes).toBeUndefined();
+    });
+  });
+
+  it('record_deployment_test rejects not-needed without meaningful notes, but does not require notes for passed/failed', async () => {
+    await withTask(makeTask({ id: 't-test-notes' }), async () => {
+      await callToolFallback('record_manual_deployment', { taskId: 't-test-notes', status: 'deployed' });
+      const acceptedPassed = await callToolFallback('record_deployment_test', { taskId: 't-test-notes', status: 'passed', notes: '' });
+      expect(acceptedPassed.error).toBeUndefined();
+      const acceptedFailed = await callToolFallback('record_deployment_test', { taskId: 't-test-notes', status: 'failed' });
+      expect(acceptedFailed.error).toBeUndefined();
+      const rejectedNotNeeded = await callToolFallback('record_deployment_test', { taskId: 't-test-notes', status: 'not-needed', notes: '' });
+      expect(rejectedNotNeeded.error).toBeDefined();
+    });
+  });
+
+  it('REGRESSION: failed deployment blocks testing/commit', async () => {
+    await withTask(makeTask({ id: 't-deploy-failed' }), async () => {
+      await callToolFallback('record_manual_deployment', { taskId: 't-deploy-failed', status: 'failed', notes: 'Solution import failed with a dependency error.' });
+      const gate = await callToolFallback('get_deployment_testing_state', { taskId: 't-deploy-failed' });
+      expect(gate.canProceedToCommit).toBe(false);
+      expect(gate.nextRecommendedAction).toBe('wait_for_manual_deployment');
+    });
+  });
+
+  it('REGRESSION: failed browser test blocks commit', async () => {
+    await withTask(makeTask({ id: 't-test-failed' }), async () => {
+      await callToolFallback('record_manual_deployment', { taskId: 't-test-failed', status: 'deployed', notes: 'Deployed to dev.' });
+      await callToolFallback('record_deployment_test', { taskId: 't-test-failed', status: 'failed', notes: 'onChange handler did not fire.' });
+      const gate = await callToolFallback('get_deployment_testing_state', { taskId: 't-test-failed' });
+      expect(gate.canProceedToCommit).toBe(false);
+      expect(gate.nextRecommendedAction).toBe('fix_code_or_redeploy');
+    });
+  });
+
+  it('REGRESSION: passing deployment and browser test enables commit preparation', async () => {
+    await withTask(makeTask({ id: 't-both-pass' }), async () => {
+      await callToolFallback('record_manual_deployment', { taskId: 't-both-pass', status: 'deployed', notes: 'Deployed to dev.' });
+      await callToolFallback('record_deployment_test', { taskId: 't-both-pass', status: 'passed', notes: 'Verified in browser.' });
+      const gate = await callToolFallback('get_deployment_testing_state', { taskId: 't-both-pass' });
+      expect(gate.canProceedToCommit).toBe(true);
+      expect(gate.nextRecommendedAction).toBe('prepare_commit');
+    });
+  });
+
+  it('get_pull_request_state reports not created for a task with no gitWorkflow/PR tracking', async () => {
+    await withTask(makeTask({ id: 't-pr-none' }), async () => {
+      const result = await callToolFallback('get_pull_request_state', { taskId: 't-pr-none' });
+      expect(result.prCreated).toBe(false);
+      expect(result.commitVerified).toBe(false);
+      expect(result.canEnterCodeReview).toBe(false);
+      expect(result.nextRecommendedAction).toBe('commit_and_push');
+    });
+  });
+
+  it('record_pull_request_created requires a prUrl', async () => {
+    await withTask(makeTask({ id: 't-pr-nourl' }), async () => {
+      const result = await callToolFallback('record_pull_request_created', { taskId: 't-pr-nourl', prUrl: '' });
+      expect(result.error).toBeDefined();
+    });
+  });
+
+  it('REGRESSION: PR creation/recording is required before entering Code Review even with verified commit+push', async () => {
+    const task = makeTask({
+      id: 't-pr-required',
+      gitWorkflow: {
+        lastCommitHash: 'abc123', lastCommitBranch: 'feature/x',
+        lastPushedBranch: 'feature/x', lastPushedAt: '2026-06-15T10:00:00.000Z',
+      },
+    });
+    await withTask(task, async () => {
+      const before = await callToolFallback('get_pull_request_state', { taskId: 't-pr-required' });
+      expect(before.commitVerified).toBe(true);
+      expect(before.pushVerified).toBe(true);
+      expect(before.canEnterCodeReview).toBe(false);
+      expect(before.nextRecommendedAction).toBe('prepare_pull_request');
+    });
+  });
+
+  it('recording a pull request with verified commit+push moves the task to Code Review / waiting for colleague review', async () => {
+    const task = makeTask({
+      id: 't-pr-complete',
+      status: 'in-progress',
+      gitWorkflow: {
+        lastCommitHash: 'abc123', lastCommitBranch: 'feature/x',
+        lastPushedBranch: 'feature/x', lastPushedAt: '2026-06-15T10:00:00.000Z',
+      },
+    });
+    await withTask(task, async (tmpDir, fs, path) => {
+      const result = await callToolFallback('record_pull_request_created', {
+        taskId: 't-pr-complete', prUrl: 'https://dev.azure.com/org/proj/_git/repo/pullrequest/42',
+      });
+      expect(result.recorded).toBe(true);
+      expect(result.canEnterCodeReview).toBe(true);
+      expect(result.nextRecommendedAction).toBe('wait_for_colleague_code_review');
+
+      const raw = JSON.parse(await fs.readFile(path.join(tmpDir, 'tasks.json'), 'utf8'));
+      const saved = raw.find((t) => t.id === 't-pr-complete');
+      expect(saved.status).toBe('ready-for-review');
+      expect(saved.waitingState).toBe('code-review');
+      expect(saved.crmDeveloperWorkflow.pullRequestTracking.prUrl).toBe('https://dev.azure.com/org/proj/_git/repo/pullrequest/42');
+    });
+  });
+
+  it('REGRESSION: AI Kit review never counts as colleague PR review — full AI Kit detail does not unblock Code Review without a PR', async () => {
+    const task = makeTask({
+      id: 't-aikit-not-colleague',
+      implementationVerification: {
+        aiCodeReview: {
+          status: 'passed', reviewedFiles: ['a.js'], rulesFiles: ['r.md'], checklistFiles: ['c.md'], knownPrReviewFiles: ['p.md'],
+        },
+      },
+      gitWorkflow: {
+        lastCommitHash: 'abc123', lastCommitBranch: 'feature/x',
+        lastPushedBranch: 'feature/x', lastPushedAt: '2026-06-15T10:00:00.000Z',
+      },
+    });
+    await withTask(task, async () => {
+      const result = await callToolFallback('get_pull_request_state', { taskId: 't-aikit-not-colleague' });
+      expect(result.canEnterCodeReview).toBe(false);
+    });
+  });
+
+  describe('continue_developer_workflow — full Deployment & Testing / Commit & Push / PR sequence', () => {
+    function readyForDeploymentTask(overrides = {}) {
+      return makeTask({
+        taskMode: 'developer',
+        workflowSetup: { devTargetKind: 'script', repositoryRoot: 'C:\\Repo', artifactPath: 'Scripts\\nvr.js' },
+        crmDeveloperWorkflow: { detectedWorkKind: 'script' },
+        implementationVerification: {
+          dataverseCheck: { status: 'skipped' },
+          aiCodeReview: {
+            status: 'passed',
+            reviewedFiles: ['Scripts/nvr.js'], rulesFiles: ['r.md'], checklistFiles: ['c.md'], knownPrReviewFiles: ['p.md'],
+          },
+        },
+        ...overrides,
+      });
+    }
+
+    it('recommends wait_for_manual_deployment once Implementation Verification passes', async () => {
+      await withTask(readyForDeploymentTask({ id: 't-cdw-deploy' }), async () => {
+        const result = await callToolFallback('continue_developer_workflow', { taskId: 't-cdw-deploy' });
+        expect(result.nextAction).toBe('wait_for_manual_deployment');
+        expect(result.requiresUserApproval).toBe(true);
+        expect(result.allowedWrites).toContain('record_manual_deployment');
+        expect(result.forbiddenWrites).toContain('commit_task_changes');
+      });
+    });
+
+    it('recommends wait_for_deployment_test once deployment is recorded but the test is not', async () => {
+      const task = readyForDeploymentTask({
+        id: 't-cdw-test',
+        deploymentTesting: { deployment: { status: 'deployed', notes: 'Deployed to dev.' } },
+      });
+      await withTask(task, async () => {
+        const result = await callToolFallback('continue_developer_workflow', { taskId: 't-cdw-test' });
+        expect(result.nextAction).toBe('wait_for_deployment_test');
+        expect(result.allowedWrites).toContain('record_deployment_test');
+      });
+    });
+
+    it('recommends fix_code_or_redeploy when the deployment test failed', async () => {
+      const task = readyForDeploymentTask({
+        id: 't-cdw-test-failed',
+        deploymentTesting: {
+          deployment: { status: 'deployed', notes: 'Deployed to dev.' },
+          test: { status: 'failed', notes: 'onChange did not fire.' },
+        },
+      });
+      await withTask(task, async () => {
+        const result = await callToolFallback('continue_developer_workflow', { taskId: 't-cdw-test-failed' });
+        expect(result.nextAction).toBe('fix_code_or_redeploy');
+        expect(result.forbiddenWrites).toContain('commit_task_changes');
+      });
+    });
+
+    it('recommends prepare_commit once deployment and test both resolve, with no commit yet', async () => {
+      const task = readyForDeploymentTask({
+        id: 't-cdw-prepare-commit',
+        deploymentTesting: {
+          deployment: { status: 'deployed', notes: 'Deployed to dev.' },
+          test: { status: 'passed', notes: 'Verified in browser.' },
+        },
+      });
+      await withTask(task, async () => {
+        const result = await callToolFallback('continue_developer_workflow', { taskId: 't-cdw-prepare-commit' });
+        expect(result.nextAction).toBe('propose_branch');
+        expect(result.forbiddenWrites).toContain('commit_task_changes');
+      });
+    });
+
+    it('recommends commit_and_push once a commit exists but push is not verified', async () => {
+      const task = readyForDeploymentTask({
+        id: 't-cdw-push',
+        deploymentTesting: {
+          deployment: { status: 'deployed', notes: 'Deployed to dev.' },
+          test: { status: 'passed', notes: 'Verified in browser.' },
+        },
+        gitWorkflow: { lastCommitHash: 'abc123', lastCommitBranch: 'feature/x' },
+      });
+      await withTask(task, async () => {
+        const result = await callToolFallback('continue_developer_workflow', { taskId: 't-cdw-push' });
+        expect(result.nextAction).toBe('commit_and_push');
+        expect(result.allowedWrites).toContain('push_task_branch');
+      });
+    });
+
+    it('recommends prepare_pull_request once push is verified but no PR is recorded', async () => {
+      const task = readyForDeploymentTask({
+        id: 't-cdw-pr',
+        deploymentTesting: {
+          deployment: { status: 'deployed', notes: 'Deployed to dev.' },
+          test: { status: 'passed', notes: 'Verified in browser.' },
+        },
+        gitWorkflow: {
+          lastCommitHash: 'abc123', lastCommitBranch: 'feature/x',
+          lastPushedBranch: 'feature/x', lastPushedAt: '2026-06-15T10:00:00.000Z',
+        },
+      });
+      await withTask(task, async () => {
+        const result = await callToolFallback('continue_developer_workflow', { taskId: 't-cdw-pr' });
+        expect(result.nextAction).toBe('prepare_pull_request');
+        expect(result.recommendedTool).toBe('prepare_pull_request_for_task');
+        expect(result.forbiddenWrites).toContain('commit_task_changes');
+      });
+    });
+
+    it('recommends wait_for_colleague_code_review once commit, push, and PR are all verified', async () => {
+      const task = readyForDeploymentTask({
+        id: 't-cdw-review',
+        deploymentTesting: {
+          deployment: { status: 'deployed', notes: 'Deployed to dev.' },
+          test: { status: 'passed', notes: 'Verified in browser.' },
+        },
+        gitWorkflow: {
+          lastCommitHash: 'abc123', lastCommitBranch: 'feature/x',
+          lastPushedBranch: 'feature/x', lastPushedAt: '2026-06-15T10:00:00.000Z',
+        },
+        crmDeveloperWorkflow: {
+          detectedWorkKind: 'script',
+          pullRequestTracking: { createdManually: true, createdAt: '2026-06-15T10:05:00.000Z', prUrl: 'https://dev.azure.com/org/proj/_git/repo/pullrequest/1' },
+        },
+      });
+      await withTask(task, async () => {
+        const result = await callToolFallback('continue_developer_workflow', { taskId: 't-cdw-review' });
+        expect(result.nextAction).toBe('wait_for_colleague_code_review');
+        expect(result.instructionForAI.toLowerCase()).toContain('independent');
+        expect(result.forbiddenWrites).toContain('commit_task_changes');
+      });
+    });
+
+    // -------------------------------------------------------------------------
+    // Deployment & Testing transition persistence (bug fix regression coverage)
+    // -------------------------------------------------------------------------
+
+    it('REGRESSION: persists the Development -> Deployment & Testing transition once verification passes', async () => {
+      // Root cause of the reported bug: continue_developer_workflow only ever computed and
+      // returned a recommendation — it never wrote task.waitingState, so the task visibly stayed
+      // in Development / Verify Implementation forever, even after Claude called it.
+      const task = readyForDeploymentTask({ id: 't-cdw-transition', status: 'in-progress', waitingState: null });
+      await withTask(task, async (tmpDir, fs, path) => {
+        const result = await callToolFallback('continue_developer_workflow', { taskId: 't-cdw-transition' });
+        expect(result.nextAction).toBe('wait_for_manual_deployment');
+        expect(result.transitionedToDeploymentTesting).toBe(true);
+
+        const raw = JSON.parse(await fs.readFile(path.join(tmpDir, 'tasks.json'), 'utf8'));
+        const saved = raw.find((t) => t.id === 't-cdw-transition');
+        expect(saved.waitingState).toBe('consultant-testing');
+        expect(saved.status).toBe('in-progress'); // status itself is untouched — only waitingState moves
+      });
+    });
+
+    it('REGRESSION: the transition performs no deployment, Git, filesystem, or Dataverse write — deployment/test remain unresolved', async () => {
+      const task = readyForDeploymentTask({ id: 't-cdw-transition-clean', status: 'in-progress', waitingState: null });
+      await withTask(task, async (tmpDir, fs, path) => {
+        await callToolFallback('continue_developer_workflow', { taskId: 't-cdw-transition-clean' });
+        const raw = JSON.parse(await fs.readFile(path.join(tmpDir, 'tasks.json'), 'utf8'));
+        const saved = raw.find((t) => t.id === 't-cdw-transition-clean');
+        expect(saved.deploymentTesting).toBeUndefined();
+        expect(saved.gitWorkflow).toBeUndefined();
+        const deployGate = await callToolFallback('get_deployment_testing_state', { taskId: 't-cdw-transition-clean' });
+        expect(deployGate.deploymentStatus).toBe('not-run');
+        expect(deployGate.testStatus).toBe('not-run');
+        expect(deployGate.canProceedToCommit).toBe(false);
+      });
+    });
+
+    it('is idempotent — a second call while still waiting for manual deployment does not re-append an audit note or change state', async () => {
+      const task = readyForDeploymentTask({ id: 't-cdw-idempotent', status: 'in-progress', waitingState: null });
+      await withTask(task, async (tmpDir, fs, path) => {
+        await callToolFallback('continue_developer_workflow', { taskId: 't-cdw-idempotent' });
+        const second = await callToolFallback('continue_developer_workflow', { taskId: 't-cdw-idempotent' });
+        expect(second.nextAction).toBe('wait_for_manual_deployment');
+        expect(second.transitionedToDeploymentTesting).toBe(false); // already transitioned — no-op
+
+        const raw = JSON.parse(await fs.readFile(path.join(tmpDir, 'tasks.json'), 'utf8'));
+        const saved = raw.find((t) => t.id === 't-cdw-idempotent');
+        expect(saved.waitingState).toBe('consultant-testing');
+        const transitionNotes = (saved.notes ?? '').split('\n').filter((l) => l.includes('transitioned to Deployment & Testing'));
+        expect(transitionNotes).toHaveLength(1);
+      });
+    });
+
+    it('does not re-transition once deployment/test are already resolved and the task has moved on to commit/push', async () => {
+      const task = readyForDeploymentTask({
+        id: 't-cdw-already-past',
+        waitingState: 'consultant-testing',
+        deploymentTesting: {
+          deployment: { status: 'deployed', notes: 'Deployed to dev.' },
+          test: { status: 'passed', notes: 'Verified in browser.' },
+        },
+      });
+      await withTask(task, async () => {
+        const result = await callToolFallback('continue_developer_workflow', { taskId: 't-cdw-already-past' });
+        expect(result.nextAction).toBe('propose_branch');
+        expect(result.transitionedToDeploymentTesting).toBe(false);
+      });
+    });
+
+    it('REGRESSION: a legacy task stuck in Development with passed verification and no deploymentTesting record transitions cleanly without resetting verification', async () => {
+      // Backward compatibility: a task that already passed Implementation Verification before this
+      // fix existed (status/waitingState still plain Development, no deploymentTesting field at all).
+      const task = readyForDeploymentTask({ id: 't-cdw-legacy', status: 'in-progress', waitingState: null });
+      delete task.deploymentTesting;
+      await withTask(task, async (tmpDir, fs, path) => {
+        const result = await callToolFallback('continue_developer_workflow', { taskId: 't-cdw-legacy' });
+        expect(result.nextAction).toBe('wait_for_manual_deployment');
+        expect(result.transitionedToDeploymentTesting).toBe(true);
+
+        const raw = JSON.parse(await fs.readFile(path.join(tmpDir, 'tasks.json'), 'utf8'));
+        const saved = raw.find((t) => t.id === 't-cdw-legacy');
+        expect(saved.waitingState).toBe('consultant-testing');
+        // Passed verification results are untouched — no reset performed.
+        expect(saved.implementationVerification.dataverseCheck.status).toBe('skipped');
+        expect(saved.implementationVerification.aiCodeReview.status).toBe('passed');
+      });
+    });
+
+    it('does not transition on non-deployment-testing nextAction values (e.g. run_ai_kit_review)', async () => {
+      const task = makeTask({
+        id: 't-cdw-not-yet',
+        taskMode: 'developer',
+        workflowSetup: { devTargetKind: 'script', repositoryRoot: 'C:\\Repo', artifactPath: 'Scripts\\nvr.js' },
+        crmDeveloperWorkflow: { detectedWorkKind: 'script' },
+        implementationVerification: { dataverseCheck: { status: 'skipped' } },
+        waitingState: null,
+      });
+      await withTask(task, async (tmpDir, fs, path) => {
+        const result = await callToolFallback('continue_developer_workflow', { taskId: 't-cdw-not-yet' });
+        expect(result.nextAction).toBe('run_ai_kit_review');
+        expect(result.transitionedToDeploymentTesting).toBe(false);
+        const raw = JSON.parse(await fs.readFile(path.join(tmpDir, 'tasks.json'), 'utf8'));
+        expect(raw.find((t) => t.id === 't-cdw-not-yet').waitingState).toBeNull();
+      });
+    });
   });
 });

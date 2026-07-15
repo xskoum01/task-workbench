@@ -1,12 +1,14 @@
 /**
  * implementationGate
  *
- * Single TypeScript port of the hard-gate logic that decides whether a task may move to
- * Code Review / Waiting for PR. This mirrors, function-for-function, the Rust implementation in
- * src-tauri/src/lib.rs (task_mcp_normalize_dataverse_gate, task_mcp_ai_kit_review_gate,
- * task_mcp_derive_dataverse_check_status, task_mcp_dataverse_warnings_accepted,
- * task_mcp_compute_progression_gate) so the MCP-facing workflow and the human-facing
- * Implementation Verification modal / "Move to Code Review" button enforce identical rules.
+ * Single TypeScript port of the hard-gate logic that decides whether a task may move on from
+ * Implementation Verification to Deployment & Testing (src/lib/deploymentTestingGate.ts covers the
+ * next gate: Deployment & Testing -> Commit & Push -> Pull Request -> Code Review). This mirrors,
+ * function-for-function, the Rust implementation in src-tauri/src/lib.rs
+ * (task_mcp_normalize_dataverse_gate, task_mcp_ai_kit_review_gate, task_mcp_derive_dataverse_check_status,
+ * task_mcp_dataverse_warnings_accepted, task_mcp_compute_progression_gate) so the MCP-facing
+ * workflow and the human-facing Implementation Verification modal / "Continue to Deployment &
+ * Testing" button enforce identical rules.
  *
  * Keep this file in sync with src-tauri/src/lib.rs and mcp/task-workbench-mcp.mjs — those two
  * are owned by other work and must not be edited here, but the branch logic and (closely) the
@@ -82,9 +84,12 @@ export interface AiKitReviewGateResult {
 
 /**
  * Evaluates whether a persisted AI Kit review payload (implementationVerification.aiCodeReview)
- * satisfies the hard-gate requirements: status must be "passed", fixableFindings must be empty,
- * and reviewedFiles/rulesFiles/checklistFiles/knownPrReviewFiles must all be non-empty — a
- * "passed" status with missing details is treated as incomplete, not passed.
+ * satisfies the hard-gate requirements. There are two independent ways to resolve the gate:
+ *   1. An automated review with status "passed", empty fixableFindings, and non-empty
+ *      reviewedFiles/rulesFiles/checklistFiles/knownPrReviewFiles — a "passed" status with
+ *      missing details is treated as incomplete, not passed.
+ *   2. An explicit manual UI override ("manually-verified" or "skipped") — these represent an
+ *      explicit user decision and resolve the gate without requiring the automated detail payload.
  * Mirrors task_mcp_ai_kit_review_gate in src-tauri/src/lib.rs.
  */
 export function getAiKitReviewGate(review: ImplCheckRecord | undefined | null): AiKitReviewGateResult {
@@ -94,6 +99,10 @@ export function getAiKitReviewGate(review: ImplCheckRecord | undefined | null): 
   const status = review.status ?? '';
   if (!status) {
     return { status: 'not_run', missing: [] };
+  }
+
+  if (status === 'manually-verified' || status === 'skipped') {
+    return { status: 'passed', missing: [] };
   }
 
   const hasItems = (arr: unknown[] | undefined): boolean => Array.isArray(arr) && arr.length > 0;
@@ -174,12 +183,15 @@ export interface ProgressionGateResult {
 }
 
 /**
- * Single source of truth for "can this task move to Code Review / Waiting for PR". Computed from
+ * Single source of truth for "can this task move on to Deployment & Testing". Computed from
  * the exact same fields (implementationVerification.dataverseCheck /
  * implementationVerification.aiCodeReview) that MCP's run_implementation_verification and the
  * Implementation Verification modal both read/write, so the MCP-facing workflow and the
- * human-facing "Move to Code Review" button enforce identical rules. Pure — no I/O.
- * Mirrors task_mcp_compute_progression_gate in src-tauri/src/lib.rs.
+ * human-facing "Continue to Deployment & Testing" button enforce identical rules. Pure — no I/O.
+ * Mirrors task_mcp_compute_progression_gate in src-tauri/src/lib.rs. Note: reaching Code Review
+ * itself requires the separate, later gates in src/lib/deploymentTestingGate.ts
+ * (computeDeploymentTestingGate, computeCodeReviewReadinessGate) — this gate only covers the
+ * Implementation Verification -> Deployment & Testing transition.
  */
 export function computeProgressionGate(task: Task): ProgressionGateResult {
   const dvRaw = deriveDataverseRawStatus(task);
