@@ -1,11 +1,9 @@
 ﻿import { useState, useEffect } from 'react';
-import type { AppSettings, AppTemplate, M365ConnectionStatus, MicrosoftConnectionStatus, TemplateValidationState } from '../types';
+import type { AppSettings, M365ConnectionStatus, MicrosoftConnectionStatus } from '../types';
 import { useApp } from '../context/AppContext';
 import Icon from '../components/Icon';
 import type { IconName } from '../components/Icon';
 import * as tauriApi from '../lib/tauriCommands';
-import TemplatesSection from '../components/TemplatesSection';
-import AiReviewersSettingsPanel from '../components/AiReviewersSettingsPanel';
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -148,8 +146,6 @@ export default function SettingsPage() {
   const [rescanning, setRescanning] = useState(false);
   const [rescanMsg, setRescanMsg]   = useState('');
   const [m365Notice, setM365Notice] = useState('');
-  const [templateValidation, setTemplateValidation] = useState<TemplateValidationState>('not_selected');
-  const [templateValidating, setTemplateValidating] = useState(false);
   // MCP connection test state
   const [mcpTestStatus, setMcpTestStatus] = useState<string | null>(null);
   const [mcpTestMessage, setMcpTestMessage] = useState<string>('');
@@ -170,7 +166,7 @@ export default function SettingsPage() {
     lastError?: string;
   } | null>(null);
 
-  type SettingsTab = 'general' | 'workspace' | 'ai' | 'crm' | 'm365' | 'aikit';
+  type SettingsTab = 'general' | 'workspace' | 'ai' | 'crm' | 'm365';
   const [activeTab, setActiveTab] = useState<SettingsTab>('general');
 
   type McpSetupTool = 'claude-code' | 'claude-desktop' | 'cursor' | 'vscode-copilot' | 'windsurf' | 'codex';
@@ -182,16 +178,11 @@ export default function SettingsPage() {
     { id: 'ai',        label: 'AI',             icon: 'search'         },
     { id: 'crm',       label: 'CRM Metadata',   icon: 'folder'         },
     { id: 'm365',      label: 'Microsoft 365',  icon: 'mail'           },
-    { id: 'aikit',     label: 'AI Kit',         icon: 'layers'         },
   ];
 
   useEffect(() => {
     setDraft(settings);
     setIsDirty(false);
-    // Reset validation when settings reload
-    setTemplateValidation(
-      settings.repositoryTemplatePath ? 'not_selected' : 'not_selected'
-    );
   }, [settings]);
 
   function set<K extends keyof AppSettings>(key: K, value: AppSettings[K]) {
@@ -255,83 +246,6 @@ export default function SettingsPage() {
     } finally {
       setRescanning(false);
     }
-  }
-
-  // --- Template actions ---------------------------------------------------
-
-  async function handleChooseZip() {
-    try {
-      const picked = await tauriApi.pickFile('ZIP Archives', ['zip']);
-      if (picked) {
-        setDraft((prev) => ({
-          ...prev,
-          repositoryTemplateType: 'zip',
-          repositoryTemplatePath: picked,
-        }));
-        setIsDirty(true);
-        setSaved(false);
-        setTemplateValidation('not_selected');
-      }
-    } catch (err) {
-      console.warn('pickFile unavailable:', err);
-    }
-  }
-
-  async function handleChooseTemplateFolder() {
-    try {
-      const picked = await tauriApi.pickFolder();
-      if (picked) {
-        setDraft((prev) => ({
-          ...prev,
-          repositoryTemplateType: 'folder',
-          repositoryTemplatePath: picked,
-        }));
-        setIsDirty(true);
-        setSaved(false);
-        setTemplateValidation('not_selected');
-      }
-    } catch (err) {
-      console.warn('pickFolder unavailable:', err);
-    }
-  }
-
-  async function handleOpenTemplate() {
-    const path = draft.repositoryTemplatePath;
-    if (!path) return;
-    try {
-      await tauriApi.openPath(path);
-    } catch (err) {
-      console.warn('openPath failed:', err);
-    }
-  }
-
-  async function handleValidateTemplate() {
-    const path = draft.repositoryTemplatePath;
-    const type = draft.repositoryTemplateType;
-    if (!path || !type || type === 'none') {
-      setTemplateValidation('not_selected');
-      return;
-    }
-    setTemplateValidating(true);
-    try {
-      const result = await tauriApi.validateTemplate(path, type as 'zip' | 'folder');
-      setTemplateValidation(result);
-    } catch (err) {
-      setTemplateValidation('invalid');
-    } finally {
-      setTemplateValidating(false);
-    }
-  }
-
-  function clearTemplate() {
-    setDraft((prev) => ({
-      ...prev,
-      repositoryTemplateType: 'none',
-      repositoryTemplatePath: '',
-    }));
-    setIsDirty(true);
-    setSaved(false);
-    setTemplateValidation('not_selected');
   }
 
   // --- Primarch MCP actions ------------------------------------------------
@@ -432,70 +346,6 @@ export default function SettingsPage() {
     if (activeTab !== 'crm') return;
     void refreshTaskMcpBridgeStatus();
   }, [activeTab]);
-
-  // --- AI Kit validation state ---------------------------------------------
-
-  const AI_KIT_REQUIRED_FILES = [
-    'AGENTS.md',
-    'ai-rules/crm-plugin-rules.md',
-    'ai-rules/crm-javascript-rules.md',
-    'ai-rules/crm-ribbon-rules.md',
-    'ai-rules/crm-other-rules.md',
-    'ai-rules/known-pr-review-comments.md',
-    'ai-rules/crm-code-review-checklist.md',
-    'prompts/pp-implement-crm-task.md',
-    'prompts/pp-review-diff.md',
-  ];
-
-  type AiKitValidationStatus = 'not-validated' | 'valid' | 'invalid';
-  const [aiKitValidationStatus, setAiKitValidationStatus] = useState<AiKitValidationStatus>('not-validated');
-  const [aiKitValidationMessage, setAiKitValidationMessage] = useState<string>('');
-  const [aiKitValidating, setAiKitValidating] = useState(false);
-
-  async function handleChooseAiKitFolder() {
-    try {
-      const picked = await tauriApi.pickFolder();
-      if (picked) {
-        set('powerPlatformAiKitPath', picked);
-        setAiKitValidationStatus('not-validated');
-        setAiKitValidationMessage('');
-      }
-    } catch (err) {
-      console.warn('pickFolder unavailable:', err);
-    }
-  }
-
-  async function handleValidateAiKit() {
-    const kitPath = draft.powerPlatformAiKitPath?.trim();
-    if (!kitPath) {
-      setAiKitValidationStatus('invalid');
-      setAiKitValidationMessage('Path is not set.');
-      return;
-    }
-    setAiKitValidating(true);
-    setAiKitValidationMessage('');
-    try {
-      const sep = kitPath.endsWith('/') || kitPath.endsWith('\\') ? '' : '/';
-      const missing: string[] = [];
-      for (const rel of AI_KIT_REQUIRED_FILES) {
-        const full = `${kitPath}${sep}${rel}`;
-        const exists = await tauriApi.checkPathExists(full).catch(() => false);
-        if (!exists) missing.push(rel);
-      }
-      if (missing.length === 0) {
-        setAiKitValidationStatus('valid');
-        setAiKitValidationMessage('All required files found.');
-      } else {
-        setAiKitValidationStatus('invalid');
-        setAiKitValidationMessage(`Missing: ${missing.join(', ')}`);
-      }
-    } catch (err) {
-      setAiKitValidationStatus('invalid');
-      setAiKitValidationMessage(String(err));
-    } finally {
-      setAiKitValidating(false);
-    }
-  }
 
   // Normalise to forward slashes for all snippet use.
   const taskMcpServerPath = (taskMcpBridge?.serverPath ?? 'mcp/task-workbench-mcp.mjs').replace(/\\/g, '/');
@@ -660,8 +510,7 @@ export default function SettingsPage() {
 
   // -------------------------------------------------------------------------
 
-  const baseDir      = draft.crmBaseDirectory ?? '';
-  const templatePath = draft.repositoryTemplatePath ?? '';
+  const baseDir = draft.crmBaseDirectory ?? '';
 
   return (
     <div className="page-content">
@@ -778,8 +627,8 @@ export default function SettingsPage() {
           <>
             <SettingsBlock
               icon="folder"
-              title="Repository Workspace"
-              description="Where customer repositories live, how they are detected, and what default template to use for scaffolding"
+              title="Linked Context"
+              description="Optional local locations associated with customer and workspace context records"
             >
               {/* Base directory chooser */}
               <SettingsField label="CRM Base Directory">
@@ -815,82 +664,6 @@ export default function SettingsPage() {
                 )}
               </SettingsField>
 
-              {/* Repository template */}
-              <SettingsField label="Default repository template">
-                <div className="settings-template-section">
-                  <div className="settings-template-current">
-                    {templatePath ? (
-                      <>
-                        <span
-                          className="settings-repo-dir-value"
-                          title={templatePath}
-                          style={{ flex: 1 }}
-                        >
-                          {templatePath}
-                        </span>
-                        <span
-                          className={`template-validation-badge${
-                            templateValidation === 'valid'   ? ' template-valid'   :
-                            templateValidation === 'invalid' ? ' template-invalid' : ''
-                          }`}
-                        >
-                          {templateValidation === 'valid'        ? '✓ Valid'
-                           : templateValidation === 'invalid'    ? '✗ Invalid'
-                           : 'Not validated'}
-                        </span>
-                      </>
-                    ) : (
-                      <span className="settings-repo-dir-placeholder">No template selected</span>
-                    )}
-                  </div>
-                  <div className="settings-template-actions">
-                    <button
-                      className="btn btn-primary btn-sm"
-                      onClick={handleChooseZip}
-                      title="Pick a ZIP archive as the repository template"
-                    >
-                      <Icon name="folder" size={13} /> Choose ZIP
-                    </button>
-                    <button
-                      className="btn btn-secondary btn-sm"
-                      onClick={handleChooseTemplateFolder}
-                      title="Pick a folder as the repository template"
-                    >
-                      <Icon name="folder" size={13} /> Choose Folder
-                    </button>
-                    {templatePath && (
-                      <>
-                        <button
-                          className="btn btn-secondary btn-sm"
-                          onClick={handleValidateTemplate}
-                          disabled={templateValidating}
-                        >
-                          {templateValidating ? 'Validating…' : 'Validate'}
-                        </button>
-                        <button
-                          className="btn btn-secondary btn-sm"
-                          onClick={handleOpenTemplate}
-                        >
-                          Open
-                        </button>
-                        <button
-                          className="btn btn-ghost btn-sm"
-                          onClick={clearTemplate}
-                          style={{ color: 'var(--text-muted)' }}
-                        >
-                          Clear
-                        </button>
-                      </>
-                    )}
-                  </div>
-                </div>
-                <p className="settings-hint">
-                  A ZIP archive with a single top-level folder (e.g.{' '}
-                  <code>_GIT_REPO_TEMPLATE/</code>) is automatically stripped so
-                  the contents land directly in the customer directory.
-                </p>
-              </SettingsField>
-
               {/* Rescan action */}
               <SettingsField label="Repository scan">
                 <div className="settings-action-row">
@@ -915,66 +688,6 @@ export default function SettingsPage() {
               </SettingsField>
             </SettingsBlock>
 
-            <SettingsBlock
-              icon="file-text"
-              title="Templates"
-              description="Plugin and Script templates for new customer repositories"
-            >
-              <TemplatesSection
-                templates={draft.templates ?? []}
-                onChange={(updated: AppTemplate[]) => {
-                  setDraft((prev) => ({ ...prev, templates: updated }));
-                  setIsDirty(true);
-                  setSaved(false);
-                }}
-              />
-            </SettingsBlock>
-
-            <SettingsBlock
-              icon="folder"
-              title="Plugin Template"
-              description="Local folder used as a template when scaffolding new plugin projects"
-            >
-              <SettingsField label="Template Folder">
-                <div style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
-                  <input
-                    className="form-input"
-                    type="text"
-                    placeholder="C:\Templates\PluginTemplate"
-                    value={draft.pluginTemplateFolder ?? ''}
-                    onChange={(e) => set('pluginTemplateFolder', e.target.value)}
-                    style={{ flex: 1 }}
-                  />
-                  <button
-                    className="btn btn-ghost btn-sm"
-                    type="button"
-                    onClick={async () => {
-                      try {
-                        const picked = await tauriApi.pickFolder();
-                        if (picked) set('pluginTemplateFolder', picked);
-                      } catch {}
-                    }}
-                    title="Browse for template folder"
-                  >
-                    Browse
-                  </button>
-                  {draft.pluginTemplateFolder && (
-                    <button
-                      className="btn btn-ghost btn-sm"
-                      type="button"
-                      onClick={() => tauriApi.openPath(draft.pluginTemplateFolder!).catch(() => {})}
-                      title="Open template folder"
-                    >
-                      Open
-                    </button>
-                  )}
-                </div>
-              </SettingsField>
-              <div className="settings-field-hint">
-                Files may contain <code>__PROJECT_NAME__</code> and <code>__NAMESPACE__</code> placeholders.
-                They are replaced when scaffolding a new plugin project.
-              </div>
-            </SettingsBlock>
           </>
         )}
 
@@ -1049,24 +762,6 @@ export default function SettingsPage() {
               </div>
             </SettingsBlock>
 
-            <SettingsBlock
-              icon="search"
-              title="AI Reviewers"
-              description="Configurable AI reviewer profiles for plugin and script code review"
-            >
-              <AiReviewersSettingsPanel
-                configs={draft.aiReviewers}
-                onChange={(updated) => {
-                  setDraft((prev) => ({ ...prev, aiReviewers: updated }));
-                  setIsDirty(true);
-                  setSaved(false);
-                }}
-              />
-              <p className="settings-hint">
-                Reviewer instructions are sent as the AI system prompt. Changes take effect
-                immediately when you save Settings.
-              </p>
-            </SettingsBlock>
           </>
         )}
 
@@ -1082,14 +777,14 @@ export default function SettingsPage() {
                 <span className={`repo-status-badge ${taskMcpBridge?.active ? 'repo-status-linked' : 'repo-status-missing'}`}>
                   {taskMcpBridge?.active ? 'Bridge Active' : 'Not running'}
                 </span>
-                <span className="repo-status-badge repo-status-missing">Local workflow writes</span>
-                <span className="repo-status-badge repo-status-linked">External writes blocked</span>
+                <span className="repo-status-badge repo-status-linked">Task-data interface</span>
+                <span className="repo-status-badge repo-status-linked">Execution blocked</span>
               </div>
               <div className="settings-field-hint" style={{ marginTop: 4 }}>
-                AI clients can create local task-workbench tasks and test tasks, and can update local task workflow fields
-                such as analysis, summary, phase, waiting state, estimate, checklist, notes, technical plan drafts,
-                consultant testing records, and manual PR tracking.
-                They still cannot modify Dataverse, Git, GitHub, Azure DevOps, plugin registrations, web resources, or repository files.
+                AI clients can read and maintain task records, responsibility, deadlines, status, notes,
+                summaries, estimates, waiting state, archive state, and structured history.
+                The interface cannot orchestrate agents, execute tasks, modify repositories, deploy artifacts,
+                or create pull requests.
               </div>
 
               <SettingsField label="Localhost endpoint">
@@ -1197,7 +892,7 @@ export default function SettingsPage() {
             <SettingsBlock
               icon="folder"
               title="CRM Metadata / Primarch MCP"
-              description="Read-only Dataverse metadata assistant for CRM skeleton and deterministic verification"
+              description="Optional read-only metadata context source. It cannot change Dataverse or execute work."
             >
               <SettingsField label="Enable CRM metadata assistant">
                 <label className="checkbox-inline" style={{ marginTop: 4 }}>
@@ -1534,97 +1229,6 @@ export default function SettingsPage() {
                 </p>
               </SettingsBlock>
             )}
-          </>
-        )}
-
-        {/* ── Power Platform AI Kit ────────────────────────────────────────── */}
-        {activeTab === 'aikit' && (
-          <>
-            <SettingsBlock
-              icon="layers"
-              title="Power Platform AI Kit"
-              description="Local Power Platform AI Kit repository path — source of truth for CRM development rules"
-            >
-              <SettingsField label="Repository path">
-                <div style={{ display: 'flex', gap: 6, alignItems: 'center', flexWrap: 'wrap' }}>
-                  <input
-                    className="form-input"
-                    type="text"
-                    placeholder="C:\repos\power-platform-ai-kit"
-                    value={draft.powerPlatformAiKitPath ?? ''}
-                    onChange={(e) => {
-                      set('powerPlatformAiKitPath', e.target.value || undefined);
-                      setAiKitValidationStatus('not-validated');
-                      setAiKitValidationMessage('');
-                    }}
-                    style={{ flex: 1, minWidth: 260 }}
-                  />
-                  <button
-                    className="btn btn-ghost btn-sm"
-                    type="button"
-                    onClick={handleChooseAiKitFolder}
-                    title="Browse for folder"
-                  >
-                    <Icon name="folder" size={13} /> Browse
-                  </button>
-                  {draft.powerPlatformAiKitPath && (
-                    <button
-                      className="btn btn-ghost btn-sm"
-                      type="button"
-                      onClick={() => tauriApi.openPath(draft.powerPlatformAiKitPath!).catch(() => {})}
-                      title="Open in file explorer"
-                    >
-                      Open
-                    </button>
-                  )}
-                </div>
-              </SettingsField>
-
-              <div className="settings-action-row" style={{ marginTop: 8 }}>
-                <button
-                  className="btn btn-secondary btn-sm"
-                  onClick={handleValidateAiKit}
-                  disabled={aiKitValidating || !draft.powerPlatformAiKitPath?.trim()}
-                >
-                  {aiKitValidating ? <><span className="btn-spinner" /> Validating…</> : 'Validate'}
-                </button>
-                {aiKitValidationStatus !== 'not-validated' && (
-                  <span
-                    className={`repo-status-badge ${
-                      aiKitValidationStatus === 'valid' ? 'repo-status-linked' : 'repo-status-missing'
-                    }`}
-                  >
-                    {aiKitValidationStatus === 'valid' ? 'Valid kit' : 'Invalid kit'}
-                  </span>
-                )}
-              </div>
-
-              {aiKitValidationMessage && (
-                <div
-                  className="settings-field-hint"
-                  style={{
-                    marginTop: 6,
-                    color: aiKitValidationStatus === 'valid' ? 'var(--color-done, #3fb950)' : 'var(--color-blocked, #e05555)',
-                  }}
-                >
-                  {aiKitValidationMessage}
-                </div>
-              )}
-
-              {!draft.powerPlatformAiKitPath && (
-                <p className="settings-hint">
-                  Set the path to the local Power Platform AI Kit repository. Used by Implement with AI Kit,
-                  Review Diff with AI Kit, and Apply AI Review Fixes actions.
-                </p>
-              )}
-
-              <div className="settings-field-hint" style={{ marginTop: 8 }}>
-                Required files: AGENTS.md, ai-rules/crm-plugin-rules.md, ai-rules/crm-javascript-rules.md,
-                ai-rules/crm-ribbon-rules.md, ai-rules/crm-other-rules.md,
-                ai-rules/known-pr-review-comments.md, ai-rules/crm-code-review-checklist.md,
-                prompts/pp-implement-crm-task.md, prompts/pp-review-diff.md
-              </div>
-            </SettingsBlock>
           </>
         )}
 

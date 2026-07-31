@@ -1,0 +1,196 @@
+openapi: 3.1.0
+info:
+  title: Task Workbench Local API
+  version: 1.0.0
+  description: >
+    Provider-neutral task, obligation, context, and history API. The API records
+    work but never executes it or orchestrates AI agents.
+servers:
+  - url: http://127.0.0.1:38473/api/v1
+security:
+  - bridgeToken: []
+paths:
+  /health:
+    get:
+      operationId: health
+      responses:
+        "200": { description: Canonical runtime health }
+        "401": { $ref: "#/components/responses/Error" }
+        "503": { $ref: "#/components/responses/Error" }
+  /capabilities:
+    get:
+      operationId: capabilities
+      responses:
+        "200": { description: Capabilities actually exposed by this runtime }
+        "401": { $ref: "#/components/responses/Error" }
+        "503": { $ref: "#/components/responses/Error" }
+  /work-items:
+    get:
+      operationId: listWorkItems
+      parameters:
+        - in: query
+          name: includeArchived
+          schema: { type: boolean, default: false }
+        - in: query
+          name: limit
+          schema: { type: integer, minimum: 1, maximum: 500, default: 100 }
+        - in: query
+          name: cursor
+          schema: { type: string }
+        - in: query
+          name: status
+          schema: { type: string }
+        - in: query
+          name: kind
+          schema: { type: string }
+        - in: query
+          name: owner
+          schema: { type: string }
+        - in: query
+          name: area
+          schema: { type: string }
+        - in: query
+          name: source
+          schema: { type: string }
+        - in: query
+          name: planningBucket
+          schema: { type: string }
+        - in: query
+          name: dueBefore
+          schema: { type: string, format: date-time }
+        - in: query
+          name: dueAfter
+          schema: { type: string, format: date-time }
+        - in: query
+          name: updatedAfter
+          schema: { type: string, format: date-time }
+      responses:
+        "200": { description: Canonical work-item page }
+    post:
+      operationId: createWorkItem
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: ./work-item.schema.json
+      responses:
+        "200": { description: Created work item }
+        "400": { $ref: "#/components/responses/Error" }
+  /work-items/{id}:
+    parameters:
+      - $ref: "#/components/parameters/WorkItemId"
+    get:
+      operationId: getWorkItem
+      responses:
+        "200": { description: Canonical work item }
+        "404": { $ref: "#/components/responses/Error" }
+    patch:
+      operationId: updateWorkItem
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [item, expectedRevision]
+              properties:
+                item: { $ref: ./work-item.schema.json }
+                expectedRevision: { type: integer, minimum: 1 }
+                actorType: { enum: [user, system, integration] }
+                actorName: { type: string }
+      responses:
+        "200": { description: Updated work item }
+        "409": { $ref: "#/components/responses/Error" }
+  /work-items/{id}/transitions:
+    parameters:
+      - $ref: "#/components/parameters/WorkItemId"
+    post:
+      operationId: transitionWorkItem
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [status, expectedRevision]
+              properties:
+                status:
+                  enum: [planned, ready, in_progress, waiting, blocked, review, completed, cancelled]
+                reason: { type: string }
+                expectedRevision: { type: integer, minimum: 1 }
+                actorName: { type: string }
+      responses:
+        "200": { description: Transitioned work item }
+        "400": { $ref: "#/components/responses/Error" }
+        "409": { $ref: "#/components/responses/Error" }
+  /work-items/{id}/notes:
+    parameters:
+      - $ref: "#/components/parameters/WorkItemId"
+    post:
+      operationId: appendWorkItemNote
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [text, expectedRevision]
+              properties:
+                text: { type: string, minLength: 1 }
+                expectedRevision: { type: integer, minimum: 1 }
+                actorName: { type: string }
+      responses:
+        "200": { description: Work item with appended context }
+        "409": { $ref: "#/components/responses/Error" }
+  /work-items/changes:
+    get:
+      operationId: listWorkItemChanges
+      parameters:
+        - in: query
+          name: after
+          schema: { type: integer, minimum: 0, default: 0 }
+        - in: query
+          name: limit
+          schema: { type: integer, minimum: 1, maximum: 500, default: 100 }
+      responses:
+        "200": { description: Ordered change records and next cursor }
+  /planning/today:
+    get:
+      operationId: getPlanningToday
+      parameters:
+        - in: query
+          name: timezone
+          schema: { type: string, default: UTC }
+      responses:
+        "200": { description: Live Now and Today planning read model }
+components:
+  securitySchemes:
+    bridgeToken:
+      type: apiKey
+      in: header
+      name: X-Task-Workbench-Bridge-Token
+  parameters:
+    WorkItemId:
+      in: path
+      name: id
+      required: true
+      schema: { type: string, minLength: 1 }
+  responses:
+    Error:
+      description: Structured application error
+      content:
+        application/json:
+          schema:
+            type: object
+            required: [ok, apiVersion, error]
+            properties:
+              ok: { const: false }
+              apiVersion: { const: "1" }
+              error:
+                type: object
+                required: [code, message]
+                properties:
+                  code: { type: string }
+                  message: { type: string }
+                  currentRevision: { type: integer }

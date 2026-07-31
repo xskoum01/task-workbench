@@ -1,82 +1,71 @@
 # Task Workbench
 
 ## Product goal
-Task Workbench is a local Tauri desktop app for a CRM/Dynamics/Dataverse developer.
 
-Main goals:
-- manage incoming tasks
-- resolve customer repositories
-- support planning and task prioritization
-- later integrate official Microsoft sign-in + Outlook + Teams import
-- create task drafts from imported Microsoft items
+Task Workbench is a local-first task and obligation management system. It is the authoritative
+source of truth for tasks, responsibilities, commitments, deadlines, status, history, and related
+context.
+
+The product must be human-friendly and expose stable machine-readable task data to AI systems and
+other applications.
+
+## Product boundary
+
+Task Workbench provides and updates task/context records only.
+
+It must not:
+
+- orchestrate AI agents or prescribe agent workflows;
+- write implementation code or repository files;
+- create branches, commits, pushes, or pull requests;
+- deploy artifacts or call external systems to complete a task;
+- report an external action as completed unless it is merely recording a user-supplied fact.
+
+Legacy developer-workflow fields may remain in imported metadata or disabled archive sources for
+backward-compatible data recovery, but they must not be reachable from the public UI, MCP tool
+list, REST API, or registered Tauri command surface.
+
+## Canonical data
+
+Canonical `WorkItem` records use explicit responsibility, obligation, lifecycle, revision,
+context, and structured history fields. New mutations go through the Rust application/repository
+layer so revisions, lifecycle validation, completion timestamps, history, and the change cursor
+remain consistent.
+
+SQLite is the authoritative store. The legacy JSON file is an idempotent migration and recovery
+source: never overwrite a failed or ambiguous JSON load, and never mark migration complete until
+the imported records have been validated.
+
+## Integration rules
+
+- MCP tools must be task-data or context-data operations.
+- Keep the MCP definitions, Rust bridge definitions, OpenAPI, and JSON Schema synchronized.
+- Use optimistic revision checks for every integration mutation after create.
+- Sanitize externally sourced text and never expose raw email HTML.
+- Stable public schemas take precedence over legacy workflow compatibility.
 
 ## Tech stack
+
 - Tauri
 - React
 - TypeScript
 - Vite
-- local JSON persistence via Tauri commands
+- embedded SQLite persistence through a Rust repository/application layer
 
 ## Design direction
-- dark
-- compact
-- professional internal desktop tool
-- no flashy consumer-style UI
-- no emoji
-- prefer consistency with VS Code / internal admin tool feel
 
-## Coding rules
-- keep code practical and maintainable
-- comments in English
-- avoid overengineering
-- prefer explicit readable code
-- preserve current architecture unless there is a strong reason to refactor
-
-## Current product direction
-- repository workflow should prioritize detecting/linking existing repos
-- template scaffolding is secondary
-- Microsoft integration must be official only:
-  - no hacks
-  - no scraping
-  - no fake auth
-  - no manual email/password form
-  - proper Microsoft sign-in and Graph only
-
-## AI workflow: Claude Project vs. Task Workbench Copy Prompt
-Stable CRM/Dynamics coding standards (JavaScript/plugin/ribbon conventions, Client API rules,
-etc.) and Power Platform AI Kit context live in the **Claude Project Instructions**, not in
-Task Workbench itself.
-
-- **Claude Project Instructions**: coding style, naming conventions, Client API rules, AI Kit
-  context. Stable across tasks — set up once, not regenerated per task.
-- **Task Workbench "Copy AI Prompt" button** (`src/lib/aiWorkflowPrompt.ts`): generates a short,
-  task-specific **workflow/task contract** — task identity, which MCP tool to call next, the
-  canWriteCode gate, the post-implementation verification loop, and stop conditions. It
-  deliberately does not repeat coding-standard text; it only points to the Claude Project
-  Instructions and AI Kit rules for style.
-- **AI Kit review** is one step inside the verification workflow (`continue_developer_workflow` /
-  `run_implementation_verification` → `nextAction=run_ai_kit_review` — `run_implementation_verification`
-  may also report `status=pending_ai_kit_review` — → Claude reviews the file against the AI Kit
-  rules and calls `record_ai_kit_review_result`) — it is not pasted as a full rules document into
-  every prompt.
-- **The Task Workbench MCP tools must be connected in the Claude session** for any of this to
-  work. The generated prompt distinguishes three failure modes: (1) the MCP toolset is not
-  connected to the session at all (`get_developer_work_packet` doesn't exist — stop immediately
-  and ask the user to connect/reload the MCP server, do not inspect files or implement anything);
-  (2) the toolset is connected but the Task Workbench app/bridge is offline
-  (`get_task_workbench_mcp_capabilities` reports `bridgeMode="offline"`); (3) the bridge is live
-  but the running toolset is stale/missing a specific required tool (`missingRequiredTools` is
-  non-empty). If MCP tools are missing entirely, the agent must stop and ask the user to
-  connect/reload MCP — never fabricate a work packet or a tool call.
-
-When editing `aiWorkflowPrompt.ts`, keep it a contract: task facts + MCP call sequence + gates.
-Do not add generic coding-standard prose — that belongs in the Claude Project Instructions.
+- dark, compact, professional desktop tool
+- clear ownership, deadline, status, and history at a glance
+- plain language instead of developer-workflow jargon
+- accessible controls and explicit destructive-action confirmation
 
 ## Working style
-When given a feature request:
-1. inspect current relevant files
-2. summarize current state
-3. propose a short implementation plan
-4. implement directly
-5. run checks
-6. explain what changed, which files changed, and what remains
+
+When changing the product:
+
+1. inspect current relevant files and stored-data compatibility;
+2. connect the change to the product goal and boundary;
+3. implement the complete user-visible path;
+4. update the stable machine-readable interface when relevant;
+5. run TypeScript, Rust, MCP, and regression checks in proportion to the change;
+6. report what remains against the full product goal.

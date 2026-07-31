@@ -26,6 +26,7 @@ import type {
   GitCommitResult,
   GitPushResult,
 } from '../types';
+import type { WorkItem, WorkItemActorType } from '../domain/workItem';
 
 export type { ClassificationResult };
 
@@ -37,6 +38,76 @@ export function loadTasks(): Promise<Task[]> {
 
 export function saveTasks(tasks: Task[]): Promise<void> {
   return invoke('save_tasks', { tasks });
+}
+
+export interface WorkItemMigrationReport {
+  databasePath: string;
+  imported: number;
+  skipped: number;
+  sourceChecksum?: string;
+  alreadyCompleted: boolean;
+}
+
+export interface WorkItemChangeRecord {
+  sequence: number;
+  workItemId: string;
+  revision: number;
+  changedAt: string;
+  action: string;
+}
+
+export interface WorkItemListResult {
+  apiVersion: string;
+  generatedAt: string;
+  snapshotRevision: number;
+  items: WorkItem[];
+  nextCursor: string | null;
+}
+
+export interface WorkItemChangesResult {
+  apiVersion: string;
+  changes: WorkItemChangeRecord[];
+  nextCursor: number | null;
+}
+
+export function initializeWorkItemStorage(): Promise<WorkItemMigrationReport> {
+  return invoke<WorkItemMigrationReport>('initialize_work_item_storage');
+}
+
+export function listWorkItems(includeArchived = false, limit = 200): Promise<WorkItemListResult> {
+  return invoke<WorkItemListResult>('list_work_items', { includeArchived, limit });
+}
+
+export function getWorkItem(id: string): Promise<WorkItem | null> {
+  return invoke<WorkItem | null>('get_work_item', { id });
+}
+
+export function createWorkItem(item: WorkItem, idempotencyKey?: string): Promise<WorkItem> {
+  return invoke<WorkItem>('create_work_item', { item, idempotencyKey });
+}
+
+export function updateWorkItem(
+  id: string,
+  item: WorkItem,
+  expectedRevision: number,
+  actorType: WorkItemActorType = 'user',
+  actorName?: string,
+): Promise<WorkItem> {
+  return invoke<WorkItem>('update_work_item', {
+    id,
+    item,
+    expectedRevision,
+    actorType,
+    actorName,
+  });
+}
+
+export function listWorkItemChanges(after = 0, limit = 200): Promise<WorkItemChangesResult> {
+  return invoke<WorkItemChangesResult>('list_work_item_changes', { after, limit });
+}
+
+export function getPlanningToday(timezone?: string): Promise<unknown> {
+  return invoke('get_planning_today', { timezone });
 }
 
 /** Explicitly clears all tasks. Bypasses the empty-overwrite guard. */

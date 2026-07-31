@@ -232,7 +232,10 @@ mod tests {
         // Verify that when temperature is not supported, we get None (not Some(0.0)).
         // The request body must not include the field at all — not even as null.
         let result = clamp_temperature("openai", "gpt-5.5", 0.2);
-        assert!(result.is_none(), "unsupported temperature must be None, not Some(...)");
+        assert!(
+            result.is_none(),
+            "unsupported temperature must be None, not Some(...)"
+        );
     }
 
     // --- Provider routing ---

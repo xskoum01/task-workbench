@@ -10,10 +10,12 @@ interface NavItem {
 }
 
 const NAV_ITEMS: NavItem[] = [
+  { page: 'overview',  label: 'Overview',    icon: 'bolt'          },
   { page: 'inbox',     label: 'Inbox',     icon: 'inbox'         },
-  { page: 'tasks',     label: 'Tasks',     icon: 'check-square'  },
-  { page: 'week-log',  label: 'Week Log',  icon: 'calendar'      },
-  { page: 'customers', label: 'Customers', icon: 'building'      },
+  { page: 'work',      label: 'Work',        icon: 'check-square'  },
+  { page: 'obligations', label: 'Obligations', icon: 'pause'       },
+  { page: 'areas',     label: 'Areas',       icon: 'building'      },
+  { page: 'activity',  label: 'Activity',    icon: 'calendar'      },
   { page: 'settings',  label: 'Settings',  icon: 'settings'      },
 ];
 
@@ -27,7 +29,7 @@ export default function Sidebar({ currentPage, onNavigate }: SidebarProps) {
 
   // Badge shows imported review items waiting for a user decision.
   // This must match the exact filter used by InboxPage so counts stay in sync.
-  const inboxBadgeCount = tasks.filter((t) => t.classificationState === 'analyzed').length;
+  const inboxBadgeCount = tasks.filter((t) => !t.archivedAt && t.classificationState === 'analyzed').length;
 
   return (
     <aside className="sidebar">

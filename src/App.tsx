@@ -7,13 +7,18 @@ import TasksPage from './pages/TasksPage';
 import WeekLogPage from './pages/WeekLogPage';
 import CustomersPage from './pages/CustomersPage';
 import SettingsPage from './pages/SettingsPage';
+import OverviewPage from './pages/OverviewPage';
+import ObligationsPage from './pages/ObligationsPage';
+import ActivityPage from './pages/ActivityPage';
 
 function renderPage(page: NavPage) {
   switch (page) {
+    case 'overview':  return <OverviewPage />;
     case 'inbox':     return <InboxPage />;
-    case 'tasks':     return <TasksPage />;
-    case 'week-log':  return <WeekLogPage />;
-    case 'customers': return <CustomersPage />;
+    case 'work':      return <TasksPage />;
+    case 'obligations': return <ObligationsPage />;
+    case 'areas':     return <CustomersPage />;
+    case 'activity':  return <ActivityPage weekLog={<WeekLogPage />} />;
     case 'settings':  return <SettingsPage />;
   }
 }
@@ -21,7 +26,7 @@ function renderPage(page: NavPage) {
 /** Inner shell — rendered after the AppProvider is mounted. */
 function AppShell() {
   const { isLoading, error } = useApp();
-  const [currentPage, setCurrentPage] = useState<NavPage>('inbox');
+  const [currentPage, setCurrentPage] = useState<NavPage>('overview');
 
   if (isLoading) {
     return (

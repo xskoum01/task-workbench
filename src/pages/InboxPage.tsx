@@ -6,7 +6,7 @@ import { generateTeamsTitle, detectTeamsUrgency, parseForwardedTeamsMessage, cle
 import { heuristicClassify } from '../lib/heuristicClassify';
 import { parseAdoEmail, resolveCustomerFromCrmCode } from '../lib/adoParsing';
 import { SourceBadge, ClassificationBadge } from '../components/StatusBadge';
-import TaskDetail from '../components/TaskDetail';
+import TaskRecordDetail from '../components/TaskRecordDetail';
 import TaskForm from '../components/TaskForm';
 import OutlookImport from '../components/OutlookImport';
 import TeamsImport from '../components/TeamsImport';
@@ -75,7 +75,7 @@ export default function InboxPage() {
   // Inbox shows only review items awaiting a user decision.
   // Pending = transient classifying state, invisible to user.
   // Created/rejected = handled elsewhere (Tasks page / silent internal record).
-  const inboxItems = tasks.filter((t) => t.classificationState === 'analyzed');
+  const inboxItems = tasks.filter((t) => !t.archivedAt && t.classificationState === 'analyzed');
 
   // Debug — visible in browser/Tauri dev tools console
   console.debug(
@@ -461,7 +461,7 @@ export default function InboxPage() {
       </div>
 
       {selectedTask && (
-        <TaskDetail task={selectedTask} onClose={() => setSelectedId(null)} />
+        <TaskRecordDetail task={selectedTask} onClose={() => setSelectedId(null)} />
       )}
 
       {showTaskForm && (

@@ -9,7 +9,7 @@ import type { Task, PlanningBucket } from '../types';
 import { useApp } from '../context/AppContext';
 import { TaskStateBadges, SourceBadge, TypeBadge } from './StatusBadge';
 import Icon from './Icon';
-import InlineTaskPanel from './InlineTaskPanel';
+import TaskRecordPanel from './TaskRecordPanel';
 import {
   BUCKET_META,
   BUCKET_ORDER,
@@ -18,7 +18,6 @@ import {
   groupByBucket,
 } from '../lib/planning';
 import { isOverdue, formatRelativeDate } from '../lib/dates';
-import CopyAiWorkflowPromptButton from './CopyAiWorkflowPromptButton';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -32,7 +31,7 @@ import CopyAiWorkflowPromptButton from './CopyAiWorkflowPromptButton';
  *   today   — tasks in the Today bucket
  *   blocked — blocked status
  *   waiting — tasks waiting on someone else
- *   pr-comments — active PR comments loop
+ *   pr-comments — imported review feedback that needs attention
  *   locked  — manually locked bucket
  */
 export type PlanningFilter = 'focus' | 'overdue' | 'today' | 'blocked' | 'waiting' | 'pr-comments' | 'locked' | null;
@@ -96,7 +95,7 @@ function SummaryBar({ tasks }: SummaryBarProps) {
   const items: { label: string; count: number; cls?: string }[] = [];
   if (overdue.length > 0) items.push({ label: 'overdue', count: overdue.length, cls: 'summary-item--overdue' });
   if (today.length > 0)   items.push({ label: 'today',   count: today.length                                 });
-  if (prComments.length > 0) items.push({ label: 'PR comments', count: prComments.length, cls: 'summary-item--blocked' });
+  if (prComments.length > 0) items.push({ label: 'needs attention', count: prComments.length, cls: 'summary-item--blocked' });
   if (waiting.length > 0) items.push({ label: 'waiting', count: waiting.length });
   if (blocked.length > 0) items.push({ label: 'blocked', count: blocked.length, cls: 'summary-item--blocked' });
   if (done.length > 0)    items.push({ label: 'done',    count: done.length,    cls: 'summary-item--done'    });
@@ -154,7 +153,7 @@ function BucketSection({ bucket, tasks, selectedId, onSelect, onOpenDetail, isFi
                 onSelect={onSelect}
               />
               {selectedId === task.id && (
-                <InlineTaskPanel
+                <TaskRecordPanel
                   task={task}
                   onOpenDetail={() => onOpenDetail(task.id)}
                 />
@@ -188,7 +187,7 @@ interface PlanningTaskRowProps {
 }
 
 function PlanningTaskRow({ task, selected, onSelect }: PlanningTaskRowProps) {
-  const { getCustomerById, updateTask, settings } = useApp();
+  const { getCustomerById, updateTask } = useApp();
   const customer = getCustomerById(task.customerId);
 
   // Use stored planning data, or compute on the fly as fallback
@@ -227,7 +226,6 @@ function PlanningTaskRow({ task, selected, onSelect }: PlanningTaskRowProps) {
       <div className="planning-task-main">
         <div className="planning-task-title-row">
           <div className="planning-task-title">{task.title}</div>
-          <CopyAiWorkflowPromptButton task={task} customer={customer} crmBaseDirectory={settings?.crmBaseDirectory} />
         </div>
 
         <div className="planning-task-meta">
@@ -376,7 +374,7 @@ export default function PlanningView({ tasks, selectedId, onSelect, onOpenDetail
                     onSelect={onSelect}
                   />
                   {selectedId === task.id && (
-                    <InlineTaskPanel
+                    <TaskRecordPanel
                       task={task}
                       onOpenDetail={() => onOpenDetail(task.id)}
                     />
@@ -391,7 +389,7 @@ export default function PlanningView({ tasks, selectedId, onSelect, onOpenDetail
   );
 }
 
-/** Convenience: returns bucket info for a task (used by TaskDetail). */
+/** Convenience: returns the effective planning bucket for a task record. */
 export function bucketInfo(task: Task): {
   effective: PlanningBucket;
   suggested: PlanningBucket | undefined;

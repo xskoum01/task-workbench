@@ -1,0 +1,127 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://task-workbench.local/schemas/v1/work-item.json",
+  "title": "Task Workbench WorkItem",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion",
+    "id",
+    "kind",
+    "title",
+    "status",
+    "priority",
+    "source",
+    "tags",
+    "context",
+    "createdAt",
+    "updatedAt",
+    "revision",
+    "history"
+  ],
+  "properties": {
+    "schemaVersion": { "const": 1 },
+    "id": { "type": "string", "minLength": 1 },
+    "kind": { "enum": ["task", "obligation"] },
+    "obligationMode": { "enum": ["one_off", "ongoing", "recurring"] },
+    "title": { "type": "string", "minLength": 1 },
+    "description": { "type": "string" },
+    "expectedOutcome": { "type": "string" },
+    "planningBucket": { "enum": ["now", "today", "tomorrow", "this_week", "later", "queue", "waiting"] },
+    "estimateMinutes": { "type": "integer", "minimum": 0 },
+    "status": {
+      "enum": [
+        "planned",
+        "ready",
+        "in_progress",
+        "waiting",
+        "blocked",
+        "review",
+        "completed",
+        "cancelled"
+      ]
+    },
+    "priority": { "enum": ["low", "normal", "high", "critical"] },
+    "owner": { "$ref": "#/$defs/partyReference" },
+    "accountableTo": { "$ref": "#/$defs/partyReference" },
+    "areaId": { "type": "string" },
+    "parentId": { "type": "string" },
+    "startAt": { "type": "string", "format": "date-time" },
+    "dueAt": { "type": "string", "format": "date-time" },
+    "completedAt": { "type": "string", "format": "date-time" },
+    "nextReviewAt": { "type": "string", "format": "date-time" },
+    "blockerReason": { "type": "string" },
+    "source": { "type": "string" },
+    "sourceUrl": { "type": "string", "format": "uri" },
+    "tags": { "type": "array", "items": { "type": "string" }, "uniqueItems": true },
+    "context": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/contextEntry" }
+    },
+    "createdAt": { "type": "string", "format": "date-time" },
+    "updatedAt": { "type": "string", "format": "date-time" },
+    "revision": { "type": "integer", "minimum": 1 },
+    "archivedAt": { "type": "string", "format": "date-time" },
+    "history": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/event" }
+    },
+    "metadata": {
+      "type": "object",
+      "additionalProperties": true
+    },
+    "externalReferences": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["type", "label", "url"],
+        "properties": {
+          "type": { "type": "string" },
+          "label": { "type": "string" },
+          "id": { "type": "string" },
+          "url": { "type": "string", "format": "uri" }
+        }
+      }
+    }
+  },
+  "$defs": {
+    "partyReference": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["displayName"],
+      "properties": {
+        "id": { "type": "string" },
+        "displayName": { "type": "string", "minLength": 1 }
+      }
+    },
+    "contextEntry": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "type", "createdAt", "actorType"],
+      "properties": {
+        "id": { "type": "string" },
+        "type": { "enum": ["note", "source", "reference", "decision"] },
+        "text": { "type": "string" },
+        "url": { "type": "string", "format": "uri" },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "actorType": { "enum": ["user", "system", "integration"] },
+        "actorName": { "type": "string" }
+      }
+    },
+    "event": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "at", "actorType", "action", "summary"],
+      "properties": {
+        "id": { "type": "string" },
+        "sequence": { "type": "integer", "minimum": 1 },
+        "at": { "type": "string", "format": "date-time" },
+        "actorType": { "enum": ["user", "system", "integration"] },
+        "actorName": { "type": "string" },
+        "action": { "type": "string" },
+        "summary": { "type": "string" },
+        "changes": { "type": "array", "items": { "type": "object" } }
+      }
+    }
+  }
+}

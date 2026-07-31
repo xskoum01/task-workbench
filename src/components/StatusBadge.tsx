@@ -3,11 +3,11 @@ import type { Task, TaskStatus, TaskSource, TaskType, ClassificationState, TaskA
 // --- Status badge ----------------------------------------------------------
 
 export const STATUS_LABELS: Record<TaskStatus, string> = {
-  'new':              'New',
-  'analyzed':         'Analyzed',
+  'new':              'Planned',
+  'analyzed':         'Ready',
   'in-progress':      'In Progress',
-  'ready-for-review': 'Code Review',
-  'done':             'Done',
+  'ready-for-review': 'Review',
+  'done':             'Completed',
   'blocked':          'Blocked',
 };
 
@@ -30,11 +30,11 @@ export const WAITING_LABELS: Record<TaskWaitingState, string> = {
   'code-review':         'Waiting for colleague review',
   // Persisted value stays 'consultant-testing' (see TaskWaitingState) — only the display label
   // changed to reflect the renamed Deployment & Testing phase (see src/lib/deploymentTestingGate.ts).
-  'consultant-testing':  'Waiting for deployment & testing',
+  'consultant-testing':  'Waiting for validation',
 };
 
 export const ATTENTION_LABELS: Record<TaskAttentionState, string> = {
-  'pr-comments': 'PR comments',
+  'pr-comments': 'Needs attention',
 };
 
 export function WaitingBadge({ state }: { state: TaskWaitingState }) {
@@ -70,7 +70,7 @@ export const TYPE_LABELS: Record<TaskType, string> = {
   'feature':    'Feature',
   'review':     'Review',
   'question':   'Question',
-  'deployment': 'Deployment',
+  'deployment': 'Delivery',
   'other':      'Other',
 };
 
@@ -92,6 +92,8 @@ const SOURCE_LABELS: Record<TaskSource, string> = {
   email:  'Email',
   teams:  'Teams',
   manual: 'Manual',
+  mcp:    'MCP',
+  devops: 'Azure DevOps',
 };
 
 interface SourceBadgeProps {

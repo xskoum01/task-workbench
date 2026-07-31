@@ -3,7 +3,7 @@ import type { Task } from '../types';
 import { useApp } from '../context/AppContext';
 import Icon from '../components/Icon';
 import Modal from '../components/Modal';
-import TaskDetail from '../components/TaskDetail';
+import TaskRecordDetail from '../components/TaskRecordDetail';
 import { TypeBadge, SourceBadge } from '../components/StatusBadge';
 
 // ---------------------------------------------------------------------------
@@ -324,7 +324,7 @@ export default function WeekLogPage() {
         {/* Task detail block below the week grid */}
         {selectedTask && (
           <div className="wl-detail-block" ref={detailRef}>
-            <TaskDetail
+            <TaskRecordDetail
               task={selectedTask}
               onClose={() => setSelectedTaskId(null)}
             />

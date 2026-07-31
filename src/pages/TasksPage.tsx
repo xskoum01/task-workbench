@@ -3,13 +3,12 @@ import type { TaskStatus } from '../types';
 import { useApp } from '../context/AppContext';
 import { TaskStateBadges, TypeBadge, SourceBadge } from '../components/StatusBadge';
 import Icon from '../components/Icon';
-import TaskDetail from '../components/TaskDetail';
-import InlineTaskPanel from '../components/InlineTaskPanel';
+import TaskRecordDetail from '../components/TaskRecordDetail';
+import TaskRecordPanel from '../components/TaskRecordPanel';
 import TaskForm from '../components/TaskForm';
 import PlanningView, { type PlanningFilter } from '../components/PlanningView';
 import { isOverdue, formatRelativeDate } from '../lib/dates';
 import { effectiveBucket } from '../lib/planning';
-import CopyAiWorkflowPromptButton from '../components/CopyAiWorkflowPromptButton';
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -24,18 +23,18 @@ const PLANNING_FILTERS: { value: PlanningFilter; label: string; title: string }[
   { value: 'today',   label: 'Today',   title: 'Tasks in the Today bucket'   },
   { value: 'blocked', label: 'Blocked', title: 'Blocked tasks'               },
   { value: 'waiting', label: 'Waiting', title: 'Tasks waiting on someone else'},
-  { value: 'pr-comments', label: 'PR Comments', title: 'Tasks with review comments to handle' },
+  { value: 'pr-comments', label: 'Needs attention', title: 'Records with review feedback to handle' },
   { value: 'locked',  label: 'Locked',  title: 'Manually locked bucket'      },
 ];
 
 const STATUS_FILTERS: { value: TaskStatus | 'all'; label: string }[] = [
   { value: 'all',              label: 'All'        },
-  { value: 'new',              label: 'New'        },
-  { value: 'analyzed',         label: 'Analyzed'   },
+  { value: 'new',              label: 'Planned'    },
+  { value: 'analyzed',         label: 'Ready'      },
   { value: 'in-progress',      label: 'In Progress'},
-  { value: 'ready-for-review', label: 'Code Review' },
+  { value: 'ready-for-review', label: 'Review'     },
   { value: 'blocked',          label: 'Blocked'    },
-  { value: 'done',             label: 'Done'       },
+  { value: 'done',             label: 'Completed'  },
 ];
 
 // ---------------------------------------------------------------------------
@@ -45,13 +44,15 @@ const STATUS_FILTERS: { value: TaskStatus | 'all'; label: string }[] = [
 export default function TasksPage() {
   const {
     tasks, getCustomerById, updateTask, deleteTask, reloadTasks,
-    taskLoadFailed, error, taskStorageStatus, restoreTasksFromLatestBackup, settings,
+    taskLoadFailed, error, taskStorageStatus, restoreTasksFromLatestBackup,
   } = useApp();
 
   const [viewMode, setViewMode]           = useState<ViewMode>('planning');
   const [filter, setFilter]               = useState<TaskStatus | 'all'>('all');
   const [planningFilter, setPlanningFilter] = useState<PlanningFilter>(null);
   const [showCompleted, setShowCompleted] = useState(false);
+  const [showArchived, setShowArchived]   = useState(false);
+  const [searchQuery, setSearchQuery]     = useState('');
   const [selectedId, setSelectedId]       = useState<string | null>(null);
   const [detailOpenId, setDetailOpenId]   = useState<string | null>(null);
   const [showTaskForm, setShowTaskForm]   = useState(false);
@@ -94,16 +95,35 @@ export default function TasksPage() {
   }
 
   // Exclude inbox-only items (pending/analyzed/rejected) — they live in the Inbox page
-  const realTasks = tasks.filter(
+  const taskRecords = tasks.filter(
     (t) => !t.classificationState || t.classificationState === 'created',
   );
+  const archivedCount = taskRecords.filter((task) => !!task.archivedAt).length;
+  const realTasks = taskRecords.filter((task) => showArchived ? !!task.archivedAt : !task.archivedAt);
+  const normalizedQuery = searchQuery.trim().toLocaleLowerCase();
+  const searchedTasks = normalizedQuery
+    ? realTasks.filter((task) => {
+        const customer = getCustomerById(task.customerId);
+        return [
+          task.title,
+          task.description,
+          task.responsibleParty,
+          task.accountableTo,
+          task.status,
+          task.obligationKind,
+          customer?.name,
+          task.ticketUrl,
+          task.devopsTaskUrl,
+        ].some((value) => value?.toLocaleLowerCase().includes(normalizedQuery));
+      })
+    : realTasks;
 
   const filtered = filter === 'all'
-    ? realTasks
-    : realTasks.filter((t) => t.status === filter);
+    ? searchedTasks
+    : searchedTasks.filter((t) => t.status === filter);
 
   // Quick counts for planning filter badges
-  const activeTasks = realTasks.filter((t) => t.status !== 'done');
+  const activeTasks = searchedTasks.filter((t) => t.status !== 'done');
   const overdueCount = activeTasks.filter((t) => t.dueAt && isOverdue(t.dueAt, t.status)).length;
   const todayCount   = activeTasks.filter((t) => effectiveBucket(t) === 'today').length;
   const blockedCount = activeTasks.filter((t) => t.status === 'blocked').length;
@@ -184,15 +204,24 @@ export default function TasksPage() {
       <div className="page-content">
         <div className="page-header">
           <div>
-            <div className="page-title">Tasks</div>
+            <div className="page-title">Work records</div>
             <div className="page-subtitle">
               {viewMode === 'list'
-                ? `${filtered.length} task${filtered.length !== 1 ? 's' : ''}`
-                : `${realTasks.filter((t) => t.status !== 'done').length} active tasks`}
+                ? `${filtered.length} record${filtered.length !== 1 ? 's' : ''}`
+                : `${searchedTasks.filter((t) => t.status !== 'done').length} active records`}
             </div>
           </div>
 
           <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+            <input
+              className="form-input"
+              type="search"
+              value={searchQuery}
+              onChange={(event) => setSearchQuery(event.target.value)}
+              placeholder="Search work, owners, context…"
+              aria-label="Search work records"
+              style={{ width: 230 }}
+            />
             {/* View mode toggle */}
             <div className="view-mode-toggle">
               <button
@@ -210,6 +239,22 @@ export default function TasksPage() {
                 Planning
               </button>
             </div>
+
+            <button
+              className={`planning-filter-chip${showArchived ? ' active' : ''}`}
+              onClick={() => {
+                setShowArchived((value) => !value);
+                setViewMode('list');
+                setFilter('all');
+                setSelectedId(null);
+              }}
+              title={showArchived ? 'Return to active records' : 'Show archived records'}
+            >
+              {showArchived ? 'Active records' : 'Archive'}
+              {!showArchived && archivedCount > 0 && (
+                <span className="planning-filter-chip-count">{archivedCount}</span>
+              )}
+            </button>
 
             {/* Planning focus filters — only visible in planning mode */}
             {viewMode === 'planning' && (
@@ -236,9 +281,9 @@ export default function TasksPage() {
                   title="Show completed tasks"
                 >
                   Completed
-                  {realTasks.filter((t) => t.status === 'done').length > 0 && (
+                  {searchedTasks.filter((t) => t.status === 'done').length > 0 && (
                     <span className="planning-filter-chip-count">
-                      {realTasks.filter((t) => t.status === 'done').length}
+                      {searchedTasks.filter((t) => t.status === 'done').length}
                     </span>
                   )}
                 </button>
@@ -250,8 +295,8 @@ export default function TasksPage() {
               <div className="planning-filter-bar">
                 {STATUS_FILTERS.map((f) => {
                   const count = f.value === 'all'
-                    ? realTasks.length
-                    : realTasks.filter((t) => t.status === f.value).length;
+                    ? searchedTasks.length
+                    : searchedTasks.filter((t) => t.status === f.value).length;
                   return (
                     <button
                       key={f.value}
@@ -273,7 +318,7 @@ export default function TasksPage() {
               className="btn btn-ghost"
               onClick={handleReload}
               disabled={reloading}
-              title="Reload tasks from storage (picks up changes made by AI/MCP)"
+              title="Reload records from storage (including integration changes)"
               style={{ minWidth: 0 }}
             >
               <Icon name="refresh-cw" size={14} className={reloading ? 'spin' : undefined} />
@@ -281,7 +326,7 @@ export default function TasksPage() {
 
             <button className="btn btn-secondary" onClick={() => setShowTaskForm(true)}>
               <span className="btn-icon">+</span>
-              New Task
+              New work item
             </button>
           </div>
         </div>
@@ -291,7 +336,7 @@ export default function TasksPage() {
           filtered.length === 0 ? (
             <div className="empty-state">
               <div className="empty-state-icon">—</div>
-              <div className="empty-state-text">No tasks match this filter</div>
+              <div className="empty-state-text">No work records match this filter</div>
             </div>
           ) : (
             <div className="task-list">
@@ -310,7 +355,6 @@ export default function TasksPage() {
                     <div className="task-list-item-main">
                       <div className="task-list-item-title-row">
                         <div className="task-list-item-title">{task.title}</div>
-                        <CopyAiWorkflowPromptButton task={task} customer={customer} crmBaseDirectory={settings?.crmBaseDirectory} />
                       </div>
                       <div className="task-list-item-meta">
                         <SourceBadge source={task.source} />
@@ -319,6 +363,15 @@ export default function TasksPage() {
                         <span className="task-list-item-customer">
                           {customer?.name ?? task.customerId}
                         </span>
+                        {task.responsibleParty && (
+                          <>
+                            <span className="task-meta-sep">Â·</span>
+                            <span title="Responsible party">Owner: {task.responsibleParty}</span>
+                          </>
+                        )}
+                        {task.obligationKind && task.obligationKind !== 'task' && (
+                          <span className="tracking-pill" title="Obligation kind">{task.obligationKind}</span>
+                        )}
                         <span className="task-meta-sep">·</span>
                         <span className="task-list-item-time">{formatRelativeDate(task.receivedAt)}</span>
                         {task.dueAt && (
@@ -359,7 +412,7 @@ export default function TasksPage() {
                         className="task-list-item-actions"
                         onClick={(e) => e.stopPropagation()}
                       >
-                        {task.status !== 'done' && (
+                        {!task.archivedAt && task.status !== 'done' && (
                           <button
                             className="tli-action-btn tli-action-btn--done"
                             title="Mark as done"
@@ -368,14 +421,22 @@ export default function TasksPage() {
                             <Icon name="check" size={12} />
                           </button>
                         )}
-                        {isConfirmingDelete ? (
+                        {task.archivedAt ? (
+                          <button
+                            className="tli-action-btn tli-action-btn--done"
+                            title="Restore task from archive"
+                            onClick={() => void updateTask(task.id, { archivedAt: undefined })}
+                          >
+                            restore
+                          </button>
+                        ) : isConfirmingDelete ? (
                           <>
                             <button
                               className="tli-action-btn tli-action-btn--confirm"
-                              title="Confirm delete"
+                              title="Confirm archive"
                               onClick={() => { deleteTask(task.id); setConfirmDeleteId(null); }}
                             >
-                              del?
+                              archive?
                             </button>
                             <button
                               className="tli-action-btn tli-action-btn--cancel"
@@ -388,7 +449,7 @@ export default function TasksPage() {
                         ) : (
                           <button
                             className="tli-action-btn tli-action-btn--delete"
-                            title="Delete task"
+                            title="Archive task"
                             onClick={() => setConfirmDeleteId(task.id)}
                           >
                             <Icon name="trash-2" size={12} />
@@ -396,9 +457,9 @@ export default function TasksPage() {
                         )}
                       </div>
                     </div>
-                    {/* Inline workbench — expands below the task header when selected */}
+                    {/* Canonical task record — expands below the task header when selected */}
                     {selectedId === task.id && (
-                      <InlineTaskPanel
+                      <TaskRecordPanel
                         task={task}
                         onOpenDetail={() => setDetailOpenId(task.id)}
                       />
@@ -413,7 +474,7 @@ export default function TasksPage() {
         {/* ---- Planning view ---- */}
         {viewMode === 'planning' && (
           <PlanningView
-            tasks={realTasks}
+            tasks={searchedTasks}
             selectedId={selectedId}
             onSelect={handleSelect}
             onOpenDetail={(id) => setDetailOpenId(id)}
@@ -423,10 +484,10 @@ export default function TasksPage() {
         )}
       </div>
 
-      {/* Full TaskDetail — opened only via the Detail button in InlineTaskPanel */}
+      {/* Canonical task record detail */}
       {detailOpenId && (() => {
         const t = realTasks.find((x) => x.id === detailOpenId);
-        return t ? <TaskDetail task={t} onClose={() => setDetailOpenId(null)} /> : null;
+        return t ? <TaskRecordDetail task={t} onClose={() => setDetailOpenId(null)} /> : null;
       })()}
 
       {showTaskForm && (

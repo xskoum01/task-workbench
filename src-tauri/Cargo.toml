@@ -30,11 +30,14 @@ zip = { version = "2", features = ["deflate"] }
 sha2 = "0.10"
 base64 = "0.22"
 rand = "0.8"
+rusqlite = { version = "0.32", features = ["bundled"] }
 # Cross-platform browser opener (used for the Microsoft sign-in redirect)
 webbrowser = "0.8"
 # URL percent-encoding for OAuth2 query strings
 urlencoding = "2"
 
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security_Credentials"] }
+
 [dev-dependencies]
 tempfile = "3"
-

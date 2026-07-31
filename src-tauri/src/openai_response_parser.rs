@@ -135,9 +135,7 @@ pub fn sanitize_openai_response_error(value: &Value, model: &str) -> String {
     if let Some(obj) = value.as_object() {
         if let Some(err) = obj.get("error") {
             if !err.is_null() {
-                let summary = err["message"]
-                    .as_str()
-                    .unwrap_or("(error object present)");
+                let summary = err["message"].as_str().unwrap_or("(error object present)");
                 // Cap at 200 chars — error messages are usually short but guard anyway
                 let safe = &summary[..summary.len().min(200)];
                 lines.push(format!("Response error: {safe}"));
@@ -260,7 +258,10 @@ mod tests {
         let result = extract_openai_response_text(&v);
         assert!(result.is_err());
         let msg = result.unwrap_err();
-        assert!(msg.contains("output array"), "expected 'output array' in: {msg}");
+        assert!(
+            msg.contains("output array"),
+            "expected 'output array' in: {msg}"
+        );
     }
 
     #[test]
@@ -335,7 +336,10 @@ mod tests {
         let v = json!({ "id": "resp_safe" });
         let msg = sanitize_openai_response_error(&v, "gpt-5.5");
         assert!(!msg.contains("sk-"), "must not contain API key pattern");
-        assert!(!msg.contains("Authorization"), "must not mention auth header");
+        assert!(
+            !msg.contains("Authorization"),
+            "must not mention auth header"
+        );
     }
 
     #[test]
@@ -358,7 +362,10 @@ mod tests {
         let msg = sanitize_openai_response_error(&v, "gpt-5.5");
         // Field names should appear in the "Top-level fields" line
         assert!(msg.contains("Top-level fields"), "must list field names");
-        assert!(msg.contains("instructions"), "field name 'instructions' should appear");
+        assert!(
+            msg.contains("instructions"),
+            "field name 'instructions' should appear"
+        );
         // But the value "secret system prompt" must NOT appear
         assert!(
             !msg.contains("secret system prompt"),
@@ -376,7 +383,10 @@ mod tests {
             ]
         });
         let msg = sanitize_openai_response_error(&v, "gpt-5.5");
-        assert!(msg.contains("message"), "output item types should be listed");
+        assert!(
+            msg.contains("message"),
+            "output item types should be listed"
+        );
     }
 
     #[test]

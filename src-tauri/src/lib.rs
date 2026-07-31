@@ -1,27 +1,33 @@
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+use rand::Rng;
+use crate::application::{MutationContext, WorkItemApplicationService, WorkItemListQuery, WorkItemRepository};
+use crate::domain::work_item::{ActorType, WorkItem, WorkItemStatus};
+use crate::storage::sqlite::SqliteWorkItemRepository;
+use reqwest::Client;
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use sha2::{Digest, Sha256};
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io;
 use std::io::BufRead;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::process::Stdio;
 use std::path::PathBuf;
-use std::collections::{HashMap, HashSet};
+use std::process::Stdio;
 use std::sync::{Mutex, OnceLock};
 use std::thread;
-use serde::{Deserialize, Serialize};
-use serde_json::Value;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader as TokioBufReader};
-use tokio::time::{timeout, Duration};
 use tauri::Manager;
 use tauri_plugin_dialog::DialogExt;
-use reqwest::Client;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader as TokioBufReader};
+use tokio::time::{timeout, Duration};
 use zip::ZipArchive;
-use sha2::{Digest, Sha256};
-use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
-use rand::Rng;
 
 mod ai_model_capabilities;
 mod openai_response_parser;
+mod application;
+mod domain;
+mod storage;
 
 // --- Helpers ---------------------------------------------------------------
 
@@ -36,11 +42,15 @@ fn resolve_nuget_version(package: &str, fallback: &str) -> String {
     );
     let result: Option<String> = (|| -> Option<String> {
         let resp = reqwest::blocking::get(&url).ok()?;
-        if !resp.status().is_success() { return None; }
+        if !resp.status().is_success() {
+            return None;
+        }
         let json: Value = resp.json().ok()?;
         let versions = json["versions"].as_array()?;
         // Versions are sorted ascending; walk from the end to find the latest stable
-        versions.iter().rev()
+        versions
+            .iter()
+            .rev()
             .filter_map(|v| v.as_str())
             .find(|v| !v.contains('-'))
             .map(|v| v.to_string())
@@ -91,21 +101,15 @@ fn hide_console_window(_cmd: &mut std::process::Command) {}
 
 #[tauri::command]
 fn load_tasks(app: tauri::AppHandle) -> Result<Value, String> {
-    let dir  = app_data_dir(&app)?;
+    let dir = app_data_dir(&app)?;
     let path = dir.join("tasks.json");
 
-    // Clean up any stale temp file left by an interrupted atomic write.
-    let tmp_path = path.with_extension("tmp");
-    if tmp_path.exists() {
-        let _ = fs::remove_file(&tmp_path);
-    }
-
-    let value = read_json(&path)?;
-    if value.is_null() {
-        Ok(Value::Array(vec![]))
-    } else {
-        Ok(value)
-    }
+    // Transitional compatibility projection: SQLite/canonical WorkItem is
+    // authoritative, while the existing UI still consumes Task-shaped JSON.
+    let repository = SqliteWorkItemRepository::in_app_data(&dir);
+    repository.migrate_json_tasks(&path).map_err(|e| e.message.clone())?;
+    let records = repository.list_legacy_compatible().map_err(|e| e.message)?;
+    Ok(Value::Array(records))
 }
 
 /// Normal save â€” refuses to overwrite a non-empty tasks.json with an empty array.
@@ -113,7 +117,10 @@ fn load_tasks(app: tauri::AppHandle) -> Result<Value, String> {
 #[tauri::command]
 fn save_tasks(app: tauri::AppHandle, tasks: Value) -> Result<(), String> {
     let dir = app_data_dir(&app)?;
-    save_tasks_impl(&dir, &tasks, false)
+    let repository = SqliteWorkItemRepository::in_app_data(&dir);
+    let values = tasks.as_array().ok_or_else(|| "Tasks must be a JSON array.".to_string())?;
+    repository.sync_legacy_snapshot(values).map_err(|e| e.message)?;
+    Ok(())
 }
 
 /// Explicitly clears all tasks.  Bypasses the empty-overwrite guard.
@@ -121,12 +128,19 @@ fn save_tasks(app: tauri::AppHandle, tasks: Value) -> Result<(), String> {
 #[tauri::command]
 fn clear_all_tasks(app: tauri::AppHandle) -> Result<(), String> {
     let dir = app_data_dir(&app)?;
+    let repo = SqliteWorkItemRepository::in_app_data(&dir);
+    repo.migrate_json_tasks(&dir.join("tasks.json")).map_err(|e| e.message)?;
+    repo.clear_all().map_err(|e| e.message)?;
     save_tasks_impl(&dir, &Value::Array(vec![]), true)
 }
 
 /// Core task-save logic.  `allow_empty_overwrite` must be true to replace a
 /// non-empty tasks.json with []; normal saves always pass false.
-fn save_tasks_impl(dir: &PathBuf, tasks: &Value, allow_empty_overwrite: bool) -> Result<(), String> {
+fn save_tasks_impl(
+    dir: &PathBuf,
+    tasks: &Value,
+    allow_empty_overwrite: bool,
+) -> Result<(), String> {
     let path = dir.join("tasks.json");
 
     let existing_count = count_tasks_on_disk(&path)?;
@@ -144,7 +158,7 @@ fn save_tasks_impl(dir: &PathBuf, tasks: &Value, allow_empty_overwrite: bool) ->
 
     // Backup the current file before overwriting.
     if path.exists() {
-        let ts    = now_unix();
+        let ts = now_unix();
         let bname = format!("tasks.backup-{}.json", ts);
         fs::copy(&path, dir.join(&bname)).map_err(|e| format!("backup tasks.json: {}", e))?;
         prune_task_backups(dir, 5);
@@ -227,7 +241,11 @@ struct TaskStorageStatus {
 fn check_task_storage_impl(dir: &PathBuf) -> Result<TaskStorageStatus, String> {
     let path = dir.join("tasks.json");
 
-    let task_count = if path.exists() { count_tasks_on_disk(&path)? } else { 0 };
+    let task_count = if path.exists() {
+        count_tasks_on_disk(&path)?
+    } else {
+        0
+    };
 
     let backups = list_task_backups(dir);
     let backup_count = backups.len();
@@ -268,17 +286,23 @@ fn check_task_storage(app: tauri::AppHandle) -> Result<TaskStorageStatus, String
 /// Returns the number of tasks restored.
 #[tauri::command]
 fn restore_tasks_from_latest_backup(app: tauri::AppHandle) -> Result<usize, String> {
-    let dir  = app_data_dir(&app)?;
+    let dir = app_data_dir(&app)?;
     let path = dir.join("tasks.json");
 
     let backups = list_task_backups(&dir);
-    let source = backups.iter().rev()
-        .find(|bp| read_json(bp).map(|v| json_array_len(&v) > 0).unwrap_or(false))
+    let source = backups
+        .iter()
+        .rev()
+        .find(|bp| {
+            read_json(bp)
+                .map(|v| json_array_len(&v) > 0)
+                .unwrap_or(false)
+        })
         .ok_or_else(|| "No non-empty backup found to restore from".to_string())?
         .clone();
 
     let restored = read_json(&source)?;
-    let count    = json_array_len(&restored);
+    let count = json_array_len(&restored);
     atomic_write_json(&path, &restored)?;
     Ok(count)
 }
@@ -385,7 +409,10 @@ fn merge_settings_defaults(defaults: &Value, current: &Value) -> Value {
             let mut merged = serde_json::Map::new();
             for (key, default_value) in default_map {
                 if let Some(current_value) = current_map.get(key) {
-                    merged.insert(key.clone(), merge_settings_defaults(default_value, current_value));
+                    merged.insert(
+                        key.clone(),
+                        merge_settings_defaults(default_value, current_value),
+                    );
                 } else {
                     merged.insert(key.clone(), default_value.clone());
                 }
@@ -486,15 +513,14 @@ fn open_in_vscode(path: String) -> Result<(), String> {
     #[cfg(not(target_os = "windows"))]
     let result = {
         eprintln!("[open_in_vscode] code \"{}\"", path);
-        std::process::Command::new("code")
-            .arg(&path)
-            .spawn()
+        std::process::Command::new("code").arg(&path).spawn()
     };
 
     result.map(|_| ()).map_err(|e| {
         eprintln!("[open_in_vscode] failed: {e}");
         if e.kind() == std::io::ErrorKind::NotFound {
-            "VS Code not found. Make sure 'code' is on PATH (run 'code .' in a terminal to verify).".to_string()
+            "VS Code not found. Make sure 'code' is on PATH (run 'code .' in a terminal to verify)."
+                .to_string()
         } else {
             format!("Failed to launch VS Code: {e}")
         }
@@ -505,7 +531,10 @@ fn open_in_vscode(path: String) -> Result<(), String> {
 /// Runs: code "<workspace_path>" ["<file_path>"]
 /// This keeps the workspace context while jumping to the file.
 #[tauri::command]
-fn open_in_vscode_workspace(workspace_path: String, file_path: Option<String>) -> Result<(), String> {
+fn open_in_vscode_workspace(
+    workspace_path: String,
+    file_path: Option<String>,
+) -> Result<(), String> {
     let wp = std::path::Path::new(&workspace_path);
     if !wp.exists() {
         return Err(format!("Workspace path not found: {workspace_path}"));
@@ -526,14 +555,18 @@ fn open_in_vscode_workspace(workspace_path: String, file_path: Option<String>) -
     let result = {
         let mut cmd = std::process::Command::new("cmd");
         cmd.arg("/c").arg("code");
-        for a in &args { cmd.arg(a); }
+        for a in &args {
+            cmd.arg(a);
+        }
         hide_console_window(&mut cmd);
         cmd.spawn()
     };
     #[cfg(not(target_os = "windows"))]
     let result = {
         let mut cmd = std::process::Command::new("code");
-        for a in &args { cmd.arg(a); }
+        for a in &args {
+            cmd.arg(a);
+        }
         cmd.spawn()
     };
 
@@ -634,13 +667,9 @@ fn git_run(repo_path: &str, args: &[&str]) -> Result<String, String> {
         }
     })?;
     if output.status.success() {
-        Ok(String::from_utf8_lossy(&output.stdout)
-            .trim()
-            .to_string())
+        Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
     } else {
-        Err(String::from_utf8_lossy(&output.stderr)
-            .trim()
-            .to_string())
+        Err(String::from_utf8_lossy(&output.stderr).trim().to_string())
     }
 }
 
@@ -649,7 +678,9 @@ fn git_run(repo_path: &str, args: &[&str]) -> Result<String, String> {
 /// Never throws â€” callers may safely treat any error as `false`.
 #[tauri::command]
 fn git_has_head(repo_path: String) -> bool {
-    if !std::path::Path::new(&repo_path).exists() { return false; }
+    if !std::path::Path::new(&repo_path).exists() {
+        return false;
+    }
     run_git_ro(&repo_path, &["rev-parse", "--verify", "HEAD"]).is_some()
 }
 
@@ -679,8 +710,8 @@ fn get_git_branch_quick(repo_path: String) -> Result<String, String> {
     if !head_path.exists() {
         return Err(format!("Not a git repository (no .git/HEAD): {repo_path}"));
     }
-    let content = fs::read_to_string(&head_path)
-        .map_err(|e| format!("Cannot read .git/HEAD: {e}"))?;
+    let content =
+        fs::read_to_string(&head_path).map_err(|e| format!("Cannot read .git/HEAD: {e}"))?;
     let content = content.trim();
     if let Some(branch) = content.strip_prefix("ref: refs/heads/") {
         Ok(branch.to_string())
@@ -752,11 +783,16 @@ fn get_git_diff(repo_path: String, file_path: Option<String>) -> Result<String, 
         return Err(format!("Repository path does not exist: {repo_path}"));
     }
     if !p.join(".git").exists() {
-        return Err(format!("'{repo_path}' is not a Git repository (no .git directory found)."));
+        return Err(format!(
+            "'{repo_path}' is not a Git repository (no .git directory found)."
+        ));
     }
 
     // Normalize repo_path: canonicalize slashes for comparison.
-    let repo_norm = repo_path.replace('\\', "/").trim_end_matches('/').to_string();
+    let repo_norm = repo_path
+        .replace('\\', "/")
+        .trim_end_matches('/')
+        .to_string();
     eprintln!("[get_git_diff] repo={repo_norm}");
 
     // Detect whether HEAD exists (a brand-new repo with no commits has an unborn branch).
@@ -772,8 +808,8 @@ fn get_git_diff(repo_path: String, file_path: Option<String>) -> Result<String, 
             eprintln!("[get_git_diff] file={fp_norm}");
 
             // If the path looks absolute (starts with / or drive letter like C:/)
-            let looks_absolute = fp_norm.starts_with('/') ||
-                fp_norm.get(1..3).map_or(false, |s| s == ":/");
+            let looks_absolute =
+                fp_norm.starts_with('/') || fp_norm.get(1..3).map_or(false, |s| s == ":/");
 
             if looks_absolute {
                 // Strip the repo prefix to produce a relative path.
@@ -801,7 +837,9 @@ fn get_git_diff(repo_path: String, file_path: Option<String>) -> Result<String, 
     let run_diff = |extra: &[&str]| -> Result<String, String> {
         let mut cmd = std::process::Command::new("git");
         cmd.arg("-C").arg(&repo_path).arg("diff");
-        for a in extra { cmd.arg(a); }
+        for a in extra {
+            cmd.arg(a);
+        }
         if let Some(ref rel) = relative_file {
             cmd.arg("--").arg(rel);
         }
@@ -822,21 +860,37 @@ fn get_git_diff(repo_path: String, file_path: Option<String>) -> Result<String, 
 
     // On unborn branches, swallow errors rather than propagating "fatal: HEAD" messages.
     let unstaged = match run_diff(&[]) {
-        Ok(s)  => s,
-        Err(e) => if head_exists { return Err(e); } else { String::new() },
+        Ok(s) => s,
+        Err(e) => {
+            if head_exists {
+                return Err(e);
+            } else {
+                String::new()
+            }
+        }
     };
     let staged = match run_diff(&["--cached"]) {
-        Ok(s)  => s,
-        Err(e) => if head_exists { return Err(e); } else { String::new() },
+        Ok(s) => s,
+        Err(e) => {
+            if head_exists {
+                return Err(e);
+            } else {
+                String::new()
+            }
+        }
     };
-    eprintln!("[get_git_diff] head={head_exists} unstaged_len={} staged_len={}", unstaged.len(), staged.len());
+    eprintln!(
+        "[get_git_diff] head={head_exists} unstaged_len={} staged_len={}",
+        unstaged.len(),
+        staged.len()
+    );
 
     // Return combined diff when both halves have content, avoiding duplication.
     let diff = match (unstaged.is_empty(), staged.is_empty()) {
         (false, false) => format!("{unstaged}\n{staged}"),
-        (false, true)  => unstaged,
-        (true,  false) => staged,
-        (true,  true)  => String::new(),
+        (false, true) => unstaged,
+        (true, false) => staged,
+        (true, true) => String::new(),
     };
     Ok(diff)
 }
@@ -849,7 +903,9 @@ fn run_git_ro(working_dir: &str, args: &[&str]) -> Option<String> {
     #[cfg(target_os = "windows")]
     hide_console_window(&mut cmd);
     cmd.arg("-C").arg(working_dir);
-    for a in args { cmd.arg(a); }
+    for a in args {
+        cmd.arg(a);
+    }
     let out = cmd
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -865,9 +921,18 @@ fn run_git_ro(working_dir: &str, args: &[&str]) -> Option<String> {
 
 /// Truncates `s` to at most `max_bytes`, respecting UTF-8 char boundaries.
 fn cap_utf8(s: String, max_bytes: usize) -> String {
-    if s.len() <= max_bytes { return s; }
-    let boundary = (0..=max_bytes).rev().find(|&i| s.is_char_boundary(i)).unwrap_or(0);
-    format!("{}\n\nâ€¦ [truncated at {} KB]", &s[..boundary], max_bytes / 1024)
+    if s.len() <= max_bytes {
+        return s;
+    }
+    let boundary = (0..=max_bytes)
+        .rev()
+        .find(|&i| s.is_char_boundary(i))
+        .unwrap_or(0);
+    format!(
+        "{}\n\nâ€¦ [truncated at {} KB]",
+        &s[..boundary],
+        max_bytes / 1024
+    )
 }
 
 /// Probes common base-branch names and returns the first that exists in the repo.
@@ -883,24 +948,30 @@ fn detect_base_branch(repo: &str) -> String {
 /// Returns `true` for paths that are typically generated/cache noise in .NET repositories.
 fn is_repo_noise(path: &str) -> bool {
     let p = path.to_lowercase().replace('\\', "/");
-    p.starts_with("bin/")       || p.contains("/bin/")      ||
-    p.starts_with("obj/")       || p.contains("/obj/")      ||
-    p.starts_with("packages/")  || p.contains("/packages/") ||
-    p.starts_with(".vs/")       || p.contains("/.vs/")      ||
-    p.ends_with(".user")        || p.ends_with(".suo")
+    p.starts_with("bin/")
+        || p.contains("/bin/")
+        || p.starts_with("obj/")
+        || p.contains("/obj/")
+        || p.starts_with("packages/")
+        || p.contains("/packages/")
+        || p.starts_with(".vs/")
+        || p.contains("/.vs/")
+        || p.ends_with(".user")
+        || p.ends_with(".suo")
 }
 
 /// Returns `true` for paths that should be flagged as suspicious additions.
 fn is_flagged_repo_path(path: &str) -> bool {
     let p = path.to_lowercase().replace('\\', "/");
-    p.contains("copilot-instructions") ||
-    (p.contains(".github/") && p.contains("instructions"))
+    p.contains("copilot-instructions") || (p.contains(".github/") && p.contains("instructions"))
 }
 
 /// Returns `true` when an untracked file is a relevant source/config file worth
 /// including in the AI review context.  Noise and flagged paths are always excluded.
 fn is_untracked_relevant(path: &str) -> bool {
-    if is_repo_noise(path) || is_flagged_repo_path(path) { return false; }
+    if is_repo_noise(path) || is_flagged_repo_path(path) {
+        return false;
+    }
     let p = path.to_lowercase().replace('\\', "/");
     p.ends_with(".cs")
         || p.ends_with(".csproj")
@@ -951,8 +1022,19 @@ fn collect_git_review_context(
 ) -> Result<GitReviewContext, String> {
     // Resolve actual git root (walks up to find .git).
     let actual_root = run_git_ro(&repo_root, &["rev-parse", "--show-toplevel"])
-        .map(|s| s.trim().replace('\\', "/").trim_end_matches('/').to_string())
-        .unwrap_or_else(|| repo_root.trim().replace('\\', "/").trim_end_matches('/').to_string());
+        .map(|s| {
+            s.trim()
+                .replace('\\', "/")
+                .trim_end_matches('/')
+                .to_string()
+        })
+        .unwrap_or_else(|| {
+            repo_root
+                .trim()
+                .replace('\\', "/")
+                .trim_end_matches('/')
+                .to_string()
+        });
     let repo = actual_root.as_str();
 
     // Current branch
@@ -963,7 +1045,9 @@ fn collect_git_review_context(
     // Base branch: prefer explicit argument, then auto-detect
     let base = {
         let candidate = base_branch.unwrap_or_default();
-        if !candidate.is_empty() && run_git_ro(repo, &["rev-parse", "--verify", &candidate]).is_some() {
+        if !candidate.is_empty()
+            && run_git_ro(repo, &["rev-parse", "--verify", &candidate]).is_some()
+        {
             candidate
         } else {
             detect_base_branch(repo)
@@ -990,13 +1074,13 @@ fn collect_git_review_context(
     let has_unstaged = !unstaged.is_empty();
 
     // Changed files
-    let name_status = run_git_ro(repo, &["diff", "--name-status", &base_range])
-        .unwrap_or_default();
+    let name_status = run_git_ro(repo, &["diff", "--name-status", &base_range]).unwrap_or_default();
     let status_short = run_git_ro(repo, &["status", "--short"])
         .map(|s| cap_utf8(s, 4_000))
         .unwrap_or_default();
 
-    let committed_files: Vec<String> = name_status.lines()
+    let committed_files: Vec<String> = name_status
+        .lines()
         .filter_map(|line| {
             let mut parts = line.splitn(2, '\t');
             parts.next();
@@ -1006,14 +1090,16 @@ fn collect_git_review_context(
         .collect();
 
     // All modified/added files listed by status (XY prefix stripped)
-    let status_files: Vec<String> = status_short.lines()
+    let status_files: Vec<String> = status_short
+        .lines()
         .filter(|l| l.len() > 3)
         .map(|l| l[3..].trim().trim_matches('"').to_string())
         .filter(|f| !f.is_empty())
         .collect();
 
     // Untracked file paths: lines with "?? " prefix
-    let untracked_raw: Vec<String> = status_short.lines()
+    let untracked_raw: Vec<String> = status_short
+        .lines()
         .filter(|l| l.starts_with("?? "))
         .map(|l| l[3..].trim().trim_matches('"').to_string())
         .filter(|f| !f.is_empty())
@@ -1021,20 +1107,30 @@ fn collect_git_review_context(
 
     let mut all_files: Vec<String> = committed_files;
     for f in &status_files {
-        if !all_files.contains(f) { all_files.push(f.clone()); }
+        if !all_files.contains(f) {
+            all_files.push(f.clone());
+        }
     }
 
-    let noise_files:   Vec<String> = all_files.iter().filter(|f| is_repo_noise(f)).cloned().collect();
-    let flagged_paths: Vec<String> = all_files.iter().filter(|f| is_flagged_repo_path(f)).cloned().collect();
+    let noise_files: Vec<String> = all_files
+        .iter()
+        .filter(|f| is_repo_noise(f))
+        .cloned()
+        .collect();
+    let flagged_paths: Vec<String> = all_files
+        .iter()
+        .filter(|f| is_flagged_repo_path(f))
+        .cloned()
+        .collect();
 
     // â”€â”€ Read relevant untracked file content â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-    const MAX_PER_FILE:  usize = 20_000;
+    const MAX_PER_FILE: usize = 20_000;
     const MAX_UNTRACKED: usize = 60_000;
 
     let mut untracked_included: Vec<String> = Vec::new();
-    let mut untracked_skipped:  Vec<String> = Vec::new();
-    let mut untracked_parts:    Vec<String> = Vec::new();
-    let mut total_untracked:    usize        = 0;
+    let mut untracked_skipped: Vec<String> = Vec::new();
+    let mut untracked_parts: Vec<String> = Vec::new();
+    let mut total_untracked: usize = 0;
 
     for rel_path in &untracked_raw {
         if total_untracked >= MAX_UNTRACKED {
@@ -1063,7 +1159,8 @@ fn collect_git_review_context(
                 let content = cap_utf8(raw, MAX_PER_FILE);
                 total_untracked += content.len();
                 // Format as pseudo-diff so the AI review command sees new-file additions
-                let plus_lines: String = content.lines()
+                let plus_lines: String = content
+                    .lines()
                     .map(|l| format!("+{l}"))
                     .collect::<Vec<_>>()
                     .join("\n");
@@ -1083,10 +1180,18 @@ fn collect_git_review_context(
 
     // Combined diff
     let mut diff_parts: Vec<String> = Vec::new();
-    if has_committed  { diff_parts.push(format!("=== BRANCH DIFF ({base} â†’ HEAD) ===\n{branch_diff}")); }
-    if has_staged     { diff_parts.push(format!("=== STAGED CHANGES ===\n{staged}")); }
-    if has_unstaged   { diff_parts.push(format!("=== UNSTAGED CHANGES ===\n{unstaged}")); }
-    if has_untracked  {
+    if has_committed {
+        diff_parts.push(format!(
+            "=== BRANCH DIFF ({base} â†’ HEAD) ===\n{branch_diff}"
+        ));
+    }
+    if has_staged {
+        diff_parts.push(format!("=== STAGED CHANGES ===\n{staged}"));
+    }
+    if has_unstaged {
+        diff_parts.push(format!("=== UNSTAGED CHANGES ===\n{unstaged}"));
+    }
+    if has_untracked {
         diff_parts.push(format!(
             "=== UNTRACKED NEW FILES ({} file(s) â€” not yet staged) ===\n{}",
             untracked_parts.len(),
@@ -1096,11 +1201,23 @@ fn collect_git_review_context(
     let diff = diff_parts.join("\n\n");
 
     let mut src: Vec<&str> = Vec::new();
-    if has_committed  { src.push("committed branch changes"); }
-    if has_staged     { src.push("staged changes"); }
-    if has_unstaged   { src.push("unstaged changes"); }
-    if has_untracked  { src.push("untracked new files"); }
-    let sources = if src.is_empty() { "no local changes found".to_string() } else { src.join(", ") };
+    if has_committed {
+        src.push("committed branch changes");
+    }
+    if has_staged {
+        src.push("staged changes");
+    }
+    if has_unstaged {
+        src.push("unstaged changes");
+    }
+    if has_untracked {
+        src.push("untracked new files");
+    }
+    let sources = if src.is_empty() {
+        "no local changes found".to_string()
+    } else {
+        src.join(", ")
+    };
 
     let summary = format!(
         "Branch: {current_branch} â†’ base: {base}. \
@@ -1166,7 +1283,12 @@ fn collect_git_file_review_context(
 ) -> Result<GitFileReviewContext, String> {
     // 1. Resolve actual git root.
     let actual_root = run_git_ro(&repo_root, &["rev-parse", "--show-toplevel"])
-        .map(|s| s.trim().replace('\\', "/").trim_end_matches('/').to_string())
+        .map(|s| {
+            s.trim()
+                .replace('\\', "/")
+                .trim_end_matches('/')
+                .to_string()
+        })
         .ok_or_else(|| format!("Not a git repository: {repo_root}"))?;
     let repo = actual_root.as_str();
 
@@ -1223,13 +1345,19 @@ fn collect_git_file_review_context(
     // 9. Combine all diffs with section headers.
     let mut diff_parts: Vec<String> = Vec::new();
     if has_committed {
-        diff_parts.push(format!("=== BRANCH DIFF ({base} â†’ HEAD) â€” {file_rel} ===\n{committed_diff}"));
+        diff_parts.push(format!(
+            "=== BRANCH DIFF ({base} â†’ HEAD) â€” {file_rel} ===\n{committed_diff}"
+        ));
     }
     if has_staged {
-        diff_parts.push(format!("=== STAGED CHANGES â€” {file_rel} ===\n{staged_diff}"));
+        diff_parts.push(format!(
+            "=== STAGED CHANGES â€” {file_rel} ===\n{staged_diff}"
+        ));
     }
     if has_unstaged {
-        diff_parts.push(format!("=== UNSTAGED CHANGES â€” {file_rel} ===\n{unstaged_diff}"));
+        diff_parts.push(format!(
+            "=== UNSTAGED CHANGES â€” {file_rel} ===\n{unstaged_diff}"
+        ));
     }
     let diff = diff_parts.join("\n\n");
 
@@ -1251,9 +1379,11 @@ fn collect_git_file_review_context(
 /// Parses `git status --short --porcelain` output into (safe, noise) file lists.
 fn parse_git_status_output(output: &str) -> (Vec<Value>, Vec<Value>) {
     let mut changed: Vec<Value> = Vec::new();
-    let mut noise:   Vec<Value> = Vec::new();
+    let mut noise: Vec<Value> = Vec::new();
     for line in output.lines() {
-        if line.len() < 3 { continue; }
+        if line.len() < 3 {
+            continue;
+        }
         let x = line.chars().next().unwrap_or(' ');
         let y = line.chars().nth(1).unwrap_or(' ');
         let path_part = line[3..].trim();
@@ -1263,12 +1393,19 @@ fn parse_git_status_output(output: &str) -> (Vec<Value>, Vec<Value>) {
         } else {
             path_part.trim_matches('"')
         };
-        let status = if x == '?' && y == '?' { "untracked" }
-            else if x == 'A' || (x == ' ' && y == 'A') { "added" }
-            else if x == 'D' || y == 'D' { "deleted" }
-            else if x == 'R' || y == 'R' { "renamed" }
-            else if x == 'M' { "staged" }
-            else { "modified" };
+        let status = if x == '?' && y == '?' {
+            "untracked"
+        } else if x == 'A' || (x == ' ' && y == 'A') {
+            "added"
+        } else if x == 'D' || y == 'D' {
+            "deleted"
+        } else if x == 'R' || y == 'R' {
+            "renamed"
+        } else if x == 'M' {
+            "staged"
+        } else {
+            "modified"
+        };
         let entry = serde_json::json!({ "path": path, "status": status });
         if is_repo_noise(path) || is_flagged_repo_path(path) {
             noise.push(entry);
@@ -1282,11 +1419,13 @@ fn parse_git_status_output(output: &str) -> (Vec<Value>, Vec<Value>) {
 /// Parses the first fetch URL from `git remote -v` output.
 fn parse_git_fetch_url(remote_output: &str) -> (Option<String>, Option<String>) {
     for line in remote_output.lines() {
-        if !line.contains("(fetch)") { continue; }
+        if !line.contains("(fetch)") {
+            continue;
+        }
         let mut parts = line.splitn(2, '\t');
         let name = parts.next().map(str::trim);
         let rest = parts.next().unwrap_or("").trim();
-        let url  = rest.split_whitespace().next().unwrap_or("").trim();
+        let url = rest.split_whitespace().next().unwrap_or("").trim();
         if !url.is_empty() {
             return (name.map(str::to_string), Some(url.to_string()));
         }
@@ -1299,22 +1438,24 @@ fn parse_git_fetch_url(remote_output: &str) -> (Option<String>, Option<String>) 
 /// crate dependency) — good enough for a suggested branch-name slug, which the user reviews
 /// and can edit before approving.
 fn remove_diacritics_basic(s: &str) -> String {
-    s.chars().map(|c| match c {
-        'á' | 'à' | 'ä' | 'â' => 'a',
-        'č' => 'c',
-        'ď' => 'd',
-        'é' | 'è' | 'ě' | 'ë' | 'ê' => 'e',
-        'í' | 'ì' | 'î' | 'ï' => 'i',
-        'ň' => 'n',
-        'ó' | 'ò' | 'ô' | 'ö' => 'o',
-        'ř' => 'r',
-        'š' => 's',
-        'ť' => 't',
-        'ú' | 'ů' | 'ü' | 'ù' | 'û' => 'u',
-        'ý' | 'ÿ' => 'y',
-        'ž' => 'z',
-        other => other,
-    }).collect()
+    s.chars()
+        .map(|c| match c {
+            'á' | 'à' | 'ä' | 'â' => 'a',
+            'č' => 'c',
+            'ď' => 'd',
+            'é' | 'è' | 'ě' | 'ë' | 'ê' => 'e',
+            'í' | 'ì' | 'î' | 'ï' => 'i',
+            'ň' => 'n',
+            'ó' | 'ò' | 'ô' | 'ö' => 'o',
+            'ř' => 'r',
+            'š' => 's',
+            'ť' => 't',
+            'ú' | 'ů' | 'ü' | 'ù' | 'û' => 'u',
+            'ý' | 'ÿ' => 'y',
+            'ž' => 'z',
+            other => other,
+        })
+        .collect()
 }
 
 /// Sanitizes an arbitrary string into a valid Git branch-name segment. Mirrors
@@ -1342,19 +1483,24 @@ fn sanitize_branch_segment(raw: &str) -> String {
 /// `prepare_commit_for_task`'s response; the user reviews/edits it before approving.
 fn generate_branch_name(task_json: &Value) -> String {
     let devops_url = task_json["devopsTaskUrl"].as_str().unwrap_or("");
-    let title_raw  = task_json["title"].as_str().unwrap_or("");
+    let title_raw = task_json["title"].as_str().unwrap_or("");
 
     const MARKER: &str = "/_workitems/edit/";
     let work_item_id: String = if let Some(pos) = devops_url.find(MARKER) {
         let after = &devops_url[pos + MARKER.len()..];
-        let end = after.find(|c: char| !c.is_ascii_digit()).unwrap_or(after.len());
+        let end = after
+            .find(|c: char| !c.is_ascii_digit())
+            .unwrap_or(after.len());
         after[..end].to_string()
     } else {
         String::new()
     };
 
     let title_stripped = if title_raw.starts_with('[') {
-        title_raw.find(']').map(|end| title_raw[end + 1..].trim()).unwrap_or(title_raw)
+        title_raw
+            .find(']')
+            .map(|end| title_raw[end + 1..].trim())
+            .unwrap_or(title_raw)
     } else {
         title_raw
     };
@@ -1363,17 +1509,31 @@ fn generate_branch_name(task_json: &Value) -> String {
 
     let max_title_len: usize = if work_item_id.is_empty() { 73 } else { 72 };
     let truncated = if title_segment.chars().count() > max_title_len {
-        title_segment.chars().take(max_title_len).collect::<String>().trim_end_matches('-').to_string()
+        title_segment
+            .chars()
+            .take(max_title_len)
+            .collect::<String>()
+            .trim_end_matches('-')
+            .to_string()
     } else {
         title_segment
     };
 
-    let body = if work_item_id.is_empty() { truncated } else { format!("{work_item_id}-{truncated}") };
+    let body = if work_item_id.is_empty() {
+        truncated
+    } else {
+        format!("{work_item_id}-{truncated}")
+    };
     let full = format!("feature/{body}");
 
     if full.chars().count() > 80 {
         let max_body = 80 - "feature/".len();
-        let capped = body.chars().take(max_body).collect::<String>().trim_end_matches('-').to_string();
+        let capped = body
+            .chars()
+            .take(max_body)
+            .collect::<String>()
+            .trim_end_matches('-')
+            .to_string();
         format!("feature/{capped}")
     } else {
         full
@@ -1382,39 +1542,64 @@ fn generate_branch_name(task_json: &Value) -> String {
 
 /// Derives a deterministic commit message from task JSON.
 fn generate_commit_message(task_json: &Value) -> String {
-    let title     = task_json["title"].as_str().unwrap_or("").trim();
+    let title = task_json["title"].as_str().unwrap_or("").trim();
     let devops_url = task_json["devopsTaskUrl"].as_str().unwrap_or("");
     // Extract numeric work-item ID from /_workitems/edit/<N>/
     let task_id: String = {
         const MARKER: &str = "/_workitems/edit/";
         if let Some(pos) = devops_url.find(MARKER) {
             let after = &devops_url[pos + MARKER.len()..];
-            let end = after.find(|c: char| !c.is_ascii_digit()).unwrap_or(after.len());
+            let end = after
+                .find(|c: char| !c.is_ascii_digit())
+                .unwrap_or(after.len());
             after[..end].to_string()
-        } else { String::new() }
+        } else {
+            String::new()
+        }
     };
     // Strip leading bracketed prefix like [TEST], [FEATURE] â€¦
     let clean = {
         let s = title;
         let s = if s.starts_with('[') {
-            if let Some(end) = s.find(']') { s[end + 1..].trim() } else { s }
-        } else { s };
+            if let Some(end) = s.find(']') {
+                s[end + 1..].trim()
+            } else {
+                s
+            }
+        } else {
+            s
+        };
         if s.chars().count() > 72 {
             format!("{}...", s.chars().take(69).collect::<String>())
         } else {
             s.to_string()
         }
     };
-    let base = if clean.is_empty() { "Update task files".to_string() } else { clean };
-    if task_id.is_empty() { base } else { format!("{task_id}: {base}") }
+    let base = if clean.is_empty() {
+        "Update task files".to_string()
+    } else {
+        clean
+    };
+    if task_id.is_empty() {
+        base
+    } else {
+        format!("{task_id}: {base}")
+    }
 }
 
 /// Core logic for getting commit preview â€” shared by Tauri command and MCP handler.
 fn git_commit_preview_impl(repo_root: &str, task_json: Option<&Value>) -> Result<Value, String> {
     // Resolve canonical git root â€” explicit error when path is not a git repo.
     let canonical_root = run_git_ro(repo_root, &["rev-parse", "--show-toplevel"])
-        .map(|s| s.trim().replace('\\', "/").trim_end_matches('/').to_string())
-        .ok_or_else(|| format!("Configured repository root is not a Git repository: {repo_root}"))?;
+        .map(|s| {
+            s.trim()
+                .replace('\\', "/")
+                .trim_end_matches('/')
+                .to_string()
+        })
+        .ok_or_else(|| {
+            format!("Configured repository root is not a Git repository: {repo_root}")
+        })?;
     let repo = canonical_root.as_str();
 
     // Check whether HEAD exists (fails in a brand-new repo with no commits).
@@ -1426,8 +1611,11 @@ fn git_commit_preview_impl(repo_root: &str, task_json: Option<&Value>) -> Result
         // Fallback: parse from .git/HEAD file directly
         .or_else(|| {
             let head_path = std::path::Path::new(repo).join(".git").join("HEAD");
-            std::fs::read_to_string(&head_path).ok()
-                .and_then(|c| c.trim().strip_prefix("ref: refs/heads/").map(str::to_string))
+            std::fs::read_to_string(&head_path).ok().and_then(|c| {
+                c.trim()
+                    .strip_prefix("ref: refs/heads/")
+                    .map(str::to_string)
+            })
         })
         .unwrap_or_default();
 
@@ -1443,13 +1631,28 @@ fn git_commit_preview_impl(repo_root: &str, task_json: Option<&Value>) -> Result
         warnings.push("Repository has no commits yet; preview is based on git status only.".into());
     }
     if branch == "main" || branch == "master" {
-        warnings.push(format!("Branch '{}' is the default branch â€” push will be blocked.", branch));
+        warnings.push(format!(
+            "Branch '{}' is the default branch â€” push will be blocked.",
+            branch
+        ));
     }
-    if branch.is_empty() { warnings.push("Could not determine branch.".into()); }
-    if changed.is_empty() && noise.is_empty() { warnings.push("No changes detected.".into()); }
-    else if changed.is_empty() { warnings.push("All changed files are in the exclusion list.".into()); }
-    if !noise.is_empty() { warnings.push(format!("{} file(s) excluded (bin/, obj/, .vs/, â€¦).", noise.len())); }
-    if remote_url.is_none() { warnings.push("No remote configured â€” push will not be available.".into()); }
+    if branch.is_empty() {
+        warnings.push("Could not determine branch.".into());
+    }
+    if changed.is_empty() && noise.is_empty() {
+        warnings.push("No changes detected.".into());
+    } else if changed.is_empty() {
+        warnings.push("All changed files are in the exclusion list.".into());
+    }
+    if !noise.is_empty() {
+        warnings.push(format!(
+            "{} file(s) excluded (bin/, obj/, .vs/, â€¦).",
+            noise.len()
+        ));
+    }
+    if remote_url.is_none() {
+        warnings.push("No remote configured â€” push will not be available.".into());
+    }
 
     let suggested_message = task_json
         .map(|t| generate_commit_message(t))
@@ -1457,7 +1660,8 @@ fn git_commit_preview_impl(repo_root: &str, task_json: Option<&Value>) -> Result
 
     // Detect remote base and check whether current HEAD has a usable merge base.
     let base_branch = detect_remote_base_branch(repo);
-    let has_merge_base = base_branch.as_deref()
+    let has_merge_base = base_branch
+        .as_deref()
         .map(|b| has_merge_base_with_remote(repo, b))
         .unwrap_or(false);
     // A feature branch can produce a normal PR only when it is not a default branch,
@@ -1476,12 +1680,16 @@ fn git_commit_preview_impl(repo_root: &str, task_json: Option<&Value>) -> Result
     // Detect upstream tracking configuration.
     // `git rev-parse --abbrev-ref --symbolic-full-name @{u}` returns e.g. "origin/main"
     // or exits non-zero when no upstream is configured.
-    let upstream_branch = run_git_ro(repo, &["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"])
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty());
+    let upstream_branch = run_git_ro(
+        repo,
+        &["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"],
+    )
+    .map(|s| s.trim().to_string())
+    .filter(|s| !s.is_empty());
     let has_upstream = upstream_branch.is_some();
     let expected_upstream = format!("origin/{branch}");
-    let upstream_matches = upstream_branch.as_deref()
+    let upstream_matches = upstream_branch
+        .as_deref()
         .map(|u| u == expected_upstream)
         .unwrap_or(false);
 
@@ -1528,8 +1736,15 @@ fn git_commit_preview_impl(repo_root: &str, task_json: Option<&Value>) -> Result
     // checkoutPerformed are always false here by construction. Approving/creating the branch
     // requires a separate explicit call to create_or_checkout_task_branch.
     let proposed_branch_name = task_json.map(generate_branch_name);
-    let branch_exists = proposed_branch_name.as_deref()
-        .map(|name| run_git_ro(repo, &["rev-parse", "--verify", &format!("refs/heads/{name}")]).is_some())
+    let branch_exists = proposed_branch_name
+        .as_deref()
+        .map(|name| {
+            run_git_ro(
+                repo,
+                &["rev-parse", "--verify", &format!("refs/heads/{name}")],
+            )
+            .is_some()
+        })
         .unwrap_or(false);
     let next_action = match &proposed_branch_name {
         Some(name) if *name == branch => "ready_to_commit",
@@ -1590,8 +1805,13 @@ fn git_commit_preview_impl(repo_root: &str, task_json: Option<&Value>) -> Result
 /// "no task-scoping information available" rather than "no related files", per
 /// git_commit_impl's unrelated-files guard.
 fn task_mcp_related_implementation_files(task: &Value) -> Vec<String> {
-    task["crmDeveloperWorkflow"]["lastAiImplementation"]["filesChanged"].as_array()
-        .map(|a| a.iter().filter_map(|v| v.as_str().map(|s| s.replace('\\', "/"))).collect())
+    task["crmDeveloperWorkflow"]["lastAiImplementation"]["filesChanged"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(|s| s.replace('\\', "/")))
+                .collect()
+        })
         .unwrap_or_default()
 }
 
@@ -1601,11 +1821,21 @@ fn task_mcp_related_implementation_files(task: &Value) -> Vec<String> {
 /// dispatch. Both match arms call this so their argument handling can never drift apart.
 fn task_mcp_parse_commit_args(args: &Value) -> (String, Vec<String>, Vec<String>, bool) {
     let message = args["message"].as_str().unwrap_or("").trim().to_string();
-    let files: Vec<String> = args["files"].as_array()
-        .map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
+    let files: Vec<String> = args["files"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect()
+        })
         .unwrap_or_default();
-    let force_add_files: Vec<String> = args["forceAddFiles"].as_array()
-        .map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
+    let force_add_files: Vec<String> = args["forceAddFiles"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect()
+        })
         .unwrap_or_default();
     let confirm_unrelated = args["confirmUnrelatedFiles"].as_bool().unwrap_or(false);
     (message, files, force_add_files, confirm_unrelated)
@@ -1632,8 +1862,12 @@ fn git_commit_impl(
     related_files: &[String],
     confirm_unrelated: bool,
 ) -> Result<Value, String> {
-    if message.trim().is_empty() { return Err("Commit message cannot be empty.".into()); }
-    if files.is_empty() { return Err("No files specified for commit.".into()); }
+    if message.trim().is_empty() {
+        return Err("Commit message cannot be empty.".into());
+    }
+    if files.is_empty() {
+        return Err("No files specified for commit.".into());
+    }
 
     let branch = run_git_ro(repo_root, &["branch", "--show-current"]).unwrap_or_default();
     if branch == "main" || branch == "master" {
@@ -1656,7 +1890,8 @@ fn git_commit_impl(
     if !related_files.is_empty() && !confirm_unrelated {
         let related_set: std::collections::HashSet<String> =
             related_files.iter().map(|f| f.replace('\\', "/")).collect();
-        let unrelated: Vec<&str> = files.iter()
+        let unrelated: Vec<&str> = files
+            .iter()
             .map(|f| f.as_str())
             .filter(|f| !related_set.contains(&f.replace('\\', "/")))
             .collect();
@@ -1668,8 +1903,10 @@ fn git_commit_impl(
         }
     }
 
-    let force_set: std::collections::HashSet<&str> = force_add_files.iter().map(String::as_str).collect();
-    let (to_force, to_check): (Vec<&String>, Vec<&String>) = files.iter().partition(|f| force_set.contains(f.as_str()));
+    let force_set: std::collections::HashSet<&str> =
+        force_add_files.iter().map(String::as_str).collect();
+    let (to_force, to_check): (Vec<&String>, Vec<&String>) =
+        files.iter().partition(|f| force_set.contains(f.as_str()));
 
     let mut blocked_by_gitignore: Vec<String> = Vec::new();
     let mut normal_files: Vec<&String> = Vec::new();
@@ -1692,10 +1929,17 @@ fn git_commit_impl(
         let mut cmd = std::process::Command::new("git");
         hide_console_window(&mut cmd);
         cmd.arg("-C").arg(repo_root).arg("add").arg("--");
-        for f in &normal_files { cmd.arg(f); }
-        let out = cmd.output().map_err(|e| format!("Failed to run git add: {e}"))?;
+        for f in &normal_files {
+            cmd.arg(f);
+        }
+        let out = cmd
+            .output()
+            .map_err(|e| format!("Failed to run git add: {e}"))?;
         if !out.status.success() {
-            return Err(format!("git add failed: {}", String::from_utf8_lossy(&out.stderr).trim()));
+            return Err(format!(
+                "git add failed: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            ));
         }
     }
     // git add -f -- <explicitly force-added files>
@@ -1703,10 +1947,17 @@ fn git_commit_impl(
         let mut cmd = std::process::Command::new("git");
         hide_console_window(&mut cmd);
         cmd.arg("-C").arg(repo_root).arg("add").arg("-f").arg("--");
-        for f in &to_force { cmd.arg(f); }
-        let out = cmd.output().map_err(|e| format!("Failed to run git add -f: {e}"))?;
+        for f in &to_force {
+            cmd.arg(f);
+        }
+        let out = cmd
+            .output()
+            .map_err(|e| format!("Failed to run git add -f: {e}"))?;
         if !out.status.success() {
-            return Err(format!("git add -f failed: {}", String::from_utf8_lossy(&out.stderr).trim()));
+            return Err(format!(
+                "git add -f failed: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            ));
         }
     }
 
@@ -1714,8 +1965,12 @@ fn git_commit_impl(
     git_run(repo_root, &["commit", "-m", message.trim()])
         .map_err(|e| format!("git commit failed: {e}"))?;
     let hash = git_run(repo_root, &["rev-parse", "--short", "HEAD"])
-        .unwrap_or_default().trim().to_string();
-    Ok(serde_json::json!({ "ok": true, "commitHash": hash, "branch": branch, "summary": format!("Commit {hash} created.") }))
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    Ok(
+        serde_json::json!({ "ok": true, "commitHash": hash, "branch": branch, "summary": format!("Commit {hash} created.") }),
+    )
 }
 
 /// Core logic for pushing the current branch â€” shared by Tauri command and MCP handler.
@@ -1728,17 +1983,27 @@ fn git_commit_impl(
 fn git_push_impl(repo_root: &str) -> Result<Value, String> {
     let branch = git_run(repo_root, &["branch", "--show-current"])
         .map_err(|e| format!("Cannot determine branch: {e}"))?
-        .trim().to_string();
-    if branch.is_empty() { return Err("Cannot push: detached HEAD or no branch.".into()); }
+        .trim()
+        .to_string();
+    if branch.is_empty() {
+        return Err("Cannot push: detached HEAD or no branch.".into());
+    }
     if branch == "main" || branch == "master" {
-        return Err(format!("Push to '{branch}' is blocked from Task Workbench. Use a feature branch."));
+        return Err(format!(
+            "Push to '{branch}' is blocked from Task Workbench. Use a feature branch."
+        ));
     }
 
     // Determine current upstream (if any). `@{u}` resolves to e.g. "origin/main" or
     // "origin/VSM/10277". Returns None when no upstream is set.
-    let upstream = run_git_ro(repo_root, &["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"]);
+    let upstream = run_git_ro(
+        repo_root,
+        &["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"],
+    );
     let expected_upstream = format!("origin/{branch}");
-    let needs_set_upstream = upstream.as_deref().map(str::trim)
+    let needs_set_upstream = upstream
+        .as_deref()
+        .map(str::trim)
         .map(|u| u != expected_upstream)
         .unwrap_or(true); // None â†’ no upstream â†’ also needs set-upstream
 
@@ -1747,11 +2012,12 @@ fn git_push_impl(repo_root: &str) -> Result<Value, String> {
         git_run(repo_root, &["push", "--set-upstream", "origin", &branch])
             .map_err(|e| format!("git push --set-upstream failed: {e}"))?;
     } else {
-        git_run(repo_root, &["push"])
-            .map_err(|e| format!("git push failed: {e}"))?;
+        git_run(repo_root, &["push"]).map_err(|e| format!("git push failed: {e}"))?;
     }
 
-    Ok(serde_json::json!({ "ok": true, "branch": branch, "summary": format!("Branch '{branch}' pushed.") }))
+    Ok(
+        serde_json::json!({ "ok": true, "branch": branch, "summary": format!("Branch '{branch}' pushed.") }),
+    )
 }
 
 /// Detects the remote default/base branch.
@@ -1787,19 +2053,34 @@ fn has_merge_base_with_remote(repo_root: &str, base_ref: &str) -> bool {
 /// Validates a Git branch name for safety. Returns Err with a human-readable reason.
 fn validate_git_branch_name(name: &str) -> Result<(), String> {
     let t = name.trim();
-    if t.is_empty()            { return Err("Branch name cannot be empty.".into()); }
-    if t.contains("..")        { return Err("Branch name must not contain \"..\"".into()); }
-    if t.starts_with('-')      { return Err("Branch name must not start with \"-\".".into()); }
-    if t.ends_with('.')        { return Err("Branch name must not end with \".\".".into()); }
-    if t.contains(' ')         { return Err("Branch name must not contain spaces.".into()); }
-    if t.contains('\\')        { return Err("Branch name must not contain backslash.".into()); }
+    if t.is_empty() {
+        return Err("Branch name cannot be empty.".into());
+    }
+    if t.contains("..") {
+        return Err("Branch name must not contain \"..\"".into());
+    }
+    if t.starts_with('-') {
+        return Err("Branch name must not start with \"-\".".into());
+    }
+    if t.ends_with('.') {
+        return Err("Branch name must not end with \".\".".into());
+    }
+    if t.contains(' ') {
+        return Err("Branch name must not contain spaces.".into());
+    }
+    if t.contains('\\') {
+        return Err("Branch name must not contain backslash.".into());
+    }
     for ch in ['~', '^', ':', '?', '*', '['] {
         if t.contains(ch) {
             return Err(format!("Branch name must not contain '{ch}'."));
         }
     }
     if t == "main" || t == "master" {
-        return Err(format!("\"{}\" is a default branch â€” use a feature branch name.", t));
+        return Err(format!(
+            "\"{}\" is a default branch â€” use a feature branch name.",
+            t
+        ));
     }
     if t.starts_with("refs/") {
         return Err("Branch name must not start with \"refs/\".".into());
@@ -1826,9 +2107,11 @@ fn create_git_branch_impl(repo_root: &str, branch_name: &str) -> Result<Value, S
         let out = {
             let mut cmd = std::process::Command::new("git");
             hide_console_window(&mut cmd);
-            cmd.arg("-C").arg(repo_root)
+            cmd.arg("-C")
+                .arg(repo_root)
                 .args(["fetch", "origin", "--prune"]);
-            cmd.output().map_err(|e| format!("Failed to run git fetch: {e}"))?
+            cmd.output()
+                .map_err(|e| format!("Failed to run git fetch: {e}"))?
         };
         if !out.status.success() {
             let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
@@ -1840,12 +2123,12 @@ fn create_git_branch_impl(repo_root: &str, branch_name: &str) -> Result<Value, S
     }
 
     // Detect remote base branch (after fetch so refs are fresh).
-    let base_branch = detect_remote_base_branch(repo_root)
-        .ok_or_else(|| {
-            "No remote base branch found (tried origin/main and origin/master). \
+    let base_branch = detect_remote_base_branch(repo_root).ok_or_else(|| {
+        "No remote base branch found (tried origin/main and origin/master). \
              Cannot create a branch with a valid PR base. \
-             Ensure a remote named 'origin' is configured and has a main or master branch.".to_string()
-        })?;
+             Ensure a remote named 'origin' is configured and has a main or master branch."
+            .to_string()
+    })?;
 
     // Guard: if uncommitted changes exist and there's no merge base, switching the
     // working tree base would risk losing or mangling those changes.
@@ -1863,7 +2146,10 @@ fn create_git_branch_impl(repo_root: &str, branch_name: &str) -> Result<Value, S
     }
 
     // Reject if the target branch already exists.
-    let already = run_git_ro(repo_root, &["rev-parse", "--verify", &format!("refs/heads/{name}")]);
+    let already = run_git_ro(
+        repo_root,
+        &["rev-parse", "--verify", &format!("refs/heads/{name}")],
+    );
     if already.is_some() {
         return Err(format!("Branch '{name}' already exists."));
     }
@@ -1874,9 +2160,15 @@ fn create_git_branch_impl(repo_root: &str, branch_name: &str) -> Result<Value, S
     let out = {
         let mut cmd = std::process::Command::new("git");
         hide_console_window(&mut cmd);
-        cmd.arg("-C").arg(repo_root)
-            .arg("checkout").arg("--no-track").arg("-b").arg(name).arg(&base_branch);
-        cmd.output().map_err(|e| format!("Failed to run git checkout -b: {e}"))?
+        cmd.arg("-C")
+            .arg(repo_root)
+            .arg("checkout")
+            .arg("--no-track")
+            .arg("-b")
+            .arg(name)
+            .arg(&base_branch);
+        cmd.output()
+            .map_err(|e| format!("Failed to run git checkout -b: {e}"))?
     };
     if !out.status.success() {
         let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
@@ -1907,7 +2199,10 @@ fn create_git_branch(repo_root: String, branch_name: String) -> Result<Value, St
 /// overwrite uncommitted local changes, git's own checkout refusal is surfaced verbatim as the
 /// blocker — this function never adds `--force`/`-f`, never stashes, and never discards changes.
 /// Never commits, pushes, or modifies any tracked file's content.
-fn checkout_or_create_task_branch_impl(repo_root: &str, branch_name: &str) -> Result<Value, String> {
+fn checkout_or_create_task_branch_impl(
+    repo_root: &str,
+    branch_name: &str,
+) -> Result<Value, String> {
     let name = branch_name.trim();
     validate_git_branch_name(name)?;
 
@@ -1915,7 +2210,11 @@ fn checkout_or_create_task_branch_impl(repo_root: &str, branch_name: &str) -> Re
         .ok_or_else(|| format!("Not a Git repository: {repo_root}"))?;
 
     let previous_branch = run_git_ro(repo_root, &["branch", "--show-current"]).unwrap_or_default();
-    let already_exists = run_git_ro(repo_root, &["rev-parse", "--verify", &format!("refs/heads/{name}")]).is_some();
+    let already_exists = run_git_ro(
+        repo_root,
+        &["rev-parse", "--verify", &format!("refs/heads/{name}")],
+    )
+    .is_some();
 
     let (branch_created, checkout_args): (bool, Vec<&str>) = if already_exists {
         (false, vec!["checkout", name])
@@ -1938,7 +2237,8 @@ fn checkout_or_create_task_branch_impl(repo_root: &str, branch_name: &str) -> Re
         let mut cmd = std::process::Command::new("git");
         hide_console_window(&mut cmd);
         cmd.arg("-C").arg(repo_root).args(&checkout_args);
-        cmd.output().map_err(|e| format!("Failed to run git checkout: {e}"))?
+        cmd.output()
+            .map_err(|e| format!("Failed to run git checkout: {e}"))?
     };
     if !out.status.success() {
         let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
@@ -1963,16 +2263,26 @@ fn checkout_or_create_task_branch_impl(repo_root: &str, branch_name: &str) -> Re
 
 /// Resolves the repository root for a task in the MCP bridge context.
 fn mcp_resolve_repo_root_for_task(app: &tauri::AppHandle, task: &Value) -> Result<String, String> {
-    if let Some(r) = task["workflowSetup"]["repositoryRoot"].as_str().filter(|s| !s.is_empty()) {
+    if let Some(r) = task["workflowSetup"]["repositoryRoot"]
+        .as_str()
+        .filter(|s| !s.is_empty())
+    {
         return Ok(r.to_string());
     }
     let customer_id = task["customerId"].as_str().unwrap_or("");
     if !customer_id.is_empty() {
         if let Ok(customers) = task_mcp_load_customers(app) {
-            if let Some(c) = customers.iter().find(|c| c["id"].as_str() == Some(customer_id)) {
-                let root = c["repositoryRootOverride"].as_str().filter(|s| !s.is_empty())
+            if let Some(c) = customers
+                .iter()
+                .find(|c| c["id"].as_str() == Some(customer_id))
+            {
+                let root = c["repositoryRootOverride"]
+                    .as_str()
+                    .filter(|s| !s.is_empty())
                     .or_else(|| c["repositoryRoot"].as_str().filter(|s| !s.is_empty()));
-                if let Some(r) = root { return Ok(r.to_string()); }
+                if let Some(r) = root {
+                    return Ok(r.to_string());
+                }
             }
         }
     }
@@ -1993,8 +2303,20 @@ fn get_git_commit_preview(repo_root: String, task_json: Option<Value>) -> Result
 /// approved. The UI has no task-implementation-file scoping, so the "unrelated files" guard is
 /// not applicable here (empty `related_files`).
 #[tauri::command]
-fn commit_task_changes(repo_root: String, files: Vec<String>, message: String, force_add_files: Option<Vec<String>>) -> Result<Value, String> {
-    git_commit_impl(&repo_root, &files, &message, &force_add_files.unwrap_or_default(), &[], true)
+fn commit_task_changes(
+    repo_root: String,
+    files: Vec<String>,
+    message: String,
+    force_add_files: Option<Vec<String>>,
+) -> Result<Value, String> {
+    git_commit_impl(
+        &repo_root,
+        &files,
+        &message,
+        &force_add_files.unwrap_or_default(),
+        &[],
+        true,
+    )
 }
 
 /// Pushes the current branch to origin.
@@ -2008,7 +2330,10 @@ fn push_task_branch(repo_root: String) -> Result<Value, String> {
 /// `create_or_checkout_task_branch` tool's `checkout_or_create_task_branch_impl` core logic —
 /// see that function for the full safety contract). Never pushes, commits, or modifies files.
 #[tauri::command]
-fn create_or_checkout_task_branch_command(repo_root: String, branch_name: String) -> Result<Value, String> {
+fn create_or_checkout_task_branch_command(
+    repo_root: String,
+    branch_name: String,
+) -> Result<Value, String> {
     checkout_or_create_task_branch_impl(&repo_root, &branch_name)
 }
 
@@ -2020,8 +2345,18 @@ fn commit_and_push_task_changes(
     message: String,
     force_add_files: Option<Vec<String>>,
 ) -> Result<Value, String> {
-    let commit_result = git_commit_impl(&repo_root, &files, &message, &force_add_files.unwrap_or_default(), &[], true)?;
-    let hash = commit_result["commitHash"].as_str().unwrap_or("?").to_string();
+    let commit_result = git_commit_impl(
+        &repo_root,
+        &files,
+        &message,
+        &force_add_files.unwrap_or_default(),
+        &[],
+        true,
+    )?;
+    let hash = commit_result["commitHash"]
+        .as_str()
+        .unwrap_or("?")
+        .to_string();
     let push_result = git_push_impl(&repo_root)?;
     let branch = push_result["branch"].as_str().unwrap_or("?").to_string();
     Ok(serde_json::json!({
@@ -2051,13 +2386,23 @@ fn get_ai_config(app: &tauri::AppHandle) -> Result<AiConfig, String> {
     let path = app_data_dir(app)?.join("settings.json");
     let settings = read_json(&path)?;
 
-    let provider = settings["activeAiProvider"].as_str().unwrap_or("openai").to_string();
+    let provider = settings["activeAiProvider"]
+        .as_str()
+        .unwrap_or("openai")
+        .to_string();
 
     let (api_key, model) = if provider == "anthropic" {
-        let key = settings["anthropicApiKey"].as_str().unwrap_or("").to_string();
+        let key = settings["anthropicApiKey"]
+            .as_str()
+            .unwrap_or("")
+            .to_string();
         let mdl = {
             let m = settings["anthropicModel"].as_str().unwrap_or("");
-            if m.is_empty() { "claude-sonnet-4-5".to_string() } else { m.to_string() }
+            if m.is_empty() {
+                "claude-sonnet-4-5".to_string()
+            } else {
+                m.to_string()
+            }
         };
         (key, mdl)
     } else {
@@ -2074,7 +2419,11 @@ fn get_ai_config(app: &tauri::AppHandle) -> Result<AiConfig, String> {
             let m = settings["openaiModel"].as_str().unwrap_or("");
             if m.is_empty() {
                 let legacy = settings["aiModel"].as_str().unwrap_or("");
-                if legacy.is_empty() { "gpt-4.1-mini".to_string() } else { legacy.to_string() }
+                if legacy.is_empty() {
+                    "gpt-4.1-mini".to_string()
+                } else {
+                    legacy.to_string()
+                }
             } else {
                 m.to_string()
             }
@@ -2083,13 +2432,21 @@ fn get_ai_config(app: &tauri::AppHandle) -> Result<AiConfig, String> {
     };
 
     if api_key.is_empty() {
-        let label = if provider == "anthropic" { "Anthropic" } else { "OpenAI" };
+        let label = if provider == "anthropic" {
+            "Anthropic"
+        } else {
+            "OpenAI"
+        };
         return Err(format!(
             "AI API key not configured. Add your {label} API key in Settings â†’ AI."
         ));
     }
 
-    Ok(AiConfig { provider, api_key, model })
+    Ok(AiConfig {
+        provider,
+        api_key,
+        model,
+    })
 }
 
 /// Legacy helper â€” kept to avoid touching unchanged call sites individually.
@@ -2132,7 +2489,8 @@ async fn call_openai_with_temperature(
     }
 
     // Collect parameter names sent (excluding api_key which travels in the Authorization header).
-    let sent_params: Vec<String> = body.as_object()
+    let sent_params: Vec<String> = body
+        .as_object()
         .map(|o| o.keys().cloned().collect())
         .unwrap_or_default();
 
@@ -2157,7 +2515,7 @@ async fn call_openai_with_temperature(
                 "\n\nNote: an unsupported parameter was rejected by the model. \
                  Task Workbench omits unsupported parameters automatically for recognized \
                  models. If this error persists, the model name may not be recognized â€” \
-                 try using a known model such as gpt-4.1-mini."
+                 try using a known model such as gpt-4.1-mini.",
             );
         }
         return Err(msg);
@@ -2196,7 +2554,8 @@ async fn call_anthropic_text(
         }
     }
 
-    let sent_params: Vec<String> = body.as_object()
+    let sent_params: Vec<String> = body
+        .as_object()
         .map(|o| o.keys().cloned().collect())
         .unwrap_or_default();
 
@@ -2226,12 +2585,19 @@ async fn call_anthropic_text(
         .map(|s| s.to_string())
         .ok_or_else(|| {
             let snippet = json.to_string();
-            format!("Unexpected Anthropic response format: {}", &snippet[..snippet.len().min(300)])
+            format!(
+                "Unexpected Anthropic response format: {}",
+                &snippet[..snippet.len().min(300)]
+            )
         })
 }
 
 /// Provider-aware AI text call. Routes to OpenAI or Anthropic based on config.
-async fn call_ai_text(config: &AiConfig, instructions: &str, prompt: &str) -> Result<String, String> {
+async fn call_ai_text(
+    config: &AiConfig,
+    instructions: &str,
+    prompt: &str,
+) -> Result<String, String> {
     call_ai_text_with_temperature(config, instructions, prompt, None).await
 }
 
@@ -2243,9 +2609,23 @@ async fn call_ai_text_with_temperature(
     temperature: Option<f64>,
 ) -> Result<String, String> {
     if config.provider == "anthropic" {
-        call_anthropic_text(&config.api_key, &config.model, instructions, prompt, temperature).await
+        call_anthropic_text(
+            &config.api_key,
+            &config.model,
+            instructions,
+            prompt,
+            temperature,
+        )
+        .await
     } else {
-        call_openai_with_temperature(&config.api_key, &config.model, instructions, prompt, temperature).await
+        call_openai_with_temperature(
+            &config.api_key,
+            &config.model,
+            instructions,
+            prompt,
+            temperature,
+        )
+        .await
     }
 }
 
@@ -2283,8 +2663,10 @@ fn normalize_task_analysis(mut v: Value) -> Value {
     // Fix null bilingual array fields â€” only touch keys that already exist in the response
     let array_fields = [
         "problemPoints",
-        "problemPointsCz", "problemPointsEn",
-        "actionPointsCz",  "actionPointsEn",
+        "problemPointsCz",
+        "problemPointsEn",
+        "actionPointsCz",
+        "actionPointsEn",
     ];
     for key in &array_fields {
         if v.get(*key).is_some() && !v[key].is_array() {
@@ -2298,16 +2680,20 @@ fn normalize_task_analysis(mut v: Value) -> Value {
 
 /// Analyses a task using AI and returns a TaskAnalysis JSON object.
 #[tauri::command]
-async fn analyze_task(app: tauri::AppHandle, task: Value, customer: Value) -> Result<Value, String> {
+async fn analyze_task(
+    app: tauri::AppHandle,
+    task: Value,
+    customer: Value,
+) -> Result<Value, String> {
     let config = get_ai_config(&app)?;
 
-    let title         = task["title"].as_str().unwrap_or("");
-    let task_type     = task["taskType"].as_str().unwrap_or("");
-    let source        = task["source"].as_str().unwrap_or("");
-    let message       = task["originalMessage"].as_str().unwrap_or("");
+    let title = task["title"].as_str().unwrap_or("");
+    let task_type = task["taskType"].as_str().unwrap_or("");
+    let source = task["source"].as_str().unwrap_or("");
+    let message = task["originalMessage"].as_str().unwrap_or("");
     let customer_name = customer["name"].as_str().unwrap_or("Unknown");
-    let namespace     = customer["namespace"].as_str().unwrap_or("");
-    let repo_name     = customer["repositoryName"].as_str().unwrap_or("");
+    let namespace = customer["namespace"].as_str().unwrap_or("");
+    let repo_name = customer["repositoryName"].as_str().unwrap_or("");
 
     let instructions = "You are a Dynamics 365 / Dataverse developer assistant. \
 Return ONLY valid JSON â€” no markdown, no prose, no code fences. \
@@ -2360,13 +2746,17 @@ Rules â€” follow strictly:\n\
 
 /// Generates a professional reply draft. Returns plain text.
 #[tauri::command]
-async fn generate_reply(app: tauri::AppHandle, task: Value, customer: Value) -> Result<String, String> {
+async fn generate_reply(
+    app: tauri::AppHandle,
+    task: Value,
+    customer: Value,
+) -> Result<String, String> {
     let config = get_ai_config(&app)?;
 
-    let title         = task["title"].as_str().unwrap_or("");
-    let task_type     = task["taskType"].as_str().unwrap_or("");
-    let status        = task["status"].as_str().unwrap_or("");
-    let message       = task["originalMessage"].as_str().unwrap_or("");
+    let title = task["title"].as_str().unwrap_or("");
+    let task_type = task["taskType"].as_str().unwrap_or("");
+    let status = task["status"].as_str().unwrap_or("");
+    let message = task["originalMessage"].as_str().unwrap_or("");
     let customer_name = customer["name"].as_str().unwrap_or("there");
 
     let instructions = "Write brief professional client replies. Plain text only â€” no markdown.";
@@ -2384,19 +2774,24 @@ set clear expectations. End with 'Best regards'."
 
 /// Generates a C# plugin skeleton and returns a SkeletonPreview JSON object.
 #[tauri::command]
-async fn generate_skeleton_preview(app: tauri::AppHandle, task: Value, customer: Value) -> Result<Value, String> {
+async fn generate_skeleton_preview(
+    app: tauri::AppHandle,
+    task: Value,
+    customer: Value,
+) -> Result<Value, String> {
     let config = get_ai_config(&app)?;
 
-    let title     = task["title"].as_str().unwrap_or("");
+    let title = task["title"].as_str().unwrap_or("");
     let task_type = task["taskType"].as_str().unwrap_or("");
-    let message   = task["originalMessage"].as_str().unwrap_or("");
+    let message = task["originalMessage"].as_str().unwrap_or("");
     // Namespace priority:
     //   1. customer.namespace (explicitly configured for the customer)
     //   2. workflowSetup.pluginProject (the confirmed project = its root namespace in the built-in template)
     //   3. task.selectedPluginProject
     //   4. hard-coded fallback
-    let customer_ns  = customer["namespace"].as_str().unwrap_or("");
-    let plugin_proj  = task["workflowSetup"]["pluginProject"].as_str()
+    let customer_ns = customer["namespace"].as_str().unwrap_or("");
+    let plugin_proj = task["workflowSetup"]["pluginProject"]
+        .as_str()
         .or_else(|| task["selectedPluginProject"].as_str())
         .unwrap_or("");
     let namespace: &str = if !customer_ns.is_empty() {
@@ -2482,7 +2877,10 @@ async fn run_ai_file_review(
     let raw = fs::read_to_string(&file_path)
         .map_err(|e| format!("Cannot read file '{file_path}': {e}"))?;
     let content = if raw.len() > MAX_BYTES {
-        let boundary = (0..=MAX_BYTES).rev().find(|&i| raw.is_char_boundary(i)).unwrap_or(0);
+        let boundary = (0..=MAX_BYTES)
+            .rev()
+            .find(|&i| raw.is_char_boundary(i))
+            .unwrap_or(0);
         format!("{}\n\nâ€¦ [file truncated at 200 KB]", &raw[..boundary])
     } else {
         raw
@@ -2493,9 +2891,7 @@ async fn run_ai_file_review(
         .map(|n| n.to_string_lossy().to_string())
         .unwrap_or_else(|| file_path.clone());
 
-    let prompt = format!(
-        "Review the following file: **{file_name}**\n\n```\n{content}\n```"
-    );
+    let prompt = format!("Review the following file: **{file_name}**\n\n```\n{content}\n```");
 
     // Append structured-JSON format requirement to whatever reviewer instructions were provided.
     let json_format_requirement = r#"
@@ -2541,8 +2937,13 @@ Pravidla:
         format!("{instructions}{json_format_requirement}")
     };
 
-    let temp_opt = if temperature > 0.0 { Some(temperature) } else { None };
-    let text = call_ai_text_with_temperature(&ai_config, &full_instructions, &prompt, temp_opt).await?;
+    let temp_opt = if temperature > 0.0 {
+        Some(temperature)
+    } else {
+        None
+    };
+    let text =
+        call_ai_text_with_temperature(&ai_config, &full_instructions, &prompt, temp_opt).await?;
     let stripped = strip_json_fences(text.trim());
 
     // Try to parse the model response as structured JSON.
@@ -2551,13 +2952,14 @@ Pravidla:
             // Inject the fields that the frontend expects (reviewerName, filePath, fileName)
             // directly into the structured object so callers don't need to graft them on.
             parsed["reviewerName"] = serde_json::Value::String(reviewer_name);
-            parsed["filePath"]     = serde_json::Value::String(file_path);
-            parsed["fileName"]     = serde_json::Value::String(file_name);
+            parsed["filePath"] = serde_json::Value::String(file_path);
+            parsed["fileName"] = serde_json::Value::String(file_name);
             Ok(serde_json::json!({ "structured": parsed, "markdown": null }))
         }
         Err(_) => {
             // JSON parsing failed â€” return as markdown so the frontend can still show the result.
-            let header = format!("**Reviewer:** {reviewer_name}  \n**File:** {file_name}\n\n---\n\n");
+            let header =
+                format!("**Reviewer:** {reviewer_name}  \n**File:** {file_name}\n\n---\n\n");
             Ok(serde_json::json!({ "structured": null, "markdown": format!("{header}{text}") }))
         }
     }
@@ -2565,11 +2967,19 @@ Pravidla:
 
 /// Strips optional ```json ... ``` or ``` ... ``` fences the model may emit.
 fn strip_json_fences(s: &str) -> &str {
-    let s = if s.starts_with("```json") { &s[7..] }
-            else if s.starts_with("```")  { &s[3..] }
-            else                           { s };
+    let s = if s.starts_with("```json") {
+        &s[7..]
+    } else if s.starts_with("```") {
+        &s[3..]
+    } else {
+        s
+    };
     let s = s.trim_start();
-    if s.ends_with("```") { s[..s.len() - 3].trim_end() } else { s }
+    if s.ends_with("```") {
+        s[..s.len() - 3].trim_end()
+    } else {
+        s
+    }
 }
 
 /// AI code review that operates on a Git diff rather than a complete source file.
@@ -2601,7 +3011,10 @@ async fn run_ai_change_review(
     // Cap diff at 200 KB to stay within model context limits.
     const MAX_BYTES: usize = 200 * 1024;
     let diff_content = if diff.len() > MAX_BYTES {
-        let boundary = (0..=MAX_BYTES).rev().find(|&i| diff.is_char_boundary(i)).unwrap_or(0);
+        let boundary = (0..=MAX_BYTES)
+            .rev()
+            .find(|&i| diff.is_char_boundary(i))
+            .unwrap_or(0);
         format!("{}\n\nâ€¦ [diff truncated at 200 KB]", &diff[..boundary])
     } else {
         diff.clone()
@@ -2662,20 +3075,26 @@ Pravidla:
         format!("{instructions}{json_format_requirement}")
     };
 
-    let temp_opt = if temperature > 0.0 { Some(temperature) } else { None };
-    let text = call_ai_text_with_temperature(&ai_config, &full_instructions, &prompt, temp_opt).await?;
+    let temp_opt = if temperature > 0.0 {
+        Some(temperature)
+    } else {
+        None
+    };
+    let text =
+        call_ai_text_with_temperature(&ai_config, &full_instructions, &prompt, temp_opt).await?;
     let stripped = strip_json_fences(text.trim());
 
     match serde_json::from_str::<Value>(stripped) {
         Ok(mut parsed) => {
             parsed["reviewerName"] = serde_json::Value::String(reviewer_name);
             // filePath is not a single file for a diff review â€” use file_name as a hint.
-            parsed["filePath"]     = serde_json::Value::String(file_name.clone());
-            parsed["fileName"]     = serde_json::Value::String(file_name);
+            parsed["filePath"] = serde_json::Value::String(file_name.clone());
+            parsed["fileName"] = serde_json::Value::String(file_name);
             Ok(serde_json::json!({ "structured": parsed, "markdown": null }))
         }
         Err(_) => {
-            let header = format!("**Reviewer:** {reviewer_name}  \n**File (diff):** {file_name}\n\n---\n\n");
+            let header =
+                format!("**Reviewer:** {reviewer_name}  \n**File (diff):** {file_name}\n\n---\n\n");
             Ok(serde_json::json!({ "structured": null, "markdown": format!("{header}{text}") }))
         }
     }
@@ -2713,8 +3132,14 @@ async fn run_ai_kit_implementation(
 
     const MAX_BYTES: usize = 150 * 1024;
     let content_trimmed = if artifact_content.len() > MAX_BYTES {
-        let boundary = (0..=MAX_BYTES).rev().find(|&i| artifact_content.is_char_boundary(i)).unwrap_or(0);
-        format!("{}\n\nâ€¦ [file truncated at 150 KB]", &artifact_content[..boundary])
+        let boundary = (0..=MAX_BYTES)
+            .rev()
+            .find(|&i| artifact_content.is_char_boundary(i))
+            .unwrap_or(0);
+        format!(
+            "{}\n\nâ€¦ [file truncated at 150 KB]",
+            &artifact_content[..boundary]
+        )
     } else {
         artifact_content.clone()
     };
@@ -2723,7 +3148,11 @@ async fn run_ai_kit_implementation(
         "{task_context}\n\n## CURRENT FILE CONTENT\n\n```\n{content_trimmed}\n```\n\nImplement the required changes according to the task and rules above. Return ONLY the JSON response â€” no prose, no fences."
     );
 
-    let temp_opt = if temperature > 0.0 { Some(temperature) } else { None };
+    let temp_opt = if temperature > 0.0 {
+        Some(temperature)
+    } else {
+        None
+    };
     let text = call_ai_text_with_temperature(&ai_config, &instructions, &prompt, temp_opt).await?;
     let stripped = strip_json_fences(text.trim());
 
@@ -2824,11 +3253,14 @@ fn create_plugin_project_from_template(
         fs::create_dir_all(&dest).map_err(|e| format!("Failed to create solution root: {e}"))?;
 
         let proj_dir = dest.join(&project_name);
-        fs::create_dir_all(&proj_dir).map_err(|e| format!("Failed to create project folder: {e}"))?;
+        fs::create_dir_all(&proj_dir)
+            .map_err(|e| format!("Failed to create project folder: {e}"))?;
 
         // Stable project GUID for .sln / .csproj consistency
-        let proj_guid = format!("{:08X}-{:04X}-{:04X}-{:04X}-{:012X}",
-            0xAABBCCDDu32, 0x1234u16, 0x5678u16, 0x9ABCu16, 0x0123456789ABu64);
+        let proj_guid = format!(
+            "{:08X}-{:04X}-{:04X}-{:04X}-{:012X}",
+            0xAABBCCDDu32, 0x1234u16, 0x5678u16, 0x9ABCu16, 0x0123456789ABu64
+        );
         // C# project type GUID (same for SDK-style and legacy)
         let cs_project_type_guid = "FAE04EC0-301F-11D3-BF4B-00C04F79EFBC";
 
@@ -2860,7 +3292,10 @@ EndGlobal\r\n"
             .map_err(|e| format!("Failed to write .sln: {e}"))?;
 
         // ----- Initial plugin class body (shared) -----
-        let class_name = format!("{}Plugin", project_name.split('.').last().unwrap_or(&project_name));
+        let class_name = format!(
+            "{}Plugin",
+            project_name.split('.').last().unwrap_or(&project_name)
+        );
 
         if legacy_style {
             // =============================================================
@@ -2873,8 +3308,10 @@ EndGlobal\r\n"
             let props_dir = proj_dir.join("Properties");
             fs::create_dir_all(&props_dir)
                 .map_err(|e| format!("Failed to create Properties folder: {e}"))?;
-            let assembly_guid = format!("{:08X}-{:04X}-{:04X}-{:04X}-{:012X}",
-                0x11223344u32, 0xAABBu16, 0xCCDDu16, 0xEEFFu16, 0x001122334455u64);
+            let assembly_guid = format!(
+                "{:08X}-{:04X}-{:04X}-{:04X}-{:012X}",
+                0x11223344u32, 0xAABBu16, 0xCCDDu16, 0xEEFFu16, 0x001122334455u64
+            );
             let assembly_info = format!(
                 "using System.Reflection;\r\n\
 using System.Runtime.InteropServices;\r\n\
@@ -2907,8 +3344,7 @@ using System.Runtime.InteropServices;\r\n\
                 .map_err(|e| format!("Failed to write packages.config: {e}"))?;
 
             // --- app.config ---
-            let app_config =
-                "<?xml version=\"1.0\" encoding=\"utf-8\"?>\r\n\
+            let app_config = "<?xml version=\"1.0\" encoding=\"utf-8\"?>\r\n\
 <configuration>\r\n  \
 <startup>\r\n    \
 <supportedRuntime version=\"v4.0\" sku=\".NETFramework,Version=v4.6.2\" />\r\n  \
@@ -2999,8 +3435,11 @@ using System.Runtime.InteropServices;\r\n\
 </Project>\r\n",
                 key_none = if snk_generated { "    <None Include=\"key.snk\" />\r\n  " } else { "  " },
             );
-            fs::write(proj_dir.join(format!("{project_name}.csproj")), csproj.as_bytes())
-                .map_err(|e| format!("Failed to write .csproj: {e}"))?;
+            fs::write(
+                proj_dir.join(format!("{project_name}.csproj")),
+                csproj.as_bytes(),
+            )
+            .map_err(|e| format!("Failed to write .csproj: {e}"))?;
 
             // --- Initial plugin class ---
             if create_initial_class {
@@ -3011,7 +3450,6 @@ using System.Runtime.InteropServices;\r\n\
                         .map_err(|e| format!("Failed to write initial class: {e}"))?;
                 }
             }
-
         } else {
             // =============================================================
             // SDK-style scaffold (PackageReference, net462, MSBuild SDK)
@@ -3031,8 +3469,11 @@ using System.Runtime.InteropServices;\r\n\
 </ItemGroup>\r\n\
 </Project>\r\n"
             );
-            fs::write(proj_dir.join(format!("{project_name}.csproj")), csproj.as_bytes())
-                .map_err(|e| format!("Failed to write .csproj: {e}"))?;
+            fs::write(
+                proj_dir.join(format!("{project_name}.csproj")),
+                csproj.as_bytes(),
+            )
+            .map_err(|e| format!("Failed to write .csproj: {e}"))?;
 
             if create_initial_class {
                 let class_file = proj_dir.join(format!("{class_name}.cs"));
@@ -3045,7 +3486,10 @@ using System.Runtime.InteropServices;\r\n\
 
             // Try to format with dotnet format (best-effort, failure ignored).
             let _ = std::process::Command::new("dotnet")
-                .args(["format", &dest.join(format!("{project_name}.sln")).to_string_lossy()])
+                .args([
+                    "format",
+                    &dest.join(format!("{project_name}.sln")).to_string_lossy(),
+                ])
                 .stdout(std::process::Stdio::null())
                 .stderr(std::process::Stdio::null())
                 .status();
@@ -3063,17 +3507,29 @@ using System.Runtime.InteropServices;\r\n\
     }
 
     // Derive substitution values.
-    let plugin_class       = format!("{}Plugin", project_name.split('.').last().unwrap_or(&project_name));
-    let assembly_guid      = task_mcp_generate_id();
+    let plugin_class = format!(
+        "{}Plugin",
+        project_name.split('.').last().unwrap_or(&project_name)
+    );
+    let assembly_guid = task_mcp_generate_id();
     // Literal template folder base name (e.g. "Template.Plugin") â€” replaced with project_name
     // in all names and content so a real VS project works as a template without manual renaming.
-    let template_base_name = src.file_name()
+    let template_base_name = src
+        .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_default();
 
     // Copy template tree (skips .vs, bin, obj, packages, key.snk, copilot-instructions.md)
-    copy_template_tree(src, &dest, &project_name, &namespace, &plugin_class, &assembly_guid, &template_base_name)
-        .map_err(|e| format!("Template copy failed: {e}"))?;
+    copy_template_tree(
+        src,
+        &dest,
+        &project_name,
+        &namespace,
+        &plugin_class,
+        &assembly_guid,
+        &template_base_name,
+    )
+    .map_err(|e| format!("Template copy failed: {e}"))?;
 
     // Generate a fresh key.snk after the copy.
     // Never reuse a key from the template â€” each project must have its own signing key.
@@ -3140,8 +3596,14 @@ fn copy_template_tree(
 ) -> Result<(), io::Error> {
     /// Apply all substitutions to a string: explicit placeholders first, then the
     /// literal template base name (only when non-empty and different from project_name).
-    fn subst(s: &str, project_name: &str, namespace: &str,
-             plugin_class: &str, assembly_guid: &str, base: &str) -> String {
+    fn subst(
+        s: &str,
+        project_name: &str,
+        namespace: &str,
+        plugin_class: &str,
+        assembly_guid: &str,
+        base: &str,
+    ) -> String {
         let mut out = s
             .replace("__PROJECT_NAME__", project_name)
             .replace("__NAMESPACE__", namespace)
@@ -3161,31 +3623,68 @@ fn copy_template_tree(
         let src_path = entry.path();
 
         // --- Skip unwanted directories ---
-        if src_path.is_dir() && matches!(
-            name_str.as_ref(),
-            ".github" | ".vs" | "bin" | "obj" | "packages"
-        ) { continue; }
+        if src_path.is_dir()
+            && matches!(
+                name_str.as_ref(),
+                ".github" | ".vs" | "bin" | "obj" | "packages"
+            )
+        {
+            continue;
+        }
 
         // --- Skip files that must be generated fresh per project ---
-        if src_path.is_file() && matches!(
-            name_str.as_ref(),
-            "key.snk" | "copilot-instructions.md"
-        ) { continue; }
+        if src_path.is_file() && matches!(name_str.as_ref(), "key.snk" | "copilot-instructions.md")
+        {
+            continue;
+        }
 
         // Substitute in the entry name (placeholders + literal base name)
-        let new_name = subst(&name_str, project_name, namespace, plugin_class, assembly_guid, template_base_name);
+        let new_name = subst(
+            &name_str,
+            project_name,
+            namespace,
+            plugin_class,
+            assembly_guid,
+            template_base_name,
+        );
         let dest_path = dest.join(&new_name);
 
         if src_path.is_dir() {
-            copy_template_tree(&src_path, &dest_path, project_name, namespace,
-                               plugin_class, assembly_guid, template_base_name)?;
+            copy_template_tree(
+                &src_path,
+                &dest_path,
+                project_name,
+                namespace,
+                plugin_class,
+                assembly_guid,
+                template_base_name,
+            )?;
         } else {
             let ext = src_path.extension().and_then(|e| e.to_str()).unwrap_or("");
-            let is_text = matches!(ext, "cs" | "csproj" | "sln" | "json" | "xml"
-                | "config" | "txt" | "md" | "targets" | "props" | "yml" | "yaml");
+            let is_text = matches!(
+                ext,
+                "cs" | "csproj"
+                    | "sln"
+                    | "json"
+                    | "xml"
+                    | "config"
+                    | "txt"
+                    | "md"
+                    | "targets"
+                    | "props"
+                    | "yml"
+                    | "yaml"
+            );
             if is_text {
                 let content = fs::read_to_string(&src_path).unwrap_or_default();
-                let new_content = subst(&content, project_name, namespace, plugin_class, assembly_guid, template_base_name);
+                let new_content = subst(
+                    &content,
+                    project_name,
+                    namespace,
+                    plugin_class,
+                    assembly_guid,
+                    template_base_name,
+                );
                 fs::write(&dest_path, new_content)?;
             } else {
                 fs::copy(&src_path, &dest_path)?;
@@ -3200,11 +3699,11 @@ fn copy_template_tree(
 /// Falls back to heuristic classification when no API key is configured.
 #[tauri::command]
 async fn classify_inbox_item(app: tauri::AppHandle, item: Value) -> Result<Value, String> {
-    let title        = item["title"].as_str().unwrap_or("").to_string();
-    let content      = item["originalMessage"].as_str().unwrap_or("").to_string();
-    let sender_name  = item["senderName"].as_str().unwrap_or("").to_string();
+    let title = item["title"].as_str().unwrap_or("").to_string();
+    let content = item["originalMessage"].as_str().unwrap_or("").to_string();
+    let sender_name = item["senderName"].as_str().unwrap_or("").to_string();
     let sender_email = item["senderEmail"].as_str().unwrap_or("").to_string();
-    let source       = item["source"].as_str().unwrap_or("email").to_string();
+    let source = item["source"].as_str().unwrap_or("email").to_string();
 
     // Truncate content to avoid unnecessarily large payloads.
     let content_trimmed = if content.len() > 3000 {
@@ -3290,30 +3789,45 @@ Field rules:\n\
 
             let text_result = call_ai_text(&config, instructions, &prompt).await;
             match text_result {
-                Ok(text) => {
-                    match serde_json::from_str::<Value>(strip_fences(&text)) {
-                        Ok(v) => {
-                            eprintln!("[classify] AI result for \"{title}\": isTask={} conf={}",
-                                v["isTask"], v["confidence"]);
-                            Ok(v)
-                        }
-                        Err(e) => {
-                            let snippet = &text[..text.len().min(300)];
-                            eprintln!("[classify] JSON parse error: {e}. Falling back to heuristic. Response: {snippet}");
-                            Ok(heuristic_classify_item(&title, &content, &sender_name, &source))
-                        }
+                Ok(text) => match serde_json::from_str::<Value>(strip_fences(&text)) {
+                    Ok(v) => {
+                        eprintln!(
+                            "[classify] AI result for \"{title}\": isTask={} conf={}",
+                            v["isTask"], v["confidence"]
+                        );
+                        Ok(v)
                     }
-                }
+                    Err(e) => {
+                        let snippet = &text[..text.len().min(300)];
+                        eprintln!("[classify] JSON parse error: {e}. Falling back to heuristic. Response: {snippet}");
+                        Ok(heuristic_classify_item(
+                            &title,
+                            &content,
+                            &sender_name,
+                            &source,
+                        ))
+                    }
+                },
                 Err(e) => {
                     eprintln!("[classify] OpenAI call failed: {e}. Falling back to heuristic.");
-                    Ok(heuristic_classify_item(&title, &content, &sender_name, &source))
+                    Ok(heuristic_classify_item(
+                        &title,
+                        &content,
+                        &sender_name,
+                        &source,
+                    ))
                 }
             }
         }
         Err(_) => {
             // --- Heuristic path (no OpenAI API key configured) ---
             eprintln!("[classify] No AI key â€” using heuristic classification for: {title}");
-            Ok(heuristic_classify_item(&title, &content, &sender_name, &source))
+            Ok(heuristic_classify_item(
+                &title,
+                &content,
+                &sender_name,
+                &source,
+            ))
         }
     }
 }
@@ -3321,40 +3835,77 @@ Field rules:\n\
 /// Heuristic classification used when no Claude API key is configured.
 /// Detects actionable messages and issues from keyword patterns.
 /// Works best for Czech/English developer chat messages.
-fn heuristic_classify_item(
-    title: &str,
-    content: &str,
-    sender_name: &str,
-    source: &str,
-) -> Value {
+fn heuristic_classify_item(title: &str, content: &str, sender_name: &str, source: &str) -> Value {
     let combined = format!("{} {}", title.to_lowercase(), content.to_lowercase());
 
     // --- Actionability check ---
     let action_words = [
-        "please", "fix", "check", "review", "deploy", "verify", "look into",
-        "could you", "can you", "would you", "we need", "i need",
+        "please",
+        "fix",
+        "check",
+        "review",
+        "deploy",
+        "verify",
+        "look into",
+        "could you",
+        "can you",
+        "would you",
+        "we need",
+        "i need",
         // Czech
-        "potĹ™eboval", "kouknout", "podĂ­vat", "zkontrolovat", "opravit",
-        "provÄ›Ĺ™it", "zobrazuje", "prosĂ­m",
+        "potĹ™eboval",
+        "kouknout",
+        "podĂ­vat",
+        "zkontrolovat",
+        "opravit",
+        "provÄ›Ĺ™it",
+        "zobrazuje",
+        "prosĂ­m",
     ];
     let issue_words = [
-        "not working", "broken", "bug", "error", "fails", "crash", "wrong",
-        "doesn't work", "cant work", "can't work",
+        "not working",
+        "broken",
+        "bug",
+        "error",
+        "fails",
+        "crash",
+        "wrong",
+        "doesn't work",
+        "cant work",
+        "can't work",
         // Czech
-        "nefunguje", "chyba", "problĂ©m", "nefunkcni", "nefunkÄŤnĂ­",
+        "nefunguje",
+        "chyba",
+        "problĂ©m",
+        "nefunkcni",
+        "nefunkÄŤnĂ­",
     ];
     // Environment words indicate developer-relevant context
-    let env_words = ["prod", "production", "uat", "staging", "dev ", "development"];
+    let env_words = [
+        "prod",
+        "production",
+        "uat",
+        "staging",
+        "dev ",
+        "development",
+    ];
 
-    let action_score = action_words.iter().filter(|&&w| combined.contains(w)).count();
-    let issue_score  = issue_words.iter().filter(|&&w| combined.contains(w)).count();
-    let env_score    = env_words.iter().filter(|&&w| combined.contains(w)).count();
+    let action_score = action_words
+        .iter()
+        .filter(|&&w| combined.contains(w))
+        .count();
+    let issue_score = issue_words
+        .iter()
+        .filter(|&&w| combined.contains(w))
+        .count();
+    let env_score = env_words.iter().filter(|&&w| combined.contains(w)).count();
 
     // Teams base is 20 (matches frontend heuristicClassify.ts SOURCE_BASE).
     // Zero signals â†’ score stays below MIN_CONFIDENCE_ANALYZE (50) â†’ silently skipped.
     // Email base is 35 â€” emails generally have more context.
     let base = if source == "teams" { 20u32 } else { 35u32 };
-    let score = (base + action_score as u32 * 8 + issue_score as u32 * 12 + env_score as u32 * 5).min(92);
+    let score =
+        (base + action_score as u32 * 8 + issue_score as u32 * 12 + env_score as u32 * 5).min(92);
     let is_task = score >= 50;
 
     let task_type = if issue_score > 0 { "bug-fix" } else { "other" };
@@ -3442,12 +3993,10 @@ fn pick_folder(app: tauri::AppHandle) -> Result<Option<String>, String> {
 
     let (tx, rx) = std::sync::mpsc::channel::<Option<String>>();
 
-    app.dialog()
-        .file()
-        .pick_folder(move |folder| {
-            let path = folder.map(|f| f.to_string());
-            let _ = tx.send(path);
-        });
+    app.dialog().file().pick_folder(move |folder| {
+        let path = folder.map(|f| f.to_string());
+        let _ = tx.send(path);
+    });
 
     rx.recv().map_err(|e| e.to_string())
 }
@@ -3477,16 +4026,25 @@ fn rescan_repositories(customers: Value, base_dir: String) -> Result<Value, Stri
             let mut customer = c.clone();
 
             // Resolve path using priority order
-            let resolved: Option<String> = if let Some(ov) = c["repositoryRootOverride"].as_str().filter(|s| !s.is_empty()) {
+            let resolved: Option<String> = if let Some(ov) = c["repositoryRootOverride"]
+                .as_str()
+                .filter(|s| !s.is_empty())
+            {
                 Some(ov.to_string())
             } else if !base_dir.is_empty() {
-                c["folderName"].as_str().filter(|s| !s.is_empty()).map(|folder| {
-                    let mut p = std::path::PathBuf::from(&base_dir);
-                    p.push(folder);
-                    p.to_string_lossy().to_string()
-                })
+                c["folderName"]
+                    .as_str()
+                    .filter(|s| !s.is_empty())
+                    .map(|folder| {
+                        let mut p = std::path::PathBuf::from(&base_dir);
+                        p.push(folder);
+                        p.to_string_lossy().to_string()
+                    })
             } else {
-                c["repositoryRoot"].as_str().filter(|s| !s.is_empty()).map(|s| s.to_string())
+                c["repositoryRoot"]
+                    .as_str()
+                    .filter(|s| !s.is_empty())
+                    .map(|s| s.to_string())
             };
 
             let status = match &resolved {
@@ -3513,7 +4071,11 @@ fn rescan_repositories(customers: Value, base_dir: String) -> Result<Value, Stri
 /// Opens an OS file-picker dialog filtered to the given extensions.
 /// Returns the chosen path, or null if the user cancelled.
 #[tauri::command]
-fn pick_file(app: tauri::AppHandle, filter_name: String, extensions: Vec<String>) -> Result<Option<String>, String> {
+fn pick_file(
+    app: tauri::AppHandle,
+    filter_name: String,
+    extensions: Vec<String>,
+) -> Result<Option<String>, String> {
     let exts: Vec<&str> = extensions.iter().map(|s| s.as_str()).collect();
     let result = app
         .dialog()
@@ -3546,7 +4108,11 @@ fn validate_template(path: String, template_type: String) -> Result<String, Stri
             }
         }
         "folder" => {
-            if p.is_dir() { Ok("valid".to_string()) } else { Ok("invalid".to_string()) }
+            if p.is_dir() {
+                Ok("valid".to_string())
+            } else {
+                Ok("invalid".to_string())
+            }
         }
         _ => Ok("invalid".to_string()),
     }
@@ -3566,10 +4132,14 @@ fn strip_top_level_dir(entries: &[String]) -> Option<String> {
         return None;
     }
     // Check that ALL entries share this top-level component
-    let all_match = entries.iter().all(|e| {
-        e == &first_top || e.starts_with(&format!("{}/", first_top))
-    });
-    if all_match { Some(format!("{}/", first_top)) } else { None }
+    let all_match = entries
+        .iter()
+        .all(|e| e == &first_top || e.starts_with(&format!("{}/", first_top)));
+    if all_match {
+        Some(format!("{}/", first_top))
+    } else {
+        None
+    }
 }
 
 /// Creates a customer repository at `target_path` by extracting a ZIP template.
@@ -3578,12 +4148,11 @@ fn strip_top_level_dir(entries: &[String]) -> Option<String> {
 #[tauri::command]
 fn create_repository_from_template(
     template_path: String,
-    target_path:   String,
+    target_path: String,
 ) -> Result<(), String> {
-    let zip_file = fs::File::open(&template_path)
-        .map_err(|e| format!("Cannot open template: {e}"))?;
-    let mut archive = ZipArchive::new(zip_file)
-        .map_err(|e| format!("Invalid ZIP archive: {e}"))?;
+    let zip_file =
+        fs::File::open(&template_path).map_err(|e| format!("Cannot open template: {e}"))?;
+    let mut archive = ZipArchive::new(zip_file).map_err(|e| format!("Invalid ZIP archive: {e}"))?;
 
     // Collect all entry names to detect the common top-level folder
     let names: Vec<String> = (0..archive.len())
@@ -3592,11 +4161,11 @@ fn create_repository_from_template(
     let strip_prefix = strip_top_level_dir(&names);
 
     let target = std::path::Path::new(&target_path);
-    fs::create_dir_all(target)
-        .map_err(|e| format!("Cannot create target directory: {e}"))?;
+    fs::create_dir_all(target).map_err(|e| format!("Cannot create target directory: {e}"))?;
 
     for i in 0..archive.len() {
-        let mut entry = archive.by_index(i)
+        let mut entry = archive
+            .by_index(i)
             .map_err(|e| format!("ZIP read error: {e}"))?;
 
         let raw_name = entry.name().to_string();
@@ -3618,8 +4187,7 @@ fn create_repository_from_template(
                 .map_err(|e| format!("Cannot create directory {:?}: {e}", out_path))?;
         } else {
             if let Some(parent) = out_path.parent() {
-                fs::create_dir_all(parent)
-                    .map_err(|e| format!("Cannot create parent dir: {e}"))?;
+                fs::create_dir_all(parent).map_err(|e| format!("Cannot create parent dir: {e}"))?;
             }
             let mut out_file = fs::File::create(&out_path)
                 .map_err(|e| format!("Cannot create file {:?}: {e}", out_path))?;
@@ -3639,7 +4207,7 @@ fn create_repository_from_template(
 #[serde(rename_all = "camelCase")]
 struct GitInitResult {
     /// One of: "success" | "already_exists" | "git_not_found" | "failed"
-    status:  String,
+    status: String,
     message: String,
     /// True when an initial `git add . && git commit` was created.
     initial_commit_created: bool,
@@ -3655,8 +4223,8 @@ struct GitInitResult {
 ///   `create_initial_commit` is true and the init succeeded.
 #[tauri::command]
 fn initialize_git_repository(
-    path:                  String,
-    branch:                String,
+    path: String,
+    branch: String,
     create_initial_commit: bool,
 ) -> GitInitResult {
     let target = std::path::Path::new(&path);
@@ -3664,7 +4232,7 @@ fn initialize_git_repository(
     // Guard: skip if .git already exists
     if target.join(".git").exists() {
         return GitInitResult {
-            status:  "already_exists".to_string(),
+            status: "already_exists".to_string(),
             message: ".git directory already present â€” skipped".to_string(),
             initial_commit_created: false,
         };
@@ -3685,14 +4253,16 @@ fn initialize_git_repository(
     let output = match init_out {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             return GitInitResult {
-                status:  "git_not_found".to_string(),
-                message: "git binary not found in PATH. Install Git and ensure it is on the system PATH.".to_string(),
+                status: "git_not_found".to_string(),
+                message:
+                    "git binary not found in PATH. Install Git and ensure it is on the system PATH."
+                        .to_string(),
                 initial_commit_created: false,
             };
         }
         Err(e) => {
             return GitInitResult {
-                status:  "failed".to_string(),
+                status: "failed".to_string(),
                 message: format!("Failed to launch git: {e}"),
                 initial_commit_created: false,
             };
@@ -3703,8 +4273,12 @@ fn initialize_git_repository(
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
         return GitInitResult {
-            status:  "failed".to_string(),
-            message: if stderr.is_empty() { "git init exited with a non-zero status.".to_string() } else { stderr },
+            status: "failed".to_string(),
+            message: if stderr.is_empty() {
+                "git init exited with a non-zero status.".to_string()
+            } else {
+                stderr
+            },
             initial_commit_created: false,
         };
     }
@@ -3733,7 +4307,7 @@ fn initialize_git_repository(
     }
 
     GitInitResult {
-        status:  "success".to_string(),
+        status: "success".to_string(),
         message: String::new(),
         initial_commit_created: committed,
     }
@@ -3763,7 +4337,12 @@ fn read_file_content(path: String) -> Result<String, String> {
 /// Scoring also prefers files closer to the root (lower depth = higher score).
 /// Returns the absolute path of the best candidate, or empty string if none found.
 #[tauri::command]
-fn infer_review_file_path(base_path: String, mode: String, project_name: String, class_hint: String) -> String {
+fn infer_review_file_path(
+    base_path: String,
+    mode: String,
+    project_name: String,
+    class_hint: String,
+) -> String {
     let base = std::path::Path::new(&base_path);
     if !base.exists() {
         return String::new();
@@ -3775,7 +4354,8 @@ fn infer_review_file_path(base_path: String, mode: String, project_name: String,
 
     let is_plugin = mode == "plugin";
     let excluded_dirs_plugin: &[&str] = &["bin", "obj", ".vs", "packages", ".git"];
-    let excluded_dirs_script: &[&str] = &["node_modules", "dist", "build", ".next", "coverage", ".git"];
+    let excluded_dirs_script: &[&str] =
+        &["node_modules", "dist", "build", ".next", "coverage", ".git"];
 
     let mut candidates: Vec<(i32, std::path::PathBuf)> = Vec::new();
     let proj_lower = project_name.to_lowercase();
@@ -3802,15 +4382,31 @@ fn infer_review_file_path(base_path: String, mode: String, project_name: String,
         };
         for entry in entries.filter_map(|e| e.ok()) {
             let path = entry.path();
-            let name = path.file_name().unwrap_or_default().to_string_lossy().to_lowercase();
+            let name = path
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .to_lowercase();
 
             if path.is_dir() {
                 if excluded.iter().any(|ex| name == *ex) {
                     continue;
                 }
-                walk_dir(&path, is_plugin, excluded, proj_lower, hint_words, depth + 1, candidates);
+                walk_dir(
+                    &path,
+                    is_plugin,
+                    excluded,
+                    proj_lower,
+                    hint_words,
+                    depth + 1,
+                    candidates,
+                );
             } else if path.is_file() {
-                let ext = path.extension().unwrap_or_default().to_string_lossy().to_lowercase();
+                let ext = path
+                    .extension()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .to_lowercase();
                 // Prefer files closer to the project root (max +3 bonus for depth 0).
                 let depth_score = (3i32).saturating_sub(depth as i32).max(0);
 
@@ -3818,7 +4414,11 @@ fn infer_review_file_path(base_path: String, mode: String, project_name: String,
                     if ext != "cs" {
                         continue;
                     }
-                    let stem = path.file_stem().unwrap_or_default().to_string_lossy().to_lowercase();
+                    let stem = path
+                        .file_stem()
+                        .unwrap_or_default()
+                        .to_string_lossy()
+                        .to_lowercase();
                     let mut score: i32 = depth_score;
                     // Project folder name match.
                     if !proj_lower.is_empty() && stem.contains(&*proj_lower) {
@@ -3845,11 +4445,22 @@ fn infer_review_file_path(base_path: String, mode: String, project_name: String,
                         continue;
                     }
                     // Skip declaration and test files.
-                    let fname = path.file_name().unwrap_or_default().to_string_lossy().to_lowercase();
-                    if fname.ends_with(".d.ts") || fname.contains(".test.") || fname.contains(".spec.") {
+                    let fname = path
+                        .file_name()
+                        .unwrap_or_default()
+                        .to_string_lossy()
+                        .to_lowercase();
+                    if fname.ends_with(".d.ts")
+                        || fname.contains(".test.")
+                        || fname.contains(".spec.")
+                    {
                         continue;
                     }
-                    let stem = path.file_stem().unwrap_or_default().to_string_lossy().to_lowercase();
+                    let stem = path
+                        .file_stem()
+                        .unwrap_or_default()
+                        .to_string_lossy()
+                        .to_lowercase();
                     let mut score: i32 = depth_score;
                     // Class hint word match on file name.
                     for word in hint_words {
@@ -3873,8 +4484,20 @@ fn infer_review_file_path(base_path: String, mode: String, project_name: String,
         }
     }
 
-    let excluded = if is_plugin { excluded_dirs_plugin } else { excluded_dirs_script };
-    walk_dir(base, is_plugin, excluded, &proj_lower, &hint_words, 0, &mut candidates);
+    let excluded = if is_plugin {
+        excluded_dirs_plugin
+    } else {
+        excluded_dirs_script
+    };
+    walk_dir(
+        base,
+        is_plugin,
+        excluded,
+        &proj_lower,
+        &hint_words,
+        0,
+        &mut candidates,
+    );
 
     // Sort descending by score, then ascending by path for stable tie-breaking.
     candidates.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
@@ -3901,7 +4524,11 @@ fn list_directory_files(dir: String, extension: String) -> Vec<String> {
                 .filter(|e| e.path().is_file())
                 .filter_map(|e| {
                     let name = e.file_name().to_string_lossy().to_string();
-                    if name.ends_with(&ext_suffix) { Some(name) } else { None }
+                    if name.ends_with(&ext_suffix) {
+                        Some(name)
+                    } else {
+                        None
+                    }
                 })
                 .collect()
         })
@@ -3923,7 +4550,9 @@ fn list_files_with_paths(
     excluded_dirs: Vec<String>,
 ) -> Vec<Value> {
     let root = std::path::Path::new(&dir);
-    if !root.is_dir() { return vec![]; }
+    if !root.is_dir() {
+        return vec![];
+    }
 
     // Normalise extensions: lowercase, strip leading dot.
     let exts: Vec<String> = extensions
@@ -3931,15 +4560,15 @@ fn list_files_with_paths(
         .map(|e| e.trim_start_matches('.').to_lowercase())
         .collect();
 
-    let excluded: Vec<String> = excluded_dirs
-        .iter()
-        .map(|d| d.to_lowercase())
-        .collect();
+    let excluded: Vec<String> = excluded_dirs.iter().map(|d| d.to_lowercase()).collect();
 
     let mut results: Vec<Value> = Vec::new();
     collect_files(root, &exts, recursive, &excluded, &mut results);
     results.sort_by(|a, b| {
-        a["name"].as_str().unwrap_or("").cmp(b["name"].as_str().unwrap_or(""))
+        a["name"]
+            .as_str()
+            .unwrap_or("")
+            .cmp(b["name"].as_str().unwrap_or(""))
     });
     results
 }
@@ -3972,8 +4601,6 @@ fn collect_files(
         }
     }
 }
-
-
 
 /// Writes content to the given absolute path, creating directories as needed.
 #[tauri::command]
@@ -4019,7 +4646,9 @@ fn find_packages_config(solution_dir: &std::path::Path) -> Option<PathBuf> {
         let p = entry.path();
         if p.is_dir() {
             let pc = p.join("packages.config");
-            if pc.exists() { return Some(pc); }
+            if pc.exists() {
+                return Some(pc);
+            }
         }
     }
     None
@@ -4043,8 +4672,11 @@ fn find_csproj_in_solution(solution_dir: &std::path::Path) -> Option<PathBuf> {
 fn read_crmsdk_from_packages_config(path: &std::path::Path) -> Option<(String, String)> {
     let content = fs::read_to_string(path).ok()?;
     for line in content.lines() {
-        if line.to_lowercase().contains("microsoft.crmsdk.coreassemblies") {
-            let id      = extract_xml_attr_value(line, "id")?;
+        if line
+            .to_lowercase()
+            .contains("microsoft.crmsdk.coreassemblies")
+        {
+            let id = extract_xml_attr_value(line, "id")?;
             let version = extract_xml_attr_value(line, "version")?;
             return Some((id, version));
         }
@@ -4054,22 +4686,30 @@ fn read_crmsdk_from_packages_config(path: &std::path::Path) -> Option<(String, S
 
 fn extract_xml_attr_value(line: &str, attr: &str) -> Option<String> {
     let search = format!("{}=\"", attr.to_lowercase());
-    let lower  = line.to_lowercase();
-    let pos    = lower.find(&search)?;
-    let after  = &line[pos + search.len()..];
-    let end    = after.find('"')?;
+    let lower = line.to_lowercase();
+    let pos = lower.find(&search)?;
+    let after = &line[pos + search.len()..];
+    let end = after.find('"')?;
     Some(after[..end].to_string())
 }
 
 /// Returns true if Microsoft.Xrm.Sdk.dll exists anywhere under `<solution_dir>/packages/`.
 fn xrm_sdk_dll_exists(solution_dir: &std::path::Path) -> bool {
     let packages = solution_dir.join("packages");
-    if !packages.exists() { return false; }
-    let Ok(entries) = fs::read_dir(&packages) else { return false; };
+    if !packages.exists() {
+        return false;
+    }
+    let Ok(entries) = fs::read_dir(&packages) else {
+        return false;
+    };
     for entry in entries.flatten() {
         let p = entry.path();
         if p.is_dir() {
-            if p.join("lib").join("net462").join("Microsoft.Xrm.Sdk.dll").exists() {
+            if p.join("lib")
+                .join("net462")
+                .join("Microsoft.Xrm.Sdk.dll")
+                .exists()
+            {
                 return true;
             }
         }
@@ -4083,13 +4723,13 @@ fn try_nuget_exe_restore(sln_path: &std::path::Path, solution_dir: &std::path::P
     #[cfg(target_os = "windows")]
     hide_console_window(&mut cmd);
     cmd.arg("restore")
-       .arg(sln_path.as_os_str())
-       .current_dir(solution_dir)
-       .stdout(Stdio::null())
-       .stderr(Stdio::null())
-       .status()
-       .map(|s| s.success())
-       .unwrap_or(false)
+        .arg(sln_path.as_os_str())
+        .current_dir(solution_dir)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
 }
 
 /// Downloads the named NuGet package and extracts `lib/net462/` DLLs to
@@ -4100,44 +4740,51 @@ fn download_and_extract_nuget_package(
     version: &str,
     packages_dir: &std::path::Path,
 ) -> Result<bool, String> {
-    let id_low  = package_id.to_lowercase();
+    let id_low = package_id.to_lowercase();
     let ver_low = version.to_lowercase();
     let url = format!(
         "https://api.nuget.org/v3-flatcontainer/{id_low}/{ver_low}/{id_low}.{ver_low}.nupkg"
     );
 
-    let resp = reqwest::blocking::get(&url)
-        .map_err(|e| format!("HTTP request failed: {e}"))?;
+    let resp = reqwest::blocking::get(&url).map_err(|e| format!("HTTP request failed: {e}"))?;
     if !resp.status().is_success() {
         return Err(format!("HTTP {}: {}", resp.status(), url));
     }
-    let bytes = resp.bytes().map_err(|e| format!("Failed to read response body: {e}"))?;
+    let bytes = resp
+        .bytes()
+        .map_err(|e| format!("Failed to read response body: {e}"))?;
 
     let dest_root = packages_dir.join(format!("{package_id}.{version}"));
-    let lib_dir   = dest_root.join("lib").join("net462");
+    let lib_dir = dest_root.join("lib").join("net462");
     fs::create_dir_all(&lib_dir).map_err(|e| format!("Cannot create dir: {e}"))?;
 
-    let cursor  = std::io::Cursor::new(bytes);
+    let cursor = std::io::Cursor::new(bytes);
     let mut zip = ZipArchive::new(cursor).map_err(|e| format!("Invalid .nupkg: {e}"))?;
     let mut extracted = false;
 
     for i in 0..zip.len() {
-        let mut file      = zip.by_index(i).map_err(|e| e.to_string())?;
-        let name          = file.name().to_string();
-        let name_lower    = name.to_lowercase();
+        let mut file = zip.by_index(i).map_err(|e| e.to_string())?;
+        let name = file.name().to_string();
+        let name_lower = name.to_lowercase();
 
         // Match any path containing /net462/ and ending in .dll or .xml
-        if name_lower.contains("/net462/") && (name_lower.ends_with(".dll") || name_lower.ends_with(".xml")) {
+        if name_lower.contains("/net462/")
+            && (name_lower.ends_with(".dll") || name_lower.ends_with(".xml"))
+        {
             // File name = everything after the last '/'
             if let Some(slash) = name.rfind('/') {
                 let file_name = &name[slash + 1..];
-                if file_name.is_empty() { continue; }
+                if file_name.is_empty() {
+                    continue;
+                }
                 let out_path = lib_dir.join(file_name);
-                let mut out  = fs::File::create(&out_path)
+                let mut out = fs::File::create(&out_path)
                     .map_err(|e| format!("Cannot create {}: {e}", out_path.display()))?;
                 std::io::copy(&mut file, &mut out)
                     .map_err(|e| format!("Cannot write {}: {e}", out_path.display()))?;
-                if file_name.ends_with(".dll") { extracted = true; }
+                if file_name.ends_with(".dll") {
+                    extracted = true;
+                }
             }
         }
     }
@@ -4151,14 +4798,17 @@ fn ensure_xrm_sdk_reference(
     csproj_path: &std::path::Path,
     crmsdk_version: &str,
 ) -> Result<bool, String> {
-    let raw   = fs::read_to_string(csproj_path)
-        .map_err(|e| format!("Cannot read .csproj: {e}"))?;
+    let raw = fs::read_to_string(csproj_path).map_err(|e| format!("Cannot read .csproj: {e}"))?;
     let lower = raw.to_lowercase();
 
     // SDK-style projects auto-include everything; no Reference elements needed.
-    if lower.contains("<project sdk=") { return Ok(false); }
+    if lower.contains("<project sdk=") {
+        return Ok(false);
+    }
     // Already present.
-    if lower.contains("microsoft.xrm.sdk") { return Ok(false); }
+    if lower.contains("microsoft.xrm.sdk") {
+        return Ok(false);
+    }
 
     let uses_crlf = raw.contains("\r\n");
     let eol = if uses_crlf { "\r\n" } else { "\n" };
@@ -4192,10 +4842,13 @@ fn ensure_xrm_sdk_reference(
     // Insert after the last </Reference> line.
     let close_tag = "</reference>";
     if let Some(rel) = lower.rfind(close_tag) {
-        let line_end = raw[rel..].find('\n').map(|p| rel + p + 1).unwrap_or(raw.len());
-        let before   = &raw[..line_end];
-        let after    = &raw[line_end..];
-        let updated  = format!("{before}{insert_block}{after}");
+        let line_end = raw[rel..]
+            .find('\n')
+            .map(|p| rel + p + 1)
+            .unwrap_or(raw.len());
+        let before = &raw[..line_end];
+        let after = &raw[line_end..];
+        let updated = format!("{before}{insert_block}{after}");
         fs::write(csproj_path, updated.as_bytes())
             .map_err(|e| format!("Cannot write .csproj: {e}"))?;
         return Ok(true);
@@ -4205,15 +4858,18 @@ fn ensure_xrm_sdk_reference(
     let close_group = "</itemgroup>";
     if let Some(rel) = lower.find(close_group) {
         let line_start = raw[..rel].rfind('\n').map(|p| p + 1).unwrap_or(0);
-        let before     = &raw[..line_start];
-        let after      = &raw[line_start..];
-        let updated    = format!("{before}{insert_block}{after}");
+        let before = &raw[..line_start];
+        let after = &raw[line_start..];
+        let updated = format!("{before}{insert_block}{after}");
         fs::write(csproj_path, updated.as_bytes())
             .map_err(|e| format!("Cannot write .csproj: {e}"))?;
         return Ok(true);
     }
 
-    Err("Could not find a suitable insertion point for the Xrm.Sdk Reference in the .csproj.".to_string())
+    Err(
+        "Could not find a suitable insertion point for the Xrm.Sdk Reference in the .csproj."
+            .to_string(),
+    )
 }
 
 /// Restores NuGet packages for a legacy packages.config plugin project.
@@ -4234,14 +4890,16 @@ fn restore_nuget_packages(solution_dir: String) -> Result<NugetRestoreResult, St
         .ok_or_else(|| format!("No .sln found in {solution_dir}"))?;
 
     // Validate / fix the .csproj reference (mainly for custom templates).
-    let csproj_path  = find_csproj_in_solution(sol_dir);
+    let csproj_path = find_csproj_in_solution(sol_dir);
     let packages_cfg = find_packages_config(sol_dir);
-    let crmsdk_ver   = packages_cfg.as_deref()
+    let crmsdk_ver = packages_cfg
+        .as_deref()
         .and_then(read_crmsdk_from_packages_config)
         .map(|(_, v)| v)
         .unwrap_or_else(|| "9.0.2.49".to_string());
 
-    let xrm_ref_added = csproj_path.as_deref()
+    let xrm_ref_added = csproj_path
+        .as_deref()
         .map(|p| ensure_xrm_sdk_reference(p, &crmsdk_ver).unwrap_or(false))
         .unwrap_or(false);
 
@@ -4250,13 +4908,13 @@ fn restore_nuget_packages(solution_dir: String) -> Result<NugetRestoreResult, St
         let dll_ok = xrm_sdk_dll_exists(sol_dir);
         return Ok(NugetRestoreResult {
             success: dll_ok,
-            method:  "nuget_exe".to_string(),
+            method: "nuget_exe".to_string(),
             message: if dll_ok {
                 "NuGet packages restored using nuget.exe.".to_string()
             } else {
                 "nuget.exe ran but Microsoft.Xrm.Sdk.dll was not found after restore.".to_string()
             },
-            dll_exists:    dll_ok,
+            dll_exists: dll_ok,
             xrm_ref_added,
         });
     }
@@ -4270,15 +4928,17 @@ fn restore_nuget_packages(solution_dir: String) -> Result<NugetRestoreResult, St
                     let dll_ok = xrm_sdk_dll_exists(sol_dir);
                     return Ok(NugetRestoreResult {
                         success: dll_ok,
-                        method:  "direct_download".to_string(),
+                        method: "direct_download".to_string(),
                         message: if dll_ok {
                             format!("Downloaded {id} {version} from NuGet.org.")
                         } else if extracted {
-                            format!("Downloaded {id} {version} but Microsoft.Xrm.Sdk.dll not found.")
+                            format!(
+                                "Downloaded {id} {version} but Microsoft.Xrm.Sdk.dll not found."
+                            )
                         } else {
                             format!("Downloaded {id} {version} but no DLLs were extracted.")
                         },
-                        dll_exists:    dll_ok,
+                        dll_exists: dll_ok,
                         xrm_ref_added,
                     });
                 }
@@ -4381,38 +5041,77 @@ async fn check_plugin_build_readiness(
     // 1. .sln
     let sln = find_file_ext_in_dir(sol_dir, "sln");
     match &sln {
-        Some(p) => checks.push(bcheck("sln", ".sln file", "pass",
-            p.file_name().unwrap_or_default().to_string_lossy())),
-        None    => { checks.push(bcheck("sln", ".sln file", "fail", "No .sln in solution directory.")); any_fail = true; }
+        Some(p) => checks.push(bcheck(
+            "sln",
+            ".sln file",
+            "pass",
+            p.file_name().unwrap_or_default().to_string_lossy(),
+        )),
+        None => {
+            checks.push(bcheck(
+                "sln",
+                ".sln file",
+                "fail",
+                "No .sln in solution directory.",
+            ));
+            any_fail = true;
+        }
     }
 
     // 2. .csproj
     let csproj = find_csproj_in_solution(sol_dir);
     match &csproj {
-        Some(p) => checks.push(bcheck("csproj", ".csproj file", "pass",
-            p.file_name().unwrap_or_default().to_string_lossy())),
-        None    => { checks.push(bcheck("csproj", ".csproj file", "fail", "No .csproj found in project subfolder.")); any_fail = true; }
+        Some(p) => checks.push(bcheck(
+            "csproj",
+            ".csproj file",
+            "pass",
+            p.file_name().unwrap_or_default().to_string_lossy(),
+        )),
+        None => {
+            checks.push(bcheck(
+                "csproj",
+                ".csproj file",
+                "fail",
+                "No .csproj found in project subfolder.",
+            ));
+            any_fail = true;
+        }
     }
 
     // 3. packages.config
     let packages_cfg = find_packages_config(sol_dir);
     if packages_cfg.is_some() {
-        checks.push(bcheck("packages_config", "packages.config", "pass", "Found."));
+        checks.push(bcheck(
+            "packages_config",
+            "packages.config",
+            "pass",
+            "Found.",
+        ));
     } else {
-        checks.push(bcheck("packages_config", "packages.config", "fail", "packages.config not found."));
+        checks.push(bcheck(
+            "packages_config",
+            "packages.config",
+            "fail",
+            "packages.config not found.",
+        ));
         any_fail = true;
     }
 
     // 4. key.snk â€” warning only (assembly might still build without it if signing is disabled)
-    let snk_ok = csproj.as_deref()
+    let snk_ok = csproj
+        .as_deref()
         .and_then(|p| p.parent())
         .map(|d| d.join("key.snk").exists())
         .unwrap_or(false);
     if snk_ok {
         checks.push(bcheck("key_snk", "key.snk (signing)", "pass", "Found."));
     } else {
-        checks.push(bcheck("key_snk", "key.snk (signing)", "warning",
-            "key.snk not found â€” assembly signing may fail if enabled in .csproj."));
+        checks.push(bcheck(
+            "key_snk",
+            "key.snk (signing)",
+            "warning",
+            "key.snk not found â€” assembly signing may fail if enabled in .csproj.",
+        ));
         any_warn = true;
     }
 
@@ -4420,22 +5119,45 @@ async fn check_plugin_build_readiness(
     if let Some(ref csp) = csproj {
         let content = fs::read_to_string(csp).unwrap_or_default();
         if content.to_lowercase().contains("microsoft.xrm.sdk") {
-            checks.push(bcheck("xrm_ref", "Microsoft.Xrm.Sdk reference", "pass", "Found in .csproj."));
+            checks.push(bcheck(
+                "xrm_ref",
+                "Microsoft.Xrm.Sdk reference",
+                "pass",
+                "Found in .csproj.",
+            ));
         } else {
-            checks.push(bcheck("xrm_ref", "Microsoft.Xrm.Sdk reference", "fail",
-                "Microsoft.Xrm.Sdk reference missing from .csproj."));
+            checks.push(bcheck(
+                "xrm_ref",
+                "Microsoft.Xrm.Sdk reference",
+                "fail",
+                "Microsoft.Xrm.Sdk reference missing from .csproj.",
+            ));
             any_fail = true;
         }
     } else {
-        checks.push(bcheck("xrm_ref", "Microsoft.Xrm.Sdk reference", "skip", "Skipped â€” no .csproj."));
+        checks.push(bcheck(
+            "xrm_ref",
+            "Microsoft.Xrm.Sdk reference",
+            "skip",
+            "Skipped â€” no .csproj.",
+        ));
     }
 
     // 6. Microsoft.Xrm.Sdk.dll in packages folder
     if xrm_sdk_dll_exists(sol_dir) {
-        checks.push(bcheck("xrm_dll", "Microsoft.Xrm.Sdk.dll in packages", "pass", "Found."));
+        checks.push(bcheck(
+            "xrm_dll",
+            "Microsoft.Xrm.Sdk.dll in packages",
+            "pass",
+            "Found.",
+        ));
     } else {
-        checks.push(bcheck("xrm_dll", "Microsoft.Xrm.Sdk.dll in packages", "fail",
-            "Not found â€” run NuGet restore."));
+        checks.push(bcheck(
+            "xrm_dll",
+            "Microsoft.Xrm.Sdk.dll in packages",
+            "fail",
+            "Not found â€” run NuGet restore.",
+        ));
         any_fail = true;
     }
 
@@ -4443,39 +5165,68 @@ async fn check_plugin_build_readiness(
     if let Some(ref art) = artifact_path {
         let ap = std::path::Path::new(art);
         if ap.exists() {
-            checks.push(bcheck("artifact", "Generated .cs file", "pass",
-                ap.file_name().unwrap_or_default().to_string_lossy()));
+            checks.push(bcheck(
+                "artifact",
+                "Generated .cs file",
+                "pass",
+                ap.file_name().unwrap_or_default().to_string_lossy(),
+            ));
         } else {
-            checks.push(bcheck("artifact", "Generated .cs file", "fail",
-                format!("Not found: {art}")));
+            checks.push(bcheck(
+                "artifact",
+                "Generated .cs file",
+                "fail",
+                format!("Not found: {art}"),
+            ));
             any_fail = true;
         }
     } else {
-        checks.push(bcheck("artifact", "Generated .cs file", "skip", "No artifact path configured."));
+        checks.push(bcheck(
+            "artifact",
+            "Generated .cs file",
+            "skip",
+            "No artifact path configured.",
+        ));
     }
 
     // 8. Generated .cs listed as Compile Include in .csproj
     if let (Some(ref art), Some(ref csp)) = (&artifact_path, &csproj) {
-        let ap  = std::path::Path::new(art);
+        let ap = std::path::Path::new(art);
         let dir = csp.parent().unwrap_or_else(|| std::path::Path::new("."));
         if let Ok(rel) = ap.strip_prefix(dir) {
             let rel_str = rel.to_string_lossy().replace('/', "\\");
             let content = fs::read_to_string(csp).unwrap_or_default();
             if compile_include_exists(&content, &rel_str) {
-                checks.push(bcheck("compile_include", "Compile Include in .csproj", "pass",
-                    format!("Found: {rel_str}")));
+                checks.push(bcheck(
+                    "compile_include",
+                    "Compile Include in .csproj",
+                    "pass",
+                    format!("Found: {rel_str}"),
+                ));
             } else {
-                checks.push(bcheck("compile_include", "Compile Include in .csproj", "warning",
-                    format!("{rel_str} not listed as Compile Include.")));
+                checks.push(bcheck(
+                    "compile_include",
+                    "Compile Include in .csproj",
+                    "warning",
+                    format!("{rel_str} not listed as Compile Include."),
+                ));
                 any_warn = true;
             }
         } else {
-            checks.push(bcheck("compile_include", "Compile Include in .csproj", "skip",
-                "Cannot compute relative path."));
+            checks.push(bcheck(
+                "compile_include",
+                "Compile Include in .csproj",
+                "skip",
+                "Cannot compute relative path.",
+            ));
         }
     } else {
-        checks.push(bcheck("compile_include", "Compile Include in .csproj", "skip",
-            "No artifact path configured."));
+        checks.push(bcheck(
+            "compile_include",
+            "Compile Include in .csproj",
+            "skip",
+            "No artifact path configured.",
+        ));
     }
 
     // 9. Optional msbuild (only when mandatory checks pass)
@@ -4507,13 +5258,19 @@ async fn check_plugin_build_readiness(
                             #[cfg(target_os = "windows")]
                             hide_console_window(&mut cmd);
                             cmd.arg(&sln_str)
-                               .args(["/t:Build", "/p:Configuration=Debug", "/v:minimal", "/nologo"])
-                               .current_dir(&sol_str)
-                               .stdout(Stdio::piped())
-                               .stderr(Stdio::piped())
-                               .output()
+                                .args([
+                                    "/t:Build",
+                                    "/p:Configuration=Debug",
+                                    "/v:minimal",
+                                    "/nologo",
+                                ])
+                                .current_dir(&sol_str)
+                                .stdout(Stdio::piped())
+                                .stderr(Stdio::piped())
+                                .output()
                         }),
-                    ).await;
+                    )
+                    .await;
 
                     match build_result {
                         Ok(Ok(Ok(out))) => {
@@ -4524,31 +5281,52 @@ async fn check_plugin_build_readiness(
                                 "{}{}",
                                 String::from_utf8_lossy(&out.stdout),
                                 String::from_utf8_lossy(&out.stderr),
-                            ).trim().to_string();
-                            build_output = if combined.is_empty() { None } else {
+                            )
+                            .trim()
+                            .to_string();
+                            build_output = if combined.is_empty() {
+                                None
+                            } else {
                                 Some(combined.chars().take(2000).collect())
                             };
                             if success {
                                 checks.push(bcheck("build", "MSBuild", "pass", "Build succeeded."));
                             } else {
-                                checks.push(bcheck("build", "MSBuild", "fail", "Build failed â€” see output."));
+                                checks.push(bcheck(
+                                    "build",
+                                    "MSBuild",
+                                    "fail",
+                                    "Build failed â€” see output.",
+                                ));
                                 any_fail = true;
                             }
                         }
                         Ok(Ok(Err(e))) => {
-                            checks.push(bcheck("build", "MSBuild", "warning",
-                                format!("MSBuild found but could not start: {e}")));
+                            checks.push(bcheck(
+                                "build",
+                                "MSBuild",
+                                "warning",
+                                format!("MSBuild found but could not start: {e}"),
+                            ));
                             any_warn = true;
                         }
                         Ok(Err(_)) => {
-                            checks.push(bcheck("build", "MSBuild", "warning",
-                                "MSBuild task failed unexpectedly."));
+                            checks.push(bcheck(
+                                "build",
+                                "MSBuild",
+                                "warning",
+                                "MSBuild task failed unexpectedly.",
+                            ));
                             any_warn = true;
                         }
                         Err(_) => {
                             build_attempted = true;
-                            checks.push(bcheck("build", "MSBuild", "warning",
-                                "Build check timed out after 120 s."));
+                            checks.push(bcheck(
+                                "build",
+                                "MSBuild",
+                                "warning",
+                                "Build check timed out after 120 s.",
+                            ));
                             any_warn = true;
                         }
                     }
@@ -4556,17 +5334,27 @@ async fn check_plugin_build_readiness(
             }
         }
     } else {
-        checks.push(bcheck("build", "MSBuild", "skip",
-            "Skipped â€” resolve failing checks before building."));
+        checks.push(bcheck(
+            "build",
+            "MSBuild",
+            "skip",
+            "Skipped â€” resolve failing checks before building.",
+        ));
     }
 
     let fail_count = checks.iter().filter(|c| c.result == "fail").count();
     let warn_count = checks.iter().filter(|c| c.result == "warning").count();
-    let status = if any_fail { "failed" } else if any_warn { "warnings" } else { "passed" };
+    let status = if any_fail {
+        "failed"
+    } else if any_warn {
+        "warnings"
+    } else {
+        "passed"
+    };
     let summary = match status {
-        "failed"   => format!("{fail_count} check(s) failed â€” resolve before building."),
+        "failed" => format!("{fail_count} check(s) failed â€” resolve before building."),
         "warnings" => format!("Passed with {warn_count} warning(s)."),
-        _          => "All build readiness checks passed.".to_string(),
+        _ => "All build readiness checks passed.".to_string(),
     };
 
     Ok(BuildReadinessResult {
@@ -4583,7 +5371,7 @@ async fn check_plugin_build_readiness(
 
 #[derive(Serialize, Debug)]
 struct CsprojUpdateResult {
-    action: String,        // "added" | "already_present" | "sdk_style" | "no_csproj_found"
+    action: String, // "added" | "already_present" | "sdk_style" | "no_csproj_found"
     csproj_path: Option<String>,
     message: String,
 }
@@ -4593,7 +5381,10 @@ fn find_csproj_in_dir(dir: &std::path::Path) -> Option<PathBuf> {
     let entries = fs::read_dir(dir).ok()?;
     for entry in entries.flatten() {
         let path = entry.path();
-        if path.extension().map_or(false, |ext| ext.eq_ignore_ascii_case("csproj")) {
+        if path
+            .extension()
+            .map_or(false, |ext| ext.eq_ignore_ascii_case("csproj"))
+        {
             return Some(path);
         }
     }
@@ -4709,8 +5500,7 @@ fn add_compile_include_to_csproj(cs_file_path: String) -> Result<CsprojUpdateRes
         });
     };
 
-    let raw = fs::read_to_string(&csproj_path)
-        .map_err(|e| format!("Cannot read .csproj: {e}"))?;
+    let raw = fs::read_to_string(&csproj_path).map_err(|e| format!("Cannot read .csproj: {e}"))?;
     // Strip UTF-8 BOM (U+FEFF = 3 bytes in UTF-8) so XML detection works reliably.
     let has_bom = raw.starts_with('\u{FEFF}');
     let content: String = if has_bom {
@@ -4723,24 +5513,26 @@ fn add_compile_include_to_csproj(cs_file_path: String) -> Result<CsprojUpdateRes
         return Ok(CsprojUpdateResult {
             action: "sdk_style".to_string(),
             csproj_path: Some(csproj_path.to_string_lossy().to_string()),
-            message: "SDK-style project auto-includes .cs files; no Compile entry needed.".to_string(),
+            message: "SDK-style project auto-includes .cs files; no Compile entry needed."
+                .to_string(),
         });
     }
 
     // Compute relative path from the project folder to the .cs file.
     // Use Windows backslashes â€” that is the MSBuild convention in .csproj files.
-    let rel_path = cs_path
-        .strip_prefix(proj_dir)
-        .map_err(|_| {
-            "Cannot compute relative path: the .cs file is not inside the project directory.".to_string()
-        })?;
+    let rel_path = cs_path.strip_prefix(proj_dir).map_err(|_| {
+        "Cannot compute relative path: the .cs file is not inside the project directory."
+            .to_string()
+    })?;
     let rel_str = rel_path.to_string_lossy().replace('/', "\\");
 
     if compile_include_exists(&content, &rel_str) {
         return Ok(CsprojUpdateResult {
             action: "already_present".to_string(),
             csproj_path: Some(csproj_path.to_string_lossy().to_string()),
-            message: format!("Compile Include for \"{rel_str}\" is already present in the .csproj."),
+            message: format!(
+                "Compile Include for \"{rel_str}\" is already present in the .csproj."
+            ),
         });
     }
 
@@ -4767,8 +5559,7 @@ fn add_compile_include_to_csproj(cs_file_path: String) -> Result<CsprojUpdateRes
 
 const MS_GRAPH_BASE: &str = "https://graph.microsoft.com/v1.0";
 const REDIRECT_PORT: u16 = 3049;
-const SCOPES: &str =
-    "openid profile email offline_access User.Read Mail.Read Chat.Read";
+const SCOPES: &str = "openid profile email offline_access User.Read Mail.Read Chat.Read";
 
 /// Builds the tenant-specific Microsoft identity authority URL.
 /// Single-tenant apps must use the tenant's own endpoint, not /common.
@@ -4815,7 +5606,9 @@ fn token_cache_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
 
 fn load_token_cache(app: &tauri::AppHandle) -> Option<TokenCache> {
     let path = token_cache_path(app).ok()?;
-    if !path.exists() { return None; }
+    if !path.exists() {
+        return None;
+    }
     let raw = fs::read_to_string(path).ok()?;
     serde_json::from_str(&raw).ok()
 }
@@ -4855,10 +5648,13 @@ fn wait_for_redirect(port: u16) -> Result<HashMap<String, String>, String> {
 
     // Read first line: "GET /?code=...&state=... HTTP/1.1"
     let mut request_line = String::new();
-    reader.read_line(&mut request_line).map_err(|e| e.to_string())?;
+    reader
+        .read_line(&mut request_line)
+        .map_err(|e| e.to_string())?;
 
     // Send a simple success page
-    let body = b"<html><body><h2>Authentication successful. You may close this window.</h2></body></html>";
+    let body =
+        b"<html><body><h2>Authentication successful. You may close this window.</h2></body></html>";
     let response = format!(
         "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
         body.len()
@@ -4934,20 +5730,15 @@ fn msal_error_from_body(body: &str, status: u16, operation: &str) -> String {
         // Truncate the description â€” MSAL descriptions can be very long.
         let preview: String = desc.chars().take(200).collect();
         let friendly = match code {
-            "invalid_grant" | "interaction_required" =>
-                format!(
-                    "InvalidAuthenticationToken â€” Microsoft connection expired ({code}). \
+            "invalid_grant" | "interaction_required" => format!(
+                "InvalidAuthenticationToken â€” Microsoft connection expired ({code}). \
                      Please reconnect in Settings. Detail: {preview}"
-                ),
-            "invalid_client" | "unauthorized_client" =>
-                format!(
-                    "Outlook authorization failed (HTTP {status}, {code}): invalid client ID or \
+            ),
+            "invalid_client" | "unauthorized_client" => format!(
+                "Outlook authorization failed (HTTP {status}, {code}): invalid client ID or \
                      the app is not authorised for this tenant. Detail: {preview}"
-                ),
-            _ =>
-                format!(
-                    "MSAL {operation} failed (HTTP {status}, {code}): {preview}"
-                ),
+            ),
+            _ => format!("MSAL {operation} failed (HTTP {status}, {code}): {preview}"),
         };
         eprintln!("[token] MSAL error during {operation}: code={code} HTTP={status}");
         return friendly;
@@ -4989,7 +5780,11 @@ async fn exchange_code_for_tokens(
     let body_text = raw_resp.text().await.unwrap_or_default();
     eprintln!("[token] exchange_code HTTP {status}");
     if !status.is_success() {
-        return Err(msal_error_from_body(&body_text, status.as_u16(), "code exchange"));
+        return Err(msal_error_from_body(
+            &body_text,
+            status.as_u16(),
+            "code exchange",
+        ));
     }
     let resp: TokenResponse = serde_json::from_str(&body_text)
         .map_err(|e| format!("Failed to parse token exchange response: {e}"))?;
@@ -5027,7 +5822,11 @@ async fn refresh_access_token(
     let body_text = raw_resp.text().await.unwrap_or_default();
     eprintln!("[token] refresh_access_token HTTP {status}");
     if !status.is_success() {
-        return Err(msal_error_from_body(&body_text, status.as_u16(), "token refresh"));
+        return Err(msal_error_from_body(
+            &body_text,
+            status.as_u16(),
+            "token refresh",
+        ));
     }
     let resp: TokenResponse = serde_json::from_str(&body_text)
         .map_err(|e| format!("Failed to parse token refresh response: {e}"))?;
@@ -5090,7 +5889,7 @@ async fn graph_get(url: &str, access_token: &str) -> Result<Value, String> {
         if let Ok(json) = serde_json::from_str::<Value>(&raw) {
             if let Some(err_obj) = json.get("error") {
                 let code = err_obj["code"].as_str().unwrap_or("unknown");
-                let msg  = err_obj["message"].as_str().unwrap_or("no detail");
+                let msg = err_obj["message"].as_str().unwrap_or("no detail");
                 let friendly = match code {
                     "Authorization_RequestDenied" | "Unauthorized" | "AccessDenied" =>
                         format!("Missing Microsoft permissions ({code}): {msg}. Make sure Mail.Read is granted in Azure."),
@@ -5131,7 +5930,7 @@ async fn graph_get(url: &str, access_token: &str) -> Result<Value, String> {
     // Graph occasionally returns 200 with an error object in the body.
     if let Some(err_obj) = body.get("error") {
         let code = err_obj["code"].as_str().unwrap_or("unknown");
-        let msg  = err_obj["message"].as_str().unwrap_or("no detail");
+        let msg = err_obj["message"].as_str().unwrap_or("no detail");
         let friendly = match code {
             "Authorization_RequestDenied" | "Unauthorized" | "AccessDenied" =>
                 format!("Missing Microsoft permissions ({code}): {msg}"),
@@ -5152,9 +5951,8 @@ async fn graph_get(url: &str, access_token: &str) -> Result<Value, String> {
 /// calls don't spin-retry with a dead token. Returns a prefixed error so callers can
 /// surface a targeted "please reconnect" message instead of a generic decode error.
 async fn ensure_valid_token(app: &tauri::AppHandle, client_id: &str) -> Result<String, String> {
-    let cache = load_token_cache(app).ok_or(
-        "MICROSOFT_NOT_CONNECTED: Not authenticated. Please sign in via Settings."
-    )?;
+    let cache = load_token_cache(app)
+        .ok_or("MICROSOFT_NOT_CONNECTED: Not authenticated. Please sign in via Settings.")?;
     if now_unix() < cache.expires_at {
         return Ok(cache.access_token);
     }
@@ -5208,9 +6006,9 @@ async fn connect_microsoft_account(
     }
 
     let authority = ms_authority(&tenant_id);
-    let verifier  = generate_code_verifier();
+    let verifier = generate_code_verifier();
     let challenge = generate_code_challenge(&verifier);
-    let state     = generate_state();
+    let state = generate_state();
     let redirect_uri = format!("http://localhost:{REDIRECT_PORT}");
     let auth_url = format!(
         "{authority}/oauth2/v2.0/authorize\
@@ -5223,7 +6021,7 @@ async fn connect_microsoft_account(
          &code_challenge_method=S256\
          &prompt=select_account",
         redirect_uri_enc = urlencoding::encode(&redirect_uri),
-        scopes           = urlencoding::encode(SCOPES),
+        scopes = urlencoding::encode(SCOPES),
     );
 
     webbrowser::open(&auth_url).map_err(|e| format!("Cannot open browser: {e}"))?;
@@ -5239,7 +6037,10 @@ async fn connect_microsoft_account(
     if let Some(err) = params.get("error_description") {
         return Err(err.clone());
     }
-    let code = params.get("code").ok_or("No code in redirect response")?.clone();
+    let code = params
+        .get("code")
+        .ok_or("No code in redirect response")?
+        .clone();
 
     let client = Client::new();
     let cache = exchange_code_for_tokens(&client, &client_id, &tenant_id, &code, &verifier).await?;
@@ -5253,7 +6054,7 @@ async fn connect_microsoft_account(
             .unwrap_or("")
             .to_owned(),
         display_name: me["displayName"].as_str().unwrap_or("").to_owned(),
-        tenant_id,  // use the configured value, not me["id"] which is the user's object ID
+        tenant_id, // use the configured value, not me["id"] which is the user's object ID
         last_sync_at: chrono_now_iso(),
     };
     Ok(info)
@@ -5266,14 +6067,16 @@ async fn refresh_microsoft_connection(
     app: tauri::AppHandle,
     client_id: String,
 ) -> Result<MicrosoftAccountInfo, String> {
-    let cache = load_token_cache(&app)
-        .ok_or("Not authenticated. Please sign in first.")?;
+    let cache = load_token_cache(&app).ok_or("Not authenticated. Please sign in first.")?;
     if cache.tenant_id.is_empty() {
-        return Err("Tenant ID missing from token cache. Please disconnect and sign in again.".into());
+        return Err(
+            "Tenant ID missing from token cache. Please disconnect and sign in again.".into(),
+        );
     }
     let tenant_id = cache.tenant_id.clone();
-    let client    = Client::new();
-    let new_cache = refresh_access_token(&client, &client_id, &tenant_id, &cache.refresh_token).await?;
+    let client = Client::new();
+    let new_cache =
+        refresh_access_token(&client, &client_id, &tenant_id, &cache.refresh_token).await?;
     save_token_cache(&app, &new_cache)?;
 
     let me: Value = graph_get(&format!("{MS_GRAPH_BASE}/me"), &new_cache.access_token).await?;
@@ -5311,10 +6114,7 @@ fn get_microsoft_connection_state(app: tauri::AppHandle) -> String {
 
 /// Fetch recent Outlook messages (top 25, sorted by received date desc).
 #[tauri::command]
-async fn get_outlook_messages(
-    app: tauri::AppHandle,
-    client_id: String,
-) -> Result<Value, String> {
+async fn get_outlook_messages(app: tauri::AppHandle, client_id: String) -> Result<Value, String> {
     let token = ensure_valid_token(&app, &client_id).await?;
     // Server-side filter: only flagged emails.
     // NOTE: $orderby is intentionally omitted â€” Graph rejects the combination of
@@ -5411,7 +6211,10 @@ async fn get_outlook_flagged_list(
     // only fires when $orderby is mixed with the flag filter, not for AND-filter clauses.
     let filter = if days_back > 0 {
         use std::time::{SystemTime, UNIX_EPOCH};
-        let now_secs = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+        let now_secs = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
         let cutoff_secs = now_secs.saturating_sub((days_back as u64) * 86400);
         let cutoff_date = unix_secs_to_date_str(cutoff_secs);
         // Percent-encode spaces and '/' in the filter string.
@@ -5470,7 +6273,9 @@ async fn get_outlook_flagged_list(
 
     eprintln!(
         "[Outlook] get_outlook_flagged_list: days_back={} fetched={} shown={}",
-        days_back, fetched_count, messages.len()
+        days_back,
+        fetched_count,
+        messages.len()
     );
     Ok(serde_json::json!({ "messages": messages, "fetchedCount": fetched_count }))
 }
@@ -5487,24 +6292,28 @@ async fn resolve_cid_attachments(html: &str, message_id: &str, token: &str) -> S
     }
     let att_url = format!("{MS_GRAPH_BASE}/me/messages/{message_id}/attachments");
     let att_data = match graph_get(&att_url, token).await {
-        Ok(d)  => d,
+        Ok(d) => d,
         Err(e) => {
-            eprintln!("[cid] attachment fetch failed for {}: {}", &message_id[..message_id.len().min(12)], e);
+            eprintln!(
+                "[cid] attachment fetch failed for {}: {}",
+                &message_id[..message_id.len().min(12)],
+                e
+            );
             return html.to_string();
         }
     };
     let attachments = match att_data["value"].as_array() {
         Some(a) => a.clone(),
-        None    => return html.to_string(),
+        None => return html.to_string(),
     };
 
     let mut resolved = html.to_string();
     for att in &attachments {
         // Only handle inline file attachments that carry base64 content.
-        let is_inline      = att["isInline"].as_bool().unwrap_or(false);
-        let content_id     = att["contentId"].as_str().unwrap_or("");
-        let content_type   = att["contentType"].as_str().unwrap_or("image/png");
-        let content_bytes  = att["contentBytes"].as_str().unwrap_or("");
+        let is_inline = att["isInline"].as_bool().unwrap_or(false);
+        let content_id = att["contentId"].as_str().unwrap_or("");
+        let content_type = att["contentType"].as_str().unwrap_or("image/png");
+        let content_bytes = att["contentBytes"].as_str().unwrap_or("");
         if !is_inline || content_id.is_empty() || content_bytes.is_empty() {
             continue;
         }
@@ -5539,10 +6348,13 @@ async fn get_outlook_message_full(
          ?$select=id,subject,from,receivedDateTime,bodyPreview,webLink,body,flag"
     );
     let m = graph_get(&url, &token).await?;
-    let from_email  = m["from"]["emailAddress"]["address"].as_str().unwrap_or("").to_string();
+    let from_email = m["from"]["emailAddress"]["address"]
+        .as_str()
+        .unwrap_or("")
+        .to_string();
     let subject_str = m["subject"].as_str().unwrap_or("");
     let preview_str = m["bodyPreview"].as_str().unwrap_or("");
-    let body_html   = m["body"]["content"].as_str().unwrap_or("").to_string();
+    let body_html = m["body"]["content"].as_str().unwrap_or("").to_string();
     // strip_html_email preserves block-level line breaks for quoted-reply detection.
     // body_full is the plain-text path â€” AI, prefilter, ADO parsing all use this.
     let mut body_full = strip_html_email(&body_html);
@@ -5552,7 +6364,11 @@ async fn get_outlook_message_full(
             for (href, label) in &ado_pairs {
                 body_full.push_str(&format!("\n##ADO## {} ||| {}", href, label));
             }
-            eprintln!("[ado-link] {} ADO link(s) for messageId={}", ado_pairs.len(), &message_id[..message_id.len().min(12)]);
+            eprintln!(
+                "[ado-link] {} ADO link(s) for messageId={}",
+                ado_pairs.len(),
+                &message_id[..message_id.len().min(12)]
+            );
         }
     }
     // Resolve CID inline images â†’ data: URIs for the HTML display path.
@@ -5568,7 +6384,10 @@ async fn get_outlook_message_full(
     );
 
     let is_flagged = m["flag"]["flagStatus"].as_str() == Some("flagged");
-    eprintln!("[Outlook] get_outlook_message_full: messageId={}", &message_id[..message_id.len().min(12)]);
+    eprintln!(
+        "[Outlook] get_outlook_message_full: messageId={}",
+        &message_id[..message_id.len().min(12)]
+    );
     Ok(serde_json::json!({
         "id":         m["id"],
         "subject":    m["subject"].as_str().unwrap_or("(no subject)"),
@@ -5587,10 +6406,7 @@ async fn get_outlook_message_full(
 /// Note: $orderby is NOT supported on /me/chats â€” it causes a 400 when combined
 /// with $expand. Results are sorted in Rust after fetching.
 #[tauri::command]
-async fn get_teams_chats(
-    app: tauri::AppHandle,
-    client_id: String,
-) -> Result<Value, String> {
+async fn get_teams_chats(app: tauri::AppHandle, client_id: String) -> Result<Value, String> {
     let token = ensure_valid_token(&app, &client_id).await?;
     // $orderby intentionally omitted: the Graph /me/chats endpoint does not
     // support it (returns 400), especially when combined with $expand.
@@ -5602,7 +6418,10 @@ async fn get_teams_chats(
     );
     let data = graph_get(&url, &token).await?;
     let raw_chats = data["value"].as_array().cloned().unwrap_or_default();
-    eprintln!("[Teams] get_teams_chats: {} chats returned from Graph", raw_chats.len());
+    eprintln!(
+        "[Teams] get_teams_chats: {} chats returned from Graph",
+        raw_chats.len()
+    );
 
     let mut chats: Vec<Value> = raw_chats
         .into_iter()
@@ -5642,7 +6461,10 @@ async fn get_teams_chats(
         tb.cmp(ta)
     });
 
-    eprintln!("[Teams] get_teams_chats: returning {} chats to frontend", chats.len());
+    eprintln!(
+        "[Teams] get_teams_chats: returning {} chats to frontend",
+        chats.len()
+    );
     Ok(serde_json::json!(chats))
 }
 
@@ -5661,14 +6483,19 @@ async fn get_teams_chat_messages(
     );
     let data = graph_get(&url, &token).await?;
     let raw = data["value"].as_array().cloned().unwrap_or_default();
-    eprintln!("[Teams] get_teams_chat_messages: {} raw messages for chat {chat_id}", raw.len());
+    eprintln!(
+        "[Teams] get_teams_chat_messages: {} raw messages for chat {chat_id}",
+        raw.len()
+    );
 
     let mut filtered_out = 0usize;
     let messages: Vec<Value> = raw
         .into_iter()
         .filter(|m| {
             let keep = m["messageType"].as_str() == Some("message");
-            if !keep { filtered_out += 1; }
+            if !keep {
+                filtered_out += 1;
+            }
             keep
         })
         .map(|m| {
@@ -5705,7 +6532,10 @@ async fn get_teams_intake_messages(
     chat_id: String,
 ) -> Result<Value, String> {
     if chat_id.trim().is_empty() {
-        return Err("Teams intake chat ID is not configured. Set it in Settings â†’ Teams Intake.".to_string());
+        return Err(
+            "Teams intake chat ID is not configured. Set it in Settings â†’ Teams Intake."
+                .to_string(),
+        );
     }
     let token = ensure_valid_token(&app, &client_id).await?;
 
@@ -5720,10 +6550,17 @@ async fn get_teams_intake_messages(
 
     // Today-only filter: keep messages whose createdDateTime starts with today's UTC date.
     use std::time::{SystemTime, UNIX_EPOCH};
-    let now_secs = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+    let now_secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
     let today_str = unix_secs_to_date_str(now_secs);
-    eprintln!("[Teams-intake] chatId prefix={} today_utc={} raw_count={}",
-        &chat_id[..chat_id.len().min(12)], today_str, raw.len());
+    eprintln!(
+        "[Teams-intake] chatId prefix={} today_utc={} raw_count={}",
+        &chat_id[..chat_id.len().min(12)],
+        today_str,
+        raw.len()
+    );
 
     let mut messages: Vec<Value> = Vec::new();
     let mut filtered_out = 0usize;
@@ -5756,16 +6593,16 @@ async fn get_teams_intake_messages(
             || plain_lower.contains("from:")
             || plain_lower.contains("original message");
         if looks_forwarded {
-            let msg_id  = m["id"].as_str().unwrap_or("?");
+            let msg_id = m["id"].as_str().unwrap_or("?");
             let snippet = &raw_content[..raw_content.len().min(300)];
             eprintln!("[Teams-fwd-diag] id={msg_id} bodyType={body_content_type} atts={att_count}");
             eprintln!("[Teams-fwd-diag] html_snippet={snippet:?}");
             if let Some(atts_arr) = atts {
                 for (ai, att) in atts_arr.iter().enumerate() {
-                    let ct      = att["contentType"].as_str().unwrap_or("?");
-                    let att_id  = att["id"].as_str().unwrap_or("?");
-                    let c_snip  = att["content"].as_str().unwrap_or("");
-                    let c_snip  = &c_snip[..c_snip.len().min(200)];
+                    let ct = att["contentType"].as_str().unwrap_or("?");
+                    let att_id = att["id"].as_str().unwrap_or("?");
+                    let c_snip = att["content"].as_str().unwrap_or("");
+                    let c_snip = &c_snip[..c_snip.len().min(200)];
                     eprintln!("[Teams-fwd-diag]   att[{ai}] contentType={ct:?} id={att_id} content={c_snip:?}");
                 }
             }
@@ -5774,51 +6611,69 @@ async fn get_teams_intake_messages(
         // Parse forwarded-message metadata from the raw HTML *before* it is lost.
         let fwd = parse_teams_forwarded_card(&m, raw_content);
         if fwd.is_some() {
-            eprintln!("[Teams-intake] forwarded card detected in message {}",
-                m["id"].as_str().unwrap_or("?"));
+            eprintln!(
+                "[Teams-intake] forwarded card detected in message {}",
+                m["id"].as_str().unwrap_or("?")
+            );
         }
 
         // â”€â”€ Teams message link resolution â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         // If the intake message body contains a "Copy link to message" URL,
         // resolve and prefer the original linked message over forwarded heuristics.
         let link = parse_teams_message_link(&content);
-        let mut linked_type   = "";         // "chat" | "channel" | ""
-        let mut linked_url    = String::new();
+        let mut linked_type = ""; // "chat" | "channel" | ""
+        let mut linked_url = String::new();
         let mut link_resolved = false;
         let mut linked_meta: Option<ForwardedMeta> = None;
 
         if let Some(ref lnk) = link {
             linked_url = lnk.raw_url.clone();
             if lnk.is_channel {
-                linked_type = "channel";       // not supported â€” surface in UI
-                eprintln!("[Teams-link] channel link detected (unsupported): {}", &lnk.raw_url[..lnk.raw_url.len().min(80)]);
+                linked_type = "channel"; // not supported â€” surface in UI
+                eprintln!(
+                    "[Teams-link] channel link detected (unsupported): {}",
+                    &lnk.raw_url[..lnk.raw_url.len().min(80)]
+                );
                 // Still try to parse the preview card text for the original sender/body.
                 if let Some(pc) = parse_teams_preview_card(&content) {
-                    eprintln!("[Teams-link] preview card parsed from channel link: sender=\"{}\"", pc.sender_name);
+                    eprintln!(
+                        "[Teams-link] preview card parsed from channel link: sender=\"{}\"",
+                        pc.sender_name
+                    );
                     linked_meta = Some(pc);
                 }
             } else {
                 linked_type = "chat";
-                eprintln!("[Teams-link] chat link detected, resolving: chat={} msg={}",
+                eprintln!(
+                    "[Teams-link] chat link detected, resolving: chat={} msg={}",
                     &lnk.chat_id[..lnk.chat_id.len().min(20)],
-                    &lnk.message_id[..lnk.message_id.len().min(20)]);
+                    &lnk.message_id[..lnk.message_id.len().min(20)]
+                );
                 match try_fetch_linked_chat_message(&token, &lnk.chat_id, &lnk.message_id).await {
                     Ok(Some(meta)) => {
                         eprintln!("[Teams-link] resolved: sender=\"{}\"", meta.sender_name);
                         link_resolved = true;
-                        linked_meta   = Some(meta);
+                        linked_meta = Some(meta);
                     }
                     Ok(None) => {
                         eprintln!("[Teams-link] could not resolve (no data / permission); trying preview-card fallback");
                         if let Some(pc) = parse_teams_preview_card(&content) {
-                            eprintln!("[Teams-link] preview card fallback: sender=\"{}\"", pc.sender_name);
+                            eprintln!(
+                                "[Teams-link] preview card fallback: sender=\"{}\"",
+                                pc.sender_name
+                            );
                             linked_meta = Some(pc);
                         }
                     }
                     Err(e) => {
-                        eprintln!("[Teams-link] resolution error: {e}; trying preview-card fallback");
+                        eprintln!(
+                            "[Teams-link] resolution error: {e}; trying preview-card fallback"
+                        );
                         if let Some(pc) = parse_teams_preview_card(&content) {
-                            eprintln!("[Teams-link] preview card fallback: sender=\"{}\"", pc.sender_name);
+                            eprintln!(
+                                "[Teams-link] preview card fallback: sender=\"{}\"",
+                                pc.sender_name
+                            );
                             linked_meta = Some(pc);
                         }
                     }
@@ -5851,7 +6706,11 @@ async fn get_teams_intake_messages(
             "linkedMessageResolved": link_resolved,
         }));
     }
-    eprintln!("[Teams-intake] {} messages kept today, {} filtered out", messages.len(), filtered_out);
+    eprintln!(
+        "[Teams-intake] {} messages kept today, {} filtered out",
+        messages.len(),
+        filtered_out
+    );
     Ok(serde_json::json!(messages))
 }
 
@@ -5880,7 +6739,10 @@ async fn get_teams_recent_messages(
     );
     let chats_data = graph_get(&chats_url, &token).await?;
     let raw_chats = chats_data["value"].as_array().cloned().unwrap_or_default();
-    eprintln!("[Teams] get_teams_recent_messages: {} chats loaded (target: 25)", raw_chats.len());
+    eprintln!(
+        "[Teams] get_teams_recent_messages: {} chats loaded (target: 25)",
+        raw_chats.len()
+    );
 
     // Step 2: for each chat, fetch the 2 most recent messages
     let mut all_messages: Vec<Value> = Vec::new();
@@ -5895,11 +6757,15 @@ async fn get_teams_recent_messages(
         };
         let members: Vec<&str> = chat["members"]
             .as_array()
-            .map(|arr| arr.iter().filter_map(|m| m["displayName"].as_str()).collect())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|m| m["displayName"].as_str())
+                    .collect()
+            })
             .unwrap_or_default();
         let members_summary = members.join(", ");
         let chat_topic = chat["topic"].as_str().unwrap_or("").to_string();
-        let chat_type  = chat["chatType"].as_str().unwrap_or("").to_string();
+        let chat_type = chat["chatType"].as_str().unwrap_or("").to_string();
 
         let msgs_url = format!(
             "{MS_GRAPH_BASE}/me/chats/{chat_id}/messages\
@@ -5907,7 +6773,7 @@ async fn get_teams_recent_messages(
              &$orderby=createdDateTime%20desc"
         );
         let msgs_data = match graph_get(&msgs_url, &token).await {
-            Ok(d)  => d,
+            Ok(d) => d,
             Err(e) => {
                 eprintln!("[Teams] get_teams_recent_messages: skipped chat {chat_id}: {e}");
                 chats_with_errors += 1;
@@ -5968,15 +6834,15 @@ async fn get_teams_recent_messages(
 /// Convert a Unix timestamp (seconds since epoch) to a UTC date string "YYYY-MM-DD".
 /// Uses Howard Hinnant's civil-from-days algorithm â€” no external crate required.
 fn unix_secs_to_date_str(secs: u64) -> String {
-    let z   = (secs / 86400) as i64 + 719468;
+    let z = (secs / 86400) as i64 + 719468;
     let era = if z >= 0 { z } else { z - 146096 } / 146097;
     let doe = z - era * 146097;
     let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
     let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp  = (5 * doy + 2) / 153;
-    let d   = doy - (153 * mp + 2) / 5 + 1;
-    let m   = if mp < 10 { mp + 3 } else { mp - 9 };
-    let y   = yoe + era * 400 + if m <= 2 { 1 } else { 0 };
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = yoe + era * 400 + if m <= 2 { 1 } else { 0 };
     format!("{:04}-{:02}-{:02}", y, m, d)
 }
 
@@ -6001,7 +6867,10 @@ async fn get_teams_self_chat_messages(
     if my_id.is_empty() {
         return Err("Could not determine signed-in user ID from Microsoft Graph.".to_string());
     }
-    eprintln!("[Teams-selfchat] signed-in userId prefix={}", &my_id[..my_id.len().min(8)]);
+    eprintln!(
+        "[Teams-selfchat] signed-in userId prefix={}",
+        &my_id[..my_id.len().min(8)]
+    );
 
     // Step 2: fetch chats with members expanded so we can identify the self-chat.
     let chats_url = format!(
@@ -6024,9 +6893,16 @@ async fn get_teams_self_chat_messages(
             return None;
         }
         let all_self = members.iter().all(|m| {
-            m["userId"].as_str().map(|id| id == my_id.as_str()).unwrap_or(false)
+            m["userId"]
+                .as_str()
+                .map(|id| id == my_id.as_str())
+                .unwrap_or(false)
         });
-        if all_self { Some(c["id"].as_str()?.to_string()) } else { None }
+        if all_self {
+            Some(c["id"].as_str()?.to_string())
+        } else {
+            None
+        }
     });
     let chat_id = match self_chat_id {
         Some(id) => id,
@@ -6034,7 +6910,10 @@ async fn get_teams_self_chat_messages(
             "Self-chat not found. Open Teams, go to Chat, and send a message to yourself to create the intake chat.".to_string()
         ),
     };
-    eprintln!("[Teams-selfchat] self-chat found chatId prefix={}", &chat_id[..chat_id.len().min(12)]);
+    eprintln!(
+        "[Teams-selfchat] self-chat found chatId prefix={}",
+        &chat_id[..chat_id.len().min(12)]
+    );
 
     // Step 4: fetch latest 50 messages from the self-chat (newest first).
     let msgs_url = format!(
@@ -6047,7 +6926,10 @@ async fn get_teams_self_chat_messages(
 
     // Step 5: compute today's UTC date string for the today-only filter.
     use std::time::{SystemTime, UNIX_EPOCH};
-    let now_secs = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+    let now_secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
     let today_str = unix_secs_to_date_str(now_secs);
     eprintln!("[Teams-selfchat] today_utc={}", today_str);
 
@@ -6084,7 +6966,8 @@ async fn get_teams_self_chat_messages(
     }
     eprintln!(
         "[Teams-selfchat] {} messages kept today, {} filtered out",
-        messages.len(), filtered_out
+        messages.len(),
+        filtered_out
     );
     Ok(serde_json::json!(messages))
 }
@@ -6100,7 +6983,7 @@ async fn get_teams_self_chat_messages(
 ///   - Work item creation / updates
 ///   - Build notifications
 fn is_potential_ado_email(from_email: &str, subject: &str, body_preview: &str) -> bool {
-    let email_lower   = from_email.to_ascii_lowercase();
+    let email_lower = from_email.to_ascii_lowercase();
     let subject_lower = subject.to_ascii_lowercase();
     let preview_lower = body_preview.to_ascii_lowercase();
 
@@ -6115,7 +6998,7 @@ fn is_potential_ado_email(from_email: &str, subject: &str, body_preview: &str) -
 
     // Subject-based: low false-positive patterns that are strongly ADO-specific.
     let subject_signals: &[&str] = &[
-        "pr - ",           // PR review request: "PR - Fix login - Proj 42 (Reviewer)"
+        "pr - ", // PR review request: "PR - Fix login - Proj 42 (Reviewer)"
         "pull request",
         "has commented on",
         "commented on",
@@ -6167,13 +7050,18 @@ fn extract_ado_link_pairs(html: &str) -> Vec<(String, String)> {
 
     loop {
         // Find the next opening <a ...> tag
-        let Some(rel_a) = lower[search_pos..].find("<a ").or_else(|| lower[search_pos..].find("<a\t"))
-            else { break };
+        let Some(rel_a) = lower[search_pos..]
+            .find("<a ")
+            .or_else(|| lower[search_pos..].find("<a\t"))
+        else {
+            break;
+        };
         let a_start = search_pos + rel_a;
 
         // Find the closing > of this opening tag
-        let Some(rel_gt) = lower[a_start..].find('>')
-            else { break };
+        let Some(rel_gt) = lower[a_start..].find('>') else {
+            break;
+        };
         let tag_end = a_start + rel_gt + 1; // byte after '>'
 
         let tag_slice = &html[a_start..tag_end - 1]; // content inside <a ... >
@@ -6181,9 +7069,13 @@ fn extract_ado_link_pairs(html: &str) -> Vec<(String, String)> {
         // Extract href value â€” look for href="..."
         let href_opt = 'href: {
             let tag_lower = tag_slice.to_ascii_lowercase();
-            let Some(href_pos) = tag_lower.find("href=\"") else { break 'href None };
+            let Some(href_pos) = tag_lower.find("href=\"") else {
+                break 'href None;
+            };
             let value_start = href_pos + 6; // after href="
-            let Some(value_end) = tag_lower[value_start..].find('"') else { break 'href None };
+            let Some(value_end) = tag_lower[value_start..].find('"') else {
+                break 'href None;
+            };
             let raw_href = &tag_slice[value_start..value_start + value_end];
             // Keep Azure DevOps URLs: both the modern dev.azure.com domain
             // and the legacy <org>.visualstudio.com domain still used by many orgs.
@@ -6207,7 +7099,11 @@ fn extract_ado_link_pairs(html: &str) -> Vec<(String, String)> {
                 String::new()
             };
             let label = anchor_text.split_whitespace().collect::<Vec<_>>().join(" ");
-            eprintln!("[ado-link] candidate href={} label=\"{}\"", &href[..href.len().min(120)], label);
+            eprintln!(
+                "[ado-link] candidate href={} label=\"{}\"",
+                &href[..href.len().min(120)],
+                label
+            );
             pairs.push((href, label));
         }
 
@@ -6220,13 +7116,36 @@ fn extract_ado_link_pairs(html: &str) -> Vec<(String, String)> {
 /// `tag` must be the raw tag name+attributes, lowercased (without < >).
 fn is_block_tag(tag: &str) -> bool {
     // Extract just the tag name (first word, strip leading slash for closing tags)
-    let name = tag.trim_start_matches('/').split_ascii_whitespace().next().unwrap_or("");
+    let name = tag
+        .trim_start_matches('/')
+        .split_ascii_whitespace()
+        .next()
+        .unwrap_or("");
     matches!(
         name,
-        "p" | "div" | "br" | "hr" | "tr" | "td" | "th" | "li" | "dt" | "dd"
-            | "h1" | "h2" | "h3" | "h4" | "h5" | "h6"
-            | "blockquote" | "pre" | "article" | "section"
-            | "table" | "thead" | "tbody" | "tfoot"
+        "p" | "div"
+            | "br"
+            | "hr"
+            | "tr"
+            | "td"
+            | "th"
+            | "li"
+            | "dt"
+            | "dd"
+            | "h1"
+            | "h2"
+            | "h3"
+            | "h4"
+            | "h5"
+            | "h6"
+            | "blockquote"
+            | "pre"
+            | "article"
+            | "section"
+            | "table"
+            | "thead"
+            | "tbody"
+            | "tfoot"
     )
 }
 
@@ -6267,21 +7186,21 @@ fn strip_html_email(html: &str) -> String {
 
     // Decode common HTML entities
     let decoded = out
-        .replace("&nbsp;",  " ")
-        .replace("&amp;",   "&")
-        .replace("&lt;",    "<")
-        .replace("&gt;",    ">")
-        .replace("&quot;",  "\"")
-        .replace("&apos;",  "'")
-        .replace("&#39;",   "'")
+        .replace("&nbsp;", " ")
+        .replace("&amp;", "&")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&apos;", "'")
+        .replace("&#39;", "'")
         .replace("&mdash;", "\u{2014}")
         .replace("&ndash;", "\u{2013}")
         .replace("&ldquo;", "\u{201c}")
         .replace("&rdquo;", "\u{201d}")
         .replace("&lsquo;", "\u{2018}")
         .replace("&rsquo;", "\u{2019}")
-        .replace("&hellip;","\u{2026}")
-        .replace("&bull;",  "\u{2022}")
+        .replace("&hellip;", "\u{2026}")
+        .replace("&bull;", "\u{2022}")
         .replace("&#8211;", "\u{2013}")
         .replace("&#8212;", "\u{2014}")
         .replace("&#8216;", "\u{2018}")
@@ -6318,7 +7237,10 @@ fn strip_html(html: &str) -> String {
     for ch in html.chars() {
         match ch {
             '<' => in_tag = true,
-            '>' => { in_tag = false; out.push(' '); }  // replace tag with space
+            '>' => {
+                in_tag = false;
+                out.push(' ');
+            } // replace tag with space
             c if !in_tag => out.push(c),
             _ => {}
         }
@@ -6326,21 +7248,21 @@ fn strip_html(html: &str) -> String {
 
     // Step 2: decode common HTML entities
     let decoded = out
-        .replace("&nbsp;",  " ")
-        .replace("&amp;",   "&")
-        .replace("&lt;",    "<")
-        .replace("&gt;",    ">")
-        .replace("&quot;",  "\"")
-        .replace("&apos;",  "'")
-        .replace("&#39;",   "'")
+        .replace("&nbsp;", " ")
+        .replace("&amp;", "&")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&apos;", "'")
+        .replace("&#39;", "'")
         .replace("&mdash;", "\u{2014}")
         .replace("&ndash;", "\u{2013}")
         .replace("&ldquo;", "\u{201c}")
         .replace("&rdquo;", "\u{201d}")
         .replace("&lsquo;", "\u{2018}")
         .replace("&rsquo;", "\u{2019}")
-        .replace("&hellip;","\u{2026}")
-        .replace("&bull;",  "\u{2022}")
+        .replace("&hellip;", "\u{2026}")
+        .replace("&bull;", "\u{2022}")
         .replace("&#8211;", "\u{2013}")
         .replace("&#8212;", "\u{2014}")
         .replace("&#8216;", "\u{2018}")
@@ -6377,7 +7299,20 @@ fn chrono_now_iso() -> String {
     }
 
     let leap = is_leap_year(year);
-    let days_per_month: [i64; 12] = [31, if leap { 29 } else { 28 }, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+    let days_per_month: [i64; 12] = [
+        31,
+        if leap { 29 } else { 28 },
+        31,
+        30,
+        31,
+        30,
+        31,
+        31,
+        30,
+        31,
+        30,
+        31,
+    ];
     let mut month = 1i64;
     for &dim in &days_per_month {
         if remaining_days < dim {
@@ -6391,12 +7326,175 @@ fn chrono_now_iso() -> String {
     format!("{year:04}-{month:02}-{day:02}T{h:02}:{m:02}:{s:02}Z")
 }
 
+// --- Canonical WorkItem application/transport adapters --------------------
+
+fn initialize_canonical_storage(app: &tauri::AppHandle) -> Result<(), String> {
+    let dir = app_data_dir(app)?;
+    let repo = SqliteWorkItemRepository::in_app_data(&dir);
+    repo.migrate_json_tasks(&dir.join("tasks.json"))
+        .map(|_| ())
+        .map_err(|e| e.message)
+}
+
+fn canonical_storage_ready(app: &tauri::AppHandle) -> Result<(), String> {
+    let result = CANONICAL_STORAGE_INIT.get_or_init(|| {
+        let started = std::time::Instant::now();
+        let result = initialize_canonical_storage(app);
+        eprintln!(
+            "[task-mcp-bridge] canonical storage initialization completed: ok={} elapsedMs={}",
+            result.is_ok(),
+            started.elapsed().as_millis()
+        );
+        result
+    });
+    result.clone()
+}
+
+fn canonical_repo(app: &tauri::AppHandle) -> Result<SqliteWorkItemRepository, String> {
+    canonical_storage_ready(app)?;
+    let dir = app_data_dir(app)?;
+    let repo = SqliteWorkItemRepository::in_app_data(&dir);
+    repo.initialize().map_err(|e| e.message)?;
+    Ok(repo)
+}
+
+fn canonical_error(error: crate::application::ApplicationError) -> String {
+    serde_json::to_string(&error).unwrap_or_else(|_| error.message)
+}
+
+fn canonical_external_references(item: &WorkItem) -> Vec<Value> {
+    let mut refs: Vec<Value> = item.external_references.iter().map(|reference| serde_json::json!({"type": reference.reference_type, "label": reference.label, "id": reference.id, "url": reference.url})).collect();
+    for (key, kind, label) in [
+        ("devopsTaskUrl", "azure_devops_work_item", "Azure DevOps"),
+        ("ticketUrl", "ticket", "Helpdesk ticket"),
+    ] {
+        if let Some(url) = item.metadata.get(key).and_then(Value::as_str).filter(|v| !v.is_empty()) {
+            if !refs.iter().any(|r| r["url"] == url) {
+                let id = url.rsplit('/').next().filter(|v| !v.is_empty() && v.chars().all(|c| c.is_ascii_digit()));
+                refs.push(serde_json::json!({"type": kind, "label": label, "id": id, "url": url}));
+            }
+        }
+    }
+    if let Some(url) = item.source_url.as_deref().filter(|v| !v.is_empty()) {
+        refs.push(serde_json::json!({"type":"source", "label":"Source", "url":url}));
+    }
+    refs
+}
+
+fn canonical_summary(item: &WorkItem) -> Value {
+    let planning_bucket = item.planning_bucket.clone().map(Value::String).or_else(|| item.metadata.get("planningBucket").cloned()).unwrap_or(Value::Null);
+    let estimate_minutes = item.estimate_minutes.map(Value::from).or_else(|| item.metadata.get("estimateMinutes").cloned()).or_else(|| item.metadata.get("estimatedEffort").and_then(|v| v.as_f64()).map(|h| Value::from((h * 60.0).round() as i64)));
+    serde_json::json!({
+        "id": item.id, "kind": item.kind, "title": item.title, "status": item.status,
+        "priority": item.priority, "planningBucket": planning_bucket,
+        "owner": item.owner, "area": item.area_id.as_ref().map(|id| serde_json::json!({"id":id,"name":id})),
+        "dueAt": item.due_at, "estimateMinutes": estimate_minutes, "source": item.source,
+        "updatedAt": item.updated_at, "revision": item.revision, "archived": item.archived_at.is_some()
+    })
+}
+
+fn canonical_detail(item: &WorkItem) -> Value {
+    let mut detail = serde_json::to_value(item).unwrap_or(Value::Null);
+    if let Value::Object(ref mut map) = detail {
+        map.insert("planningBucket".to_string(), item.planning_bucket.clone().map(Value::String).or_else(|| item.metadata.get("planningBucket").cloned()).unwrap_or(Value::Null));
+        map.insert("estimateMinutes".to_string(), item.estimate_minutes.map(Value::from).or_else(|| item.metadata.get("estimateMinutes").cloned()).or_else(|| item.metadata.get("estimatedEffort").and_then(|v| v.as_f64()).map(|h| Value::from((h * 60.0).round() as i64))).unwrap_or(Value::Null));
+        map.insert("externalReferences".to_string(), Value::Array(canonical_external_references(item)));
+        map.insert("structuredContext".to_string(), Value::Array(serde_json::to_value(&item.context).unwrap_or(Value::Array(vec![])).as_array().cloned().unwrap_or_default()));
+        map.insert("notes".to_string(), Value::Array(item.context.iter().filter(|e| e.entry_type == "note").map(|e| serde_json::to_value(e).unwrap_or(Value::Null)).collect()));
+    }
+    detail
+}
+
+#[tauri::command]
+fn initialize_work_item_storage(app: tauri::AppHandle) -> Result<Value, String> {
+    let repo = canonical_repo(&app)?;
+    let dir = app_data_dir(&app)?;
+    let report = repo.migrate_json_tasks(&dir.join("tasks.json")).map_err(canonical_error)?;
+    serde_json::to_value(report).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn list_work_items(app: tauri::AppHandle, include_archived: Option<bool>, limit: Option<usize>, status: Option<String>, kind: Option<String>, owner: Option<String>, area: Option<String>, source: Option<String>, planning_bucket: Option<String>, due_before: Option<String>, due_after: Option<String>, updated_after: Option<String>, cursor: Option<String>) -> Result<Value, String> {
+    let repo = canonical_repo(&app)?;
+    let service = WorkItemApplicationService { repository: &repo };
+    let requested_limit = limit.unwrap_or(50).clamp(1, 500);
+    let mut items = service.list(&WorkItemListQuery { include_archived: include_archived.unwrap_or(false), limit: requested_limit.saturating_add(1), status, kind, owner, area, source, planning_bucket, due_before, due_after, updated_after, cursor }).map_err(canonical_error)?;
+    let next_cursor = if items.len() > requested_limit { items.pop().map(|item| format!("{}|{}", item.updated_at, item.id)) } else { None };
+    Ok(serde_json::json!({"apiVersion":"1", "generatedAt": chrono_now_iso(), "snapshotRevision": items.iter().map(|i| i.revision).max().unwrap_or(0), "items": items.iter().map(canonical_summary).collect::<Vec<_>>(), "nextCursor": next_cursor}))
+}
+
+#[tauri::command]
+fn get_work_item(app: tauri::AppHandle, id: String) -> Result<Value, String> {
+    let repo = canonical_repo(&app)?;
+    let service = WorkItemApplicationService { repository: &repo };
+    Ok(canonical_detail(&service.get(&id).map_err(canonical_error)?))
+}
+
+#[tauri::command]
+fn list_work_item_changes(app: tauri::AppHandle, after: Option<i64>, limit: Option<usize>) -> Result<Value, String> {
+    let repo = canonical_repo(&app)?;
+    let changes = repo.changes_after(after.unwrap_or(0), limit.unwrap_or(100)).map_err(canonical_error)?;
+    let projected: Vec<Value> = changes.iter().map(|change| serde_json::json!({
+        "sequence": change.sequence,
+        "revision": change.revision,
+        "workItemId": change.work_item_id,
+        "changeType": change.action,
+        "changedFields": [],
+        "changedAt": change.changed_at,
+    })).collect();
+    Ok(serde_json::json!({"apiVersion":"1", "changes":projected, "nextCursor": changes.last().map(|c| c.sequence)}))
+}
+
+#[tauri::command]
+fn create_work_item(app: tauri::AppHandle, item: WorkItem, idempotency_key: Option<String>) -> Result<Value, String> {
+    let repo = canonical_repo(&app)?;
+    let created = match idempotency_key.as_deref().filter(|key| !key.trim().is_empty()) {
+        Some(key) => repo.create_idempotent(&item, key),
+        None => repo.create(&item),
+    }.map_err(canonical_error)?;
+    Ok(canonical_detail(&created))
+}
+
+#[tauri::command]
+fn update_work_item(app: tauri::AppHandle, id: String, item: WorkItem, expected_revision: i64, actor_name: Option<String>) -> Result<Value, String> {
+    let repo = canonical_repo(&app)?;
+    let updated = repo.update(&id, &item, &MutationContext { expected_revision, actor_type: ActorType::User, actor_name }).map_err(canonical_error)?;
+    Ok(canonical_detail(&updated))
+}
+
+#[tauri::command]
+fn transition_work_item(app: tauri::AppHandle, id: String, status: String, reason: Option<String>, expected_revision: i64, actor_name: Option<String>) -> Result<Value, String> {
+    let repo = canonical_repo(&app)?;
+    let target: WorkItemStatus = serde_json::from_value(Value::String(status.clone())).map_err(|e| e.to_string())?;
+    let service = WorkItemApplicationService { repository: &repo };
+    let updated = service.transition(&id, target, reason.as_deref(), expected_revision, &chrono_now_iso(), actor_name).map_err(canonical_error)?;
+    Ok(canonical_detail(&updated))
+}
+
+#[tauri::command]
+fn append_work_item_note(app: tauri::AppHandle, id: String, text: String, expected_revision: i64, actor_name: Option<String>) -> Result<Value, String> {
+    if text.trim().is_empty() { return Err(canonical_error(crate::application::ApplicationError::validation("Note text must not be empty."))); }
+    let repo = canonical_repo(&app)?;
+    let service = WorkItemApplicationService { repository: &repo };
+    let updated = service.append_note(&id, &text, expected_revision, &chrono_now_iso(), actor_name).map_err(canonical_error)?;
+    Ok(canonical_detail(&updated))
+}
+
+#[tauri::command]
+fn get_planning_today(app: tauri::AppHandle, timezone: Option<String>) -> Result<Value, String> {
+    let repo = canonical_repo(&app)?;
+    let service = WorkItemApplicationService { repository: &repo };
+    let items = service.list(&WorkItemListQuery { include_archived: false, limit: 500, planning_bucket: Some("now".to_string()), ..Default::default() }).map_err(canonical_error)?;
+    let today = service.list(&WorkItemListQuery { include_archived: false, limit: 500, planning_bucket: Some("today".to_string()), ..Default::default() }).map_err(canonical_error)?;
+    Ok(serde_json::json!({"apiVersion":"1", "generatedAt":chrono_now_iso(), "sourceRevision": items.iter().chain(today.iter()).map(|i| i.revision).max().unwrap_or(0), "timezone": timezone.unwrap_or_else(|| "UTC".to_string()), "sections":{"now":items.iter().map(canonical_summary).collect::<Vec<_>>(), "today":today.iter().map(canonical_summary).collect::<Vec<_>>()}}))
+}
+
 // --- Teams message link detection and resolution --------------------------
 
 /// Structured data extracted from a Teams message URL.
 struct ParsedTeamsLink {
-    raw_url:    String,
-    chat_id:    String,
+    raw_url: String,
+    chat_id: String,
     message_id: String,
     /// True when the URL contains a non-empty `groupId` query parameter,
     /// which signals a channel (team) message rather than a plain chat message.
@@ -6420,7 +7518,7 @@ fn parse_teams_message_link(plain_text: &str) -> Option<ParsedTeamsLink> {
         .find(|c: char| c.is_whitespace())
         .unwrap_or(after_prefix.len());
     let url_part = &after_prefix[..url_len];
-    let raw_url  = format!("{PREFIX}{url_part}");
+    let raw_url = format!("{PREFIX}{url_part}");
 
     // Split path: <encoded-chat-id>/<message-id>[?query]
     let slash = url_part.find('/')?;
@@ -6429,9 +7527,13 @@ fn parse_teams_message_link(plain_text: &str) -> Option<ParsedTeamsLink> {
 
     let q_pos = after_slash.find('?').unwrap_or(after_slash.len());
     let encoded_message_id = &after_slash[..q_pos];
-    let query = if q_pos < after_slash.len() { &after_slash[q_pos + 1..] } else { "" };
+    let query = if q_pos < after_slash.len() {
+        &after_slash[q_pos + 1..]
+    } else {
+        ""
+    };
 
-    let chat_id    = percent_decode(encoded_chat_id);
+    let chat_id = percent_decode(encoded_chat_id);
     let message_id = percent_decode(encoded_message_id);
     if chat_id.is_empty() || message_id.is_empty() {
         return None;
@@ -6445,15 +7547,20 @@ fn parse_teams_message_link(plain_text: &str) -> Option<ParsedTeamsLink> {
         key == "groupId" && !val.is_empty()
     });
 
-    Some(ParsedTeamsLink { raw_url, chat_id, message_id, is_channel })
+    Some(ParsedTeamsLink {
+        raw_url,
+        chat_id,
+        message_id,
+        is_channel,
+    })
 }
 
 /// Attempt to fetch the linked Teams chat message directly from Graph.
 /// Returns `Ok(Some(meta))` on success, `Ok(None)` on not-found / permission
 /// error (caller should surface "unresolved"), `Err(())` on unexpected failure.
 async fn try_fetch_linked_chat_message(
-    token:      &str,
-    chat_id:    &str,
+    token: &str,
+    chat_id: &str,
     message_id: &str,
 ) -> Result<Option<ForwardedMeta>, String> {
     let url = format!("{MS_GRAPH_BASE}/me/chats/{chat_id}/messages/{message_id}");
@@ -6467,15 +7574,19 @@ async fn try_fetch_linked_chat_message(
                 .as_str()
                 .filter(|s| !s.is_empty())
                 .map(|s| s.to_string());
-            let sent_at  = data["createdDateTime"].as_str().map(|s| s.to_string());
+            let sent_at = data["createdDateTime"].as_str().map(|s| s.to_string());
             let body_html = data["body"]["content"].as_str().unwrap_or("");
-            let content   = strip_html(body_html).trim().to_string();
+            let content = strip_html(body_html).trim().to_string();
 
             if sender_name.is_empty() && content.is_empty() {
                 return Ok(None);
             }
             Ok(Some(ForwardedMeta {
-                sender_name: if sender_name.is_empty() { "[unknown]".to_string() } else { sender_name },
+                sender_name: if sender_name.is_empty() {
+                    "[unknown]".to_string()
+                } else {
+                    sender_name
+                },
                 sender_email,
                 sent_at,
                 content,
@@ -6532,7 +7643,9 @@ fn parse_teams_preview_card(content: &str) -> Option<ForwardedMeta> {
 
     // Strip trailing Teams chrome ("| Chat | Microsoft Teams" etc.)
     let clean = strip_teams_chrome(without_url);
-    if clean.is_empty() { return None; }
+    if clean.is_empty() {
+        return None;
+    }
 
     // Expect first non-empty line to be "<SenderName>: <body text>"
     let first_line = clean.lines().next()?.trim();
@@ -6545,7 +7658,9 @@ fn parse_teams_preview_card(content: &str) -> Option<ForwardedMeta> {
     }
 
     let body_first = first_line[colon_idx + 1..].trim();
-    let rest_lines: Vec<&str> = clean.lines().skip(1)
+    let rest_lines: Vec<&str> = clean
+        .lines()
+        .skip(1)
         .map(|l| l.trim())
         .filter(|l| !l.is_empty())
         .collect();
@@ -6555,22 +7670,24 @@ fn parse_teams_preview_card(content: &str) -> Option<ForwardedMeta> {
         format!("{body_first}\n{}", rest_lines.join("\n"))
     };
     let body = body.trim().to_string();
-    if body.is_empty() { return None; }
+    if body.is_empty() {
+        return None;
+    }
 
     Some(ForwardedMeta {
-        sender_name:  name.to_string(),
+        sender_name: name.to_string(),
         sender_email: None,
-        sent_at:      None,
-        content:      body,
+        sent_at: None,
+        content: body,
     })
 }
 
 /// Metadata extracted from a forwarded Teams intake message.
 struct ForwardedMeta {
-    sender_name:  String,
+    sender_name: String,
     sender_email: Option<String>,
-    sent_at:      Option<String>,
-    content:      String,
+    sent_at: Option<String>,
+    content: String,
 }
 
 /// Attempt to extract original-message metadata from a forwarded Teams intake message.
@@ -6610,7 +7727,11 @@ fn parse_teams_forwarded_card(msg: &Value, body_html: &str) -> Option<ForwardedM
                     .as_str()
                     .filter(|s| !s.is_empty())
                     .map(|s| s.to_string());
-                let preview = c["messagePreview"].as_str().unwrap_or("").trim().to_string();
+                let preview = c["messagePreview"]
+                    .as_str()
+                    .unwrap_or("")
+                    .trim()
+                    .to_string();
                 if !sender_name.is_empty() {
                     // Prefer the structured preview; fall back to the full stripped body.
                     let full_stripped = strip_html(body_html);
@@ -6656,11 +7777,16 @@ fn parse_teams_forwarded_card(msg: &Value, body_html: &str) -> Option<ForwardedM
                 let first = lines.first().copied().unwrap_or("");
                 let (sender_name, content) = if let Some(rest) = first.strip_prefix("From:") {
                     let raw = rest.trim();
-                    let name = if let Some(a) = raw.find('<') { raw[..a].trim().to_string() }
-                               else { raw.to_string() };
+                    let name = if let Some(a) = raw.find('<') {
+                        raw[..a].trim().to_string()
+                    } else {
+                        raw.to_string()
+                    };
                     (name, lines[1..].join("\n").trim().to_string())
                 } else if first.contains(" wrote:") || first.contains(" says:") {
-                    let name = first.split_once(" wrote:").or_else(|| first.split_once(" says:"))
+                    let name = first
+                        .split_once(" wrote:")
+                        .or_else(|| first.split_once(" says:"))
                         .map(|(n, _)| n.trim().to_string())
                         .unwrap_or_default();
                     (name, lines[1..].join("\n").trim().to_string())
@@ -6689,10 +7815,10 @@ fn parse_teams_forwarded_card(msg: &Value, body_html: &str) -> Option<ForwardedM
     if lower_html.contains("<b>from:</b>") || lower_html.contains("<strong>from:</strong>") {
         let plain = strip_html(body_html);
         let lines: Vec<&str> = plain.lines().collect();
-        let mut sender_name:  String          = String::new();
-        let mut sender_email: Option<String>  = None;
-        let mut sent_at:      Option<String>  = None;
-        let mut body_start:   usize           = lines.len(); // default: no body found
+        let mut sender_name: String = String::new();
+        let mut sender_email: Option<String> = None;
+        let mut sent_at: Option<String> = None;
+        let mut body_start: usize = lines.len(); // default: no body found
 
         for (i, line) in lines.iter().enumerate() {
             let t = line.trim();
@@ -6700,11 +7826,11 @@ fn parse_teams_forwarded_card(msg: &Value, body_html: &str) -> Option<ForwardedM
                 let raw = rest.trim();
                 if let (Some(a), Some(b)) = (raw.find('<'), raw.find('>')) {
                     // "Display Name <user@domain>"
-                    sender_name  = raw[..a].trim().to_string();
+                    sender_name = raw[..a].trim().to_string();
                     sender_email = Some(raw[a + 1..b].trim().to_string());
                 } else if raw.contains('@') {
                     sender_email = Some(raw.to_string());
-                    sender_name  = raw.split('@').next().unwrap_or(raw).to_string();
+                    sender_name = raw.split('@').next().unwrap_or(raw).to_string();
                 } else {
                     sender_name = raw.to_string();
                 }
@@ -6724,14 +7850,18 @@ fn parse_teams_forwarded_card(msg: &Value, body_html: &str) -> Option<ForwardedM
         if !sender_name.is_empty() && body_start < lines.len() {
             let content = lines[body_start..].join("\n").trim().to_string();
             if !content.is_empty() {
-                return Some(ForwardedMeta { sender_name, sender_email, sent_at, content });
+                return Some(ForwardedMeta {
+                    sender_name,
+                    sender_email,
+                    sent_at,
+                    content,
+                });
             }
         }
     }
 
     None
 }
-
 
 // --- Task Workbench MCP bridge --------------------------------------------
 
@@ -6743,6 +7873,7 @@ const TASK_MCP_MAX_BODY_BYTES: usize = 256 * 1024;
 
 static TASK_MCP_BRIDGE_STATE: OnceLock<Mutex<Value>> = OnceLock::new();
 static TASK_MCP_BRIDGE_TOKEN: OnceLock<String> = OnceLock::new();
+static CANONICAL_STORAGE_INIT: OnceLock<Result<(), String>> = OnceLock::new();
 
 fn task_mcp_bridge_token() -> &'static str {
     TASK_MCP_BRIDGE_TOKEN.get_or_init(|| {
@@ -6761,8 +7892,9 @@ fn task_mcp_bridge_state() -> &'static Mutex<Value> {
             "active": false,
             "host": TASK_MCP_BRIDGE_HOST,
             "port": TASK_MCP_BRIDGE_PORT,
-            "readOnlyTools": task_mcp_read_only_tool_definitions(),
-            "localWriteTools": task_mcp_local_write_tool_definitions(),
+            "canonicalTools": canonical_mcp_tool_definitions(),
+            "readOnlyTools": canonical_mcp_tool_definitions().into_iter().filter(|tool| matches!(tool["name"].as_str(), Some("list_work_items"|"get_work_item"|"list_work_item_changes"|"get_planning_today"))).collect::<Vec<_>>(),
+            "localWriteTools": canonical_mcp_tool_definitions().into_iter().filter(|tool| matches!(tool["name"].as_str(), Some("create_work_item"|"update_work_item"|"transition_work_item"|"append_work_item_note"))).collect::<Vec<_>>(),
             "readOnlyMode": false,
             "localWriteMode": true,
             "lastError": Value::Null,
@@ -6782,18 +7914,21 @@ fn task_mcp_current_bridge_state() -> Value {
     task_mcp_bridge_state()
         .lock()
         .map(|v| v.clone())
-        .unwrap_or_else(|_| serde_json::json!({
-            "active": false,
-            "host": TASK_MCP_BRIDGE_HOST,
-            "port": TASK_MCP_BRIDGE_PORT,
-            "readOnlyTools": task_mcp_read_only_tool_definitions(),
-            "localWriteTools": task_mcp_local_write_tool_definitions(),
-            "readOnlyMode": false,
-            "localWriteMode": true,
-            "lastError": "Bridge state lock poisoned.",
-            "serverPath": task_mcp_server_script_path(),
-            "bridgeToken": task_mcp_bridge_token(),
-        }))
+        .unwrap_or_else(|_| {
+            serde_json::json!({
+                "active": false,
+                "host": TASK_MCP_BRIDGE_HOST,
+                "port": TASK_MCP_BRIDGE_PORT,
+                "canonicalTools": canonical_mcp_tool_definitions(),
+                "readOnlyTools": canonical_mcp_tool_definitions().into_iter().filter(|tool| matches!(tool["name"].as_str(), Some("list_work_items"|"get_work_item"|"list_work_item_changes"|"get_planning_today"))).collect::<Vec<_>>(),
+                "localWriteTools": canonical_mcp_tool_definitions().into_iter().filter(|tool| matches!(tool["name"].as_str(), Some("create_work_item"|"update_work_item"|"transition_work_item"|"append_work_item_note"))).collect::<Vec<_>>(),
+                "readOnlyMode": false,
+                "localWriteMode": true,
+                "lastError": "Bridge state lock poisoned.",
+                "serverPath": task_mcp_server_script_path(),
+                "bridgeToken": task_mcp_bridge_token(),
+            })
+        })
 }
 
 fn task_mcp_current_bridge_state_for_ui() -> Value {
@@ -6887,8 +8022,11 @@ fn task_mcp_required_developer_workflow_tools() -> &'static [&'static str] {
 
 /// Required developer-workflow tool names absent from `defined_names`. Pure — no I/O — so tests
 /// can simulate a toolset that is missing a required tool without touching the real tool list.
-fn task_mcp_missing_required_tools_from(defined_names: &std::collections::HashSet<String>) -> Vec<String> {
-    task_mcp_required_developer_workflow_tools().iter()
+fn task_mcp_missing_required_tools_from(
+    defined_names: &std::collections::HashSet<String>,
+) -> Vec<String> {
+    task_mcp_required_developer_workflow_tools()
+        .iter()
         .filter(|name| !defined_names.contains(**name))
         .map(|name| name.to_string())
         .collect()
@@ -6898,7 +8036,8 @@ fn task_mcp_missing_required_tools_from(defined_names: &std::collections::HashSe
 /// empty in a correctly built app — this is a real, dynamic check (not a hardcoded assumption) so
 /// it catches accidental removal/renaming of a required tool as a regression, not just in theory.
 fn task_mcp_missing_required_tools() -> Vec<String> {
-    let defined: std::collections::HashSet<String> = task_mcp_tool_definitions().iter()
+    let defined: std::collections::HashSet<String> = task_mcp_tool_definitions()
+        .iter()
         .filter_map(|t| t["name"].as_str().map(str::to_string))
         .collect();
     task_mcp_missing_required_tools_from(&defined)
@@ -6909,7 +8048,9 @@ fn task_mcp_missing_required_tools() -> Vec<String> {
 /// tests can simulate a toolset that is missing a required tool.
 fn task_mcp_capabilities_from(defined_names: &std::collections::HashSet<String>) -> Value {
     let missing = task_mcp_missing_required_tools_from(defined_names);
-    let can_run_implementation_verification = !missing.iter().any(|m| m == "run_implementation_verification");
+    let can_run_implementation_verification = !missing
+        .iter()
+        .any(|m| m == "run_implementation_verification");
     let can_record_ai_kit_review = !missing.iter().any(|m| m == "record_ai_kit_review_result");
     let can_run_developer_workflow = missing.is_empty();
     let recommended_action = if missing.is_empty() {
@@ -6947,8 +8088,16 @@ fn task_mcp_apply_tooling_availability_guard(
     next_action: &'static str,
     missing_tools: &[String],
 ) -> (&'static str, &'static str, Vec<String>) {
-    if next_action == "run_ai_kit_review" && missing_tools.iter().any(|m| m == "record_ai_kit_review_result") {
-        ("tooling_error", "reload_mcp_or_start_app", vec!["record_ai_kit_review_result".to_string()])
+    if next_action == "run_ai_kit_review"
+        && missing_tools
+            .iter()
+            .any(|m| m == "record_ai_kit_review_result")
+    {
+        (
+            "tooling_error",
+            "reload_mcp_or_start_app",
+            vec!["record_ai_kit_review_result".to_string()],
+        )
     } else {
         (status, next_action, Vec::new())
     }
@@ -6958,7 +8107,8 @@ fn task_mcp_apply_tooling_availability_guard(
 /// code at all means the bridge is live (bridgeMode is always "live-rust" here) — the JS fallback
 /// mirror in mcp/task-workbench-mcp.mjs handles the js-fallback/offline cases.
 fn task_mcp_capabilities() -> Value {
-    let defined: std::collections::HashSet<String> = task_mcp_tool_definitions().iter()
+    let defined: std::collections::HashSet<String> = task_mcp_tool_definitions()
+        .iter()
         .filter_map(|t| t["name"].as_str().map(str::to_string))
         .collect();
     task_mcp_capabilities_from(&defined)
@@ -7013,6 +8163,33 @@ fn task_mcp_tool_definitions() -> Vec<Value> {
     tools
 }
 
+fn canonical_mcp_tool_definitions() -> Vec<Value> {
+    vec![
+        serde_json::json!({"name":"list_work_items","description":"List canonical task and obligation summaries. Read-only; never executes work.","inputSchema":{"type":"object","additionalProperties":false,"properties":{"includeArchived":{"type":"boolean"},"limit":{"type":"integer","minimum":1,"maximum":500},"cursor":{"type":"string"},"status":{"type":"string"},"kind":{"type":"string"},"owner":{"type":"string"},"area":{"type":"string"},"source":{"type":"string"},"planningBucket":{"type":"string"},"dueBefore":{"type":"string"},"dueAfter":{"type":"string"},"updatedAfter":{"type":"string"}}}}),
+        serde_json::json!({"name":"get_work_item","description":"Get one canonical work-item detail by stable id.","inputSchema":{"type":"object","required":["id"],"additionalProperties":false,"properties":{"id":{"type":"string","minLength":1}}}}),
+        serde_json::json!({"name":"list_work_item_changes","description":"Read ordered changes after a revision cursor.","inputSchema":{"type":"object","additionalProperties":false,"properties":{"after":{"type":"integer","minimum":0},"limit":{"type":"integer","minimum":1,"maximum":500}}}}),
+        serde_json::json!({"name":"create_work_item","description":"Create a canonical task or obligation record only.","inputSchema":{"type":"object","required":["item"],"additionalProperties":false,"properties":{"item":{"type":"object"},"idempotencyKey":{"type":"string"}}}}),
+        serde_json::json!({"name":"update_work_item","description":"Update canonical work-item data with expected revision.","inputSchema":{"type":"object","required":["id","item","expectedRevision"],"additionalProperties":false,"properties":{"id":{"type":"string"},"item":{"type":"object"},"expectedRevision":{"type":"integer","minimum":1},"actorName":{"type":"string"}}}}),
+        serde_json::json!({"name":"transition_work_item","description":"Apply a validated lifecycle transition.","inputSchema":{"type":"object","required":["id","status","expectedRevision"],"additionalProperties":false,"properties":{"id":{"type":"string"},"status":{"type":"string"},"reason":{"type":"string"},"expectedRevision":{"type":"integer","minimum":1},"actorName":{"type":"string"}}}}),
+        serde_json::json!({"name":"append_work_item_note","description":"Append contextual information to a work item.","inputSchema":{"type":"object","required":["id","text","expectedRevision"],"additionalProperties":false,"properties":{"id":{"type":"string"},"text":{"type":"string","minLength":1},"expectedRevision":{"type":"integer","minimum":1},"actorName":{"type":"string"}}}}),
+        serde_json::json!({"name":"get_planning_today","description":"Return the live deterministic Now and Today planning sections.","inputSchema":{"type":"object","additionalProperties":false,"properties":{"timezone":{"type":"string"}}}}),
+    ]
+}
+
+fn task_mcp_execute_canonical_tool(app: &tauri::AppHandle, name: &str, args: &Value) -> Result<Value, String> {
+    match name {
+        "list_work_items" => list_work_items(app.clone(), args["includeArchived"].as_bool(), args["limit"].as_u64().map(|v| v as usize), args["status"].as_str().map(str::to_string), args["kind"].as_str().map(str::to_string), args["owner"].as_str().map(str::to_string), args["area"].as_str().map(str::to_string), args["source"].as_str().map(str::to_string), args["planningBucket"].as_str().map(str::to_string), args["dueBefore"].as_str().map(str::to_string), args["dueAfter"].as_str().map(str::to_string), args["updatedAfter"].as_str().map(str::to_string), args["cursor"].as_str().map(str::to_string)),
+        "get_work_item" => get_work_item(app.clone(), args["id"].as_str().unwrap_or_default().to_string()),
+        "list_work_item_changes" => list_work_item_changes(app.clone(), args["after"].as_i64(), args["limit"].as_u64().map(|v| v as usize)),
+        "create_work_item" => { let item: WorkItem = serde_json::from_value(args["item"].clone()).map_err(|e| e.to_string())?; create_work_item(app.clone(), item, args["idempotencyKey"].as_str().map(str::to_string)) },
+        "update_work_item" => { let item: WorkItem = serde_json::from_value(args["item"].clone()).map_err(|e| e.to_string())?; update_work_item(app.clone(), args["id"].as_str().unwrap_or_default().to_string(), item, args["expectedRevision"].as_i64().unwrap_or(0), args["actorName"].as_str().map(str::to_string)) },
+        "transition_work_item" => transition_work_item(app.clone(), args["id"].as_str().unwrap_or_default().to_string(), args["status"].as_str().unwrap_or_default().to_string(), args["reason"].as_str().map(str::to_string), args["expectedRevision"].as_i64().unwrap_or(0), args["actorName"].as_str().map(str::to_string)),
+        "append_work_item_note" => append_work_item_note(app.clone(), args["id"].as_str().unwrap_or_default().to_string(), args["text"].as_str().unwrap_or_default().to_string(), args["expectedRevision"].as_i64().unwrap_or(0), args["actorName"].as_str().map(str::to_string)),
+        "get_planning_today" => get_planning_today(app.clone(), args["timezone"].as_str().map(str::to_string)),
+        _ => Err(format!("Unknown canonical tool: {name}")),
+    }
+}
+
 fn task_mcp_strip_html(value: &str) -> String {
     let mut text = value
         .replace("<br>", "\n")
@@ -7029,8 +8206,7 @@ fn task_mcp_strip_html(value: &str) -> String {
         }
     }
 
-    text
-        .split_whitespace()
+    text.split_whitespace()
         .collect::<Vec<_>>()
         .join(" ")
         .trim()
@@ -7042,7 +8218,13 @@ fn task_mcp_summarize(value: Option<&str>, max_len: usize) -> String {
     if clean.len() <= max_len {
         return clean;
     }
-    format!("{}...", clean.chars().take(max_len.saturating_sub(3)).collect::<String>())
+    format!(
+        "{}...",
+        clean
+            .chars()
+            .take(max_len.saturating_sub(3))
+            .collect::<String>()
+    )
 }
 
 fn task_mcp_is_developer_task(task: &Value) -> bool {
@@ -7056,7 +8238,10 @@ fn task_mcp_is_developer_task(task: &Value) -> bool {
 }
 
 fn task_mcp_latest_verification(task: &Value) -> Value {
-    let reports = task["crmVerificationReports"].as_array().cloned().unwrap_or_default();
+    let reports = task["crmVerificationReports"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
     if reports.is_empty() {
         return serde_json::json!({
             "exists": false,
@@ -7088,60 +8273,87 @@ fn task_mcp_approval_summary(gate: Option<&Value>) -> Value {
 
 fn task_mcp_plan_approval_safety_check(task: &Value, packet: &Value) -> Vec<String> {
     let mut reasons: Vec<String> = Vec::new();
-    let workflow  = task.get("crmDeveloperWorkflow").unwrap_or(&Value::Null);
-    let impl_obj  = &packet["implementation"];
-    let plan      = &workflow["technicalPlan"];
+    let workflow = task.get("crmDeveloperWorkflow").unwrap_or(&Value::Null);
+    let impl_obj = &packet["implementation"];
+    let plan = &workflow["technicalPlan"];
 
     if task["taskMode"].as_str() != Some("developer") {
         reasons.push("Task mode is not 'developer'.".to_string());
     }
 
-    let work_kind = workflow["detectedWorkKind"].as_str()
+    let work_kind = workflow["detectedWorkKind"]
+        .as_str()
         .or_else(|| task["workflowSetup"]["devTargetKind"].as_str())
         .unwrap_or("unknown");
     if matches!(work_kind, "unknown" | "") {
-        reasons.push("Work kind is not yet classified. Set work kind to plugin or script.".to_string());
+        reasons.push(
+            "Work kind is not yet classified. Set work kind to plugin or script.".to_string(),
+        );
     }
 
     if plan.is_null() {
-        reasons.push("No technical plan has been saved. Call save_technical_plan first.".to_string());
+        reasons
+            .push("No technical plan has been saved. Call save_technical_plan first.".to_string());
     } else {
         if !plan["invalidatedAt"].is_null() {
-            reasons.push("Technical plan has been invalidated and must be regenerated.".to_string());
+            reasons
+                .push("Technical plan has been invalidated and must be regenerated.".to_string());
         }
-        if plan["externalActionPreview"].as_array().map(|a| !a.is_empty()).unwrap_or(false) {
+        if plan["externalActionPreview"]
+            .as_array()
+            .map(|a| !a.is_empty())
+            .unwrap_or(false)
+        {
             reasons.push("Technical plan includes external actions (deploy/upload/Dataverse write). These require manual user approval and cannot be auto-approved.".to_string());
         }
-        let has_todo = plan["implementationSteps"].as_array()
-            .map(|a| a.iter().any(|v| {
-                let s = v.as_str().unwrap_or("").to_lowercase();
-                s.contains("todo") || s.contains("scaffold") || s.contains("placeholder")
-            }))
+        let has_todo = plan["implementationSteps"]
+            .as_array()
+            .map(|a| {
+                a.iter().any(|v| {
+                    let s = v.as_str().unwrap_or("").to_lowercase();
+                    s.contains("todo") || s.contains("scaffold") || s.contains("placeholder")
+                })
+            })
             .unwrap_or(false)
-            || plan["risks"].as_array()
-            .map(|a| a.iter().any(|v| {
-                let s = v.as_str().unwrap_or("").to_lowercase();
-                s.contains("todo") || s.contains("scaffold") || s.contains("placeholder")
-            }))
-            .unwrap_or(false);
+            || plan["risks"]
+                .as_array()
+                .map(|a| {
+                    a.iter().any(|v| {
+                        let s = v.as_str().unwrap_or("").to_lowercase();
+                        s.contains("todo") || s.contains("scaffold") || s.contains("placeholder")
+                    })
+                })
+                .unwrap_or(false);
         if has_todo {
             reasons.push("Technical plan steps or risks contain TODO/scaffold/placeholder text. Regenerate the plan with concrete implementation steps.".to_string());
         }
     }
 
     if impl_obj["scaffoldOnly"].as_bool().unwrap_or(false) {
-        reasons.push("scaffoldOnly=true: required write targets or field mappings are not fully defined.".to_string());
+        reasons.push(
+            "scaffoldOnly=true: required write targets or field mappings are not fully defined."
+                .to_string(),
+        );
     }
 
-    if impl_obj["finalConsistencyGuardApplied"].as_bool().unwrap_or(false) {
+    if impl_obj["finalConsistencyGuardApplied"]
+        .as_bool()
+        .unwrap_or(false)
+    {
         reasons.push("finalConsistencyGuardApplied=true: plan still contains scaffold/TODO text alongside empty field mappings.".to_string());
     }
 
     let requires_fm = impl_obj["requiresFieldMappings"].as_bool().unwrap_or(false);
-    let fm_count    = impl_obj["fieldMappings"].as_array().map(|a| a.len()).unwrap_or(0);
-    let fm_source   = impl_obj["fieldMappingsSource"].as_str().unwrap_or("none");
+    let fm_count = impl_obj["fieldMappings"]
+        .as_array()
+        .map(|a| a.len())
+        .unwrap_or(0);
+    let fm_source = impl_obj["fieldMappingsSource"].as_str().unwrap_or("none");
     let implementation_pattern = impl_obj["implementationPattern"].as_str();
-    let is_non_mapping_pattern = matches!(implementation_pattern, Some("ui-business-rule") | Some("ribbon-action"));
+    let is_non_mapping_pattern = matches!(
+        implementation_pattern,
+        Some("ui-business-rule") | Some("ribbon-action")
+    );
 
     if requires_fm {
         if fm_count == 0 {
@@ -7163,19 +8375,42 @@ fn task_mcp_plan_approval_safety_check(task: &Value, packet: &Value) -> Vec<Stri
         if wt["artifactPath"].as_str().unwrap_or("").is_empty() {
             reasons.push("Target file/artifact path is not set.".to_string());
         }
-        if wt["eventName"].as_str().unwrap_or("").is_empty() && wt["eventFieldName"].as_str().unwrap_or("").is_empty() {
+        if wt["eventName"].as_str().unwrap_or("").is_empty()
+            && wt["eventFieldName"].as_str().unwrap_or("").is_empty()
+        {
             reasons.push("Event/eventField is not set.".to_string());
         }
-        let referenced_len = impl_obj["referencedFields"].as_array().map(|a| a.len()).unwrap_or(0);
-        let affected_len = impl_obj["affectedFields"].as_array().map(|a| a.len()).unwrap_or(0);
+        let referenced_len = impl_obj["referencedFields"]
+            .as_array()
+            .map(|a| a.len())
+            .unwrap_or(0);
+        let affected_len = impl_obj["affectedFields"]
+            .as_array()
+            .map(|a| a.len())
+            .unwrap_or(0);
         if referenced_len == 0 && affected_len == 0 {
-            reasons.push("No referenced/affected fields are defined for this UI/business-rule script.".to_string());
+            reasons.push(
+                "No referenced/affected fields are defined for this UI/business-rule script."
+                    .to_string(),
+            );
         }
-        if impl_obj["businessRules"].as_array().map(|a| a.is_empty()).unwrap_or(true) {
-            reasons.push("No business rules are defined for this UI/business-rule script.".to_string());
+        if impl_obj["businessRules"]
+            .as_array()
+            .map(|a| a.is_empty())
+            .unwrap_or(true)
+        {
+            reasons.push(
+                "No business rules are defined for this UI/business-rule script.".to_string(),
+            );
         }
-        if impl_obj["acceptanceCriteria"].as_array().map(|a| a.is_empty()).unwrap_or(true) {
-            reasons.push("No acceptance criteria are defined for this UI/business-rule script.".to_string());
+        if impl_obj["acceptanceCriteria"]
+            .as_array()
+            .map(|a| a.is_empty())
+            .unwrap_or(true)
+        {
+            reasons.push(
+                "No acceptance criteria are defined for this UI/business-rule script.".to_string(),
+            );
         }
     }
 
@@ -7205,6 +8440,11 @@ fn task_mcp_safe_task_summary(task: &Value) -> Value {
         "summary": task_mcp_summarize(summary_source, TASK_MCP_MAX_SUMMARY_LENGTH),
         "attentionState": task["attentionState"].as_str(),
         "waitingState": task["waitingState"].as_str(),
+        // Authoritative planning metadata consumed by read-only integrations.
+        // Keep this bounded: no full task record or source content is exposed.
+        "planningBucket": task["planningBucket"].as_str(),
+        "estimatedEffort": task["estimatedEffort"].as_f64(),
+        "projectLabel": task["projectLabel"].as_str().or(task["customerName"].as_str()),
     });
 
     if workflow["currentStep"].is_string() || workflow["detectedWorkKind"].is_string() {
@@ -7374,12 +8614,20 @@ fn task_mcp_matches_scaffold_text(text: &str) -> bool {
         return true;
     }
     // Czech variants
-    if lower.contains("field mappings nejsou definov") { return true; }
-    if lower.contains("mapov") && (lower.contains("doplnit") || lower.contains("mus") && lower.contains("dopl")) {
+    if lower.contains("field mappings nejsou definov") {
         return true;
     }
-    if lower.contains("doplnění") && lower.contains("field mapping") { return true; }
-    if lower.contains("připravit todo") || lower.contains("pripravi todo") { return true; }
+    if lower.contains("mapov")
+        && (lower.contains("doplnit") || lower.contains("mus") && lower.contains("dopl"))
+    {
+        return true;
+    }
+    if lower.contains("doplnění") && lower.contains("field mapping") {
+        return true;
+    }
+    if lower.contains("připravit todo") || lower.contains("pripravi todo") {
+        return true;
+    }
     false
 }
 
@@ -7391,22 +8639,48 @@ fn task_mcp_matches_scaffold_text(text: &str) -> bool {
 /// etc.) were already verified by the safety check returning a single reason, but the
 /// packet-level conditions below are double-checked for belt-and-suspenders safety.
 fn task_mcp_can_safely_refresh_plan(packet: &Value) -> bool {
-    let impl_obj  = &packet["implementation"];
+    let impl_obj = &packet["implementation"];
     let write_tgt = &packet["writeTarget"];
 
     // Field mappings must be non-empty and from a trusted source.
-    let fm_count  = impl_obj["fieldMappings"].as_array().map(|a| a.len()).unwrap_or(0);
-    if fm_count == 0 { return false; }
+    let fm_count = impl_obj["fieldMappings"]
+        .as_array()
+        .map(|a| a.len())
+        .unwrap_or(0);
+    if fm_count == 0 {
+        return false;
+    }
     let fm_source = impl_obj["fieldMappingsSource"].as_str().unwrap_or("none");
-    if !matches!(fm_source, "template" | "plan") { return false; }
+    if !matches!(fm_source, "template" | "plan") {
+        return false;
+    }
 
     // Packet must not flag scaffoldOnly or finalConsistencyGuardApplied.
-    if impl_obj["scaffoldOnly"].as_bool().unwrap_or(true)                { return false; }
-    if impl_obj["finalConsistencyGuardApplied"].as_bool().unwrap_or(true) { return false; }
+    if impl_obj["scaffoldOnly"].as_bool().unwrap_or(true) {
+        return false;
+    }
+    if impl_obj["finalConsistencyGuardApplied"]
+        .as_bool()
+        .unwrap_or(true)
+    {
+        return false;
+    }
 
     // writeTarget must have the concrete values required to generate steps.
-    if write_tgt["artifactPath"].as_str().filter(|s| !s.is_empty()).is_none() { return false; }
-    if write_tgt["targetEntity"].as_str().filter(|s| !s.is_empty()).is_none() { return false; }
+    if write_tgt["artifactPath"]
+        .as_str()
+        .filter(|s| !s.is_empty())
+        .is_none()
+    {
+        return false;
+    }
+    if write_tgt["targetEntity"]
+        .as_str()
+        .filter(|s| !s.is_empty())
+        .is_none()
+    {
+        return false;
+    }
 
     true
 }
@@ -7415,9 +8689,15 @@ fn task_mcp_can_safely_refresh_plan(packet: &Value) -> bool {
 /// Used by the safe plan refresh path to replace stale scaffold/TODO steps.
 fn task_mcp_generate_concrete_steps_from_packet(packet: &Value) -> Vec<Value> {
     let write_tgt = &packet["writeTarget"];
-    let impl_obj  = &packet["implementation"];
-    let field_mappings   = impl_obj["fieldMappings"].as_array().cloned().unwrap_or_default();
-    let validation_fields = impl_obj["validationFields"].as_array().cloned().unwrap_or_default();
+    let impl_obj = &packet["implementation"];
+    let field_mappings = impl_obj["fieldMappings"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    let validation_fields = impl_obj["validationFields"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
     let work_kind = write_tgt["kind"].as_str().unwrap_or("");
     let mut steps: Vec<Value> = Vec::new();
 
@@ -7427,17 +8707,24 @@ fn task_mcp_generate_concrete_steps_from_packet(packet: &Value) -> Vec<Value> {
             steps.push(serde_json::json!(format!("Create or update {}.", ap)));
         }
         // 2. Handler registration
-        let on_load   = write_tgt["handlers"]["onLoad"].as_str().unwrap_or("");
+        let on_load = write_tgt["handlers"]["onLoad"].as_str().unwrap_or("");
         let on_change = write_tgt["handlers"]["onChange"].as_str().unwrap_or("");
         match (!on_load.is_empty(), !on_change.is_empty()) {
-            (true, true)  => steps.push(serde_json::json!(format!("Register/prepare handlers {} and {}.", on_load, on_change))),
-            (true, false) => steps.push(serde_json::json!(format!("Register/prepare handler {}.", on_load))),
-            _             => {}
+            (true, true) => steps.push(serde_json::json!(format!(
+                "Register/prepare handlers {} and {}.",
+                on_load, on_change
+            ))),
+            (true, false) => steps.push(serde_json::json!(format!(
+                "Register/prepare handler {}.",
+                on_load
+            ))),
+            _ => {}
         }
         // 3. Retrieve source entity on event field change
         let event_field = write_tgt["eventFieldName"].as_str().unwrap_or("");
         if !event_field.is_empty() {
-            let source_entity = field_mappings.first()
+            let source_entity = field_mappings
+                .first()
                 .and_then(|m| m["source"].as_str())
                 .and_then(|s| s.split('.').next())
                 .unwrap_or("source");
@@ -7455,25 +8742,37 @@ fn task_mcp_generate_concrete_steps_from_packet(packet: &Value) -> Vec<Value> {
         // 5. Validation-only fields
         for vf in &validation_fields {
             if let Some(s) = vf.as_str() {
-                steps.push(serde_json::json!(format!("Use {} only as validation source for conditional logic.", s)));
+                steps.push(serde_json::json!(format!(
+                    "Use {} only as validation source for conditional logic.",
+                    s
+                )));
             }
         }
         // 6. No-auto-save / no-upload guardrails
         steps.push(serde_json::json!("Do not auto-save the form."));
-        steps.push(serde_json::json!("Do not upload/register the web resource automatically."));
+        steps.push(serde_json::json!(
+            "Do not upload/register the web resource automatically."
+        ));
     } else {
         // Plugin
-        let artifact = write_tgt["artifactPath"].as_str()
+        let artifact = write_tgt["artifactPath"]
+            .as_str()
             .or_else(|| write_tgt["pluginProject"].as_str())
             .unwrap_or("");
         if !artifact.is_empty() {
-            steps.push(serde_json::json!(format!("Create or update the plugin class in {}.", artifact)));
+            steps.push(serde_json::json!(format!(
+                "Create or update the plugin class in {}.",
+                artifact
+            )));
         }
-        let message       = write_tgt["message"].as_str().unwrap_or("");
-        let stage         = write_tgt["stage"].as_str().unwrap_or("");
+        let message = write_tgt["message"].as_str().unwrap_or("");
+        let stage = write_tgt["stage"].as_str().unwrap_or("");
         let target_entity = write_tgt["targetEntity"].as_str().unwrap_or("");
         if !message.is_empty() && !stage.is_empty() && !target_entity.is_empty() {
-            steps.push(serde_json::json!(format!("Register handler for {} {} on {}.", message, stage, target_entity)));
+            steps.push(serde_json::json!(format!(
+                "Register handler for {} {} on {}.",
+                message, stage, target_entity
+            )));
         }
         for m in &field_mappings {
             if let (Some(src), Some(tgt)) = (m["source"].as_str(), m["target"].as_str()) {
@@ -7490,22 +8789,41 @@ fn task_mcp_generate_concrete_steps_from_packet(packet: &Value) -> Vec<Value> {
 /// The 3-char minimum on the prefix avoids false positives from common 2-letter English words
 /// like "is", "on", "no" that would otherwise match the publisher-prefix shape.
 fn task_mcp_looks_like_crm_name(word: &str) -> bool {
-    let Some(first_us) = word.find('_') else { return false; };
-    if first_us < 3 || first_us > 5 { return false; }
-    if first_us + 1 >= word.len() { return false; }
+    let Some(first_us) = word.find('_') else {
+        return false;
+    };
+    if first_us < 3 || first_us > 5 {
+        return false;
+    }
+    if first_us + 1 >= word.len() {
+        return false;
+    }
     let prefix = &word[..first_us];
     let suffix = &word[first_us + 1..];
-    if !prefix.chars().all(|c| c.is_ascii_lowercase()) { return false; }
-    if suffix.len() < 3 { return false; }
-    if !suffix.chars().next().map(|c| c.is_ascii_lowercase()).unwrap_or(false) { return false; }
-    suffix.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+    if !prefix.chars().all(|c| c.is_ascii_lowercase()) {
+        return false;
+    }
+    if suffix.len() < 3 {
+        return false;
+    }
+    if !suffix
+        .chars()
+        .next()
+        .map(|c| c.is_ascii_lowercase())
+        .unwrap_or(false)
+    {
+        return false;
+    }
+    suffix
+        .chars()
+        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
 }
 
 /// Builds the set of logical names (entities and fields) that are trusted in the given work packet.
 /// Includes: target entity, event field name, entity/field parts from fieldMappings and validationFields.
 fn task_mcp_build_allowed_logical_names(packet: &Value) -> std::collections::HashSet<String> {
     let mut allowed = std::collections::HashSet::<String>::new();
-    let impl_obj  = &packet["implementation"];
+    let impl_obj = &packet["implementation"];
     let write_tgt = &packet["writeTarget"];
 
     fn add_dotted(set: &mut std::collections::HashSet<String>, s: &str) {
@@ -7522,7 +8840,10 @@ fn task_mcp_build_allowed_logical_names(packet: &Value) -> std::collections::Has
     }
     // eventFieldName is a field name (e.g. nvr_assetid), not an entity name — still add it so
     // risks that legitimately mention the trigger field are not incorrectly removed.
-    if let Some(s) = write_tgt["eventFieldName"].as_str().filter(|s| !s.is_empty()) {
+    if let Some(s) = write_tgt["eventFieldName"]
+        .as_str()
+        .filter(|s| !s.is_empty())
+    {
         allowed.insert(s.to_lowercase());
     }
     if let Some(mappings) = impl_obj["fieldMappings"].as_array() {
@@ -7547,12 +8868,17 @@ fn task_mcp_build_allowed_logical_names(packet: &Value) -> std::collections::Has
 /// Returns `true` if `risk_text` contains a CRM-style logical name that is **not** in `allowed`.
 /// Used to filter risks that mention hallucinated or stale entity/field names not present in the
 /// trusted work packet.
-fn task_mcp_risk_mentions_unknown_entity(risk_text: &str, allowed: &std::collections::HashSet<String>) -> bool {
+fn task_mcp_risk_mentions_unknown_entity(
+    risk_text: &str,
+    allowed: &std::collections::HashSet<String>,
+) -> bool {
     let lower = risk_text.to_lowercase();
     let mut word_start: Option<usize> = None;
     for (byte_pos, ch) in lower.char_indices() {
         if ch.is_ascii_alphanumeric() || ch == '_' {
-            if word_start.is_none() { word_start = Some(byte_pos); }
+            if word_start.is_none() {
+                word_start = Some(byte_pos);
+            }
         } else if let Some(start) = word_start.take() {
             let word = &lower[start..byte_pos];
             if task_mcp_looks_like_crm_name(word) && !allowed.contains(word) {
@@ -7574,15 +8900,23 @@ fn task_mcp_risk_mentions_unknown_entity(risk_text: &str, allowed: &std::collect
 /// `existing_risks`, also removes risks that mention CRM entity names not present in the
 /// trusted packet (to eliminate hallucinated/stale entity references), and appends standard
 /// guardrail risks for the work kind if not already present.
-fn task_mcp_generate_clean_risks_from_packet(existing_risks: &[Value], packet: &Value) -> Vec<Value> {
+fn task_mcp_generate_clean_risks_from_packet(
+    existing_risks: &[Value],
+    packet: &Value,
+) -> Vec<Value> {
     let work_kind = packet["writeTarget"]["kind"].as_str().unwrap_or("");
     let allowed = task_mcp_build_allowed_logical_names(packet);
 
     // Preserve risks that contain neither scaffold/TODO text nor unknown CRM entity names.
-    let mut risks: Vec<Value> = existing_risks.iter()
+    let mut risks: Vec<Value> = existing_risks
+        .iter()
         .filter(|v| {
-            let t = v.as_str().map(str::to_string).unwrap_or_else(|| v.to_string());
-            !task_mcp_matches_scaffold_text(&t) && !task_mcp_risk_mentions_unknown_entity(&t, &allowed)
+            let t = v
+                .as_str()
+                .map(str::to_string)
+                .unwrap_or_else(|| v.to_string());
+            !task_mcp_matches_scaffold_text(&t)
+                && !task_mcp_risk_mentions_unknown_entity(&t, &allowed)
         })
         .cloned()
         .collect();
@@ -7597,7 +8931,9 @@ fn task_mcp_generate_clean_risks_from_packet(existing_risks: &[Value], packet: &
         &["Plugin registration is a manual approval-gated step."]
     };
     for &risk in standard {
-        let already = risks.iter().any(|r| r.as_str().map(|s| s.contains(risk)).unwrap_or(false));
+        let already = risks
+            .iter()
+            .any(|r| r.as_str().map(|s| s.contains(risk)).unwrap_or(false));
         if !already {
             risks.push(serde_json::json!(risk));
         }
@@ -7609,13 +8945,21 @@ fn task_mcp_generate_clean_risks_from_packet(existing_risks: &[Value], packet: &
 /// Check whether a candidate string looks like `entity.field` where both parts are
 /// CRM-style logical names (underscore-separated lowercase alphanumeric).
 fn task_mcp_is_valid_crm_dotted(s: &str) -> bool {
-    let Some(dot) = s.find('.') else { return false; };
+    let Some(dot) = s.find('.') else {
+        return false;
+    };
     let entity = &s[..dot];
     let field = &s[dot + 1..];
     let valid_part = |p: &str| -> bool {
-        if p.len() < 2 { return false; }
-        p.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
-            && p.chars().next().map(|c| c.is_ascii_lowercase()).unwrap_or(false)
+        if p.len() < 2 {
+            return false;
+        }
+        p.chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+            && p.chars()
+                .next()
+                .map(|c| c.is_ascii_lowercase())
+                .unwrap_or(false)
             && p.contains('_')
     };
     valid_part(entity) && valid_part(field)
@@ -7635,7 +8979,11 @@ fn task_mcp_extract_left_dotted(text: &str) -> Option<String> {
         }
     }
     let token = &text[i..];
-    if token.contains('.') { Some(token.to_lowercase()) } else { None }
+    if token.contains('.') {
+        Some(token.to_lowercase())
+    } else {
+        None
+    }
 }
 
 /// Extract `entity.field` token starting at the beginning of `text`.
@@ -7652,7 +9000,11 @@ fn task_mcp_extract_right_dotted(text: &str) -> Option<String> {
         }
     }
     let token = &text[..end];
-    if token.contains('.') { Some(token.to_lowercase()) } else { None }
+    if token.contains('.') {
+        Some(token.to_lowercase())
+    } else {
+        None
+    }
 }
 
 /// Count distinct CRM-style logical names (`prefix_suffix` pattern) in text.
@@ -7660,14 +9012,25 @@ fn task_mcp_count_crm_names(text: &str) -> usize {
     let mut names = std::collections::HashSet::new();
     for word in text.split(|c: char| !c.is_ascii_alphanumeric() && c != '_') {
         let word = word.to_lowercase();
-        if word.len() < 4 { continue; }
-        if !word.contains('_') { continue; }
+        if word.len() < 4 {
+            continue;
+        }
+        if !word.contains('_') {
+            continue;
+        }
         let first = word.chars().next().unwrap_or(' ');
-        if !first.is_ascii_lowercase() { continue; }
+        if !first.is_ascii_lowercase() {
+            continue;
+        }
         // Must have at least one segment before and after the underscore
         let underscore = word.find('_').unwrap_or(0);
-        if underscore == 0 || underscore == word.len() - 1 { continue; }
-        if word.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_') {
+        if underscore == 0 || underscore == word.len() - 1 {
+            continue;
+        }
+        if word
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+        {
             names.insert(word);
         }
     }
@@ -7681,9 +9044,17 @@ fn task_mcp_detect_field_mappings(task: &Value) -> (bool, Vec<Value>, Vec<Value>
         let mut out = String::with_capacity(s.len());
         let mut in_tag = false;
         for c in s.chars() {
-            if c == '<' { in_tag = true; out.push(' '); }
-            else if c == '>' { if !in_tag { out.push(c); } in_tag = false; }
-            else if !in_tag { out.push(c); }
+            if c == '<' {
+                in_tag = true;
+                out.push(' ');
+            } else if c == '>' {
+                if !in_tag {
+                    out.push(c);
+                }
+                in_tag = false;
+            } else if !in_tag {
+                out.push(c);
+            }
         }
         out
     };
@@ -7692,31 +9063,64 @@ fn task_mcp_detect_field_mappings(task: &Value) -> (bool, Vec<Value>, Vec<Value>
     let plan = &workflow["technicalPlan"];
 
     let join_array = |v: &Value| -> String {
-        v.as_array().map(|arr| arr.iter().map(|x| {
-            x.as_str().unwrap_or_else(|| x["description"].as_str()
-                .or_else(|| x["step"].as_str())
-                .or_else(|| x["risk"].as_str())
-                .unwrap_or(""))
-        }).collect::<Vec<_>>().join("\n")).unwrap_or_default()
+        v.as_array()
+            .map(|arr| {
+                arr.iter()
+                    .map(|x| {
+                        x.as_str().unwrap_or_else(|| {
+                            x["description"]
+                                .as_str()
+                                .or_else(|| x["step"].as_str())
+                                .or_else(|| x["risk"].as_str())
+                                .unwrap_or("")
+                        })
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            })
+            .unwrap_or_default()
     };
 
     let text_parts: Vec<(&str, String)> = vec![
-        ("originalMessage", strip_html(task["originalMessage"].as_str().unwrap_or(""))),
-        ("description",     strip_html(task["description"].as_str().unwrap_or(""))),
-        ("analysisEn",      strip_html(task["analysisResult"]["summaryEn"].as_str().unwrap_or(""))),
-        ("analysis",        strip_html(task["analysisResult"]["summary"].as_str().unwrap_or(""))),
-        ("requirements",    join_array(&task["analysisResult"]["requirements"])),
-        ("planSummary",     strip_html(plan["summary"].as_str().unwrap_or(""))),
-        ("planSteps",       join_array(&plan["implementationSteps"])),
-        ("planRisks",       join_array(&plan["risks"])),
+        (
+            "originalMessage",
+            strip_html(task["originalMessage"].as_str().unwrap_or("")),
+        ),
+        (
+            "description",
+            strip_html(task["description"].as_str().unwrap_or("")),
+        ),
+        (
+            "analysisEn",
+            strip_html(task["analysisResult"]["summaryEn"].as_str().unwrap_or("")),
+        ),
+        (
+            "analysis",
+            strip_html(task["analysisResult"]["summary"].as_str().unwrap_or("")),
+        ),
+        (
+            "requirements",
+            join_array(&task["analysisResult"]["requirements"]),
+        ),
+        (
+            "planSummary",
+            strip_html(plan["summary"].as_str().unwrap_or("")),
+        ),
+        ("planSteps", join_array(&plan["implementationSteps"])),
+        ("planRisks", join_array(&plan["risks"])),
     ];
 
-    let sources: Vec<String> = text_parts.iter()
+    let sources: Vec<String> = text_parts
+        .iter()
         .filter(|(_, v)| !v.trim().is_empty())
         .map(|(k, _)| k.to_string())
         .collect();
 
-    let raw_text: String = text_parts.iter().map(|(_, v)| v.as_str()).collect::<Vec<_>>().join("\n");
+    let raw_text: String = text_parts
+        .iter()
+        .map(|(_, v)| v.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
     let raw_text = raw_text.trim();
     if raw_text.is_empty() {
         return (false, vec![], vec![], sources);
@@ -7724,30 +9128,34 @@ fn task_mcp_detect_field_mappings(task: &Value) -> (bool, Vec<Value>, Vec<Value>
 
     // Detect source/target entity context
     let lower = raw_text.to_lowercase();
-    let has_source_context = lower.contains("source entit") || lower.contains("src entit")
+    let has_source_context = lower.contains("source entit")
+        || lower.contains("src entit")
         || (lower.contains("zdrojov") && lower.contains("entit"))
         || lower.contains("zdroj:");
-    let has_target_context = lower.contains("target entit") || lower.contains("destination entit")
+    let has_target_context = lower.contains("target entit")
+        || lower.contains("destination entit")
         || (lower.contains("cílov") && lower.contains("entit"))
         || (lower.contains("cilova") && lower.contains("entit"))
-        || lower.contains("cíl:") || lower.contains("cil:");
+        || lower.contains("cíl:")
+        || lower.contains("cil:");
 
     let crm_count = task_mcp_count_crm_names(&lower);
 
     // Detect when plan text signals incomplete field mapping work
-    let plan_signals_incomplete = crm_count >= 2 && (
-        lower.contains("field mappings are not defined")
-        || lower.contains("define field mappings")
-        || lower.contains("field mappings not defined")
-        || lower.contains("field mappings nejsou definov")
-        || (lower.contains("mapov") && lower.contains("dopl") && crm_count >= 2)
-        || lower.contains("doplnění") && lower.contains("field mapping")
-        || lower.contains("připravit todo") || lower.contains("pripravi todo")
-        || (lower.contains("todo") && lower.contains("map") && lower.contains("field"))
-        || (lower.contains("field") && lower.contains("map") && lower.contains("todo"))
-    );
+    let plan_signals_incomplete = crm_count >= 2
+        && (lower.contains("field mappings are not defined")
+            || lower.contains("define field mappings")
+            || lower.contains("field mappings not defined")
+            || lower.contains("field mappings nejsou definov")
+            || (lower.contains("mapov") && lower.contains("dopl") && crm_count >= 2)
+            || lower.contains("doplnění") && lower.contains("field mapping")
+            || lower.contains("připravit todo")
+            || lower.contains("pripravi todo")
+            || (lower.contains("todo") && lower.contains("map") && lower.contains("field"))
+            || (lower.contains("field") && lower.contains("map") && lower.contains("todo")));
 
-    let detected = ((has_source_context || has_target_context) && crm_count >= 3) || plan_signals_incomplete;
+    let detected =
+        ((has_source_context || has_target_context) && crm_count >= 3) || plan_signals_incomplete;
     if !detected {
         return (false, vec![], vec![], sources);
     }
@@ -7778,25 +9186,62 @@ fn task_mcp_detect_field_mappings(task: &Value) -> (bool, Vec<Value>, Vec<Value>
     }
 
     // Extraction attempt 2: Source entity/fields / Target entity/fields block
-    let src_entity = find_pattern_after(&lower, &[
-        "source entity:", "source entity :", "zdrojová entita:", "zdrojova entita:", "zdroj:",
-    ]);
-    let tgt_entity = find_pattern_after(&lower, &[
-        "target entity:", "target entity :", "cílová entita:", "cilova entita:", "cíl:", "cil:",
-    ]);
-    let src_fields_str = find_pattern_after(&lower, &[
-        "source fields:", "source field:", "zdrojová pole:", "zdrojova pole:", "pole zdroje:",
-        "copy fields:", "fields:",
-    ]);
-    let tgt_fields_str = find_pattern_after(&lower, &[
-        "target fields:", "target field:", "cílová pole:", "cilova pole:", "pole cíle:", "pole cile:",
-    ]);
+    let src_entity = find_pattern_after(
+        &lower,
+        &[
+            "source entity:",
+            "source entity :",
+            "zdrojová entita:",
+            "zdrojova entita:",
+            "zdroj:",
+        ],
+    );
+    let tgt_entity = find_pattern_after(
+        &lower,
+        &[
+            "target entity:",
+            "target entity :",
+            "cílová entita:",
+            "cilova entita:",
+            "cíl:",
+            "cil:",
+        ],
+    );
+    let src_fields_str = find_pattern_after(
+        &lower,
+        &[
+            "source fields:",
+            "source field:",
+            "zdrojová pole:",
+            "zdrojova pole:",
+            "pole zdroje:",
+            "copy fields:",
+            "fields:",
+        ],
+    );
+    let tgt_fields_str = find_pattern_after(
+        &lower,
+        &[
+            "target fields:",
+            "target field:",
+            "cílová pole:",
+            "cilova pole:",
+            "pole cíle:",
+            "pole cile:",
+        ],
+    );
 
-    if let (Some(se), Some(te), Some(sfs), Some(tfs)) = (src_entity, tgt_entity, src_fields_str, tgt_fields_str) {
+    if let (Some(se), Some(te), Some(sfs), Some(tfs)) =
+        (src_entity, tgt_entity, src_fields_str, tgt_fields_str)
+    {
         let parse_fields = |s: &str| -> Vec<String> {
             s.split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
                 .map(str::trim)
-                .filter(|f| f.len() > 2 && f.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') && f.contains('_'))
+                .filter(|f| {
+                    f.len() > 2
+                        && f.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+                        && f.contains('_')
+                })
                 .map(|f| f.to_lowercase())
                 .collect()
         };
@@ -7807,7 +9252,8 @@ fn task_mcp_detect_field_mappings(task: &Value) -> (bool, Vec<Value>, Vec<Value>
             let mappings: Vec<Value> = (0..pair_count)
                 .map(|i| serde_json::json!({"source": format!("{}.{}", se.trim(), sf[i]), "target": format!("{}.{}", te.trim(), tf[i])}))
                 .collect();
-            let validation_fields: Vec<Value> = sf[pair_count..].iter()
+            let validation_fields: Vec<Value> = sf[pair_count..]
+                .iter()
                 .map(|f| serde_json::json!(format!("{}.{}", se.trim(), f)))
                 .collect();
             return (true, mappings, validation_fields, sources);
@@ -7834,83 +9280,149 @@ fn find_pattern_after<'a>(lower: &'a str, prefixes: &[&str]) -> Option<&'a str> 
 
 const DEVELOPER_WORK_PACKET_VERSION: &str = "4";
 
-fn task_mcp_developer_work_packet(task: &Value, customer_dev_defaults: Option<&Value>, ai_kit_path: Option<&str>) -> Value {
+fn task_mcp_developer_work_packet(
+    task: &Value,
+    customer_dev_defaults: Option<&Value>,
+    ai_kit_path: Option<&str>,
+) -> Value {
     let setup = task.get("workflowSetup").unwrap_or(&Value::Null);
     let workflow = task.get("crmDeveloperWorkflow").unwrap_or(&Value::Null);
     let plan = &workflow["technicalPlan"];
     let plan_target = &plan["target"];
     let readiness = task_mcp_implementation_readiness(task);
-    let template = task_mcp_match_template(task["title"].as_str().unwrap_or(""), &task_mcp_task_text_for_inference(task));
-    let work_kind = workflow["detectedWorkKind"].as_str()
+    let template = task_mcp_match_template(
+        task["title"].as_str().unwrap_or(""),
+        &task_mcp_task_text_for_inference(task),
+    );
+    let work_kind = workflow["detectedWorkKind"]
+        .as_str()
         .or_else(|| setup["devTargetKind"].as_str())
         .or_else(|| plan["workKind"].as_str())
         .unwrap_or("unknown");
-    let is_script = work_kind == "script" || work_kind == "ribbon" || setup["devTargetKind"].as_str() == Some("script");
-    let script_naming = if is_script { task_mcp_compute_script_naming(task, customer_dev_defaults) } else { None };
+    let is_script = work_kind == "script"
+        || work_kind == "ribbon"
+        || setup["devTargetKind"].as_str() == Some("script");
+    let script_naming = if is_script {
+        task_mcp_compute_script_naming(task, customer_dev_defaults)
+    } else {
+        None
+    };
     let verification = task_mcp_latest_verification(task);
     let approval = task_mcp_approval_summary(workflow.get("planApproval"));
     let next = task_mcp_next_recommended_step(task);
 
     // ── Field mapping detection (four paths, matching JS v4 logic) ──────────
-    let plan_field_mappings = plan["fieldMappings"].as_array().cloned().unwrap_or_default();
+    let plan_field_mappings = plan["fieldMappings"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
     let empty_field_mappings = plan_field_mappings.is_empty();
 
-    let template_needs_mapping = template.as_ref().map(|t| {
-        t["sourceFields"].as_array().map(|a| !a.is_empty()).unwrap_or(false)
-    }).unwrap_or(false);
+    let template_needs_mapping = template
+        .as_ref()
+        .map(|t| {
+            t["sourceFields"]
+                .as_array()
+                .map(|a| !a.is_empty())
+                .unwrap_or(false)
+        })
+        .unwrap_or(false);
 
     let plan_has_unmapped_with_no_mapped = {
-        let unmapped = plan["unmappedSourceFields"].as_array().map(|a| !a.is_empty()).unwrap_or(false);
+        let unmapped = plan["unmappedSourceFields"]
+            .as_array()
+            .map(|a| !a.is_empty())
+            .unwrap_or(false);
         unmapped && empty_field_mappings
     };
 
     // Template path: auto-derive fieldMappings from template sourceFields/targetFields when plan is empty
-    let template_field_mappings: Vec<Value> = if template_needs_mapping && plan_field_mappings.is_empty() {
-        template.as_ref().map(|tpl| {
-            let src_entity = tpl["sourceEntity"].as_str().unwrap_or("");
-            let tgt_entity = tpl["targetEntity"].as_str()
-                .or_else(|| setup["primaryEntityLogicalName"].as_str())
-                .or_else(|| plan_target["entityLogicalName"].as_str())
-                .unwrap_or("");
-            if src_entity.is_empty() || tgt_entity.is_empty() { return vec![]; }
-            let src_fields: Vec<&str> = tpl["sourceFields"].as_array()
-                .map(|a| a.iter().filter_map(|v| v.as_str()).collect())
-                .unwrap_or_default();
-            let tgt_fields: Vec<&str> = tpl["targetFields"].as_array()
-                .map(|a| a.iter().filter_map(|v| v.as_str()).collect())
-                .unwrap_or_default();
-            let pair_count = src_fields.len().min(tgt_fields.len());
-            (0..pair_count).map(|i| serde_json::json!({
-                "source": format!("{}.{}", src_entity, src_fields[i]),
-                "target": format!("{}.{}", tgt_entity, tgt_fields[i])
-            })).collect()
-        }).unwrap_or_default()
-    } else { vec![] };
+    let template_field_mappings: Vec<Value> =
+        if template_needs_mapping && plan_field_mappings.is_empty() {
+            template
+                .as_ref()
+                .map(|tpl| {
+                    let src_entity = tpl["sourceEntity"].as_str().unwrap_or("");
+                    let tgt_entity = tpl["targetEntity"]
+                        .as_str()
+                        .or_else(|| setup["primaryEntityLogicalName"].as_str())
+                        .or_else(|| plan_target["entityLogicalName"].as_str())
+                        .unwrap_or("");
+                    if src_entity.is_empty() || tgt_entity.is_empty() {
+                        return vec![];
+                    }
+                    let src_fields: Vec<&str> = tpl["sourceFields"]
+                        .as_array()
+                        .map(|a| a.iter().filter_map(|v| v.as_str()).collect())
+                        .unwrap_or_default();
+                    let tgt_fields: Vec<&str> = tpl["targetFields"]
+                        .as_array()
+                        .map(|a| a.iter().filter_map(|v| v.as_str()).collect())
+                        .unwrap_or_default();
+                    let pair_count = src_fields.len().min(tgt_fields.len());
+                    (0..pair_count)
+                        .map(|i| {
+                            serde_json::json!({
+                                "source": format!("{}.{}", src_entity, src_fields[i]),
+                                "target": format!("{}.{}", tgt_entity, tgt_fields[i])
+                            })
+                        })
+                        .collect()
+                })
+                .unwrap_or_default()
+        } else {
+            vec![]
+        };
 
     // Text extraction path (only when template and plan don't already signal mapping work)
-    let (text_detected_required, text_extracted_mappings, text_extracted_validation, text_detection_sources) =
-        if empty_field_mappings && !template_needs_mapping && !plan_has_unmapped_with_no_mapped {
-            task_mcp_detect_field_mappings(task)
-        } else {
-            (false, vec![], vec![], vec![])
-        };
+    let (
+        text_detected_required,
+        text_extracted_mappings,
+        text_extracted_validation,
+        text_detection_sources,
+    ) = if empty_field_mappings && !template_needs_mapping && !plan_has_unmapped_with_no_mapped {
+        task_mcp_detect_field_mappings(task)
+    } else {
+        (false, vec![], vec![], vec![])
+    };
 
     // Script implementation pattern: 'field-mapping' (source→target copy/prefill, needs
     // fieldMappings), 'ui-business-rule' (form UI logic — required level, visibility,
     // notifications, locking, option filtering — no fieldMappings by design), or
     // 'ribbon-action'. workflowSetup override wins over the template. Mirrors
     // mcp/task-workbench-mcp.mjs buildDeveloperWorkPacket — keep in sync.
-    let implementation_pattern: Option<String> = setup["implementationPattern"].as_str().map(str::to_string)
-        .or_else(|| template.as_ref().and_then(|t| t["implementationPattern"].as_str()).map(str::to_string))
-        .or_else(|| if template_needs_mapping { Some("field-mapping".to_string()) } else { None });
-    let is_non_mapping_pattern = matches!(implementation_pattern.as_deref(), Some("ui-business-rule") | Some("ribbon-action"));
+    let implementation_pattern: Option<String> = setup["implementationPattern"]
+        .as_str()
+        .map(str::to_string)
+        .or_else(|| {
+            template
+                .as_ref()
+                .and_then(|t| t["implementationPattern"].as_str())
+                .map(str::to_string)
+        })
+        .or_else(|| {
+            if template_needs_mapping {
+                Some("field-mapping".to_string())
+            } else {
+                None
+            }
+        });
+    let is_non_mapping_pattern = matches!(
+        implementation_pattern.as_deref(),
+        Some("ui-business-rule") | Some("ribbon-action")
+    );
     // An explicit requiresFieldMappings (workflowSetup override, then template) is authoritative:
     // it overrides the heuristic signals below in both directions — a stale
     // plan.unmappedSourceFields left over from an earlier save must not force a UI/business-rule
     // script with no field-mapping needs to be misread as requiring mappings.
-    let explicit_requires_field_mappings: Option<bool> = setup["requiresFieldMappings"].as_bool()
-        .or_else(|| template.as_ref().and_then(|t| t["requiresFieldMappings"].as_bool()));
-    let heuristic_requires_field_mappings = template_needs_mapping || plan_has_unmapped_with_no_mapped || text_detected_required;
+    let explicit_requires_field_mappings: Option<bool> =
+        setup["requiresFieldMappings"].as_bool().or_else(|| {
+            template
+                .as_ref()
+                .and_then(|t| t["requiresFieldMappings"].as_bool())
+        });
+    let heuristic_requires_field_mappings =
+        template_needs_mapping || plan_has_unmapped_with_no_mapped || text_detected_required;
     let requires_field_mappings = if is_non_mapping_pattern {
         false
     } else {
@@ -7919,26 +9431,70 @@ fn task_mcp_developer_work_packet(task: &Value, customer_dev_defaults: Option<&V
     // UI/business-rule and ribbon-action script context — workflowSetup (persisted by
     // prepare_developer_task when a template applies) wins over the template, so these survive
     // even once the task text no longer re-matches the template that originally set them.
-    let referenced_fields: Vec<Value> = setup["referencedFields"].as_array().cloned()
-        .or_else(|| template.as_ref().and_then(|t| t["referencedFields"].as_array().cloned()))
+    let referenced_fields: Vec<Value> = setup["referencedFields"]
+        .as_array()
+        .cloned()
+        .or_else(|| {
+            template
+                .as_ref()
+                .and_then(|t| t["referencedFields"].as_array().cloned())
+        })
         .unwrap_or_default();
-    let trigger_fields: Vec<Value> = setup["triggerFields"].as_array().cloned()
-        .or_else(|| template.as_ref().and_then(|t| t["triggerFields"].as_array().cloned()))
+    let trigger_fields: Vec<Value> = setup["triggerFields"]
+        .as_array()
+        .cloned()
+        .or_else(|| {
+            template
+                .as_ref()
+                .and_then(|t| t["triggerFields"].as_array().cloned())
+        })
         .unwrap_or_default();
-    let affected_fields: Vec<Value> = setup["affectedFields"].as_array().cloned()
-        .or_else(|| template.as_ref().and_then(|t| t["affectedFields"].as_array().cloned()))
+    let affected_fields: Vec<Value> = setup["affectedFields"]
+        .as_array()
+        .cloned()
+        .or_else(|| {
+            template
+                .as_ref()
+                .and_then(|t| t["affectedFields"].as_array().cloned())
+        })
         .unwrap_or_default();
-    let ui_rules: Vec<Value> = setup["uiRules"].as_array().cloned()
-        .or_else(|| template.as_ref().and_then(|t| t["uiRules"].as_array().cloned()))
+    let ui_rules: Vec<Value> = setup["uiRules"]
+        .as_array()
+        .cloned()
+        .or_else(|| {
+            template
+                .as_ref()
+                .and_then(|t| t["uiRules"].as_array().cloned())
+        })
         .unwrap_or_default();
-    let option_set_values: Value = if setup["optionSetValues"].is_object() { setup["optionSetValues"].clone() }
-        else if let Some(t) = &template { if t["optionSetValues"].is_object() { t["optionSetValues"].clone() } else { serde_json::json!({}) } }
-        else { serde_json::json!({}) };
-    let notification_ids: Vec<Value> = setup["notificationIds"].as_array().cloned()
-        .or_else(|| template.as_ref().and_then(|t| t["notificationIds"].as_array().cloned()))
+    let option_set_values: Value = if setup["optionSetValues"].is_object() {
+        setup["optionSetValues"].clone()
+    } else if let Some(t) = &template {
+        if t["optionSetValues"].is_object() {
+            t["optionSetValues"].clone()
+        } else {
+            serde_json::json!({})
+        }
+    } else {
+        serde_json::json!({})
+    };
+    let notification_ids: Vec<Value> = setup["notificationIds"]
+        .as_array()
+        .cloned()
+        .or_else(|| {
+            template
+                .as_ref()
+                .and_then(|t| t["notificationIds"].as_array().cloned())
+        })
         .unwrap_or_default();
-    let forbidden_operations: Vec<Value> = setup["forbiddenOperations"].as_array().cloned()
-        .or_else(|| template.as_ref().and_then(|t| t["forbiddenOperations"].as_array().cloned()))
+    let forbidden_operations: Vec<Value> = setup["forbiddenOperations"]
+        .as_array()
+        .cloned()
+        .or_else(|| {
+            template
+                .as_ref()
+                .and_then(|t| t["forbiddenOperations"].as_array().cloned())
+        })
         .unwrap_or_default();
 
     let field_mappings_missing = requires_field_mappings
@@ -7946,40 +9502,64 @@ fn task_mcp_developer_work_packet(task: &Value, customer_dev_defaults: Option<&V
         && text_extracted_mappings.is_empty()
         && template_field_mappings.is_empty();
 
-    let plan_approval_required = plan.is_object() && !approval["approved"].as_bool().unwrap_or(false);
-    let readiness_ready = readiness["isImplementationReady"].as_bool().unwrap_or(false);
+    let plan_approval_required =
+        plan.is_object() && !approval["approved"].as_bool().unwrap_or(false);
+    let readiness_ready = readiness["isImplementationReady"]
+        .as_bool()
+        .unwrap_or(false);
 
     let mut can_write = readiness_ready && !plan_approval_required && !field_mappings_missing;
 
-    let blockers: Vec<Value> = readiness["blockers"].as_array().cloned().unwrap_or_default();
+    let blockers: Vec<Value> = readiness["blockers"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
 
     let mut decision_reason;
     let mut blocking_user_action = Value::Null;
 
     if can_write {
-        decision_reason = "Task Workbench says implementation is ready. Use this packet as the working contract.".to_string();
+        decision_reason =
+            "Task Workbench says implementation is ready. Use this packet as the working contract."
+                .to_string();
     } else if plan_approval_required {
-        decision_reason = "Technical plan approval is required in Task Workbench before code changes.".to_string();
-        blocking_user_action = serde_json::json!("Review and approve the technical implementation plan in Task Workbench.");
+        decision_reason =
+            "Technical plan approval is required in Task Workbench before code changes."
+                .to_string();
+        blocking_user_action = serde_json::json!(
+            "Review and approve the technical implementation plan in Task Workbench."
+        );
     } else if field_mappings_missing {
         decision_reason = if text_detected_required {
             "Field mapping work is indicated in the original assignment but field mappings have not been defined in the technical plan. Complete the technical plan before implementation.".to_string()
         } else {
-            "Field mappings are missing. Complete the technical plan before implementation.".to_string()
+            "Field mappings are missing. Complete the technical plan before implementation."
+                .to_string()
         };
-        blocking_user_action = serde_json::json!("Run prepare_developer_task to regenerate the technical plan with field mappings.");
+        blocking_user_action = serde_json::json!(
+            "Run prepare_developer_task to regenerate the technical plan with field mappings."
+        );
     } else {
-        decision_reason = blockers.first()
+        decision_reason = blockers
+            .first()
             .and_then(|b| b.as_str())
             .or_else(|| readiness["recommendedNextStep"].as_str())
             .unwrap_or("Task Workbench says implementation is not ready yet.")
             .to_string();
         if !plan.is_object() {
-            blocking_user_action = serde_json::json!("Run prepare_developer_task to create/refresh setup and the technical plan.");
-        } else if blockers.first().and_then(|b| b.as_str()).map(|s| s.contains("has not been saved to task setup")).unwrap_or(false) {
+            blocking_user_action = serde_json::json!(
+                "Run prepare_developer_task to create/refresh setup and the technical plan."
+            );
+        } else if blockers
+            .first()
+            .and_then(|b| b.as_str())
+            .map(|s| s.contains("has not been saved to task setup"))
+            .unwrap_or(false)
+        {
             blocking_user_action = serde_json::json!("Run prepare_developer_task or call set_task_developer_target to save the target path.");
         } else if !blockers.is_empty() {
-            blocking_user_action = serde_json::json!("Resolve the listed blockers in Task Workbench.");
+            blocking_user_action =
+                serde_json::json!("Resolve the listed blockers in Task Workbench.");
         }
     }
 
@@ -8001,14 +9581,26 @@ fn task_mcp_developer_work_packet(task: &Value, customer_dev_defaults: Option<&V
     // ── Guard 2: scaffold signal detection (diagnostic) ──────────────────────
     let mut scaffold_signal_detected = false;
     let mut scaffold_signal_sources: Vec<Value> = Vec::new();
-    let raw_steps: Vec<Value> = plan["implementationSteps"].as_array().cloned().unwrap_or_default();
+    let raw_steps: Vec<Value> = plan["implementationSteps"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
     let raw_risks: Vec<Value> = plan["risks"].as_array().cloned().unwrap_or_default();
     if can_write && final_field_mappings.is_empty() {
-        let check_texts: Vec<String> = raw_steps.iter().chain(raw_risks.iter())
-            .map(|v| v.as_str().map(str::to_string).unwrap_or_else(|| v.to_string()))
-            .chain(std::iter::once(plan["summary"].as_str().unwrap_or("").to_string()))
+        let check_texts: Vec<String> = raw_steps
+            .iter()
+            .chain(raw_risks.iter())
+            .map(|v| {
+                v.as_str()
+                    .map(str::to_string)
+                    .unwrap_or_else(|| v.to_string())
+            })
+            .chain(std::iter::once(
+                plan["summary"].as_str().unwrap_or("").to_string(),
+            ))
             .collect();
-        let signals: Vec<Value> = check_texts.into_iter()
+        let signals: Vec<Value> = check_texts
+            .into_iter()
             .filter(|t| task_mcp_matches_scaffold_text(t))
             .map(Value::String)
             .collect();
@@ -8020,9 +9612,13 @@ fn task_mcp_developer_work_packet(task: &Value, customer_dev_defaults: Option<&V
 
     // ── Sanitize scaffold steps/risks when mappings are available ─────────────
     let sanitized_steps: Vec<Value> = if can_write && !final_field_mappings.is_empty() {
-        raw_steps.iter()
+        raw_steps
+            .iter()
             .filter(|v| {
-                let text = v.as_str().map(str::to_string).unwrap_or_else(|| v.to_string());
+                let text = v
+                    .as_str()
+                    .map(str::to_string)
+                    .unwrap_or_else(|| v.to_string());
                 !task_mcp_matches_scaffold_text(&text)
             })
             .cloned()
@@ -8031,9 +9627,13 @@ fn task_mcp_developer_work_packet(task: &Value, customer_dev_defaults: Option<&V
         raw_steps.clone()
     };
     let sanitized_risks: Vec<Value> = if can_write && !final_field_mappings.is_empty() {
-        raw_risks.iter()
+        raw_risks
+            .iter()
             .filter(|v| {
-                let text = v.as_str().map(str::to_string).unwrap_or_else(|| v.to_string());
+                let text = v
+                    .as_str()
+                    .map(str::to_string)
+                    .unwrap_or_else(|| v.to_string());
                 !task_mcp_matches_scaffold_text(&text)
             })
             .cloned()
@@ -8045,9 +9645,14 @@ fn task_mcp_developer_work_packet(task: &Value, customer_dev_defaults: Option<&V
     // ── Final packet invariant ────────────────────────────────────────────────
     let mut final_consistency_guard_applied = false;
     if can_write && final_field_mappings.is_empty() {
-        let packet_has_scaffold = sanitized_steps.iter().chain(sanitized_risks.iter())
+        let packet_has_scaffold = sanitized_steps
+            .iter()
+            .chain(sanitized_risks.iter())
             .any(|v| {
-                let text = v.as_str().map(str::to_string).unwrap_or_else(|| v.to_string());
+                let text = v
+                    .as_str()
+                    .map(str::to_string)
+                    .unwrap_or_else(|| v.to_string());
                 task_mcp_matches_scaffold_text(&text)
             });
         if packet_has_scaffold {
@@ -8059,10 +9664,12 @@ fn task_mcp_developer_work_packet(task: &Value, customer_dev_defaults: Option<&V
     }
 
     // ── Write target ──────────────────────────────────────────────────────────
-    let target_entity = setup["primaryEntityLogicalName"].as_str()
+    let target_entity = setup["primaryEntityLogicalName"]
+        .as_str()
         .or_else(|| plan_target["entityLogicalName"].as_str())
         .or_else(|| template.as_ref().and_then(|t| t["targetEntity"].as_str()));
-    let repository_root = setup["repositoryRoot"].as_str()
+    let repository_root = setup["repositoryRoot"]
+        .as_str()
         .or_else(|| customer_dev_defaults.and_then(|d| d["repositoryRoot"].as_str()));
 
     let write_target = if is_script {
@@ -8114,11 +9721,18 @@ fn task_mcp_developer_work_packet(task: &Value, customer_dev_defaults: Option<&V
 
     // ── Conventions ───────────────────────────────────────────────────────────
     let mut convention_sources: Vec<Value> = Vec::new();
-    if let Some(v) = setup["conventionsSource"].as_str().filter(|s| !s.is_empty()) {
+    if let Some(v) = setup["conventionsSource"]
+        .as_str()
+        .filter(|s| !s.is_empty())
+    {
         convention_sources.push(serde_json::json!(v));
     }
     if let Some(defaults) = customer_dev_defaults {
-        let key = if is_script { "jsConventionsSource" } else { "pluginConventionsSource" };
+        let key = if is_script {
+            "jsConventionsSource"
+        } else {
+            "pluginConventionsSource"
+        };
         if let Some(v) = defaults[key].as_str().filter(|s| !s.is_empty()) {
             convention_sources.push(serde_json::json!(v));
         }
@@ -8181,21 +9795,34 @@ fn task_mcp_developer_work_packet(task: &Value, customer_dev_defaults: Option<&V
             if let Some(tpl) = &template {
                 let source_entity = tpl["sourceEntity"].as_str().unwrap_or("source");
                 let target_ent = target_entity.unwrap_or("");
-                let src_fields: Vec<&str> = tpl["sourceFields"].as_array()
+                let src_fields: Vec<&str> = tpl["sourceFields"]
+                    .as_array()
                     .map(|a| a.iter().filter_map(|v| v.as_str()).collect())
                     .unwrap_or_default();
-                let tgt_fields: Vec<&str> = tpl["targetFields"].as_array()
+                let tgt_fields: Vec<&str> = tpl["targetFields"]
+                    .as_array()
                     .map(|a| a.iter().filter_map(|v| v.as_str()).collect())
                     .unwrap_or_default();
                 let pair_count = src_fields.len().min(tgt_fields.len());
                 (0..pair_count)
-                    .map(|i| serde_json::json!(format!("{}.{} -> {}.{}", source_entity, src_fields[i], target_ent, tgt_fields[i])))
+                    .map(|i| {
+                        serde_json::json!(format!(
+                            "{}.{} -> {}.{}",
+                            source_entity, src_fields[i], target_ent, tgt_fields[i]
+                        ))
+                    })
                     .collect()
-            } else { vec![] }
+            } else {
+                vec![]
+            }
         } else if text_detected_required {
             vec![serde_json::json!("Field mapping work detected in original assignment but target field assignments could not be safely extracted. Define field mappings in the technical plan using prepare_developer_task.")]
         } else {
-            plan["unmappedSourceFields"].as_array().cloned().unwrap_or_default().iter()
+            plan["unmappedSourceFields"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default()
+                .iter()
                 .filter_map(|f| f.as_str())
                 .map(|f| serde_json::json!(format!("{} (no target field defined in plan)", f)))
                 .collect()
@@ -8212,12 +9839,22 @@ fn task_mcp_developer_work_packet(task: &Value, customer_dev_defaults: Option<&V
     // ── AI Kit ────────────────────────────────────────────────────────────────
     let ai_kit_available = ai_kit_path.is_some();
     let ai_kit_rules_files: Vec<String> = if let Some(kit) = ai_kit_path.filter(|s| !s.is_empty()) {
-        let rules_rel = if work_kind == "plugin" { "ai-rules/crm-plugin-rules.md" }
-            else if work_kind == "ribbon" { "ai-rules/crm-ribbon-rules.md" }
-            else { "ai-rules/crm-javascript-rules.md" };
-        let sep = if kit.ends_with('/') || kit.ends_with('\\') { "" } else { "/" };
+        let rules_rel = if work_kind == "plugin" {
+            "ai-rules/crm-plugin-rules.md"
+        } else if work_kind == "ribbon" {
+            "ai-rules/crm-ribbon-rules.md"
+        } else {
+            "ai-rules/crm-javascript-rules.md"
+        };
+        let sep = if kit.ends_with('/') || kit.ends_with('\\') {
+            ""
+        } else {
+            "/"
+        };
         vec![format!("{kit}{sep}{rules_rel}")]
-    } else { vec![] };
+    } else {
+        vec![]
+    };
     let ai_kit_review_note = if is_script {
         "Run AI Kit review for the created/updated script before upload or registration."
     } else {
@@ -8227,16 +9864,22 @@ fn task_mcp_developer_work_packet(task: &Value, customer_dev_defaults: Option<&V
     let recommended_next_action = if can_write {
         "Implement only the work described in this packet.".to_string()
     } else {
-        blocking_user_action.as_str()
+        blocking_user_action
+            .as_str()
             .or_else(|| readiness["recommendedNextStep"].as_str())
             .unwrap_or("Resolve Task Workbench blockers before implementation.")
             .to_string()
     };
 
-    let field_mappings_source = if !text_extracted_mappings.is_empty() { "text-extracted" }
-        else if !template_field_mappings.is_empty() { "template" }
-        else if !plan_field_mappings.is_empty() { "plan" }
-        else { "none" };
+    let field_mappings_source = if !text_extracted_mappings.is_empty() {
+        "text-extracted"
+    } else if !template_field_mappings.is_empty() {
+        "template"
+    } else if !plan_field_mappings.is_empty() {
+        "plan"
+    } else {
+        "none"
+    };
 
     let mut packet = serde_json::json!({
         "taskId": task["id"].as_str().unwrap_or(""),
@@ -8346,9 +9989,13 @@ fn task_mcp_developer_work_packet(task: &Value, customer_dev_defaults: Option<&V
     if can_write && !final_field_mappings.is_empty() {
         let allowed = task_mcp_build_allowed_logical_names(&packet);
         if let Some(risks) = packet["implementation"]["risks"].as_array().cloned() {
-            let filtered: Vec<Value> = risks.into_iter()
+            let filtered: Vec<Value> = risks
+                .into_iter()
                 .filter(|v| {
-                    let t = v.as_str().map(str::to_string).unwrap_or_else(|| v.to_string());
+                    let t = v
+                        .as_str()
+                        .map(str::to_string)
+                        .unwrap_or_else(|| v.to_string());
                     !task_mcp_risk_mentions_unknown_entity(&t, &allowed)
                 })
                 .collect();
@@ -8359,7 +10006,14 @@ fn task_mcp_developer_work_packet(task: &Value, customer_dev_defaults: Option<&V
 }
 
 fn task_mcp_allowed_statuses() -> &'static [&'static str] {
-    &["new", "analyzed", "in-progress", "ready-for-review", "done", "blocked"]
+    &[
+        "new",
+        "analyzed",
+        "in-progress",
+        "ready-for-review",
+        "done",
+        "blocked",
+    ]
 }
 
 fn task_mcp_allowed_waiting_states() -> &'static [&'static str] {
@@ -8371,7 +10025,14 @@ fn task_mcp_allowed_attention_states() -> &'static [&'static str] {
 }
 
 fn task_mcp_allowed_phases() -> &'static [&'static str] {
-    &["new", "analyzed", "development", "testing", "review", "done"]
+    &[
+        "new",
+        "analyzed",
+        "development",
+        "testing",
+        "review",
+        "done",
+    ]
 }
 
 fn task_mcp_allowed_modes() -> &'static [&'static str] {
@@ -8379,11 +10040,26 @@ fn task_mcp_allowed_modes() -> &'static [&'static str] {
 }
 
 fn task_mcp_allowed_work_kinds() -> &'static [&'static str] {
-    &["plugin", "script", "ribbon", "repo-only", "bugfix", "review", "general", "unknown"]
+    &[
+        "plugin",
+        "script",
+        "ribbon",
+        "repo-only",
+        "bugfix",
+        "review",
+        "general",
+        "unknown",
+    ]
 }
 
 fn task_mcp_allowed_external_action_types() -> &'static [&'static str] {
-    &["plugin-registration", "web-resource-upload", "publish-customizations", "pull-request", "manual-check"]
+    &[
+        "plugin-registration",
+        "web-resource-upload",
+        "publish-customizations",
+        "pull-request",
+        "manual-check",
+    ]
 }
 
 fn task_mcp_allowed_work_actions() -> &'static [&'static str] {
@@ -8400,9 +10076,16 @@ fn task_mcp_allowed_consultant_test_statuses() -> &'static [&'static str] {
 
 fn task_mcp_allowed_checklist_keys() -> &'static [&'static str] {
     &[
-        "task-analyzed", "setup-confirmed", "crm-metadata-verified",
-        "technical-plan-ready", "implementation-done", "local-test-done",
-        "consultant-testing", "pull-request", "code-review", "done",
+        "task-analyzed",
+        "setup-confirmed",
+        "crm-metadata-verified",
+        "technical-plan-ready",
+        "implementation-done",
+        "local-test-done",
+        "consultant-testing",
+        "pull-request",
+        "code-review",
+        "done",
     ]
 }
 
@@ -8415,7 +10098,15 @@ fn task_mcp_allowed_create_sources() -> &'static [&'static str] {
 }
 
 fn task_mcp_allowed_create_task_types() -> &'static [&'static str] {
-    &["bug-fix", "bug", "feature", "review", "question", "deployment", "other"]
+    &[
+        "bug-fix",
+        "bug",
+        "feature",
+        "review",
+        "question",
+        "deployment",
+        "other",
+    ]
 }
 
 /// Generates a UUID v4 string using the existing `rand` crate (no extra dependencies).
@@ -8440,19 +10131,21 @@ fn task_mcp_display_phase(task: &Value) -> &'static str {
         return "testing";
     }
     match task["status"].as_str().unwrap_or("new") {
-        "in-progress"      => "development",
+        "in-progress" => "development",
         "ready-for-review" => "review",
-        "new"              => "new",
-        "analyzed"         => "analyzed",
-        "done"             => "done",
-        "blocked"          => "blocked",
-        _                  => "new",
+        "new" => "new",
+        "analyzed" => "analyzed",
+        "done" => "done",
+        "blocked" => "blocked",
+        _ => "new",
     }
 }
 
 /// Sanitizes a JSON array of strings into a Vec<Value>, applying length/count limits.
 fn task_mcp_collect_string_array(value: &Value, max_count: usize, max_len: usize) -> Vec<Value> {
-    let Some(arr) = value.as_array() else { return vec![]; };
+    let Some(arr) = value.as_array() else {
+        return vec![];
+    };
     arr.iter()
         .take(max_count)
         .filter_map(|v| v.as_str())
@@ -8473,41 +10166,55 @@ fn task_mcp_checklist_override(task: &Value, key: &str) -> Option<String> {
 /// Builds a checklist JSON array mirroring TypeScript buildWorkflowChecklist.
 fn task_mcp_workflow_checklist(task: &Value) -> Vec<Value> {
     let wf = task.get("crmDeveloperWorkflow").unwrap_or(&Value::Null);
-    let ver = task.get("crmVerificationReports")
+    let ver = task
+        .get("crmVerificationReports")
         .and_then(|v| v.as_array())
         .and_then(|arr| arr.first());
-    let ver_verdict  = ver.and_then(|v| v["verdict"].as_str()).unwrap_or("none");
-    let ver_ok       = matches!(ver_verdict, "pass" | "warnings");
-    let ver_fail     = ver_verdict == "fail";
+    let ver_verdict = ver.and_then(|v| v["verdict"].as_str()).unwrap_or("none");
+    let ver_ok = matches!(ver_verdict, "pass" | "warnings");
+    let ver_fail = ver_verdict == "fail";
 
     let plan_approved = wf["planApproval"]["approved"].as_bool().unwrap_or(false)
         && wf["planApproval"]["invalidatedAt"].is_null();
     let diff_approved = wf["diffApproval"]["approved"].as_bool().unwrap_or(false)
         && wf["diffApproval"]["invalidatedAt"].is_null();
-    let consultant_done = (wf["externalExecution"]["completed"].as_bool().unwrap_or(false)
+    let consultant_done = (wf["externalExecution"]["completed"]
+        .as_bool()
+        .unwrap_or(false)
         && wf["externalExecution"]["invalidatedAt"].is_null())
-        || task.get("consultantTestRecord")
-            .and_then(|v| v["status"].as_str()) == Some("confirmed");
-    let pr_tracked   = wf["pullRequestTracking"]["createdManually"].as_bool().unwrap_or(false)
+        || task
+            .get("consultantTestRecord")
+            .and_then(|v| v["status"].as_str())
+            == Some("confirmed");
+    let pr_tracked = wf["pullRequestTracking"]["createdManually"]
+        .as_bool()
+        .unwrap_or(false)
         && wf["pullRequestTracking"]["invalidatedAt"].is_null();
-    let review_done  = !wf["pullRequestReview"].is_null()
-        && wf["pullRequestReview"]["invalidatedAt"].is_null();
-    let review_needs_attention = wf["pullRequestReview"]["attentionRequired"].as_bool().unwrap_or(false);
+    let review_done =
+        !wf["pullRequestReview"].is_null() && wf["pullRequestReview"]["invalidatedAt"].is_null();
+    let review_needs_attention = wf["pullRequestReview"]["attentionRequired"]
+        .as_bool()
+        .unwrap_or(false);
 
-    let status  = task["status"].as_str().unwrap_or("new");
+    let status = task["status"].as_str().unwrap_or("new");
     let waiting = task["waitingState"].as_str().unwrap_or("");
     let is_in_progress = status == "in-progress";
-    let is_testing     = waiting == "consultant-testing";
-    let is_review      = status == "ready-for-review";
-    let is_done        = status == "done";
-    let has_analysis   = !task["analysisResult"].is_null() || status != "new";
-    let setup_confirmed = task.get("workflowSetup")
+    let is_testing = waiting == "consultant-testing";
+    let is_review = status == "ready-for-review";
+    let is_done = status == "done";
+    let has_analysis = !task["analysisResult"].is_null() || status != "new";
+    let setup_confirmed = task
+        .get("workflowSetup")
         .map_or(false, |ws| !ws["confirmedAt"].is_null());
 
-    let local_test_status = task.get("localTestRecord")
-        .and_then(|v| v["status"].as_str()).unwrap_or("");
-    let consultant_not_needed = task.get("consultantTestRecord")
-        .and_then(|v| v["status"].as_str()) == Some("not-needed");
+    let local_test_status = task
+        .get("localTestRecord")
+        .and_then(|v| v["status"].as_str())
+        .unwrap_or("");
+    let consultant_not_needed = task
+        .get("consultantTestRecord")
+        .and_then(|v| v["status"].as_str())
+        == Some("not-needed");
 
     // Helper: override if set, else return default
     macro_rules! ov {
@@ -8516,16 +10223,88 @@ fn task_mcp_workflow_checklist(task: &Value) -> Vec<Value> {
         };
     }
 
-    let analyzed   = ov!("task-analyzed",         if has_analysis   { "done" } else { "pending" });
-    let setup      = ov!("setup-confirmed",        if setup_confirmed{ "done" } else { "pending" });
-    let crm_ver    = ov!("crm-metadata-verified",  if ver_fail { "warning" } else if ver_ok { "done" } else { "pending" });
-    let tech_plan  = ov!("technical-plan-ready",   if plan_approved { "done" } else if !wf["technicalPlan"].is_null() { "partial" } else { "pending" });
-    let impl_done  = ov!("implementation-done",    if diff_approved { "done" } else if is_in_progress && !is_testing { "active" } else { "pending" });
-    let local_test = ov!("local-test-done",        match local_test_status { "passed" => "done", "failed" => "warning", "not-needed" => "optional", _ => "pending" });
-    let consultant = ov!("consultant-testing",     if consultant_done { "done" } else if is_testing { "active" } else if consultant_not_needed { "optional" } else { "skip" });
-    let pr         = ov!("pull-request",           if pr_tracked { "done" } else if is_review { "active" } else { "pending" });
-    let review     = ov!("code-review",            if review_done { if review_needs_attention { "warning" } else { "done" } } else { "pending" });
-    let done       = ov!("done",                   if is_done { "done" } else { "pending" });
+    let analyzed = ov!(
+        "task-analyzed",
+        if has_analysis { "done" } else { "pending" }
+    );
+    let setup = ov!(
+        "setup-confirmed",
+        if setup_confirmed { "done" } else { "pending" }
+    );
+    let crm_ver = ov!(
+        "crm-metadata-verified",
+        if ver_fail {
+            "warning"
+        } else if ver_ok {
+            "done"
+        } else {
+            "pending"
+        }
+    );
+    let tech_plan = ov!(
+        "technical-plan-ready",
+        if plan_approved {
+            "done"
+        } else if !wf["technicalPlan"].is_null() {
+            "partial"
+        } else {
+            "pending"
+        }
+    );
+    let impl_done = ov!(
+        "implementation-done",
+        if diff_approved {
+            "done"
+        } else if is_in_progress && !is_testing {
+            "active"
+        } else {
+            "pending"
+        }
+    );
+    let local_test = ov!(
+        "local-test-done",
+        match local_test_status {
+            "passed" => "done",
+            "failed" => "warning",
+            "not-needed" => "optional",
+            _ => "pending",
+        }
+    );
+    let consultant = ov!(
+        "consultant-testing",
+        if consultant_done {
+            "done"
+        } else if is_testing {
+            "active"
+        } else if consultant_not_needed {
+            "optional"
+        } else {
+            "skip"
+        }
+    );
+    let pr = ov!(
+        "pull-request",
+        if pr_tracked {
+            "done"
+        } else if is_review {
+            "active"
+        } else {
+            "pending"
+        }
+    );
+    let review = ov!(
+        "code-review",
+        if review_done {
+            if review_needs_attention {
+                "warning"
+            } else {
+                "done"
+            }
+        } else {
+            "pending"
+        }
+    );
+    let done = ov!("done", if is_done { "done" } else { "pending" });
 
     vec![
         serde_json::json!({"key":"task-analyzed",        "label":"Task analyzed",       "status": analyzed}),
@@ -8563,28 +10342,28 @@ fn task_mcp_append_audit_note(task: &mut Value, action: &str) {
 }
 
 fn task_mcp_find_task_index(tasks: &[Value], task_id: &str) -> Option<usize> {
-    tasks.iter().position(|task| task["id"].as_str().unwrap_or("") == task_id)
+    tasks
+        .iter()
+        .position(|task| task["id"].as_str().unwrap_or("") == task_id)
 }
 
 fn task_mcp_load_tasks(app: &tauri::AppHandle) -> Result<Vec<Value>, String> {
-    let path = app_data_dir(app)?.join("tasks.json");
-    let value = read_json(&path)?;
-    if value.is_null() {
-        return Ok(vec![]);
-    }
-    value
-        .as_array()
-        .cloned()
-        .ok_or_else(|| "tasks.json must contain a JSON array.".to_string())
+    let dir = app_data_dir(app)?;
+    let repo = SqliteWorkItemRepository::in_app_data(&dir);
+    repo.migrate_json_tasks(&dir.join("tasks.json")).map_err(|e| e.message)?;
+    repo.list_legacy_compatible().map_err(|e| e.message)
 }
 
 fn task_mcp_save_tasks(app: &tauri::AppHandle, tasks: &[Value]) -> Result<(), String> {
-    let path = app_data_dir(app)?.join("tasks.json");
-    write_json(&path, &Value::Array(tasks.to_vec()))
+    let dir = app_data_dir(app)?;
+    let repo = SqliteWorkItemRepository::in_app_data(&dir);
+    repo.sync_legacy_snapshot(tasks).map_err(|e| e.message)
 }
 
 fn task_mcp_get_task<'a>(tasks: &'a [Value], task_id: &str) -> Option<&'a Value> {
-    tasks.iter().find(|task| task["id"].as_str().unwrap_or("") == task_id)
+    tasks
+        .iter()
+        .find(|task| task["id"].as_str().unwrap_or("") == task_id)
 }
 
 fn task_mcp_next_recommended_step(task: &Value) -> Value {
@@ -8613,7 +10392,9 @@ fn task_mcp_next_recommended_step(task: &Value) -> Value {
         });
     }
 
-    let plan_approved = workflow["planApproval"]["approved"].as_bool().unwrap_or(false)
+    let plan_approved = workflow["planApproval"]["approved"]
+        .as_bool()
+        .unwrap_or(false)
         && workflow["planApproval"]["invalidatedAt"].is_null();
     if !plan_approved {
         return serde_json::json!({
@@ -8644,35 +10425,35 @@ fn task_mcp_next_recommended_step(task: &Value) -> Value {
 fn task_mcp_set_status_phase(task: &mut Value, phase: &str) {
     match phase {
         "new" => {
-            task["status"]       = serde_json::json!("new");
+            task["status"] = serde_json::json!("new");
             task["waitingState"] = Value::Null;
             task["attentionState"] = Value::Null;
         }
         "analyzed" => {
-            task["status"]       = serde_json::json!("analyzed");
+            task["status"] = serde_json::json!("analyzed");
             task["waitingState"] = Value::Null;
             task["attentionState"] = Value::Null;
         }
         "development" => {
-            task["status"]       = serde_json::json!("in-progress");
+            task["status"] = serde_json::json!("in-progress");
             task["waitingState"] = Value::Null;
             task["attentionState"] = Value::Null;
         }
         "testing" => {
-            task["status"]       = serde_json::json!("in-progress");
+            task["status"] = serde_json::json!("in-progress");
             task["waitingState"] = serde_json::json!("consultant-testing");
             task["attentionState"] = Value::Null;
         }
         "review" => {
-            task["status"]       = serde_json::json!("ready-for-review");
+            task["status"] = serde_json::json!("ready-for-review");
             task["waitingState"] = serde_json::json!("code-review");
             task["attentionState"] = Value::Null;
         }
         "done" => {
-            task["status"]       = serde_json::json!("done");
+            task["status"] = serde_json::json!("done");
             task["waitingState"] = Value::Null;
             task["attentionState"] = Value::Null;
-            task["completedAt"]  = serde_json::json!(chrono_now_iso());
+            task["completedAt"] = serde_json::json!(chrono_now_iso());
         }
         _ => {}
     }
@@ -8728,7 +10509,9 @@ fn task_mcp_is_non_empty_workflow_value(value: &Value) -> bool {
 /// confirmReset) — a task with none of this state is already effectively clean, and resetting it
 /// is a safe no-op. Mirrors JS taskHasResettableWorkflowState.
 fn task_mcp_task_has_resettable_workflow_state(task: &Value) -> bool {
-    TASK_MCP_RESETTABLE_WORKFLOW_KEYS.iter().any(|key| task_mcp_is_non_empty_workflow_value(&task[key]))
+    TASK_MCP_RESETTABLE_WORKFLOW_KEYS
+        .iter()
+        .any(|key| task_mcp_is_non_empty_workflow_value(&task[key]))
 }
 
 /// Resets a task's local workflow/execution state to the equivalent of a fresh NEW task, in
@@ -8742,7 +10525,11 @@ fn task_mcp_task_has_resettable_workflow_state(task: &Value) -> bool {
 /// set, otherwise allows it (idempotent no-op case and explicit-confirmation case both return Ok).
 /// Pure — no I/O — so the confirmReset gate is unit-testable without a full task_mcp_execute_tool
 /// dispatch. The "set_task_phase" match arm calls this before task_mcp_reset_task_workflow_to_new.
-fn task_mcp_decide_new_phase_reset(task: &Value, confirm_reset: bool, task_id: &str) -> Result<(), String> {
+fn task_mcp_decide_new_phase_reset(
+    task: &Value,
+    confirm_reset: bool,
+    task_id: &str,
+) -> Result<(), String> {
     if task_mcp_task_has_resettable_workflow_state(task) && !confirm_reset {
         return Err(format!(
             "Resetting task '{task_id}' to NEW will clear saved analysis, developer setup, technical plans and \
@@ -8774,7 +10561,11 @@ fn task_mcp_reset_task_workflow_to_new(task: &mut Value) {
 ///
 /// `payload` carries transition-specific inputs as a JSON object (e.g. `{"canWriteCode": true}`
 /// for `technical_plan_approved`). Unknown transitions are a no-op.
-fn task_mcp_apply_developer_workflow_transition(task: &mut Value, transition: &str, payload: &Value) {
+fn task_mcp_apply_developer_workflow_transition(
+    task: &mut Value,
+    transition: &str,
+    payload: &Value,
+) {
     match transition {
         "technical_plan_approved" => {
             // Leaving NEW/Analyze: a plan can only be approved once the task has been analyzed.
@@ -8846,31 +10637,53 @@ fn task_mcp_workflow_overview(task: &Value) -> Value {
 fn task_mcp_is_script_workflow_task(task: &Value) -> bool {
     let setup = task.get("workflowSetup").unwrap_or(&Value::Null);
     let workflow = task.get("crmDeveloperWorkflow").unwrap_or(&Value::Null);
-    let work_kind = workflow["detectedWorkKind"].as_str()
+    let work_kind = workflow["detectedWorkKind"]
+        .as_str()
         .or_else(|| setup["devTargetKind"].as_str())
         .unwrap_or("unknown");
-    work_kind == "script" || work_kind == "ribbon" || setup["devTargetKind"].as_str() == Some("script")
+    work_kind == "script"
+        || work_kind == "ribbon"
+        || setup["devTargetKind"].as_str() == Some("script")
 }
 
 /// Picks the file from filesChanged that best matches the task's known script artifact/name.
 /// Mirrors the JS `resolveImplementedScriptArtifact` helper.
-fn task_mcp_resolve_implemented_script_artifact(task: &Value, files_changed: &[&str]) -> Option<String> {
+fn task_mcp_resolve_implemented_script_artifact(
+    task: &Value,
+    files_changed: &[&str],
+) -> Option<String> {
     let normalize = |p: &str| p.replace('\\', "/").to_lowercase();
-    let script_candidates: Vec<&str> = files_changed.iter().copied()
+    let script_candidates: Vec<&str> = files_changed
+        .iter()
+        .copied()
         .filter(|f| {
             let lower = f.to_lowercase();
-            lower.ends_with(".js") || lower.ends_with(".ts") || lower.ends_with(".jsx") || lower.ends_with(".tsx")
+            lower.ends_with(".js")
+                || lower.ends_with(".ts")
+                || lower.ends_with(".jsx")
+                || lower.ends_with(".tsx")
         })
         .collect();
-    if script_candidates.is_empty() { return None; }
+    if script_candidates.is_empty() {
+        return None;
+    }
 
     let setup = task.get("workflowSetup").unwrap_or(&Value::Null);
-    let desired = setup["desiredScriptFile"].as_str().map(normalize).filter(|s| !s.is_empty());
-    let existing = setup["artifactPath"].as_str().or_else(|| setup["scriptPath"].as_str())
-        .map(normalize).filter(|s| !s.is_empty());
+    let desired = setup["desiredScriptFile"]
+        .as_str()
+        .map(normalize)
+        .filter(|s| !s.is_empty());
+    let existing = setup["artifactPath"]
+        .as_str()
+        .or_else(|| setup["scriptPath"].as_str())
+        .map(normalize)
+        .filter(|s| !s.is_empty());
 
     if let Some(desired) = &desired {
-        if let Some(m) = script_candidates.iter().find(|f| normalize(f).ends_with(desired.as_str())) {
+        if let Some(m) = script_candidates
+            .iter()
+            .find(|f| normalize(f).ends_with(desired.as_str()))
+        {
             return Some((*m).to_string());
         }
     }
@@ -8889,33 +10702,55 @@ fn task_mcp_resolve_implemented_script_artifact(task: &Value, files_changed: &[&
 /// TaskDevModePanel / ImplementationVerificationModal / repositoryContext.ts resolve to the
 /// actual implemented artifact instead of a stale or empty workflowSetup.artifactPath.
 fn task_mcp_apply_implemented_script_artifact(task: &mut Value, implemented_path: &str) {
-    if task["workflowSetup"].is_null() { task["workflowSetup"] = serde_json::json!({}); }
+    if task["workflowSetup"].is_null() {
+        task["workflowSetup"] = serde_json::json!({});
+    }
     let normalized = implemented_path.replace('\\', "/");
-    let file_name = normalized.rsplit('/').next().unwrap_or(&normalized).to_string();
+    let file_name = normalized
+        .rsplit('/')
+        .next()
+        .unwrap_or(&normalized)
+        .to_string();
     task["workflowSetup"]["artifactPath"] = serde_json::json!(implemented_path);
     task["workflowSetup"]["desiredScriptFile"] = serde_json::json!(file_name);
     let is_absolute = std::path::Path::new(implemented_path).is_absolute();
     if is_absolute {
         task["workflowSetup"]["absoluteScriptPath"] = serde_json::json!(implemented_path);
-    } else if let Some(repo_root) = task["workflowSetup"]["repositoryRoot"].as_str().filter(|s| !s.is_empty()) {
+    } else if let Some(repo_root) = task["workflowSetup"]["repositoryRoot"]
+        .as_str()
+        .filter(|s| !s.is_empty())
+    {
         let joined = std::path::Path::new(repo_root).join(implemented_path);
-        task["workflowSetup"]["absoluteScriptPath"] = serde_json::json!(joined.to_string_lossy().to_string());
+        task["workflowSetup"]["absoluteScriptPath"] =
+            serde_json::json!(joined.to_string_lossy().to_string());
     }
 }
 
 /// Resolves an absolute filesystem path for the task's current script artifact, if known.
 fn task_mcp_resolve_script_absolute_path(task: &Value) -> Option<String> {
     let setup = task.get("workflowSetup").unwrap_or(&Value::Null);
-    if let Some(p) = setup["absoluteScriptPath"].as_str().filter(|s| !s.is_empty()) {
+    if let Some(p) = setup["absoluteScriptPath"]
+        .as_str()
+        .filter(|s| !s.is_empty())
+    {
         return Some(p.to_string());
     }
-    let artifact = setup["artifactPath"].as_str().or_else(|| setup["scriptPath"].as_str())?;
-    if artifact.is_empty() { return None; }
+    let artifact = setup["artifactPath"]
+        .as_str()
+        .or_else(|| setup["scriptPath"].as_str())?;
+    if artifact.is_empty() {
+        return None;
+    }
     if std::path::Path::new(artifact).is_absolute() {
         return Some(artifact.to_string());
     }
     let repo_root = setup["repositoryRoot"].as_str().filter(|s| !s.is_empty())?;
-    Some(std::path::Path::new(repo_root).join(artifact).to_string_lossy().to_string())
+    Some(
+        std::path::Path::new(repo_root)
+            .join(artifact)
+            .to_string_lossy()
+            .to_string(),
+    )
 }
 
 /// Deterministic regex-free business-rule check for one static rule id. Keep in sync with the
@@ -8924,21 +10759,37 @@ fn task_mcp_resolve_script_absolute_path(task: &Value) -> Option<String> {
 /// hand-implemented substring/proximity checks instead of compiled patterns.
 fn task_mcp_static_rule_matches(rule_id: &str, content: &str, content_lower: &str) -> bool {
     match rule_id {
-        "retrieve-source-entity" => content_lower.contains("retrieverecord") && content_lower.contains("nvr_customerasset"),
+        "retrieve-source-entity" => {
+            content_lower.contains("retrieverecord") && content_lower.contains("nvr_customerasset")
+        }
         "no-xrm-page" => content.contains("Xrm.Page"),
         "no-autosave" => content_lower.contains(".data.save("),
-        "no-webresource-upload" => content_lower.contains("uploadwebresource")
-            || content_lower.contains("registerevent")
-            || content_lower.contains("updatewebresourceset"),
-        "no-todo-fixme-placeholder" => content_lower.contains("todo")
-            || content_lower.contains("fixme")
-            || content_lower.contains("placeholder"),
-        "no-empty-lookup-entitytype" => ["entitytype: \"\"", "entitytype:\"\"", "entitytype: ''", "entitytype:''"]
-            .iter().any(|p| content_lower.contains(p)),
-        "no-write-validationfields" => task_mcp_call_contains_arg(content_lower, "setvalue(", "nvr_statuscustom"),
-        "status-custom-checks-inactive-values" => content_lower.contains("inactive")
-            || content_lower.contains("retired")
-            || content_lower.contains("lost"),
+        "no-webresource-upload" => {
+            content_lower.contains("uploadwebresource")
+                || content_lower.contains("registerevent")
+                || content_lower.contains("updatewebresourceset")
+        }
+        "no-todo-fixme-placeholder" => {
+            content_lower.contains("todo")
+                || content_lower.contains("fixme")
+                || content_lower.contains("placeholder")
+        }
+        "no-empty-lookup-entitytype" => [
+            "entitytype: \"\"",
+            "entitytype:\"\"",
+            "entitytype: ''",
+            "entitytype:''",
+        ]
+        .iter()
+        .any(|p| content_lower.contains(p)),
+        "no-write-validationfields" => {
+            task_mcp_call_contains_arg(content_lower, "setvalue(", "nvr_statuscustom")
+        }
+        "status-custom-checks-inactive-values" => {
+            content_lower.contains("inactive")
+                || content_lower.contains("retired")
+                || content_lower.contains("lost")
+        }
         "notification-on-inactive-status" => content_lower.contains("notification"),
         _ => false,
     }
@@ -8950,7 +10801,9 @@ fn task_mcp_call_contains_arg(content_lower: &str, call_prefix: &str, arg: &str)
     let mut search_from = 0usize;
     while let Some(idx) = content_lower[search_from..].find(call_prefix) {
         let start = search_from + idx + call_prefix.len();
-        if start >= content_lower.len() { break; }
+        if start >= content_lower.len() {
+            break;
+        }
         if let Some(end_rel) = content_lower[start..].find(')') {
             if content_lower[start..start + end_rel].contains(arg) {
                 return true;
@@ -8963,8 +10816,14 @@ fn task_mcp_call_contains_arg(content_lower: &str, call_prefix: &str, arg: &str)
 
 /// Runs the matched template's staticRules against implemented file content. No LLM call.
 /// Returns (status, findings, fixable_findings).
-fn task_mcp_run_static_business_rule_checks(template: Option<&Value>, file_content: &str) -> (String, Vec<String>, Vec<Value>) {
-    let rules = template.and_then(|t| t["staticRules"].as_array()).cloned().unwrap_or_default();
+fn task_mcp_run_static_business_rule_checks(
+    template: Option<&Value>,
+    file_content: &str,
+) -> (String, Vec<String>, Vec<Value>) {
+    let rules = template
+        .and_then(|t| t["staticRules"].as_array())
+        .cloned()
+        .unwrap_or_default();
     if rules.is_empty() {
         return (
             "skipped".to_string(),
@@ -8980,19 +10839,34 @@ fn task_mcp_run_static_business_rule_checks(template: Option<&Value>, file_conte
         let description = rule["description"].as_str().unwrap_or("").to_string();
         let rule_type = rule["type"].as_str().unwrap_or("must-match");
         let matched = task_mcp_static_rule_matches(&id, file_content, &content_lower);
-        let pass = if rule_type == "must-not-match" { !matched } else { matched };
-        findings.push(format!("{}|{}", if pass { "pass" } else { "fail" }, description));
+        let pass = if rule_type == "must-not-match" {
+            !matched
+        } else {
+            matched
+        };
+        findings.push(format!(
+            "{}|{}",
+            if pass { "pass" } else { "fail" },
+            description
+        ));
         if !pass {
             fixable.push(serde_json::json!({ "id": id, "description": description }));
         }
     }
-    let status = if fixable.is_empty() { "passed" } else { "failed" };
+    let status = if fixable.is_empty() {
+        "passed"
+    } else {
+        "failed"
+    };
     (status.to_string(), findings, fixable)
 }
 
 /// Statuses that count as "resolved" for a modal check row without MCP re-running it.
 fn task_mcp_impl_check_resolved(status: &str) -> bool {
-    matches!(status, "passed" | "warnings" | "skipped" | "manually-verified" | "failed")
+    matches!(
+        status,
+        "passed" | "warnings" | "skipped" | "manually-verified" | "failed"
+    )
 }
 
 /// True for script/ribbon AND plugin tasks — the task kinds run_implementation_verification's
@@ -9001,17 +10875,22 @@ fn task_mcp_impl_check_resolved(status: &str) -> bool {
 fn task_mcp_is_verifiable_dev_task(task: &Value) -> bool {
     let setup = task.get("workflowSetup").unwrap_or(&Value::Null);
     let workflow = task.get("crmDeveloperWorkflow").unwrap_or(&Value::Null);
-    let work_kind = workflow["detectedWorkKind"].as_str()
+    let work_kind = workflow["detectedWorkKind"]
+        .as_str()
         .or_else(|| setup["devTargetKind"].as_str())
         .unwrap_or("unknown");
     matches!(work_kind, "script" | "ribbon" | "plugin")
-        || matches!(setup["devTargetKind"].as_str(), Some("script") | Some("plugin"))
+        || matches!(
+            setup["devTargetKind"].as_str(),
+            Some("script") | Some("plugin")
+        )
 }
 
 fn task_mcp_is_plugin_dev_task(task: &Value) -> bool {
     let setup = task.get("workflowSetup").unwrap_or(&Value::Null);
     let workflow = task.get("crmDeveloperWorkflow").unwrap_or(&Value::Null);
-    workflow["detectedWorkKind"].as_str() == Some("plugin") || setup["devTargetKind"].as_str() == Some("plugin")
+    workflow["detectedWorkKind"].as_str() == Some("plugin")
+        || setup["devTargetKind"].as_str() == Some("plugin")
 }
 
 /// Compares the task's customer's expected Dataverse environment label against the active
@@ -9019,14 +10898,20 @@ fn task_mcp_is_plugin_dev_task(task: &Value) -> bool {
 /// when BOTH are set (non-empty, trimmed) and they differ under a case-insensitive comparison —
 /// an intentionally opt-in check: tasks/connections that never set a label are not blocked by a
 /// check that has nothing to compare against.
-fn task_mcp_dataverse_environment_mismatch(task: &Value, customers: &[Value], settings: &Value) -> Option<(String, String)> {
+fn task_mcp_dataverse_environment_mismatch(
+    task: &Value,
+    customers: &[Value],
+    settings: &Value,
+) -> Option<(String, String)> {
     let customer_id = task["customerId"].as_str().unwrap_or("");
-    let expected = customers.iter()
+    let expected = customers
+        .iter()
         .find(|c| c["id"].as_str() == Some(customer_id))
         .and_then(|c| c["dataverseEnvironmentLabel"].as_str())
         .map(str::trim)
         .filter(|s| !s.is_empty());
-    let active = settings["primarchMcpEnvironmentLabel"].as_str()
+    let active = settings["primarchMcpEnvironmentLabel"]
+        .as_str()
         .map(str::trim)
         .filter(|s| !s.is_empty());
     match (expected, active) {
@@ -9043,7 +10928,13 @@ fn task_mcp_dataverse_environment_mismatch(task: &Value, customers: &[Value], se
 fn task_mcp_normalize_dataverse_gate(raw_status: &str, warnings_accepted: bool) -> &'static str {
     match raw_status {
         "passed" | "skipped" | "manually-verified" => "passed",
-        "warnings" => if warnings_accepted { "passed" } else { "warnings_unaccepted" },
+        "warnings" => {
+            if warnings_accepted {
+                "passed"
+            } else {
+                "warnings_unaccepted"
+            }
+        }
         "failed" => "failed",
         "needs_configuration" => "needs_configuration",
         _ => "not_run",
@@ -9070,22 +10961,41 @@ fn task_mcp_ai_kit_review_gate(review: &Value) -> (&'static str, Vec<String>) {
     if matches!(status, "manually-verified" | "skipped") {
         return ("passed", vec![]);
     }
-    let has_items = |key: &str| review[key].as_array().map(|a| !a.is_empty()).unwrap_or(false);
+    let has_items = |key: &str| {
+        review[key]
+            .as_array()
+            .map(|a| !a.is_empty())
+            .unwrap_or(false)
+    };
     let mut missing = Vec::new();
-    if !has_items("reviewedFiles") { missing.push("reviewedFiles is empty".to_string()); }
-    if !has_items("rulesFiles") { missing.push("rulesFiles is empty".to_string()); }
-    if !has_items("checklistFiles") { missing.push("checklistFiles is empty".to_string()); }
-    if !has_items("knownPrReviewFiles") { missing.push("knownPrReviewFiles is empty".to_string()); }
+    if !has_items("reviewedFiles") {
+        missing.push("reviewedFiles is empty".to_string());
+    }
+    if !has_items("rulesFiles") {
+        missing.push("rulesFiles is empty".to_string());
+    }
+    if !has_items("checklistFiles") {
+        missing.push("checklistFiles is empty".to_string());
+    }
+    if !has_items("knownPrReviewFiles") {
+        missing.push("knownPrReviewFiles is empty".to_string());
+    }
 
     if has_items("fixableFindings") {
         missing.push("fixableFindings is non-empty".to_string());
         return ("failed", missing);
     }
     match status {
-        "failed"   => ("failed", missing),
+        "failed" => ("failed", missing),
         "warnings" => ("pending", missing),
-        "passed"   => if missing.is_empty() { ("passed", vec![]) } else { ("incomplete", missing) },
-        _          => ("not_run", vec![]),
+        "passed" => {
+            if missing.is_empty() {
+                ("passed", vec![])
+            } else {
+                ("incomplete", missing)
+            }
+        }
+        _ => ("not_run", vec![]),
     }
 }
 
@@ -9094,11 +11004,17 @@ fn task_mcp_ai_kit_review_gate(review: &Value) -> (&'static str, Vec<String>) {
 /// .js/.ts artifacts, so MCP cannot run this check for script tasks; it can only report the
 /// same status the modal would show.
 fn task_mcp_derive_dataverse_check_status(task: &Value) -> String {
-    let override_status = task["implementationVerification"]["dataverseCheck"]["status"].as_str().unwrap_or("");
-    if matches!(override_status, "skipped" | "manually-verified" | "needs_configuration") {
+    let override_status = task["implementationVerification"]["dataverseCheck"]["status"]
+        .as_str()
+        .unwrap_or("");
+    if matches!(
+        override_status,
+        "skipped" | "manually-verified" | "needs_configuration"
+    ) {
         return override_status.to_string();
     }
-    let verdict = task["crmVerificationReports"].as_array()
+    let verdict = task["crmVerificationReports"]
+        .as_array()
         .and_then(|a| a.first())
         .and_then(|r| r["verdict"].as_str())
         .unwrap_or("");
@@ -9117,9 +11033,15 @@ fn task_mcp_derive_dataverse_check_status(task: &Value) -> String {
 fn task_mcp_dataverse_metadata_check_passthrough(task: &Value) -> (String, String) {
     let status = task_mcp_derive_dataverse_check_status(task);
     if task_mcp_impl_check_resolved(&status) {
-        (status.clone(), format!("Existing Dataverse Metadata Check status: {status}."))
+        (
+            status.clone(),
+            format!("Existing Dataverse Metadata Check status: {status}."),
+        )
     } else {
-        ("needs_manual_action".to_string(), "Run Dataverse Metadata Check in the Implementation Verification modal.".to_string())
+        (
+            "needs_manual_action".to_string(),
+            "Run Dataverse Metadata Check in the Implementation Verification modal.".to_string(),
+        )
     }
 }
 
@@ -9127,11 +11049,20 @@ fn task_mcp_dataverse_metadata_check_passthrough(task: &Value) -> (String, Strin
 /// implementationVerification.aiCodeReview — the LLM-backed AI Kit/Settings Reviewer, distinct
 /// from the deterministic staticRules check). MCP cannot invoke a live LLM reviewer headlessly.
 fn task_mcp_ai_internal_code_review_passthrough(task: &Value) -> (String, String) {
-    let status = task["implementationVerification"]["aiCodeReview"]["status"].as_str().unwrap_or("");
+    let status = task["implementationVerification"]["aiCodeReview"]["status"]
+        .as_str()
+        .unwrap_or("");
     if task_mcp_impl_check_resolved(status) {
-        (status.to_string(), format!("Existing AI Kit review status: {status}."))
+        (
+            status.to_string(),
+            format!("Existing AI Kit review status: {status}."),
+        )
     } else {
-        ("needs_manual_action".to_string(), "Run AI Kit Review or Settings Reviewer in the Implementation Verification modal.".to_string())
+        (
+            "needs_manual_action".to_string(),
+            "Run AI Kit Review or Settings Reviewer in the Implementation Verification modal."
+                .to_string(),
+        )
     }
 }
 
@@ -9142,14 +11073,20 @@ fn task_mcp_ai_internal_code_review_passthrough(task: &Value) -> (String, String
 /// same derivation here so every read path (modal, workflow overview, run_implementation_
 /// verification, get_implementation_verification_summary) agrees.
 fn task_mcp_local_test_impl_passthrough(task: &Value) -> (String, String) {
-    let status = task["implementationVerification"]["localTest"]["status"].as_str().unwrap_or("");
+    let status = task["implementationVerification"]["localTest"]["status"]
+        .as_str()
+        .unwrap_or("");
     if status == "passed" || status == "not-needed" || status == "failed" {
-        return (status.to_string(), format!("Existing Local Test status: {status}."));
+        return (
+            status.to_string(),
+            format!("Existing Local Test status: {status}."),
+        );
     }
     if task_mcp_is_legacy_ai_managed_local_test_not_needed(task) {
         return (
             "not-needed".to_string(),
-            "Skipped for AI-managed workflow; no browser/model-driven app test was performed.".to_string(),
+            "Skipped for AI-managed workflow; no browser/model-driven app test was performed."
+                .to_string(),
         );
     }
     ("needs_manual_action".to_string(), "Record Local Test in the Implementation Verification modal after manual/browser CRM testing (or mark it not-needed there).".to_string())
@@ -9163,7 +11100,9 @@ fn task_mcp_record_ai_managed_local_test_not_needed(task: &mut Value, now: &str)
     if !task["implementationVerification"].is_object() {
         task["implementationVerification"] = serde_json::json!({});
     }
-    let existing_status = task["implementationVerification"]["localTest"]["status"].as_str().unwrap_or("");
+    let existing_status = task["implementationVerification"]["localTest"]["status"]
+        .as_str()
+        .unwrap_or("");
     if existing_status == "passed" || existing_status == "failed" {
         return;
     }
@@ -9180,7 +11119,8 @@ fn task_mcp_record_ai_managed_local_test_not_needed(task: &mut Value, now: &str)
 /// writing it directly. Ordinary manually managed tasks (no completed AI implementation) never
 /// match this and must still show Local Test as not-run/needs_manual_action.
 fn task_mcp_is_legacy_ai_managed_local_test_not_needed(task: &Value) -> bool {
-    let ai_completed = task["crmDeveloperWorkflow"]["lastAiImplementation"]["completedAt"].as_str()
+    let ai_completed = task["crmDeveloperWorkflow"]["lastAiImplementation"]["completedAt"]
+        .as_str()
         .map(|s| !s.is_empty())
         .unwrap_or(false);
     let legacy_not_needed = task["localTestRecord"]["status"].as_str() == Some("not-needed");
@@ -9192,10 +11132,15 @@ fn task_mcp_is_legacy_ai_managed_local_test_not_needed(task: &Value) -> bool {
 /// get_task_workflow_overview). Built ONLY from the canonical fields ImplementationVerification
 /// Modal reads. Never a side-channel-only MCP result. Mirrors JS buildModalVerificationSummary.
 fn task_mcp_build_modal_verification_summary(task: &Value) -> Value {
-    let build_status = task["implementationVerification"]["buildCheck"]["status"].as_str().unwrap_or("not-run");
+    let build_status = task["implementationVerification"]["buildCheck"]["status"]
+        .as_str()
+        .unwrap_or("not-run");
     let build_summary = task["implementationVerification"]["buildCheck"]["summary"].as_str();
-    let mut build_check = serde_json::json!({ "status": build_status, "label": "Script File Readiness" });
-    if let Some(summary) = build_summary { build_check["message"] = serde_json::json!(summary); }
+    let mut build_check =
+        serde_json::json!({ "status": build_status, "label": "Script File Readiness" });
+    if let Some(summary) = build_summary {
+        build_check["message"] = serde_json::json!(summary);
+    }
 
     let (dv_status, dv_message) = task_mcp_dataverse_metadata_check_passthrough(task);
     let (ai_status, ai_message) = task_mcp_ai_internal_code_review_passthrough(task);
@@ -9307,11 +11252,22 @@ fn task_mcp_compute_progression_gate(task: &Value) -> Value {
 
 /// Keys of the modal-required rows still unresolved (needs_manual_action or genuinely not-run).
 fn task_mcp_unresolved_modal_rows(summary: &Value) -> Vec<String> {
-    let unresolved = |row: &Value| matches!(row["status"].as_str(), Some("needs_manual_action") | Some("not-run"));
+    let unresolved = |row: &Value| {
+        matches!(
+            row["status"].as_str(),
+            Some("needs_manual_action") | Some("not-run")
+        )
+    };
     let mut rows = Vec::new();
-    if unresolved(&summary["dataverseCheck"]) { rows.push("dataverseCheck".to_string()); }
-    if unresolved(&summary["aiCodeReview"]) { rows.push("aiCodeReview".to_string()); }
-    if unresolved(&summary["localTest"]) { rows.push("localTest".to_string()); }
+    if unresolved(&summary["dataverseCheck"]) {
+        rows.push("dataverseCheck".to_string());
+    }
+    if unresolved(&summary["aiCodeReview"]) {
+        rows.push("aiCodeReview".to_string());
+    }
+    if unresolved(&summary["localTest"]) {
+        rows.push("localTest".to_string());
+    }
     rows
 }
 
@@ -9320,18 +11276,30 @@ fn task_mcp_unresolved_modal_rows(summary: &Value) -> Vec<String> {
 /// the Implementation Verification modal footer — so all four always say the same thing. Only
 /// mentions the checks that are actually still unresolved.
 fn task_mcp_compose_manual_verification_step(summary: &Value) -> String {
-    let needs = |row: &Value| matches!(row["status"].as_str(), Some("needs_manual_action") | Some("not-run"));
+    let needs = |row: &Value| {
+        matches!(
+            row["status"].as_str(),
+            Some("needs_manual_action") | Some("not-run")
+        )
+    };
     let dv_needs = needs(&summary["dataverseCheck"]);
     let ai_needs = needs(&summary["aiCodeReview"]);
 
     let mut modal_names: Vec<&str> = Vec::new();
-    if dv_needs { modal_names.push("Dataverse Metadata Check"); }
-    if ai_needs { modal_names.push("AI Kit/Settings Review"); }
+    if dv_needs {
+        modal_names.push("Dataverse Metadata Check");
+    }
+    if ai_needs {
+        modal_names.push("AI Kit/Settings Review");
+    }
 
     if modal_names.is_empty() {
         "All Implementation Verification checks are resolved.".to_string()
     } else {
-        format!("Run {} in the Implementation Verification modal.", modal_names.join(" and "))
+        format!(
+            "Run {} in the Implementation Verification modal.",
+            modal_names.join(" and ")
+        )
     }
 }
 
@@ -9344,11 +11312,17 @@ fn task_mcp_compose_manual_verification_step(summary: &Value) -> String {
 // ---------------------------------------------------------------------------
 
 fn task_mcp_derive_manual_deployment_status(task: &Value) -> String {
-    task["deploymentTesting"]["deployment"]["status"].as_str().unwrap_or("not-run").to_string()
+    task["deploymentTesting"]["deployment"]["status"]
+        .as_str()
+        .unwrap_or("not-run")
+        .to_string()
 }
 
 fn task_mcp_derive_deployment_test_status(task: &Value) -> String {
-    task["deploymentTesting"]["test"]["status"].as_str().unwrap_or("not-run").to_string()
+    task["deploymentTesting"]["test"]["status"]
+        .as_str()
+        .unwrap_or("not-run")
+        .to_string()
 }
 
 /// Single source of truth for "can this task proceed to Commit & Push". Pure — no I/O.
@@ -9407,7 +11381,9 @@ fn task_mcp_compute_deployment_testing_gate(task: &Value) -> Value {
 /// the 'not-needed' override requires a real, non-empty user-provided reason. Pure — no I/O.
 fn task_mcp_validate_not_needed_requires_notes(status: &str, notes: &str) -> Result<(), String> {
     if status == "not-needed" && notes.trim().is_empty() {
-        Err(format!("notes is required and must be meaningful when recording status='{status}'"))
+        Err(format!(
+            "notes is required and must be meaningful when recording status='{status}'"
+        ))
     } else {
         Ok(())
     }
@@ -9421,7 +11397,8 @@ fn task_mcp_require_deployment_testing_gate_resolved(task: &Value) -> Result<(),
     if gate["canProceedToCommit"].as_bool().unwrap_or(false) {
         Ok(())
     } else {
-        let reason = gate["blockingChecks"][0]["reason"].as_str()
+        let reason = gate["blockingChecks"][0]["reason"]
+            .as_str()
             .unwrap_or("Deployment & Testing is not resolved yet.");
         Err(format!(
             "Cannot commit/push: {reason} Record manual deployment and a browser/application test \
@@ -9435,7 +11412,10 @@ fn task_mcp_require_deployment_testing_gate_resolved(task: &Value) -> Result<(),
 /// created/recorded pull request — never satisfied by an AI/Claude code review alone.
 fn task_mcp_compute_code_review_readiness_gate(task: &Value) -> Value {
     let gw = &task["gitWorkflow"];
-    let commit_verified = gw["lastCommitHash"].as_str().map(|s| !s.is_empty()).unwrap_or(false);
+    let commit_verified = gw["lastCommitHash"]
+        .as_str()
+        .map(|s| !s.is_empty())
+        .unwrap_or(false);
     let last_pushed_branch = gw["lastPushedBranch"].as_str().filter(|s| !s.is_empty());
     let last_commit_branch = gw["lastCommitBranch"].as_str().filter(|s| !s.is_empty());
     let push_verified = last_pushed_branch.is_some()
@@ -9444,7 +11424,10 @@ fn task_mcp_compute_code_review_readiness_gate(task: &Value) -> Value {
 
     let pr_tracking = &task["crmDeveloperWorkflow"]["pullRequestTracking"];
     let pr_recorded = pr_tracking["createdManually"].as_bool().unwrap_or(false)
-        && pr_tracking["prUrl"].as_str().map(|s| !s.is_empty()).unwrap_or(false)
+        && pr_tracking["prUrl"]
+            .as_str()
+            .map(|s| !s.is_empty())
+            .unwrap_or(false)
         && pr_tracking["invalidatedAt"].is_null();
 
     let can_enter_code_review = commit_verified && push_verified && pr_recorded;
@@ -9468,7 +11451,11 @@ fn task_mcp_compute_code_review_readiness_gate(task: &Value) -> Value {
 /// continue_developer_workflow nextAction values that mean "the task is now (or already) in the
 /// Deployment & Testing phase". Kept in sync with DEPLOYMENT_TESTING_NEXT_ACTIONS in
 /// mcp/task-workbench-mcp.mjs.
-const DEPLOYMENT_TESTING_NEXT_ACTIONS: &[&str] = &["wait_for_manual_deployment", "wait_for_deployment_test", "fix_code_or_redeploy"];
+const DEPLOYMENT_TESTING_NEXT_ACTIONS: &[&str] = &[
+    "wait_for_manual_deployment",
+    "wait_for_deployment_test",
+    "fix_code_or_redeploy",
+];
 
 /// Pure decision: should this continue_developer_workflow call persist the Development ->
 /// Deployment & Testing transition? True exactly when the computed nextAction indicates the
@@ -9476,7 +11463,8 @@ const DEPLOYMENT_TESTING_NEXT_ACTIONS: &[&str] = &["wait_for_manual_deployment",
 /// call while still waiting on manual deployment/testing, or once past it to commit/push/PR, is a
 /// no-op here). Pure — no I/O.
 fn task_mcp_should_transition_to_deployment_testing(task: &Value, next_action: &str) -> bool {
-    DEPLOYMENT_TESTING_NEXT_ACTIONS.contains(&next_action) && task["waitingState"].as_str() != Some("consultant-testing")
+    DEPLOYMENT_TESTING_NEXT_ACTIONS.contains(&next_action)
+        && task["waitingState"].as_str() != Some("consultant-testing")
 }
 
 /// Applies the Development -> Deployment & Testing transition to `task` in place, when
@@ -9492,14 +11480,20 @@ fn task_mcp_apply_deployment_testing_transition(task: &mut Value, next_action: &
     }
     task["waitingState"] = serde_json::json!("consultant-testing");
     task["attentionState"] = Value::Null;
-    task_mcp_append_audit_note(task, &format!("continue_developer_workflow -> transitioned to Deployment & Testing ({next_action})"));
+    task_mcp_append_audit_note(
+        task,
+        &format!(
+            "continue_developer_workflow -> transitioned to Deployment & Testing ({next_action})"
+        ),
+    );
     true
 }
 
 fn task_mcp_compute_continue_workflow_step(task: &Value) -> Value {
-    let setup    = task.get("workflowSetup").unwrap_or(&Value::Null);
+    let setup = task.get("workflowSetup").unwrap_or(&Value::Null);
     let workflow = task.get("crmDeveloperWorkflow").unwrap_or(&Value::Null);
-    let work_kind = workflow["detectedWorkKind"].as_str()
+    let work_kind = workflow["detectedWorkKind"]
+        .as_str()
         .or_else(|| setup["devTargetKind"].as_str())
         .unwrap_or("unknown");
     let is_script = task_mcp_is_verifiable_dev_task(task);
@@ -9510,13 +11504,17 @@ fn task_mcp_compute_continue_workflow_step(task: &Value) -> Value {
     // here; see task_mcp_compute_deployment_testing_gate below for the canonical post-deployment
     // test gate.)
     let dv_check = &task["implementationVerification"]["dataverseCheck"];
-    let first_verdict = task["crmVerificationReports"].as_array()
+    let first_verdict = task["crmVerificationReports"]
+        .as_array()
         .and_then(|a| a.first())
         .and_then(|r| r["verdict"].as_str())
         .unwrap_or("");
     let dv_done = !dv_check["skippedAt"].is_null()
         || !dv_check["manuallyVerifiedAt"].is_null()
-        || matches!(dv_check["status"].as_str().unwrap_or(""), "skipped" | "done" | "manually-verified")
+        || matches!(
+            dv_check["status"].as_str().unwrap_or(""),
+            "skipped" | "done" | "manually-verified"
+        )
         || matches!(first_verdict, "pass" | "warnings" | "fail");
     if !dv_done {
         if is_script {
@@ -9533,8 +11531,12 @@ fn task_mcp_compute_continue_workflow_step(task: &Value) -> Value {
                     "forbiddenWrites": ["commit_task_changes", "push_task_branch", "commit_and_push_task_changes"],
                 });
             }
-            let mcp_verification_failed_with_fixes = mcp_verification["status"].as_str() == Some("failed")
-                && mcp_verification["fixableFindings"].as_array().map(|a| !a.is_empty()).unwrap_or(false);
+            let mcp_verification_failed_with_fixes = mcp_verification["status"].as_str()
+                == Some("failed")
+                && mcp_verification["fixableFindings"]
+                    .as_array()
+                    .map(|a| !a.is_empty())
+                    .unwrap_or(false);
             if mcp_verification_failed_with_fixes {
                 return serde_json::json!({
                     "nextAction": "fix_code",
@@ -9560,8 +11562,13 @@ fn task_mcp_compute_continue_workflow_step(task: &Value) -> Value {
                 });
             }
             if mcp_verification["status"].as_str() == Some("needs_configuration") {
-                let reason = mcp_verification["checks"].as_array()
-                    .and_then(|checks| checks.iter().find(|c| c["status"].as_str() == Some("needs_configuration")))
+                let reason = mcp_verification["checks"]
+                    .as_array()
+                    .and_then(|checks| {
+                        checks
+                            .iter()
+                            .find(|c| c["status"].as_str() == Some("needs_configuration"))
+                    })
                     .and_then(|c| c["findings"][0].as_str())
                     .unwrap_or("Dataverse Metadata Check is not configured.")
                     .to_string();
@@ -9590,7 +11597,9 @@ fn task_mcp_compute_continue_workflow_step(task: &Value) -> Value {
                 });
             }
             if mcp_verification["status"].as_str() == Some("needs_manual_action") {
-                let manual_step = task_mcp_compose_manual_verification_step(&task_mcp_build_modal_verification_summary(task));
+                let manual_step = task_mcp_compose_manual_verification_step(
+                    &task_mcp_build_modal_verification_summary(task),
+                );
                 return serde_json::json!({
                     "nextAction": "wait_for_user",
                     "canProceed": false,
@@ -9664,8 +11673,13 @@ fn task_mcp_compute_continue_workflow_step(task: &Value) -> Value {
     // deploymentTesting field — never the legacy localTestRecord/implementationVerification.
     // localTest/consultantTestRecord fields.
     let deployment_gate = task_mcp_compute_deployment_testing_gate(task);
-    if !deployment_gate["canProceedToCommit"].as_bool().unwrap_or(false) {
-        let next = deployment_gate["nextRecommendedAction"].as_str().unwrap_or("");
+    if !deployment_gate["canProceedToCommit"]
+        .as_bool()
+        .unwrap_or(false)
+    {
+        let next = deployment_gate["nextRecommendedAction"]
+            .as_str()
+            .unwrap_or("");
         if next == "wait_for_manual_deployment" {
             return serde_json::json!({
                 "nextAction": "wait_for_manual_deployment",
@@ -9705,7 +11719,9 @@ fn task_mcp_compute_continue_workflow_step(task: &Value) -> Value {
     // 5. Commit verified? Push verified? Pull request created/recorded? Each is a separate,
     // explicit user approval — approving one is never approval for the next.
     let review_readiness = task_mcp_compute_code_review_readiness_gate(task);
-    let commit_verified = review_readiness["commitVerified"].as_bool().unwrap_or(false);
+    let commit_verified = review_readiness["commitVerified"]
+        .as_bool()
+        .unwrap_or(false);
     let push_verified = review_readiness["pushVerified"].as_bool().unwrap_or(false);
     let pr_recorded = review_readiness["prRecorded"].as_bool().unwrap_or(false);
     if commit_verified && push_verified && pr_recorded {
@@ -9747,7 +11763,9 @@ fn task_mcp_compute_continue_workflow_step(task: &Value) -> Value {
 
     // 6. Propose/confirm branch, then commit — each step requires its OWN explicit user
     // approval. Confirming a branch name does not imply the commit is approved, and vice versa.
-    let confirmed_branch = task["gitWorkflow"]["confirmedBranch"].as_str().filter(|s| !s.is_empty());
+    let confirmed_branch = task["gitWorkflow"]["confirmedBranch"]
+        .as_str()
+        .filter(|s| !s.is_empty());
     if let Some(branch) = confirmed_branch {
         return serde_json::json!({
             "nextAction": "prepare_commit",
@@ -9786,7 +11804,7 @@ fn task_mcp_implementation_readiness(task: &Value) -> Value {
         });
     }
 
-    let setup    = task.get("workflowSetup").unwrap_or(&Value::Null);
+    let setup = task.get("workflowSetup").unwrap_or(&Value::Null);
     let workflow = task.get("crmDeveloperWorkflow").unwrap_or(&Value::Null);
     let detected = workflow["detectedWorkKind"].as_str().unwrap_or("");
     let dev_kind = setup["devTargetKind"].as_str().unwrap_or("");
@@ -9795,15 +11813,26 @@ fn task_mcp_implementation_readiness(task: &Value) -> Value {
     let is_script = dev_kind == "script" || detected == "script" || detected == "ribbon";
 
     if !is_plugin && !is_script {
-        let title    = task["title"].as_str().unwrap_or("").to_lowercase();
-        let original = task["originalMessage"].as_str().unwrap_or("").to_lowercase();
-        let label    = task["classificationLabel"].as_str().unwrap_or("").to_lowercase();
-        let corpus   = format!("{} {} {}", title, original, label);
-        let looks_script = corpus.contains("javascript") || corpus.contains("form script")
-            || corpus.contains("web resource") || corpus.contains("jscript")
-            || corpus.contains("on load") || corpus.contains("onload")
-            || corpus.contains("on save") || corpus.contains("onsave")
-            || corpus.contains("field change") || corpus.contains("column change")
+        let title = task["title"].as_str().unwrap_or("").to_lowercase();
+        let original = task["originalMessage"]
+            .as_str()
+            .unwrap_or("")
+            .to_lowercase();
+        let label = task["classificationLabel"]
+            .as_str()
+            .unwrap_or("")
+            .to_lowercase();
+        let corpus = format!("{} {} {}", title, original, label);
+        let looks_script = corpus.contains("javascript")
+            || corpus.contains("form script")
+            || corpus.contains("web resource")
+            || corpus.contains("jscript")
+            || corpus.contains("on load")
+            || corpus.contains("onload")
+            || corpus.contains("on save")
+            || corpus.contains("onsave")
+            || corpus.contains("field change")
+            || corpus.contains("column change")
             || corpus.contains("onchange");
         let warnings_val: Vec<&str> = if looks_script {
             vec!["Task text mentions JavaScript/form scripts. Consider classifying this task as script work kind."]
@@ -9826,8 +11855,13 @@ fn task_mcp_implementation_readiness(task: &Value) -> Value {
     let mut blockers: Vec<String> = Vec::new();
     let mut warnings: Vec<String> = Vec::new();
 
-    let customer = setup["customerId"].as_str().or(task["customerId"].as_str()).unwrap_or("");
-    if customer.is_empty() { blockers.push("Customer/environment is not set.".into()); }
+    let customer = setup["customerId"]
+        .as_str()
+        .or(task["customerId"].as_str())
+        .unwrap_or("");
+    if customer.is_empty() {
+        blockers.push("Customer/environment is not set.".into());
+    }
 
     if setup["repositoryRoot"].as_str().unwrap_or("").is_empty() {
         blockers.push("Repository root is not set.".into());
@@ -9836,56 +11870,91 @@ fn task_mcp_implementation_readiness(task: &Value) -> Value {
         blockers.push("Developer setup has not been confirmed.".into());
     }
 
-    let has_plan = workflow.get("technicalPlan").map(|p| p.is_object()).unwrap_or(false);
-    if !has_plan { blockers.push("Technical implementation plan is missing.".into()); }
+    let has_plan = workflow
+        .get("technicalPlan")
+        .map(|p| p.is_object())
+        .unwrap_or(false);
+    if !has_plan {
+        blockers.push("Technical implementation plan is missing.".into());
+    }
 
-    let latest_verdict = task.get("crmVerificationReports")
+    let latest_verdict = task
+        .get("crmVerificationReports")
         .and_then(|r| r.as_array())
         .and_then(|arr| arr.first())
         .and_then(|r| r["verdict"].as_str())
         .unwrap_or("");
-    let dv_check = task.get("implementationVerification")
+    let dv_check = task
+        .get("implementationVerification")
         .and_then(|v| v.get("dataverseCheck"))
         .unwrap_or(&Value::Null);
     let dv_satisfied = matches!(latest_verdict, "pass" | "warnings" | "fail")
         || !dv_check["skippedAt"].is_null()
         || !dv_check["manuallyVerifiedAt"].is_null()
-        || dv_check["status"].as_str().map(|s| s == "skipped" || s == "manually-verified").unwrap_or(false);
+        || dv_check["status"]
+            .as_str()
+            .map(|s| s == "skipped" || s == "manually-verified")
+            .unwrap_or(false);
 
     if !dv_satisfied {
         if is_script {
             warnings.push("Dataverse metadata verification for JS/TS runs automatically after implementation via run_implementation_verification (Primarch, when configured) — not before.".into());
         } else {
-            blockers.push("Dataverse metadata verification has not been completed or explicitly skipped.".into());
+            blockers.push(
+                "Dataverse metadata verification has not been completed or explicitly skipped."
+                    .into(),
+            );
         }
     } else {
-        if latest_verdict == "warnings" { warnings.push("Dataverse verification completed with warnings. Review before implementing.".into()); }
-        if latest_verdict == "fail"     { warnings.push("Dataverse verification found issues. Ensure they are accounted for in the technical plan.".into()); }
+        if latest_verdict == "warnings" {
+            warnings.push(
+                "Dataverse verification completed with warnings. Review before implementing."
+                    .into(),
+            );
+        }
+        if latest_verdict == "fail" {
+            warnings.push("Dataverse verification found issues. Ensure they are accounted for in the technical plan.".into());
+        }
     }
 
     let plan_target = if has_plan {
-        workflow.get("technicalPlan").and_then(|p| p.get("target")).unwrap_or(&Value::Null)
+        workflow
+            .get("technicalPlan")
+            .and_then(|p| p.get("target"))
+            .unwrap_or(&Value::Null)
     } else {
         &Value::Null
     };
 
     if is_plugin {
-        let plugin_project = setup["pluginProject"].as_str()
+        let plugin_project = setup["pluginProject"]
+            .as_str()
             .or(task["selectedPluginProject"].as_str())
             .or(plan_target["pluginProject"].as_str())
             .unwrap_or("");
-        if plugin_project.is_empty() { blockers.push("Plugin project is not selected.".into()); }
+        if plugin_project.is_empty() {
+            blockers.push("Plugin project is not selected.".into());
+        }
 
-        let entity = setup["primaryEntityLogicalName"].as_str()
+        let entity = setup["primaryEntityLogicalName"]
+            .as_str()
             .or(plan_target["entityLogicalName"].as_str())
             .unwrap_or("");
-        if entity.is_empty() { blockers.push("Target entity logical name is not set.".into()); }
+        if entity.is_empty() {
+            blockers.push("Target entity logical name is not set.".into());
+        }
 
         if has_plan {
             let mut missing: Vec<&str> = Vec::new();
-            if plan_target["message"].as_str().unwrap_or("").is_empty() { missing.push("message"); }
-            if plan_target["stage"].as_str().unwrap_or("").is_empty()   { missing.push("stage"); }
-            if plan_target["mode"].as_str().unwrap_or("").is_empty()    { missing.push("mode"); }
+            if plan_target["message"].as_str().unwrap_or("").is_empty() {
+                missing.push("message");
+            }
+            if plan_target["stage"].as_str().unwrap_or("").is_empty() {
+                missing.push("stage");
+            }
+            if plan_target["mode"].as_str().unwrap_or("").is_empty() {
+                missing.push("mode");
+            }
             if !missing.is_empty() {
                 blockers.push(format!("Plugin registration details are incomplete: {} not specified in technical plan.", missing.join(", ")));
             }
@@ -9893,19 +11962,26 @@ fn task_mcp_implementation_readiness(task: &Value) -> Value {
     }
 
     if is_script {
-        let artifact   = setup["artifactPath"].as_str().unwrap_or("");
+        let artifact = setup["artifactPath"].as_str().unwrap_or("");
         let setup_path = setup["scriptPath"].as_str().unwrap_or("");
-        let plan_path  = plan_target["scriptPath"].as_str().unwrap_or("");
-        let target_path = if !artifact.is_empty() { artifact }
-                          else if !setup_path.is_empty() { setup_path }
-                          else { plan_path };
+        let plan_path = plan_target["scriptPath"].as_str().unwrap_or("");
+        let target_path = if !artifact.is_empty() {
+            artifact
+        } else if !setup_path.is_empty() {
+            setup_path
+        } else {
+            plan_path
+        };
 
         if target_path.is_empty() {
             blockers.push("Target script/artifact path is not set.".into());
         } else {
             let action_type = setup["actionType"].as_str().unwrap_or("");
             let is_specific = |p: &str| -> bool {
-                p.ends_with(".js") || p.ends_with(".ts") || p.ends_with(".jsx") || p.ends_with(".tsx")
+                p.ends_with(".js")
+                    || p.ends_with(".ts")
+                    || p.ends_with(".jsx")
+                    || p.ends_with(".tsx")
             };
 
             if action_type == "create-new-script" {
@@ -9914,32 +11990,47 @@ fn task_mcp_implementation_readiness(task: &Value) -> Value {
                 // separate bare scriptPath (folder) field or a plan.target.scriptPath. A
                 // customer without an explicit scriptFolder never populates workflowSetup.
                 // scriptPath even once artifactPath is correctly resolved from the template.
-                let has_dir      = !artifact.is_empty() || !setup_path.is_empty();
+                let has_dir = !artifact.is_empty() || !setup_path.is_empty();
                 let desired_file = setup["desiredScriptFile"].as_str().unwrap_or("");
-                let has_filename = !artifact.is_empty() || is_specific(setup_path) || is_specific(plan_path) || !desired_file.is_empty();
+                let has_filename = !artifact.is_empty()
+                    || is_specific(setup_path)
+                    || is_specific(plan_path)
+                    || !desired_file.is_empty();
                 if !has_dir || !has_filename {
                     blockers.push("Script creation requires a known target directory and file name. Set script path and desired file name.".into());
                 }
             } else if action_type == "update-existing-script" {
-                let has_specific = !artifact.is_empty() || is_specific(setup_path) || is_specific(plan_path);
+                let has_specific =
+                    !artifact.is_empty() || is_specific(setup_path) || is_specific(plan_path);
                 if !has_specific {
                     blockers.push("Script update requires a specific existing file path. Set script path to an existing .js file.".into());
                 }
             }
         }
 
-        let entity = setup["primaryEntityLogicalName"].as_str()
+        let entity = setup["primaryEntityLogicalName"]
+            .as_str()
             .or(plan_target["entityLogicalName"].as_str())
             .unwrap_or("");
-        if entity.is_empty() { blockers.push("Target entity logical name (table) is not set.".into()); }
+        if entity.is_empty() {
+            blockers.push("Target entity logical name (table) is not set.".into());
+        }
 
         if has_plan {
             let has_form_event = !plan_target["formName"].as_str().unwrap_or("").is_empty()
                 || !plan_target["eventName"].as_str().unwrap_or("").is_empty()
-                || !plan_target["eventFieldName"].as_str().unwrap_or("").is_empty()
-                || !plan_target["functionName"].as_str().unwrap_or("").is_empty();
-            let manual_later = setup["scriptFormRegistration"].as_str()
-                .map(|s| s == "manual-later").unwrap_or(false);
+                || !plan_target["eventFieldName"]
+                    .as_str()
+                    .unwrap_or("")
+                    .is_empty()
+                || !plan_target["functionName"]
+                    .as_str()
+                    .unwrap_or("")
+                    .is_empty();
+            let manual_later = setup["scriptFormRegistration"]
+                .as_str()
+                .map(|s| s == "manual-later")
+                .unwrap_or(false);
             if !has_form_event && !manual_later {
                 blockers.push("Form/event registration details are not set. Add form name, event name, or mark as manual registration later.".into());
             }
@@ -9948,23 +12039,41 @@ fn task_mcp_implementation_readiness(task: &Value) -> Value {
 
     let is_ready = blockers.is_empty();
     let recommended: String = if is_ready {
-        if !warnings.is_empty() { "Review warnings, then proceed with code generation.".into() }
-        else                    { "Ready for code generation.".into() }
+        if !warnings.is_empty() {
+            "Review warnings, then proceed with code generation.".into()
+        } else {
+            "Ready for code generation.".into()
+        }
     } else {
         let first = blockers.first().map(|s| s.as_str()).unwrap_or("");
-        if      first.contains("Customer")                    { "Set customer/environment for this task.".into() }
-        else if first.contains("Repository root")             { "Set repository root via Developer Target Setup.".into() }
-        else if first.contains("setup has not been confirmed"){ "Complete and confirm the developer setup.".into() }
-        else if first.contains("Technical implementation")    { "Generate a technical implementation plan.".into() }
-        else if first.contains("Dataverse metadata")          { "Run Dataverse metadata verification or mark it as not required.".into() }
-        else if first.contains("Plugin project")              { "Select the plugin project.".into() }
-        else if first.contains("Target entity")               { "Specify the target entity logical name in the technical plan.".into() }
-        else if first.contains("Plugin registration")         { "Specify message, stage, and execution mode in the technical plan.".into() }
-        else if first.contains("Script creation requires")    { "Set target directory and file name for script creation in Developer Target Setup.".into() }
-        else if first.contains("Script update requires")      { "Set the existing script file path in Developer Target Setup.".into() }
-        else if first.contains("Target script")               { "Set the target script path via Developer Target Setup.".into() }
-        else if first.contains("Form/event")                  { "Add form/event details to the technical plan, or mark form registration as manual-later.".into() }
-        else                                                  { "Resolve all blockers before proceeding with implementation.".into() }
+        if first.contains("Customer") {
+            "Set customer/environment for this task.".into()
+        } else if first.contains("Repository root") {
+            "Set repository root via Developer Target Setup.".into()
+        } else if first.contains("setup has not been confirmed") {
+            "Complete and confirm the developer setup.".into()
+        } else if first.contains("Technical implementation") {
+            "Generate a technical implementation plan.".into()
+        } else if first.contains("Dataverse metadata") {
+            "Run Dataverse metadata verification or mark it as not required.".into()
+        } else if first.contains("Plugin project") {
+            "Select the plugin project.".into()
+        } else if first.contains("Target entity") {
+            "Specify the target entity logical name in the technical plan.".into()
+        } else if first.contains("Plugin registration") {
+            "Specify message, stage, and execution mode in the technical plan.".into()
+        } else if first.contains("Script creation requires") {
+            "Set target directory and file name for script creation in Developer Target Setup."
+                .into()
+        } else if first.contains("Script update requires") {
+            "Set the existing script file path in Developer Target Setup.".into()
+        } else if first.contains("Target script") {
+            "Set the target script path via Developer Target Setup.".into()
+        } else if first.contains("Form/event") {
+            "Add form/event details to the technical plan, or mark form registration as manual-later.".into()
+        } else {
+            "Resolve all blockers before proceeding with implementation.".into()
+        }
     };
 
     serde_json::json!({
@@ -10151,34 +12260,57 @@ fn task_mcp_task_text_for_inference(task: &Value) -> String {
 /// with broad/generic matchKeywords cannot match a different task that merely has a similar title.
 fn task_mcp_match_template(title: &str, description: &str) -> Option<Value> {
     let haystack = format!("{title} {description}");
-    if haystack.trim().is_empty() { return None; }
+    if haystack.trim().is_empty() {
+        return None;
+    }
     let lower = haystack.to_lowercase();
     let title_lower = title.to_lowercase();
     for tpl in task_mcp_builtin_templates() {
         if let Some(required) = tpl["requiredKeywords"].as_array() {
             if !required.is_empty() {
-                let all_present = required.iter()
-                    .all(|k| k.as_str().map(|s| lower.contains(&s.to_lowercase())).unwrap_or(false));
-                if !all_present { continue; }
+                let all_present = required.iter().all(|k| {
+                    k.as_str()
+                        .map(|s| lower.contains(&s.to_lowercase()))
+                        .unwrap_or(false)
+                });
+                if !all_present {
+                    continue;
+                }
             }
         }
         if let Some(required_any) = tpl["requiredAnyKeywords"].as_array() {
             if !required_any.is_empty() {
-                let any_present = required_any.iter()
-                    .any(|k| k.as_str().map(|s| lower.contains(&s.to_lowercase())).unwrap_or(false));
-                if !any_present { continue; }
+                let any_present = required_any.iter().any(|k| {
+                    k.as_str()
+                        .map(|s| lower.contains(&s.to_lowercase()))
+                        .unwrap_or(false)
+                });
+                if !any_present {
+                    continue;
+                }
             }
         }
         if let Some(pattern) = tpl["titlePattern"].as_str() {
-            if title_lower.contains(&pattern.to_lowercase()) { return Some(tpl); }
+            if title_lower.contains(&pattern.to_lowercase()) {
+                return Some(tpl);
+            }
         }
         if let Some(keywords) = tpl["matchKeywords"].as_array() {
             if !keywords.is_empty() {
-                let min_matches = tpl["minKeywordMatches"].as_u64().unwrap_or(keywords.len() as u64) as usize;
-                let hits = keywords.iter()
-                    .filter(|k| k.as_str().map(|s| lower.contains(&s.to_lowercase())).unwrap_or(false))
+                let min_matches = tpl["minKeywordMatches"]
+                    .as_u64()
+                    .unwrap_or(keywords.len() as u64) as usize;
+                let hits = keywords
+                    .iter()
+                    .filter(|k| {
+                        k.as_str()
+                            .map(|s| lower.contains(&s.to_lowercase()))
+                            .unwrap_or(false)
+                    })
                     .count();
-                if hits >= min_matches { return Some(tpl); }
+                if hits >= min_matches {
+                    return Some(tpl);
+                }
             }
         }
     }
@@ -10189,11 +12321,39 @@ fn task_mcp_match_template(title: &str, description: &str) -> Option<Value> {
 // mcp/task-workbench-mcp.mjs GENERIC_NVR_FIELD_EXCLUSIONS — keep in sync.
 fn task_mcp_generic_nvr_field_exclusions() -> &'static [&'static str] {
     &[
-        "nvr_company", "nvr_name", "nvr_type", "nvr_status", "nvr_state", "nvr_date", "nvr_amount",
-        "nvr_note", "nvr_description", "nvr_reference", "nvr_code", "nvr_value", "nvr_flag",
-        "nvr_enabled", "nvr_active", "nvr_class", "nvr_group", "nvr_owner", "nvr_user", "nvr_email",
-        "nvr_phone", "nvr_address", "nvr_city", "nvr_country", "nvr_zip", "nvr_region", "nvr_category",
-        "nvr_priority", "nvr_order", "nvr_price", "nvr_quantity", "nvr_unit", "nvr_currency",
+        "nvr_company",
+        "nvr_name",
+        "nvr_type",
+        "nvr_status",
+        "nvr_state",
+        "nvr_date",
+        "nvr_amount",
+        "nvr_note",
+        "nvr_description",
+        "nvr_reference",
+        "nvr_code",
+        "nvr_value",
+        "nvr_flag",
+        "nvr_enabled",
+        "nvr_active",
+        "nvr_class",
+        "nvr_group",
+        "nvr_owner",
+        "nvr_user",
+        "nvr_email",
+        "nvr_phone",
+        "nvr_address",
+        "nvr_city",
+        "nvr_country",
+        "nvr_zip",
+        "nvr_region",
+        "nvr_category",
+        "nvr_priority",
+        "nvr_order",
+        "nvr_price",
+        "nvr_quantity",
+        "nvr_unit",
+        "nvr_currency",
     ]
 }
 
@@ -10208,15 +12368,22 @@ fn task_mcp_extract_explicit_nvr_entity(text: &str) -> Option<String> {
     while let Some(rel) = lower[i..].find("nvr_") {
         let start = i + rel;
         // word boundary before
-        let boundary_ok = start == 0 || !(bytes[start - 1].is_ascii_alphanumeric() || bytes[start - 1] == b'_');
+        let boundary_ok =
+            start == 0 || !(bytes[start - 1].is_ascii_alphanumeric() || bytes[start - 1] == b'_');
         let mut end = start + 4;
-        while end < bytes.len() && (bytes[end].is_ascii_alphanumeric() || bytes[end] == b'_') { end += 1; }
+        while end < bytes.len() && (bytes[end].is_ascii_alphanumeric() || bytes[end] == b'_') {
+            end += 1;
+        }
         let token = &lower[start..end];
         i = end.max(start + 4);
-        if !boundary_ok { continue; }
+        if !boundary_ok {
+            continue;
+        }
         // bare = token without leading "nvr_"
         let bare = &token[4..];
-        if bare.is_empty() || !bare.chars().next().unwrap().is_ascii_alphabetic() { continue; }
+        if bare.is_empty() || !bare.chars().next().unwrap().is_ascii_alphabetic() {
+            continue;
+        }
         let bare_trimmed = bare
             .trim_end_matches("_onchange")
             .trim_end_matches("_onload")
@@ -10224,8 +12391,12 @@ fn task_mcp_extract_explicit_nvr_entity(text: &str) -> Option<String> {
             .trim_end_matches("_handler")
             .trim_end_matches("_events");
         let full = format!("nvr_{bare_trimmed}");
-        if task_mcp_generic_nvr_field_exclusions().contains(&full.as_str()) { continue; }
-        if bare_trimmed.split('_').count() > 3 { continue; }
+        if task_mcp_generic_nvr_field_exclusions().contains(&full.as_str()) {
+            continue;
+        }
+        if bare_trimmed.split('_').count() > 3 {
+            continue;
+        }
         return Some(full);
     }
     None
@@ -10237,10 +12408,27 @@ fn task_mcp_extract_explicit_nvr_entity(text: &str) -> Option<String> {
 fn task_mcp_generic_script_setup_inference(task: &Value) -> Option<Value> {
     let text = task_mcp_task_text_for_inference(task);
     let lower = text.to_lowercase();
-    let looks_script = ["javascript", "jscript", "form script", "formscript", "web resource",
-        "on-load", "onload", "on load", "on-change", "onchange", "on change", "on-save", "onsave", "on save"]
-        .iter().any(|k| lower.contains(k));
-    if !looks_script { return None; }
+    let looks_script = [
+        "javascript",
+        "jscript",
+        "form script",
+        "formscript",
+        "web resource",
+        "on-load",
+        "onload",
+        "on load",
+        "on-change",
+        "onchange",
+        "on change",
+        "on-save",
+        "onsave",
+        "on save",
+    ]
+    .iter()
+    .any(|k| lower.contains(k));
+    if !looks_script {
+        return None;
+    }
 
     let target_entity = task_mcp_extract_explicit_nvr_entity(&text)?;
 
@@ -10254,40 +12442,65 @@ fn task_mcp_generic_script_setup_inference(task: &Value) -> Option<Value> {
     let desired_script_file: String;
     if let Some((folder, file)) = file_re_path {
         desired_script_file = file.clone();
-        if !folder.is_empty() { scripts_folder_relative = folder.replace('\\', "/"); }
-        assumptions.push(format!("Target script file inferred from explicit path in the task description."));
+        if !folder.is_empty() {
+            scripts_folder_relative = folder.replace('\\', "/");
+        }
+        assumptions.push(format!(
+            "Target script file inferred from explicit path in the task description."
+        ));
     } else if let Some(file) = regex_lite_find_bare_js_file(&text) {
         desired_script_file = file.clone();
         assumptions.push(format!("Target script file inferred from explicit file name \"{file}\" in the task description."));
     } else {
         desired_script_file = format!("{target_entity}_events.js");
-        assumptions.push(format!("Target script file name defaulted from the target entity: {desired_script_file}."));
+        assumptions.push(format!(
+            "Target script file name defaulted from the target entity: {desired_script_file}."
+        ));
     }
 
     let on_load_handler = regex_lite_find_suffixed_identifier(&text, "_OnLoad");
     let on_change_handler = regex_lite_find_suffixed_identifier(&text, "_OnChange");
     if on_load_handler.is_some() || on_change_handler.is_some() {
-        assumptions.push("Handler function names taken literally from the task description.".to_string());
+        assumptions
+            .push("Handler function names taken literally from the task description.".to_string());
     }
 
-    let has_on_load = lower.contains("on-load") || lower.contains("onload") || lower.contains("on load");
+    let has_on_load =
+        lower.contains("on-load") || lower.contains("onload") || lower.contains("on load");
     let event_field_name = regex_lite_find_onchange_field(&text);
-    let event_name = if event_field_name.is_some() { Some("onChange".to_string()) }
-        else if has_on_load { Some("onLoad".to_string()) } else { None };
-
-    let on_load_function_name = on_load_handler.clone()
-        .or_else(|| if has_on_load { Some(format!("{target_entity}_OnLoad")) } else { None });
-    let on_change_function_name = on_change_handler.clone()
-        .or_else(|| event_field_name.as_ref().map(|f| format!("{f}_OnChange")));
-
-    let action_type = if (lower.contains("update") || lower.contains("modify") || lower.contains("extend"))
-        && lower.contains("existing script") {
-        "update-existing-script"
+    let event_name = if event_field_name.is_some() {
+        Some("onChange".to_string())
+    } else if has_on_load {
+        Some("onLoad".to_string())
     } else {
-        "create-new-script"
+        None
     };
 
-    let confidence = if on_load_handler.is_some() || on_change_handler.is_some() { "high" } else { "medium" };
+    let on_load_function_name = on_load_handler.clone().or_else(|| {
+        if has_on_load {
+            Some(format!("{target_entity}_OnLoad"))
+        } else {
+            None
+        }
+    });
+    let on_change_function_name = on_change_handler
+        .clone()
+        .or_else(|| event_field_name.as_ref().map(|f| format!("{f}_OnChange")));
+
+    let action_type =
+        if (lower.contains("update") || lower.contains("modify") || lower.contains("extend"))
+            && lower.contains("existing script")
+        {
+            "update-existing-script"
+        } else {
+            "create-new-script"
+        };
+
+    let confidence = if on_load_handler.is_some() || on_change_handler.is_some() {
+        "high"
+    } else {
+        "medium"
+    };
 
     Some(serde_json::json!({
         "workKind": "script",
@@ -10313,15 +12526,25 @@ fn regex_lite_find_file_with_path(text: &str) -> Option<(String, String)> {
         let mut start = i;
         while start > 0 {
             let c = bytes[start - 1];
-            if c.is_ascii_alphanumeric() || c == b'_' || c == b'\\' || c == b'/' { start -= 1; } else { break; }
+            if c.is_ascii_alphanumeric() || c == b'_' || c == b'\\' || c == b'/' {
+                start -= 1;
+            } else {
+                break;
+            }
         }
         let token = &text[start..i + 3];
-        if !(token.contains('\\') || token.contains('/')) { continue; }
-        if !token.ends_with(".js") { continue; }
+        if !(token.contains('\\') || token.contains('/')) {
+            continue;
+        }
+        if !token.ends_with(".js") {
+            continue;
+        }
         let filename_start = token.rfind(['\\', '/']).map(|p| p + 1).unwrap_or(0);
         let folder = token[..filename_start.saturating_sub(1)].to_string();
         let file = token[filename_start..].to_string();
-        if file.len() <= 3 { continue; }
+        if file.len() <= 3 {
+            continue;
+        }
         return Some((folder, file));
     }
     None
@@ -10333,11 +12556,19 @@ fn regex_lite_find_bare_js_file(text: &str) -> Option<String> {
         let mut start = i;
         while start > 0 {
             let c = bytes[start - 1];
-            if c.is_ascii_alphanumeric() || c == b'_' { start -= 1; } else { break; }
+            if c.is_ascii_alphanumeric() || c == b'_' {
+                start -= 1;
+            } else {
+                break;
+            }
         }
         let token = &text[start..i + 3];
-        if token.contains('\\') || token.contains('/') { continue; }
-        if token.len() <= 3 { continue; }
+        if token.contains('\\') || token.contains('/') {
+            continue;
+        }
+        if token.len() <= 3 {
+            continue;
+        }
         return Some(token.to_string());
     }
     None
@@ -10352,11 +12583,19 @@ fn regex_lite_find_suffixed_identifier(text: &str, suffix: &str) -> Option<Strin
         let mut start = i;
         while start > 0 {
             let c = bytes[start - 1];
-            if c.is_ascii_alphanumeric() || c == b'_' { start -= 1; } else { break; }
+            if c.is_ascii_alphanumeric() || c == b'_' {
+                start -= 1;
+            } else {
+                break;
+            }
         }
-        if start == i { continue; } // suffix alone, no identifier prefix
+        if start == i {
+            continue;
+        } // suffix alone, no identifier prefix
         let first = bytes[start];
-        if !first.is_ascii_alphabetic() { continue; }
+        if !first.is_ascii_alphabetic() {
+            continue;
+        }
         return Some(text[start..end].to_string());
     }
     None
@@ -10372,10 +12611,17 @@ fn regex_lite_find_onchange_field(text: &str) -> Option<String> {
             let rest = rest.trim_start_matches('`');
             let mut end = 0;
             let bytes = rest.as_bytes();
-            while end < bytes.len() && (bytes[end].is_ascii_alphanumeric() || bytes[end] == b'_') { end += 1; }
+            while end < bytes.len() && (bytes[end].is_ascii_alphanumeric() || bytes[end] == b'_') {
+                end += 1;
+            }
             if end > 0 {
                 let field = &rest[..end];
-                if field.chars().next().map(|c| c.is_ascii_alphabetic()).unwrap_or(false) {
+                if field
+                    .chars()
+                    .next()
+                    .map(|c| c.is_ascii_alphabetic())
+                    .unwrap_or(false)
+                {
                     return Some(field.to_string());
                 }
             }
@@ -10384,37 +12630,68 @@ fn regex_lite_find_onchange_field(text: &str) -> Option<String> {
     None
 }
 
-fn task_mcp_script_naming_from_template(task: &Value, template: Option<&Value>, defaults: Option<&Value>) -> Option<Value> {
+fn task_mcp_script_naming_from_template(
+    task: &Value,
+    template: Option<&Value>,
+    defaults: Option<&Value>,
+) -> Option<Value> {
     let setup = &task["workflowSetup"];
-    let entity = setup["primaryEntityLogicalName"].as_str()
+    let entity = setup["primaryEntityLogicalName"]
+        .as_str()
         .or_else(|| template.and_then(|t| t["scriptTarget"]["entityLogicalName"].as_str()))
         .or_else(|| template.and_then(|t| t["targetEntity"].as_str()))
         .filter(|s| !s.is_empty())?;
-    let event_field = setup["eventFieldName"].as_str()
+    let event_field = setup["eventFieldName"]
+        .as_str()
         .or_else(|| template.and_then(|t| t["scriptTarget"]["eventFieldName"].as_str()))
         .unwrap_or("");
-    let repo_root = defaults.and_then(|d| d["repositoryRoot"].as_str()).unwrap_or("");
-    let script_abs = defaults.and_then(|d| d["scriptDirectory"].as_str()).unwrap_or("");
-    let desired = setup["desiredScriptFile"].as_str()
+    let repo_root = defaults
+        .and_then(|d| d["repositoryRoot"].as_str())
+        .unwrap_or("");
+    let script_abs = defaults
+        .and_then(|d| d["scriptDirectory"].as_str())
+        .unwrap_or("");
+    let desired = setup["desiredScriptFile"]
+        .as_str()
         .or_else(|| template.and_then(|t| t["scriptNaming"]["desiredScriptFile"].as_str()))
         .unwrap_or("");
-    let desired = if desired.is_empty() { format!("{entity}_events.js") } else { desired.to_string() };
+    let desired = if desired.is_empty() {
+        format!("{entity}_events.js")
+    } else {
+        desired.to_string()
+    };
     let mut rel = template
         .and_then(|t| t["scriptNaming"]["scriptsFolderRelative"].as_str())
         .unwrap_or("")
         .to_string();
     if rel.is_empty() && !script_abs.is_empty() {
-        if !repo_root.is_empty() && script_abs.to_lowercase().starts_with(&repo_root.to_lowercase()) {
-            rel = script_abs[repo_root.len()..].trim_start_matches(|c| c == '/' || c == '\\').to_string();
+        if !repo_root.is_empty()
+            && script_abs
+                .to_lowercase()
+                .starts_with(&repo_root.to_lowercase())
+        {
+            rel = script_abs[repo_root.len()..]
+                .trim_start_matches(|c| c == '/' || c == '\\')
+                .to_string();
         }
         if rel.is_empty() {
-            rel = script_abs.replace('\\', "/").split('/').filter(|s| !s.is_empty()).last().unwrap_or("Scripts").to_string();
+            rel = script_abs
+                .replace('\\', "/")
+                .split('/')
+                .filter(|s| !s.is_empty())
+                .last()
+                .unwrap_or("Scripts")
+                .to_string();
         }
     }
     if rel.is_empty() {
         rel = "Scripts".to_string();
     }
-    let sep = if script_abs.contains('\\') || repo_root.contains('\\') { "\\" } else { "/" };
+    let sep = if script_abs.contains('\\') || repo_root.contains('\\') {
+        "\\"
+    } else {
+        "/"
+    };
     let absolute_dir = if !script_abs.is_empty() {
         script_abs.to_string()
     } else if !repo_root.is_empty() {
@@ -10422,14 +12699,22 @@ fn task_mcp_script_naming_from_template(task: &Value, template: Option<&Value>, 
     } else {
         String::new()
     };
-    let on_load = setup["onLoadFunctionName"].as_str()
+    let on_load = setup["onLoadFunctionName"]
+        .as_str()
         .or_else(|| template.and_then(|t| t["scriptNaming"]["onLoadFunctionName"].as_str()))
         .map(str::to_string)
         .unwrap_or_else(|| format!("{entity}_OnLoad"));
-    let on_change = setup["onChangeFunctionName"].as_str()
+    let on_change = setup["onChangeFunctionName"]
+        .as_str()
         .or_else(|| template.and_then(|t| t["scriptNaming"]["onChangeFunctionName"].as_str()))
         .map(str::to_string)
-        .or_else(|| if event_field.is_empty() { None } else { Some(format!("{event_field}_OnChange")) });
+        .or_else(|| {
+            if event_field.is_empty() {
+                None
+            } else {
+                Some(format!("{event_field}_OnChange"))
+            }
+        });
     let mut value = serde_json::json!({
         "namingSource": setup["namingSource"].as_str()
             .or_else(|| template.and_then(|t| t["scriptNaming"]["namingSource"].as_str()))
@@ -10442,9 +12727,13 @@ fn task_mcp_script_naming_from_template(task: &Value, template: Option<&Value>, 
         "onLoadFunctionName": on_load,
         "helperNamingRule": "descriptive camelCase, no nvr_ prefix by default",
     });
-    if let Some(v) = on_change { value["onChangeFunctionName"] = serde_json::json!(v); }
-    if let Some(v) = setup["mainHelperSuggestion"].as_str()
-        .or_else(|| template.and_then(|t| t["scriptNaming"]["mainHelperSuggestion"].as_str())) {
+    if let Some(v) = on_change {
+        value["onChangeFunctionName"] = serde_json::json!(v);
+    }
+    if let Some(v) = setup["mainHelperSuggestion"]
+        .as_str()
+        .or_else(|| template.and_then(|t| t["scriptNaming"]["mainHelperSuggestion"].as_str()))
+    {
         value["mainHelperSuggestion"] = serde_json::json!(v);
     }
     Some(value)
@@ -10453,63 +12742,100 @@ fn task_mcp_script_naming_from_template(task: &Value, template: Option<&Value>, 
 fn task_mcp_prepare_plan_draft(task: &Value, template: Option<&Value>) -> Option<Value> {
     let setup = &task["workflowSetup"];
     let workflow = &task["crmDeveloperWorkflow"];
-    let work_kind = workflow["detectedWorkKind"].as_str()
+    let work_kind = workflow["detectedWorkKind"]
+        .as_str()
         .or_else(|| setup["devTargetKind"].as_str())
         .or_else(|| template.and_then(|t| t["workKind"].as_str()))
         .unwrap_or("unknown");
-    if !matches!(work_kind, "script" | "plugin" | "ribbon") { return None; }
-    let entity = setup["primaryEntityLogicalName"].as_str()
+    if !matches!(work_kind, "script" | "plugin" | "ribbon") {
+        return None;
+    }
+    let entity = setup["primaryEntityLogicalName"]
+        .as_str()
         .or_else(|| template.and_then(|t| t["targetEntity"].as_str()))
         .or_else(|| template.and_then(|t| t["scriptTarget"]["entityLogicalName"].as_str()))
         .or_else(|| template.and_then(|t| t["pluginTarget"]["entityLogicalName"].as_str()))
         .filter(|s| !s.is_empty())?;
-    let source_entity = template.and_then(|t| t["sourceEntity"].as_str()).unwrap_or("source");
+    let source_entity = template
+        .and_then(|t| t["sourceEntity"].as_str())
+        .unwrap_or("source");
     let source_fields: Vec<String> = template
         .and_then(|t| t["sourceFields"].as_array())
-        .map(|a| a.iter().filter_map(|v| v.as_str()).map(str::to_string).collect())
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str())
+                .map(str::to_string)
+                .collect()
+        })
         .unwrap_or_default();
     let target_fields: Vec<String> = template
         .and_then(|t| t["targetFields"].as_array())
-        .map(|a| a.iter().filter_map(|v| v.as_str()).map(str::to_string).collect())
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str())
+                .map(str::to_string)
+                .collect()
+        })
         .unwrap_or_default();
     let pair_count = source_fields.len().min(target_fields.len());
     let field_mappings: Vec<Value> = (0..pair_count)
-        .map(|i| serde_json::json!({
-            "source": format!("{}.{}", source_entity, source_fields[i]),
-            "target": format!("{}.{}", entity, target_fields[i]),
-        }))
+        .map(|i| {
+            serde_json::json!({
+                "source": format!("{}.{}", source_entity, source_fields[i]),
+                "target": format!("{}.{}", entity, target_fields[i]),
+            })
+        })
         .collect();
-    let mut unmapped_source_fields: Vec<String> = source_fields.iter().skip(pair_count).cloned().collect();
+    let mut unmapped_source_fields: Vec<String> =
+        source_fields.iter().skip(pair_count).cloned().collect();
     if let Some(additional) = template.and_then(|t| t["additionalSourceFields"].as_array()) {
-        unmapped_source_fields.extend(additional.iter().filter_map(|v| v.as_str()).map(str::to_string));
+        unmapped_source_fields.extend(
+            additional
+                .iter()
+                .filter_map(|v| v.as_str())
+                .map(str::to_string),
+        );
     }
     let mapping = if field_mappings.is_empty() {
         None
     } else {
         Some(format!(
             "Map template fields: {}.",
-            field_mappings.iter().filter_map(|pair| {
-                Some(format!("{} -> {}", pair["source"].as_str()?, pair["target"].as_str()?))
-            }).collect::<Vec<_>>().join("; ")
+            field_mappings
+                .iter()
+                .filter_map(|pair| {
+                    Some(format!(
+                        "{} -> {}",
+                        pair["source"].as_str()?,
+                        pair["target"].as_str()?
+                    ))
+                })
+                .collect::<Vec<_>>()
+                .join("; ")
         ))
     };
-    let additional_mapping = if unmapped_source_fields.is_empty() {
-        None
-    } else {
-        Some(format!(
+    let additional_mapping =
+        if unmapped_source_fields.is_empty() {
+            None
+        } else {
+            Some(format!(
             "Additional source field{} available from template: {}. No target mapping is defined.",
             if unmapped_source_fields.len() == 1 { "" } else { "s" },
             unmapped_source_fields.join(", ")
         ))
-    };
+        };
     let is_script = work_kind == "script" || work_kind == "ribbon";
     let mut steps = vec![
         if is_script { format!("Use the selected script target {}.", setup["artifactPath"].as_str().or(setup["scriptPath"].as_str()).unwrap_or("the configured script path")) } else { format!("Use the selected plugin project {}.", setup["pluginProject"].as_str().unwrap_or("the configured plugin project")) },
         format!("Implement {} for {}.", setup["actionType"].as_str().or_else(|| template.and_then(|t| t["actionType"].as_str())).unwrap_or("the requested change"), entity),
         "Keep external Dataverse registration/upload as a manual approved action outside this setup step.".to_string(),
     ];
-    if let Some(m) = additional_mapping.clone() { steps.insert(2, m); }
-    if let Some(m) = mapping.clone() { steps.insert(2, m); }
+    if let Some(m) = additional_mapping.clone() {
+        steps.insert(2, m);
+    }
+    if let Some(m) = mapping.clone() {
+        steps.insert(2, m);
+    }
     let target = if is_script {
         serde_json::json!({
             "entityLogicalName": entity,
@@ -10549,25 +12875,48 @@ fn task_mcp_prepare_plan_draft(task: &Value, template: Option<&Value>) -> Option
 }
 
 fn task_mcp_plan_has_template_mapping(plan: &Value, template: Option<&Value>) -> bool {
-    let Some(tpl) = template else { return true; };
+    let Some(tpl) = template else {
+        return true;
+    };
     let source_entity = tpl["sourceEntity"].as_str().unwrap_or("source");
-    let target_entity = plan["target"]["entityLogicalName"].as_str()
+    let target_entity = plan["target"]["entityLogicalName"]
+        .as_str()
         .or_else(|| tpl["targetEntity"].as_str())
         .or_else(|| tpl["scriptTarget"]["entityLogicalName"].as_str())
         .unwrap_or("");
-    let source_fields: Vec<String> = tpl["sourceFields"].as_array()
-        .map(|a| a.iter().filter_map(|v| v.as_str()).map(str::to_string).collect())
+    let source_fields: Vec<String> = tpl["sourceFields"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str())
+                .map(str::to_string)
+                .collect()
+        })
         .unwrap_or_default();
-    let target_fields: Vec<String> = tpl["targetFields"].as_array()
-        .map(|a| a.iter().filter_map(|v| v.as_str()).map(str::to_string).collect())
+    let target_fields: Vec<String> = tpl["targetFields"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str())
+                .map(str::to_string)
+                .collect()
+        })
         .unwrap_or_default();
     let pair_count = source_fields.len().min(target_fields.len());
-    if pair_count == 0 { return true; }
-    let actual = plan["fieldMappings"].as_array().cloned().unwrap_or_default();
+    if pair_count == 0 {
+        return true;
+    }
+    let actual = plan["fieldMappings"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
     (0..pair_count).all(|i| {
         let source = format!("{}.{}", source_entity, source_fields[i]);
         let target = format!("{}.{}", target_entity, target_fields[i]);
-        actual.iter().any(|item| item["source"].as_str() == Some(source.as_str()) && item["target"].as_str() == Some(target.as_str()))
+        actual.iter().any(|item| {
+            item["source"].as_str() == Some(source.as_str())
+                && item["target"].as_str() == Some(target.as_str())
+        })
     })
 }
 
@@ -10588,11 +12937,22 @@ fn task_mcp_snapshot_proposed_setup(setup: &Value) -> Value {
     })
 }
 
-fn task_mcp_execute_tool(app: &tauri::AppHandle, tool_name: &str, args: &Value) -> Result<Value, String> {
+fn task_mcp_execute_tool(
+    app: &tauri::AppHandle,
+    tool_name: &str,
+    args: &Value,
+) -> Result<Value, String> {
+    if canonical_mcp_tool_definitions().iter().any(|tool| tool["name"].as_str() == Some(tool_name)) {
+        return task_mcp_execute_canonical_tool(app, tool_name, args);
+    }
     let mut tasks = task_mcp_load_tasks(app)?;
     let customers = task_mcp_load_customers(app).unwrap_or_default();
     let settings = load_settings(app.clone()).unwrap_or_else(|_| serde_json::json!({}));
-    let crm_base_dir = settings["crmBaseDirectory"].as_str().unwrap_or("").trim_end_matches('/').to_string();
+    let crm_base_dir = settings["crmBaseDirectory"]
+        .as_str()
+        .unwrap_or("")
+        .trim_end_matches('/')
+        .to_string();
     let mut updated = false;
 
     let result = match tool_name {
@@ -10611,7 +12971,16 @@ fn task_mcp_execute_tool(app: &tauri::AppHandle, tool_name: &str, args: &Value) 
 
             serde_json::json!({
                 "count": filtered.len(),
-                "tasks": filtered.into_iter().take(limit).map(task_mcp_safe_task_summary).collect::<Vec<Value>>(),
+                "tasks": filtered.into_iter().take(limit).map(|task| {
+                    let mut summary = task_mcp_safe_task_summary(task);
+                    if summary["projectLabel"].is_null() {
+                        let customer_id = task["customerId"].as_str().unwrap_or("");
+                        if let Some(customer) = customers.iter().find(|customer| customer["id"].as_str() == Some(customer_id)) {
+                            summary["projectLabel"] = customer["name"].clone();
+                        }
+                    }
+                    summary
+                }).collect::<Vec<Value>>(),
             })
         }
         "get_task" => {
@@ -10619,7 +12988,8 @@ fn task_mcp_execute_tool(app: &tauri::AppHandle, tool_name: &str, args: &Value) 
             if task_id.is_empty() {
                 return Err("Missing required argument: id".to_string());
             }
-            let task = task_mcp_get_task(&tasks, task_id).ok_or_else(|| format!("Task not found: {task_id}"))?;
+            let task = task_mcp_get_task(&tasks, task_id)
+                .ok_or_else(|| format!("Task not found: {task_id}"))?;
             serde_json::json!({"task": task_mcp_safe_task_detail(task)})
         }
         "get_task_summary" => {
@@ -10627,7 +12997,8 @@ fn task_mcp_execute_tool(app: &tauri::AppHandle, tool_name: &str, args: &Value) 
             if task_id.is_empty() {
                 return Err("Missing required argument: id".to_string());
             }
-            let task = task_mcp_get_task(&tasks, task_id).ok_or_else(|| format!("Task not found: {task_id}"))?;
+            let task = task_mcp_get_task(&tasks, task_id)
+                .ok_or_else(|| format!("Task not found: {task_id}"))?;
             serde_json::json!({"task": task_mcp_safe_task_summary(task)})
         }
         "get_crm_workflow_state" => {
@@ -10635,7 +13006,8 @@ fn task_mcp_execute_tool(app: &tauri::AppHandle, tool_name: &str, args: &Value) 
             if task_id.is_empty() {
                 return Err("Missing required argument: id".to_string());
             }
-            let task = task_mcp_get_task(&tasks, task_id).ok_or_else(|| format!("Task not found: {task_id}"))?;
+            let task = task_mcp_get_task(&tasks, task_id)
+                .ok_or_else(|| format!("Task not found: {task_id}"))?;
             serde_json::json!({"taskId": task_id, "crmWorkflowState": task_mcp_safe_crm_workflow_state(task)})
         }
         "get_current_crm_workflow_step" => {
@@ -10643,7 +13015,8 @@ fn task_mcp_execute_tool(app: &tauri::AppHandle, tool_name: &str, args: &Value) 
             if task_id.is_empty() {
                 return Err("Missing required argument: id".to_string());
             }
-            let task = task_mcp_get_task(&tasks, task_id).ok_or_else(|| format!("Task not found: {task_id}"))?;
+            let task = task_mcp_get_task(&tasks, task_id)
+                .ok_or_else(|| format!("Task not found: {task_id}"))?;
             let workflow = task.get("crmDeveloperWorkflow").unwrap_or(&Value::Null);
             serde_json::json!({
                 "taskId": task_id,
@@ -10663,7 +13036,8 @@ fn task_mcp_execute_tool(app: &tauri::AppHandle, tool_name: &str, args: &Value) 
             if task_id.is_empty() {
                 return Err("Missing required argument: id".to_string());
             }
-            let task = task_mcp_get_task(&tasks, task_id).ok_or_else(|| format!("Task not found: {task_id}"))?;
+            let task = task_mcp_get_task(&tasks, task_id)
+                .ok_or_else(|| format!("Task not found: {task_id}"))?;
             serde_json::json!({
                 "taskId": task_id,
                 "technicalPlan": task["crmDeveloperWorkflow"]["technicalPlan"].clone(),
@@ -10674,7 +13048,8 @@ fn task_mcp_execute_tool(app: &tauri::AppHandle, tool_name: &str, args: &Value) 
             if task_id.is_empty() {
                 return Err("Missing required argument: id".to_string());
             }
-            let task = task_mcp_get_task(&tasks, task_id).ok_or_else(|| format!("Task not found: {task_id}"))?;
+            let task = task_mcp_get_task(&tasks, task_id)
+                .ok_or_else(|| format!("Task not found: {task_id}"))?;
             let workflow = task.get("crmDeveloperWorkflow").unwrap_or(&Value::Null);
             serde_json::json!({"taskId": task_id, "pullRequest": task_mcp_pull_request_state(workflow)})
         }
@@ -10683,12 +13058,16 @@ fn task_mcp_execute_tool(app: &tauri::AppHandle, tool_name: &str, args: &Value) 
             if task_id.is_empty() {
                 return Err("Missing required argument: id".to_string());
             }
-            let task = task_mcp_get_task(&tasks, task_id).ok_or_else(|| format!("Task not found: {task_id}"))?;
+            let task = task_mcp_get_task(&tasks, task_id)
+                .ok_or_else(|| format!("Task not found: {task_id}"))?;
             serde_json::json!({"taskId": task_id, "recommendation": task_mcp_next_recommended_step(task)})
         }
         "append_task_note" => {
             let task_id = args["taskId"].as_str().unwrap_or("").trim();
-            let note = task_mcp_normalize_small_text(args["note"].as_str().unwrap_or(""), TASK_MCP_MAX_NOTE_LENGTH);
+            let note = task_mcp_normalize_small_text(
+                args["note"].as_str().unwrap_or(""),
+                TASK_MCP_MAX_NOTE_LENGTH,
+            );
             if task_id.is_empty() {
                 return Err("Missing required argument: taskId".to_string());
             }
@@ -10696,7 +13075,8 @@ fn task_mcp_execute_tool(app: &tauri::AppHandle, tool_name: &str, args: &Value) 
                 return Err("Note cannot be empty after sanitization.".to_string());
             }
 
-            let index = task_mcp_find_task_index(&tasks, task_id).ok_or_else(|| format!("Task not found: {task_id}"))?;
+            let index = task_mcp_find_task_index(&tasks, task_id)
+                .ok_or_else(|| format!("Task not found: {task_id}"))?;
             let task = &mut tasks[index];
             let existing = task["notes"].as_str().unwrap_or("").trim();
             // The timestamped note itself is the audit record â€” no separate audit line needed.
@@ -10717,10 +13097,14 @@ fn task_mcp_execute_tool(app: &tauri::AppHandle, tool_name: &str, args: &Value) 
                 return Err("Missing required argument: taskId".to_string());
             }
             if !task_mcp_allowed_statuses().contains(&status) {
-                return Err(format!("Invalid status '{status}'. Allowed: {}", task_mcp_allowed_statuses().join(", ")));
+                return Err(format!(
+                    "Invalid status '{status}'. Allowed: {}",
+                    task_mcp_allowed_statuses().join(", ")
+                ));
             }
 
-            let index = task_mcp_find_task_index(&tasks, task_id).ok_or_else(|| format!("Task not found: {task_id}"))?;
+            let index = task_mcp_find_task_index(&tasks, task_id)
+                .ok_or_else(|| format!("Task not found: {task_id}"))?;
             let task = &mut tasks[index];
             task["status"] = Value::String(status.to_string());
             if status == "done" {
@@ -10738,20 +13122,34 @@ fn task_mcp_execute_tool(app: &tauri::AppHandle, tool_name: &str, args: &Value) 
                 return Err("Missing required argument: taskId".to_string());
             }
 
-            let state_raw = args.get("attentionState").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
-            let clear = args.get("attentionState").is_some_and(|v| v.is_null()) || state_raw.is_empty() || state_raw == "none";
+            let state_raw = args
+                .get("attentionState")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            let clear = args.get("attentionState").is_some_and(|v| v.is_null())
+                || state_raw.is_empty()
+                || state_raw == "none";
             if !clear && !task_mcp_allowed_attention_states().contains(&state_raw.as_str()) {
-                return Err(format!("Invalid attentionState '{state_raw}'. Allowed: {}, or null.", task_mcp_allowed_attention_states().join(", ")));
+                return Err(format!(
+                    "Invalid attentionState '{state_raw}'. Allowed: {}, or null.",
+                    task_mcp_allowed_attention_states().join(", ")
+                ));
             }
 
-            let index = task_mcp_find_task_index(&tasks, task_id).ok_or_else(|| format!("Task not found: {task_id}"))?;
+            let index = task_mcp_find_task_index(&tasks, task_id)
+                .ok_or_else(|| format!("Task not found: {task_id}"))?;
             let task = &mut tasks[index];
             if clear {
                 task["attentionState"] = Value::Null;
                 task_mcp_append_audit_note(task, "set_task_attention_state -> null");
             } else {
                 task["attentionState"] = Value::String(state_raw.clone());
-                task_mcp_append_audit_note(task, &format!("set_task_attention_state -> {state_raw}"));
+                task_mcp_append_audit_note(
+                    task,
+                    &format!("set_task_attention_state -> {state_raw}"),
+                );
             }
             updated = true;
             serde_json::json!({"task": task_mcp_safe_task_summary(task)})
@@ -10762,13 +13160,24 @@ fn task_mcp_execute_tool(app: &tauri::AppHandle, tool_name: &str, args: &Value) 
                 return Err("Missing required argument: taskId".to_string());
             }
 
-            let state_raw = args.get("waitingState").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
-            let clear = args.get("waitingState").is_some_and(|v| v.is_null()) || state_raw.is_empty() || state_raw == "none";
+            let state_raw = args
+                .get("waitingState")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            let clear = args.get("waitingState").is_some_and(|v| v.is_null())
+                || state_raw.is_empty()
+                || state_raw == "none";
             if !clear && !task_mcp_allowed_waiting_states().contains(&state_raw.as_str()) {
-                return Err(format!("Invalid waitingState '{state_raw}'. Allowed: {}, or null.", task_mcp_allowed_waiting_states().join(", ")));
+                return Err(format!(
+                    "Invalid waitingState '{state_raw}'. Allowed: {}, or null.",
+                    task_mcp_allowed_waiting_states().join(", ")
+                ));
             }
 
-            let index = task_mcp_find_task_index(&tasks, task_id).ok_or_else(|| format!("Task not found: {task_id}"))?;
+            let index = task_mcp_find_task_index(&tasks, task_id)
+                .ok_or_else(|| format!("Task not found: {task_id}"))?;
             let task = &mut tasks[index];
             if clear {
                 task["waitingState"] = Value::Null;
@@ -10781,7 +13190,6 @@ fn task_mcp_execute_tool(app: &tauri::AppHandle, tool_name: &str, args: &Value) 
             serde_json::json!({"task": task_mcp_safe_task_summary(task)})
         }
         // â”€â”€ Task creation tools â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-
         "create_task" => {
             // Required: title â€” sanitize HTML, then reject if too long (never truncate silently)
             let title = task_mcp_strip_html(args["title"].as_str().unwrap_or(""))
@@ -10796,30 +13204,58 @@ fn task_mcp_execute_tool(app: &tauri::AppHandle, tool_name: &str, args: &Value) 
 
             // source â€” map mcp/devops to stored values
             let source_input = args["source"].as_str().unwrap_or("manual").trim();
-            if !source_input.is_empty() && !task_mcp_allowed_create_sources().contains(&source_input) {
-                return Err(format!("Invalid source '{source_input}'. Allowed: {}", task_mcp_allowed_create_sources().join(", ")));
+            if !source_input.is_empty()
+                && !task_mcp_allowed_create_sources().contains(&source_input)
+            {
+                return Err(format!(
+                    "Invalid source '{source_input}'. Allowed: {}",
+                    task_mcp_allowed_create_sources().join(", ")
+                ));
             }
             let source = match source_input {
-                "mcp"    => "manual",
+                "mcp" => "manual",
                 "devops" => "email",
-                other    => if other.is_empty() { "manual" } else { other },
+                other => {
+                    if other.is_empty() {
+                        "manual"
+                    } else {
+                        other
+                    }
+                }
             };
 
             // taskType â€” allow 'bug' as alias for 'bug-fix'
             let type_input = args["taskType"].as_str().unwrap_or("other").trim();
-            if !type_input.is_empty() && !task_mcp_allowed_create_task_types().contains(&type_input) {
-                return Err(format!("Invalid taskType '{type_input}'. Allowed: {}", task_mcp_allowed_create_task_types().join(", ")));
+            if !type_input.is_empty() && !task_mcp_allowed_create_task_types().contains(&type_input)
+            {
+                return Err(format!(
+                    "Invalid taskType '{type_input}'. Allowed: {}",
+                    task_mcp_allowed_create_task_types().join(", ")
+                ));
             }
             let task_type = match type_input {
                 "bug" => "bug-fix",
-                other => if other.is_empty() { "other" } else { other },
+                other => {
+                    if other.is_empty() {
+                        "other"
+                    } else {
+                        other
+                    }
+                }
             };
 
             // status
             let status_input = args["status"].as_str().unwrap_or("new").trim();
-            let status = if status_input.is_empty() { "new" } else { status_input };
+            let status = if status_input.is_empty() {
+                "new"
+            } else {
+                status_input
+            };
             if !task_mcp_allowed_statuses().contains(&status) {
-                return Err(format!("Invalid status '{status}'. Allowed: {}", task_mcp_allowed_statuses().join(", ")));
+                return Err(format!(
+                    "Invalid status '{status}'. Allowed: {}",
+                    task_mcp_allowed_statuses().join(", ")
+                ));
             }
 
             // waitingState
@@ -10829,7 +13265,10 @@ fn task_mcp_execute_tool(app: &tauri::AppHandle, tool_name: &str, args: &Value) 
             } else if task_mcp_allowed_waiting_states().contains(&waiting_input) {
                 Some(waiting_input)
             } else {
-                return Err(format!("Invalid waitingState '{waiting_input}'. Allowed: {}, or none.", task_mcp_allowed_waiting_states().join(", ")));
+                return Err(format!(
+                    "Invalid waitingState '{waiting_input}'. Allowed: {}, or none.",
+                    task_mcp_allowed_waiting_states().join(", ")
+                ));
             };
 
             // mode
@@ -10839,24 +13278,43 @@ fn task_mcp_execute_tool(app: &tauri::AppHandle, tool_name: &str, args: &Value) 
             } else if task_mcp_allowed_modes().contains(&mode_input) {
                 Some(mode_input)
             } else {
-                return Err(format!("Invalid mode '{mode_input}'. Allowed: developer, general"));
+                return Err(format!(
+                    "Invalid mode '{mode_input}'. Allowed: developer, general"
+                ));
             };
 
             // text fields
-            let notes       = args["notes"].as_str().map(|n| task_mcp_normalize_small_text(n, 2000)).filter(|s| !s.is_empty());
-            let summary     = args["summary"].as_str().map(|s| task_mcp_normalize_small_text(s, 1000)).filter(|s| !s.is_empty());
-            let customer_id = args["customerId"].as_str().map(|c| task_mcp_normalize_small_text(c, 100)).filter(|s| !s.is_empty()).unwrap_or_default();
+            let notes = args["notes"]
+                .as_str()
+                .map(|n| task_mcp_normalize_small_text(n, 2000))
+                .filter(|s| !s.is_empty());
+            let summary = args["summary"]
+                .as_str()
+                .map(|s| task_mcp_normalize_small_text(s, 1000))
+                .filter(|s| !s.is_empty());
+            let customer_id = args["customerId"]
+                .as_str()
+                .map(|c| task_mcp_normalize_small_text(c, 100))
+                .filter(|s| !s.is_empty())
+                .unwrap_or_default();
 
             // estimateHours
-            let estimate = if args["estimateHours"].is_null() || args["estimateHours"].is_string() && args["estimateHours"].as_str().unwrap_or("").is_empty() {
+            let estimate = if args["estimateHours"].is_null()
+                || args["estimateHours"].is_string()
+                    && args["estimateHours"].as_str().unwrap_or("").is_empty()
+            {
                 None
             } else {
-                let h = args["estimateHours"].as_f64().ok_or_else(|| "estimateHours must be a number".to_string())?;
-                if h <= 0.0 || h > 1000.0 { return Err("estimateHours must be positive and at most 1000".to_string()); }
+                let h = args["estimateHours"]
+                    .as_f64()
+                    .ok_or_else(|| "estimateHours must be a number".to_string())?;
+                if h <= 0.0 || h > 1000.0 {
+                    return Err("estimateHours must be positive and at most 1000".to_string());
+                }
                 Some(h)
             };
 
-            let id  = task_mcp_generate_id();
+            let id = task_mcp_generate_id();
             let now = chrono_now_iso();
 
             let mut new_task = serde_json::json!({
@@ -10873,17 +13331,27 @@ fn task_mcp_execute_tool(app: &tauri::AppHandle, tool_name: &str, args: &Value) 
                 "classificationState": "created",
             });
 
-            if let Some(m)  = mode_opt    { new_task["taskMode"]        = serde_json::json!(m); }
-            if let Some(ws) = waiting_opt { new_task["waitingState"]    = serde_json::json!(ws); }
-            if let Some(n)  = notes       { new_task["notes"]           = serde_json::json!(n); }
-            if let Some(h)  = estimate    { new_task["estimatedEffort"] = serde_json::json!(h); }
-            if let Some(ref s) = summary  {
+            if let Some(m) = mode_opt {
+                new_task["taskMode"] = serde_json::json!(m);
+            }
+            if let Some(ws) = waiting_opt {
+                new_task["waitingState"] = serde_json::json!(ws);
+            }
+            if let Some(n) = notes {
+                new_task["notes"] = serde_json::json!(n);
+            }
+            if let Some(h) = estimate {
+                new_task["estimatedEffort"] = serde_json::json!(h);
+            }
+            if let Some(ref s) = summary {
                 new_task["analysisResult"] = serde_json::json!({
                     "summary": s, "summaryEn": s, "confidence": 0, "suggestedActions": [],
                 });
                 if status == "analyzed" { /* analysisResult already set */ }
             }
-            if status == "done" { new_task["completedAt"] = serde_json::json!(now); }
+            if status == "done" {
+                new_task["completedAt"] = serde_json::json!(now);
+            }
 
             task_mcp_append_audit_note(&mut new_task, "create_task");
             let task_id = id.clone();
@@ -10901,21 +13369,26 @@ fn task_mcp_execute_tool(app: &tauri::AppHandle, tool_name: &str, args: &Value) 
                 if cleaned.chars().count() > 300 {
                     return Err("title must be 300 characters or fewer.".to_string());
                 }
-                if cleaned.is_empty() { "MCP workflow smoke test".to_string() } else { cleaned }
+                if cleaned.is_empty() {
+                    "MCP workflow smoke test".to_string()
+                } else {
+                    cleaned
+                }
             } else {
                 "MCP workflow smoke test".to_string()
             };
-            let extra_notes = args["notes"].as_str()
+            let extra_notes = args["notes"]
+                .as_str()
                 .map(|n| task_mcp_normalize_small_text(n, 500))
                 .filter(|s| !s.is_empty());
 
             let base = "Temporary task for MCP workflow smoke testing. Can be deleted after test.";
             let full_notes = match extra_notes {
                 Some(n) => format!("{base}\n{n}"),
-                None    => base.to_string(),
+                None => base.to_string(),
             };
 
-            let id  = task_mcp_generate_id();
+            let id = task_mcp_generate_id();
             let now = chrono_now_iso();
             let task_id = id.clone();
 
@@ -10945,13 +13418,17 @@ fn task_mcp_execute_tool(app: &tauri::AppHandle, tool_name: &str, args: &Value) 
 
         "delete_test_task" => {
             let task_id = args["taskId"].as_str().unwrap_or("").trim();
-            if task_id.is_empty() { return Err("Missing required argument: taskId".to_string()); }
+            if task_id.is_empty() {
+                return Err("Missing required argument: taskId".to_string());
+            }
 
             let index = task_mcp_find_task_index(&tasks, task_id)
                 .ok_or_else(|| format!("Task not found: {task_id}"))?;
 
-            let is_test = tasks[index].get("mcpTestTask")
-                .and_then(|v| v.as_bool()).unwrap_or(false);
+            let is_test = tasks[index]
+                .get("mcpTestTask")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
             if !is_test {
                 return Err(format!(
                     "Task {task_id} is not an MCP test task. \
@@ -10965,28 +13442,41 @@ fn task_mcp_execute_tool(app: &tauri::AppHandle, tool_name: &str, args: &Value) 
         }
 
         // â”€â”€ New read tools â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-
         "get_task_full_context" => {
             let task_id = args["id"].as_str().unwrap_or("").trim();
-            if task_id.is_empty() { return Err("Missing required argument: id".to_string()); }
+            if task_id.is_empty() {
+                return Err("Missing required argument: id".to_string());
+            }
             let task = task_mcp_get_task(&tasks, task_id)
                 .ok_or_else(|| format!("Task not found: {task_id}"))?;
             let mut detail = task_mcp_safe_task_detail(task);
-            detail["displayPhase"]       = serde_json::json!(task_mcp_display_phase(task));
-            detail["estimatedEffort"]    = task["estimatedEffort"].clone();
-            detail["budgetHours"]        = task["budgetHours"].clone();
-            detail["budgetNote"]         = serde_json::json!(task_mcp_normalize_small_text(task["budgetNote"].as_str().unwrap_or(""), 300));
-            detail["notes"]              = serde_json::json!(task_mcp_normalize_small_text(task["notes"].as_str().unwrap_or(""), 1500));
-            detail["localTestRecord"]    = task.get("localTestRecord").cloned().unwrap_or(Value::Null);
-            detail["consultantTestRecord"] = task.get("consultantTestRecord").cloned().unwrap_or(Value::Null);
-            detail["mcpNextStep"]        = task.get("mcpNextStep").cloned().unwrap_or(Value::Null);
-            detail["checklist"]                = serde_json::json!(task_mcp_workflow_checklist(task));
-            detail["pullRequestState"]         = task_mcp_pull_request_state(task.get("crmDeveloperWorkflow").unwrap_or(&Value::Null));
-            detail["nextRecommendedStep"]      = task_mcp_next_recommended_step(task);
-            detail["implementationReadiness"]  = task_mcp_implementation_readiness(task);
+            detail["displayPhase"] = serde_json::json!(task_mcp_display_phase(task));
+            detail["estimatedEffort"] = task["estimatedEffort"].clone();
+            detail["budgetHours"] = task["budgetHours"].clone();
+            detail["budgetNote"] = serde_json::json!(task_mcp_normalize_small_text(
+                task["budgetNote"].as_str().unwrap_or(""),
+                300
+            ));
+            detail["notes"] = serde_json::json!(task_mcp_normalize_small_text(
+                task["notes"].as_str().unwrap_or(""),
+                1500
+            ));
+            detail["localTestRecord"] = task.get("localTestRecord").cloned().unwrap_or(Value::Null);
+            detail["consultantTestRecord"] = task
+                .get("consultantTestRecord")
+                .cloned()
+                .unwrap_or(Value::Null);
+            detail["mcpNextStep"] = task.get("mcpNextStep").cloned().unwrap_or(Value::Null);
+            detail["checklist"] = serde_json::json!(task_mcp_workflow_checklist(task));
+            detail["pullRequestState"] = task_mcp_pull_request_state(
+                task.get("crmDeveloperWorkflow").unwrap_or(&Value::Null),
+            );
+            detail["nextRecommendedStep"] = task_mcp_next_recommended_step(task);
+            detail["implementationReadiness"] = task_mcp_implementation_readiness(task);
 
             // Embed customer developer defaults so the AI can apply them without a separate tool call
-            let customer_id = task["customerId"].as_str()
+            let customer_id = task["customerId"]
+                .as_str()
                 .or_else(|| task["workflowSetup"]["customerId"].as_str())
                 .unwrap_or("");
             let dev_defaults = task_mcp_find_customer(&customers, customer_id)
@@ -10996,7 +13486,8 @@ fn task_mcp_execute_tool(app: &tauri::AppHandle, tool_name: &str, args: &Value) 
             }
 
             // Compute developerWorkPacket.scriptNaming for script/ribbon tasks
-            let work_kind_val = task["crmDeveloperWorkflow"]["detectedWorkKind"].as_str()
+            let work_kind_val = task["crmDeveloperWorkflow"]["detectedWorkKind"]
+                .as_str()
                 .or_else(|| task["workflowSetup"]["devTargetKind"].as_str())
                 .unwrap_or("");
             if work_kind_val == "script" || work_kind_val == "ribbon" {
@@ -11009,9 +13500,15 @@ fn task_mcp_execute_tool(app: &tauri::AppHandle, tool_name: &str, args: &Value) 
         }
 
         "get_task_templates" => {
-            let matched = args["taskId"].as_str()
+            let matched = args["taskId"]
+                .as_str()
                 .and_then(|task_id| task_mcp_get_task(&tasks, task_id))
-                .and_then(|task| task_mcp_match_template(task["title"].as_str().unwrap_or(""), &task_mcp_task_text_for_inference(task)));
+                .and_then(|task| {
+                    task_mcp_match_template(
+                        task["title"].as_str().unwrap_or(""),
+                        &task_mcp_task_text_for_inference(task),
+                    )
+                });
             serde_json::json!({
                 "templates": task_mcp_builtin_templates(),
                 "matchedTemplate": matched,
@@ -11020,15 +13517,19 @@ fn task_mcp_execute_tool(app: &tauri::AppHandle, tool_name: &str, args: &Value) 
 
         "get_developer_work_packet" => {
             let task_id = args["taskId"].as_str().unwrap_or("").trim();
-            if task_id.is_empty() { return Err("Missing required argument: taskId".to_string()); }
+            if task_id.is_empty() {
+                return Err("Missing required argument: taskId".to_string());
+            }
             let task = task_mcp_get_task(&tasks, task_id)
                 .ok_or_else(|| format!("Task not found: {task_id}"))?;
-            let customer_id = task["customerId"].as_str()
+            let customer_id = task["customerId"]
+                .as_str()
                 .or_else(|| task["workflowSetup"]["customerId"].as_str())
                 .unwrap_or("");
             let dev_defaults = task_mcp_find_customer(&customers, customer_id)
                 .and_then(|c| task_mcp_customer_dev_defaults(c, &crm_base_dir));
-            let ai_kit_path = settings["powerPlatformAiKitPath"].as_str()
+            let ai_kit_path = settings["powerPlatformAiKitPath"]
+                .as_str()
                 .filter(|s| !s.trim().is_empty())
                 .map(str::to_string);
             task_mcp_developer_work_packet(task, dev_defaults.as_ref(), ai_kit_path.as_deref())
@@ -11036,7 +13537,9 @@ fn task_mcp_execute_tool(app: &tauri::AppHandle, tool_name: &str, args: &Value) 
 
         "prepare_developer_task" => {
             let task_id = args["taskId"].as_str().unwrap_or("").trim();
-            if task_id.is_empty() { return Err("Missing required argument: taskId".to_string()); }
+            if task_id.is_empty() {
+                return Err("Missing required argument: taskId".to_string());
+            }
             let mode = args["mode"].as_str().unwrap_or("setup-until-approval-gate");
             if mode != "setup-until-approval-gate" {
                 return Err(format!("Unsupported prepare_developer_task mode: {mode}"));
@@ -11045,7 +13548,8 @@ fn task_mcp_execute_tool(app: &tauri::AppHandle, tool_name: &str, args: &Value) 
             let create_plan = args["createTechnicalPlan"].as_bool().unwrap_or(true);
             let index = task_mcp_find_task_index(&tasks, task_id)
                 .ok_or_else(|| format!("Task not found: {task_id}"))?;
-            let customer_id = tasks[index]["customerId"].as_str()
+            let customer_id = tasks[index]["customerId"]
+                .as_str()
                 .or_else(|| tasks[index]["workflowSetup"]["customerId"].as_str())
                 .unwrap_or("")
                 .to_string();
@@ -11077,43 +13581,94 @@ fn task_mcp_execute_tool(app: &tauri::AppHandle, tool_name: &str, args: &Value) 
             {
                 let task = &mut tasks[index];
                 if let Some(ref tpl) = template {
-                    task["taskMode"] = serde_json::json!(tpl["mode"].as_str().unwrap_or("developer"));
-                    if task["workflowSetup"].is_null() { task["workflowSetup"] = serde_json::json!({}); }
-                    if task["crmDeveloperWorkflow"].is_null() { task["crmDeveloperWorkflow"] = serde_json::json!({"createdAt": now}); }
+                    task["taskMode"] =
+                        serde_json::json!(tpl["mode"].as_str().unwrap_or("developer"));
+                    if task["workflowSetup"].is_null() {
+                        task["workflowSetup"] = serde_json::json!({});
+                    }
+                    if task["crmDeveloperWorkflow"].is_null() {
+                        task["crmDeveloperWorkflow"] = serde_json::json!({"createdAt": now});
+                    }
                     let work_kind = tpl["workKind"].as_str().unwrap_or("unknown");
-                    task["workflowSetup"]["devTargetKind"] = serde_json::json!(if work_kind == "plugin" { "plugin" } else if work_kind == "script" || work_kind == "ribbon" { "script" } else { "repo" });
-                    task["workflowSetup"]["workIntent"] = serde_json::json!(if tpl["actionType"].as_str().unwrap_or("").starts_with("create-") { "create" } else { "update" });
+                    task["workflowSetup"]["devTargetKind"] =
+                        serde_json::json!(if work_kind == "plugin" {
+                            "plugin"
+                        } else if work_kind == "script" || work_kind == "ribbon" {
+                            "script"
+                        } else {
+                            "repo"
+                        });
+                    task["workflowSetup"]["workIntent"] = serde_json::json!(if tpl["actionType"]
+                        .as_str()
+                        .unwrap_or("")
+                        .starts_with("create-")
+                    {
+                        "create"
+                    } else {
+                        "update"
+                    });
                     task["workflowSetup"]["actionType"] = tpl["actionType"].clone();
                     task["workflowSetup"]["primaryEntityLogicalName"] = tpl["targetEntity"].clone();
                     if !tpl["scriptTarget"].is_null() {
-                        task["workflowSetup"]["eventName"] = tpl["scriptTarget"]["eventName"].clone();
-                        task["workflowSetup"]["eventFieldName"] = tpl["scriptTarget"]["eventFieldName"].clone();
+                        task["workflowSetup"]["eventName"] =
+                            tpl["scriptTarget"]["eventName"].clone();
+                        task["workflowSetup"]["eventFieldName"] =
+                            tpl["scriptTarget"]["eventFieldName"].clone();
                     }
                     if !tpl["scriptNaming"].is_null() {
-                        task["workflowSetup"]["namingSource"] = tpl["scriptNaming"]["namingSource"].clone();
-                        task["workflowSetup"]["desiredScriptFile"] = tpl["scriptNaming"]["desiredScriptFile"].clone();
-                        task["workflowSetup"]["onLoadFunctionName"] = tpl["scriptNaming"]["onLoadFunctionName"].clone();
-                        task["workflowSetup"]["onChangeFunctionName"] = tpl["scriptNaming"]["onChangeFunctionName"].clone();
-                        task["workflowSetup"]["mainHelperSuggestion"] = tpl["scriptNaming"]["mainHelperSuggestion"].clone();
+                        task["workflowSetup"]["namingSource"] =
+                            tpl["scriptNaming"]["namingSource"].clone();
+                        task["workflowSetup"]["desiredScriptFile"] =
+                            tpl["scriptNaming"]["desiredScriptFile"].clone();
+                        task["workflowSetup"]["onLoadFunctionName"] =
+                            tpl["scriptNaming"]["onLoadFunctionName"].clone();
+                        task["workflowSetup"]["onChangeFunctionName"] =
+                            tpl["scriptNaming"]["onChangeFunctionName"].clone();
+                        task["workflowSetup"]["mainHelperSuggestion"] =
+                            tpl["scriptNaming"]["mainHelperSuggestion"].clone();
                     }
                     if let Some(entity) = tpl["pluginTarget"]["entityLogicalName"].as_str() {
-                        task["workflowSetup"]["primaryEntityLogicalName"] = serde_json::json!(entity);
+                        task["workflowSetup"]["primaryEntityLogicalName"] =
+                            serde_json::json!(entity);
                     }
                     // Persist the template's implementation-pattern semantics into workflowSetup
                     // itself, so a later readiness/packet build does not depend on re-matching
                     // this template. Mirrors mcp/task-workbench-mcp.mjs prepareDeveloperTaskInMemory.
-                    if let Some(v) = tpl["implementationPattern"].as_str() { task["workflowSetup"]["implementationPattern"] = serde_json::json!(v); }
-                    if let Some(v) = tpl["requiresFieldMappings"].as_bool() { task["workflowSetup"]["requiresFieldMappings"] = serde_json::json!(v); }
-                    if tpl["referencedFields"].is_array() { task["workflowSetup"]["referencedFields"] = tpl["referencedFields"].clone(); }
-                    if tpl["triggerFields"].is_array() { task["workflowSetup"]["triggerFields"] = tpl["triggerFields"].clone(); }
-                    if tpl["affectedFields"].is_array() { task["workflowSetup"]["affectedFields"] = tpl["affectedFields"].clone(); }
-                    if tpl["uiRules"].is_array() { task["workflowSetup"]["uiRules"] = tpl["uiRules"].clone(); }
-                    if tpl["optionSetValues"].is_object() { task["workflowSetup"]["optionSetValues"] = tpl["optionSetValues"].clone(); }
-                    if tpl["notificationIds"].is_array() { task["workflowSetup"]["notificationIds"] = tpl["notificationIds"].clone(); }
-                    if tpl["forbiddenOperations"].is_array() { task["workflowSetup"]["forbiddenOperations"] = tpl["forbiddenOperations"].clone(); }
+                    if let Some(v) = tpl["implementationPattern"].as_str() {
+                        task["workflowSetup"]["implementationPattern"] = serde_json::json!(v);
+                    }
+                    if let Some(v) = tpl["requiresFieldMappings"].as_bool() {
+                        task["workflowSetup"]["requiresFieldMappings"] = serde_json::json!(v);
+                    }
+                    if tpl["referencedFields"].is_array() {
+                        task["workflowSetup"]["referencedFields"] = tpl["referencedFields"].clone();
+                    }
+                    if tpl["triggerFields"].is_array() {
+                        task["workflowSetup"]["triggerFields"] = tpl["triggerFields"].clone();
+                    }
+                    if tpl["affectedFields"].is_array() {
+                        task["workflowSetup"]["affectedFields"] = tpl["affectedFields"].clone();
+                    }
+                    if tpl["uiRules"].is_array() {
+                        task["workflowSetup"]["uiRules"] = tpl["uiRules"].clone();
+                    }
+                    if tpl["optionSetValues"].is_object() {
+                        task["workflowSetup"]["optionSetValues"] = tpl["optionSetValues"].clone();
+                    }
+                    if tpl["notificationIds"].is_array() {
+                        task["workflowSetup"]["notificationIds"] = tpl["notificationIds"].clone();
+                    }
+                    if tpl["forbiddenOperations"].is_array() {
+                        task["workflowSetup"]["forbiddenOperations"] =
+                            tpl["forbiddenOperations"].clone();
+                    }
                     task["crmDeveloperWorkflow"]["detectedWorkKind"] = serde_json::json!(work_kind);
                     task["crmDeveloperWorkflow"]["updatedAt"] = serde_json::json!(now);
-                    applied.extend(["applied_template", "set_task_mode", "set_task_work_classification"]);
+                    applied.extend([
+                        "applied_template",
+                        "set_task_mode",
+                        "set_task_work_classification",
+                    ]);
                     confidence = "high".to_string();
                     assumptions.push(format!(
                         "Setup proposed from built-in template \"{}\" matched against the task title/description.",
@@ -11124,67 +13679,175 @@ fn task_mcp_execute_tool(app: &tauri::AppHandle, tool_name: &str, args: &Value) 
                     // explicit facts in the task text, so an explicit assignment does not force a
                     // hard "set it manually" blocker. Never applied over an already-set value.
                     task["taskMode"] = serde_json::json!("developer");
-                    if task["workflowSetup"].is_null() { task["workflowSetup"] = serde_json::json!({}); }
-                    if task["crmDeveloperWorkflow"].is_null() { task["crmDeveloperWorkflow"] = serde_json::json!({"createdAt": now}); }
-                    let s = &mut task["workflowSetup"];
-                    if s["devTargetKind"].as_str().unwrap_or("").is_empty() { s["devTargetKind"] = serde_json::json!("script"); }
-                    if s["workIntent"].as_str().unwrap_or("").is_empty() {
-                        let action_type = inferred["actionType"].as_str().unwrap_or("create-new-script");
-                        s["workIntent"] = serde_json::json!(if action_type.starts_with("create-") { "create" } else { "update" });
+                    if task["workflowSetup"].is_null() {
+                        task["workflowSetup"] = serde_json::json!({});
                     }
-                    if s["actionType"].as_str().unwrap_or("").is_empty() { s["actionType"] = inferred["actionType"].clone(); }
-                    if s["primaryEntityLogicalName"].as_str().unwrap_or("").is_empty() { s["primaryEntityLogicalName"] = inferred["targetEntity"].clone(); }
-                    if s["eventName"].as_str().unwrap_or("").is_empty() && !inferred["eventName"].is_null() { s["eventName"] = inferred["eventName"].clone(); }
-                    if s["eventFieldName"].as_str().unwrap_or("").is_empty() && !inferred["eventFieldName"].is_null() { s["eventFieldName"] = inferred["eventFieldName"].clone(); }
-                    if s["scriptPath"].as_str().unwrap_or("").is_empty() { s["scriptPath"] = inferred["scriptsFolderRelative"].clone(); }
-                    if s["desiredScriptFile"].as_str().unwrap_or("").is_empty() { s["desiredScriptFile"] = inferred["desiredScriptFile"].clone(); }
-                    if s["namingSource"].as_str().unwrap_or("").is_empty() { s["namingSource"] = serde_json::json!("Scripts_Naming"); }
-                    if s["onLoadFunctionName"].as_str().unwrap_or("").is_empty() && !inferred["onLoadFunctionName"].is_null() { s["onLoadFunctionName"] = inferred["onLoadFunctionName"].clone(); }
-                    if s["onChangeFunctionName"].as_str().unwrap_or("").is_empty() && !inferred["onChangeFunctionName"].is_null() { s["onChangeFunctionName"] = inferred["onChangeFunctionName"].clone(); }
-                    if task["crmDeveloperWorkflow"]["detectedWorkKind"].as_str().unwrap_or("").is_empty() {
-                        task["crmDeveloperWorkflow"]["detectedWorkKind"] = serde_json::json!("script");
+                    if task["crmDeveloperWorkflow"].is_null() {
+                        task["crmDeveloperWorkflow"] = serde_json::json!({"createdAt": now});
+                    }
+                    let s = &mut task["workflowSetup"];
+                    if s["devTargetKind"].as_str().unwrap_or("").is_empty() {
+                        s["devTargetKind"] = serde_json::json!("script");
+                    }
+                    if s["workIntent"].as_str().unwrap_or("").is_empty() {
+                        let action_type = inferred["actionType"]
+                            .as_str()
+                            .unwrap_or("create-new-script");
+                        s["workIntent"] =
+                            serde_json::json!(if action_type.starts_with("create-") {
+                                "create"
+                            } else {
+                                "update"
+                            });
+                    }
+                    if s["actionType"].as_str().unwrap_or("").is_empty() {
+                        s["actionType"] = inferred["actionType"].clone();
+                    }
+                    if s["primaryEntityLogicalName"]
+                        .as_str()
+                        .unwrap_or("")
+                        .is_empty()
+                    {
+                        s["primaryEntityLogicalName"] = inferred["targetEntity"].clone();
+                    }
+                    if s["eventName"].as_str().unwrap_or("").is_empty()
+                        && !inferred["eventName"].is_null()
+                    {
+                        s["eventName"] = inferred["eventName"].clone();
+                    }
+                    if s["eventFieldName"].as_str().unwrap_or("").is_empty()
+                        && !inferred["eventFieldName"].is_null()
+                    {
+                        s["eventFieldName"] = inferred["eventFieldName"].clone();
+                    }
+                    if s["scriptPath"].as_str().unwrap_or("").is_empty() {
+                        s["scriptPath"] = inferred["scriptsFolderRelative"].clone();
+                    }
+                    if s["desiredScriptFile"].as_str().unwrap_or("").is_empty() {
+                        s["desiredScriptFile"] = inferred["desiredScriptFile"].clone();
+                    }
+                    if s["namingSource"].as_str().unwrap_or("").is_empty() {
+                        s["namingSource"] = serde_json::json!("Scripts_Naming");
+                    }
+                    if s["onLoadFunctionName"].as_str().unwrap_or("").is_empty()
+                        && !inferred["onLoadFunctionName"].is_null()
+                    {
+                        s["onLoadFunctionName"] = inferred["onLoadFunctionName"].clone();
+                    }
+                    if s["onChangeFunctionName"].as_str().unwrap_or("").is_empty()
+                        && !inferred["onChangeFunctionName"].is_null()
+                    {
+                        s["onChangeFunctionName"] = inferred["onChangeFunctionName"].clone();
+                    }
+                    if task["crmDeveloperWorkflow"]["detectedWorkKind"]
+                        .as_str()
+                        .unwrap_or("")
+                        .is_empty()
+                    {
+                        task["crmDeveloperWorkflow"]["detectedWorkKind"] =
+                            serde_json::json!("script");
                     }
                     task["crmDeveloperWorkflow"]["updatedAt"] = serde_json::json!(now);
-                    applied.extend(["applied_generic_inference", "set_task_mode", "set_task_work_classification"]);
-                    confidence = inferred["confidence"].as_str().unwrap_or("medium").to_string();
+                    applied.extend([
+                        "applied_generic_inference",
+                        "set_task_mode",
+                        "set_task_work_classification",
+                    ]);
+                    confidence = inferred["confidence"]
+                        .as_str()
+                        .unwrap_or("medium")
+                        .to_string();
                     assumptions.extend(
-                        inferred["assumptions"].as_array().cloned().unwrap_or_default()
-                            .iter().filter_map(|v| v.as_str().map(str::to_string))
+                        inferred["assumptions"]
+                            .as_array()
+                            .cloned()
+                            .unwrap_or_default()
+                            .iter()
+                            .filter_map(|v| v.as_str().map(str::to_string)),
                     );
                 }
 
                 if let Some(ref defaults) = dev_defaults {
-                    if task["workflowSetup"].is_null() { task["workflowSetup"] = serde_json::json!({}); }
-                    if task["workflowSetup"]["repositoryRoot"].as_str().unwrap_or("").is_empty() {
-                        if let Some(v) = defaults["repositoryRoot"].as_str() { task["workflowSetup"]["repositoryRoot"] = serde_json::json!(v); }
+                    if task["workflowSetup"].is_null() {
+                        task["workflowSetup"] = serde_json::json!({});
                     }
-                    if task["workflowSetup"]["devTargetKind"].as_str() == Some("script") && task["workflowSetup"]["scriptPath"].as_str().unwrap_or("").is_empty() {
+                    if task["workflowSetup"]["repositoryRoot"]
+                        .as_str()
+                        .unwrap_or("")
+                        .is_empty()
+                    {
+                        if let Some(v) = defaults["repositoryRoot"].as_str() {
+                            task["workflowSetup"]["repositoryRoot"] = serde_json::json!(v);
+                        }
+                    }
+                    if task["workflowSetup"]["devTargetKind"].as_str() == Some("script")
+                        && task["workflowSetup"]["scriptPath"]
+                            .as_str()
+                            .unwrap_or("")
+                            .is_empty()
+                    {
                         if let Some(dir) = defaults["scriptDirectory"].as_str() {
-                            let repo = defaults["repositoryRoot"].as_str().unwrap_or("").trim_end_matches(|c| c == '/' || c == '\\');
-                            let rel = if !repo.is_empty() && dir.to_lowercase().starts_with(&repo.to_lowercase()) {
-                                dir[repo.len()..].trim_start_matches(|c| c == '/' || c == '\\').to_string()
+                            let repo = defaults["repositoryRoot"]
+                                .as_str()
+                                .unwrap_or("")
+                                .trim_end_matches(|c| c == '/' || c == '\\');
+                            let rel = if !repo.is_empty()
+                                && dir.to_lowercase().starts_with(&repo.to_lowercase())
+                            {
+                                dir[repo.len()..]
+                                    .trim_start_matches(|c| c == '/' || c == '\\')
+                                    .to_string()
                             } else {
-                                dir.replace('\\', "/").split('/').filter(|s| !s.is_empty()).last().unwrap_or(dir).to_string()
+                                dir.replace('\\', "/")
+                                    .split('/')
+                                    .filter(|s| !s.is_empty())
+                                    .last()
+                                    .unwrap_or(dir)
+                                    .to_string()
                             };
                             task["workflowSetup"]["scriptPath"] = serde_json::json!(rel);
                         }
                     }
-                    if task["workflowSetup"]["devTargetKind"].as_str() == Some("plugin") && task["workflowSetup"]["pluginProject"].as_str().unwrap_or("").is_empty() {
-                        if let Some(v) = defaults["pluginProjectPath"].as_str() { task["workflowSetup"]["pluginProject"] = serde_json::json!(v); }
+                    if task["workflowSetup"]["devTargetKind"].as_str() == Some("plugin")
+                        && task["workflowSetup"]["pluginProject"]
+                            .as_str()
+                            .unwrap_or("")
+                            .is_empty()
+                    {
+                        if let Some(v) = defaults["pluginProjectPath"].as_str() {
+                            task["workflowSetup"]["pluginProject"] = serde_json::json!(v);
+                        }
                     }
                     applied.push("applied_customer_defaults");
                 }
 
                 if task["workflowSetup"]["actionType"].as_str() == Some("create-new-script")
-                    && !task["workflowSetup"]["repositoryRoot"].as_str().unwrap_or("").is_empty() {
-                    if let Some(naming) = task_mcp_script_naming_from_template(task, template.as_ref(), dev_defaults.as_ref()) {
-                        task["workflowSetup"]["desiredScriptFile"] = naming["desiredScriptFile"].clone();
+                    && !task["workflowSetup"]["repositoryRoot"]
+                        .as_str()
+                        .unwrap_or("")
+                        .is_empty()
+                {
+                    if let Some(naming) = task_mcp_script_naming_from_template(
+                        task,
+                        template.as_ref(),
+                        dev_defaults.as_ref(),
+                    ) {
+                        task["workflowSetup"]["desiredScriptFile"] =
+                            naming["desiredScriptFile"].clone();
                         task["workflowSetup"]["artifactPath"] = naming["scriptPath"].clone();
-                        task["workflowSetup"]["absoluteScriptPath"] = naming["absoluteScriptPath"].clone();
+                        task["workflowSetup"]["absoluteScriptPath"] =
+                            naming["absoluteScriptPath"].clone();
                         task["workflowSetup"]["namingSource"] = naming["namingSource"].clone();
-                        task["workflowSetup"]["onLoadFunctionName"] = naming["onLoadFunctionName"].clone();
-                        if !naming["onChangeFunctionName"].is_null() { task["workflowSetup"]["onChangeFunctionName"] = naming["onChangeFunctionName"].clone(); }
-                        if !naming["mainHelperSuggestion"].is_null() { task["workflowSetup"]["mainHelperSuggestion"] = naming["mainHelperSuggestion"].clone(); }
+                        task["workflowSetup"]["onLoadFunctionName"] =
+                            naming["onLoadFunctionName"].clone();
+                        if !naming["onChangeFunctionName"].is_null() {
+                            task["workflowSetup"]["onChangeFunctionName"] =
+                                naming["onChangeFunctionName"].clone();
+                        }
+                        if !naming["mainHelperSuggestion"].is_null() {
+                            task["workflowSetup"]["mainHelperSuggestion"] =
+                                naming["mainHelperSuggestion"].clone();
+                        }
                         applied.push("saved_developer_target");
                     }
                 }
@@ -11193,17 +13856,28 @@ fn task_mcp_execute_tool(app: &tauri::AppHandle, tool_name: &str, args: &Value) 
                     "{} {}",
                     task["analysisResult"]["summary"].as_str().unwrap_or(""),
                     task["analysisResult"]["summaryEn"].as_str().unwrap_or("")
-                ).to_lowercase();
+                )
+                .to_lowercase();
                 let has_stale_template_questions = analysis_text.contains("open questions")
                     || analysis_text.contains("which specific fields")
                     || analysis_text.contains("fields from the asset")
                     || analysis_text.contains("should be prefilled");
                 if (template.is_some() && has_stale_template_questions)
-                    || task["analysisResult"]["summary"].as_str().unwrap_or("").is_empty() {
-                    let summary = template.as_ref()
+                    || task["analysisResult"]["summary"]
+                        .as_str()
+                        .unwrap_or("")
+                        .is_empty()
+                {
+                    let summary = template
+                        .as_ref()
                         .and_then(|t| t["notes"].as_str())
                         .map(str::to_string)
-                        .unwrap_or_else(|| format!("Developer task setup prepared for: {}.", task["title"].as_str().unwrap_or(task_id)));
+                        .unwrap_or_else(|| {
+                            format!(
+                                "Developer task setup prepared for: {}.",
+                                task["title"].as_str().unwrap_or(task_id)
+                            )
+                        });
                     task["analysisResult"] = serde_json::json!({
                         "summary": summary,
                         "summaryEn": summary,
@@ -11213,19 +13887,45 @@ fn task_mcp_execute_tool(app: &tauri::AppHandle, tool_name: &str, args: &Value) 
                     applied.push("saved_task_analysis");
                 }
 
-                let dev_target_kind = task["workflowSetup"]["devTargetKind"].as_str().unwrap_or("").to_string();
-                let action_type = task["workflowSetup"]["actionType"].as_str().unwrap_or("").to_string();
-                let work_kind = task["crmDeveloperWorkflow"]["detectedWorkKind"].as_str()
+                let dev_target_kind = task["workflowSetup"]["devTargetKind"]
+                    .as_str()
+                    .unwrap_or("")
+                    .to_string();
+                let action_type = task["workflowSetup"]["actionType"]
+                    .as_str()
+                    .unwrap_or("")
+                    .to_string();
+                let work_kind = task["crmDeveloperWorkflow"]["detectedWorkKind"]
+                    .as_str()
                     .unwrap_or(dev_target_kind.as_str())
                     .to_string();
-                let confirmed_missing = task["workflowSetup"]["confirmedAt"].as_str().unwrap_or("").is_empty();
+                let confirmed_missing = task["workflowSetup"]["confirmedAt"]
+                    .as_str()
+                    .unwrap_or("")
+                    .is_empty();
                 if dev_target_kind == "script" || work_kind == "script" || work_kind == "ribbon" {
                     warnings.push("Dataverse metadata verification for JS/TS runs automatically after implementation via run_implementation_verification (Primarch, when configured) — not before.".into());
                 }
-                if task["workflowSetup"]["repositoryRoot"].as_str().unwrap_or("").is_empty() { missing.push("repositoryRoot".into()); }
-                if work_kind.is_empty() || work_kind == "unknown" { missing.push("workKind".into()); }
-                if action_type.is_empty() { missing.push("actionType".into()); }
-                if task["workflowSetup"]["primaryEntityLogicalName"].as_str().unwrap_or("").is_empty() { missing.push("targetEntity".into()); }
+                if task["workflowSetup"]["repositoryRoot"]
+                    .as_str()
+                    .unwrap_or("")
+                    .is_empty()
+                {
+                    missing.push("repositoryRoot".into());
+                }
+                if work_kind.is_empty() || work_kind == "unknown" {
+                    missing.push("workKind".into());
+                }
+                if action_type.is_empty() {
+                    missing.push("actionType".into());
+                }
+                if task["workflowSetup"]["primaryEntityLogicalName"]
+                    .as_str()
+                    .unwrap_or("")
+                    .is_empty()
+                {
+                    missing.push("targetEntity".into());
+                }
                 if dev_target_kind == "script" && action_type == "create-new-script" {
                     // Mirrors task_mcp_implementation_readiness's OR-based script-target check: a
                     // specific artifactPath alone is sufficient, it does not also require the
@@ -11234,26 +13934,50 @@ fn task_mcp_execute_tool(app: &tauri::AppHandle, tool_name: &str, args: &Value) 
                     // workflowSetup.scriptPath, even once artifactPath/desiredScriptFile are
                     // correctly resolved from the template/naming step.
                     let script_path = task["workflowSetup"]["scriptPath"].as_str().unwrap_or("");
-                    let artifact_path = task["workflowSetup"]["artifactPath"].as_str().unwrap_or("");
-                    let desired_file = task["workflowSetup"]["desiredScriptFile"].as_str().unwrap_or("");
-                    let is_specific = |p: &str| p.ends_with(".js") || p.ends_with(".ts") || p.ends_with(".jsx") || p.ends_with(".tsx");
+                    let artifact_path =
+                        task["workflowSetup"]["artifactPath"].as_str().unwrap_or("");
+                    let desired_file = task["workflowSetup"]["desiredScriptFile"]
+                        .as_str()
+                        .unwrap_or("");
+                    let is_specific = |p: &str| {
+                        p.ends_with(".js")
+                            || p.ends_with(".ts")
+                            || p.ends_with(".jsx")
+                            || p.ends_with(".tsx")
+                    };
                     let has_dir = !script_path.is_empty() || !artifact_path.is_empty();
-                    let has_file_name = is_specific(artifact_path) || is_specific(script_path) || !desired_file.is_empty();
+                    let has_file_name = is_specific(artifact_path)
+                        || is_specific(script_path)
+                        || !desired_file.is_empty();
                     if !has_dir || !has_file_name {
                         missing.push("script target path".into());
                     }
                 }
-                if dev_target_kind == "plugin" && task["workflowSetup"]["pluginProject"].as_str().unwrap_or("").is_empty() {
+                if dev_target_kind == "plugin"
+                    && task["workflowSetup"]["pluginProject"]
+                        .as_str()
+                        .unwrap_or("")
+                        .is_empty()
+                {
                     missing.push("plugin project".into());
                 }
                 if !missing.is_empty() {
-                    hard_blockers.push(format!("Missing required setup input(s): {}.", missing.join(", ")));
+                    hard_blockers.push(format!(
+                        "Missing required setup input(s): {}.",
+                        missing.join(", ")
+                    ));
                 }
 
                 let has_plan = task["crmDeveloperWorkflow"]["technicalPlan"].is_object();
                 let plan_needs_template_mapping = has_plan
-                    && !task_mcp_plan_has_template_mapping(&task["crmDeveloperWorkflow"]["technicalPlan"], template.as_ref());
-                if create_plan && (!has_plan || plan_needs_template_mapping) && hard_blockers.is_empty() {
+                    && !task_mcp_plan_has_template_mapping(
+                        &task["crmDeveloperWorkflow"]["technicalPlan"],
+                        template.as_ref(),
+                    );
+                if create_plan
+                    && (!has_plan || plan_needs_template_mapping)
+                    && hard_blockers.is_empty()
+                {
                     if let Some(plan_base) = task_mcp_prepare_plan_draft(task, template.as_ref()) {
                         task["crmDeveloperWorkflow"]["technicalPlan"] = serde_json::json!({
                             "generatedAt": now,
@@ -11269,14 +13993,20 @@ fn task_mcp_execute_tool(app: &tauri::AppHandle, tool_name: &str, args: &Value) 
                             "target": plan_base["target"].clone(),
                         });
                         task["crmDeveloperWorkflow"]["planApproval"] = Value::Null;
-                        task["crmDeveloperWorkflow"]["currentStep"] = serde_json::json!("technical-plan");
+                        task["crmDeveloperWorkflow"]["currentStep"] =
+                            serde_json::json!("technical-plan");
                         task["crmDeveloperWorkflow"]["updatedAt"] = serde_json::json!(now);
                         applied.extend(["saved_technical_plan", "marked_technical_plan_ready"]);
                         gates.push(serde_json::json!({"type": "technical-plan-approval", "message": "Review and approve the technical implementation plan."}));
                     } else {
                         warnings.push("Technical plan was not created because the task context is not specific enough.".into());
                     }
-                } else if has_plan && !task_mcp_approval_summary(task["crmDeveloperWorkflow"].get("planApproval"))["approved"].as_bool().unwrap_or(false) {
+                } else if has_plan
+                    && !task_mcp_approval_summary(task["crmDeveloperWorkflow"].get("planApproval"))
+                        ["approved"]
+                        .as_bool()
+                        .unwrap_or(false)
+                {
                     gates.push(serde_json::json!({"type": "technical-plan-approval", "message": "Review and approve the technical implementation plan."}));
                 }
 
@@ -11296,17 +14026,27 @@ fn task_mcp_execute_tool(app: &tauri::AppHandle, tool_name: &str, args: &Value) 
                 "blocked"
             } else if !gates.is_empty() {
                 "stopped_at_approval_gate"
-            } else if readiness["isImplementationReady"].as_bool().unwrap_or(false) {
+            } else if readiness["isImplementationReady"]
+                .as_bool()
+                .unwrap_or(false)
+            {
                 "ready_for_implementation"
             } else {
                 "blocked"
             };
             let mut detail = task_mcp_safe_task_detail(task);
             detail["implementationReadiness"] = readiness.clone();
-            if let Some(ref dd) = dev_defaults { detail["customerDevDefaults"] = dd.clone(); }
+            if let Some(ref dd) = dev_defaults {
+                detail["customerDevDefaults"] = dd.clone();
+            }
             updated = true;
-            let applied_actions: Vec<&str> = applied.into_iter().collect::<HashSet<_>>().into_iter().collect();
-            let requires_user_confirmation = applied_actions.contains(&"applied_template") || applied_actions.contains(&"applied_generic_inference");
+            let applied_actions: Vec<&str> = applied
+                .into_iter()
+                .collect::<HashSet<_>>()
+                .into_iter()
+                .collect();
+            let requires_user_confirmation = applied_actions.contains(&"applied_template")
+                || applied_actions.contains(&"applied_generic_inference");
             let applied_setup = task_mcp_snapshot_proposed_setup(&task["workflowSetup"]);
             serde_json::json!({
                 "taskId": task_id,
@@ -11330,7 +14070,9 @@ fn task_mcp_execute_tool(app: &tauri::AppHandle, tool_name: &str, args: &Value) 
 
         "get_task_workflow_overview" => {
             let task_id = args["id"].as_str().unwrap_or("").trim();
-            if task_id.is_empty() { return Err("Missing required argument: id".to_string()); }
+            if task_id.is_empty() {
+                return Err("Missing required argument: id".to_string());
+            }
             let task = task_mcp_get_task(&tasks, task_id)
                 .ok_or_else(|| format!("Task not found: {task_id}"))?;
             let mut overview = task_mcp_workflow_overview(task);
@@ -11340,7 +14082,9 @@ fn task_mcp_execute_tool(app: &tauri::AppHandle, tool_name: &str, args: &Value) 
 
         "get_task_original_message" => {
             let task_id = args["id"].as_str().unwrap_or("").trim();
-            if task_id.is_empty() { return Err("Missing required argument: id".to_string()); }
+            if task_id.is_empty() {
+                return Err("Missing required argument: id".to_string());
+            }
             let task = task_mcp_get_task(&tasks, task_id)
                 .ok_or_else(|| format!("Task not found: {task_id}"))?;
             serde_json::json!({
@@ -11357,7 +14101,9 @@ fn task_mcp_execute_tool(app: &tauri::AppHandle, tool_name: &str, args: &Value) 
 
         "get_task_developer_setup" => {
             let task_id = args["id"].as_str().unwrap_or("").trim();
-            if task_id.is_empty() { return Err("Missing required argument: id".to_string()); }
+            if task_id.is_empty() {
+                return Err("Missing required argument: id".to_string());
+            }
             let task = task_mcp_get_task(&tasks, task_id)
                 .ok_or_else(|| format!("Task not found: {task_id}"))?;
             let setup = task.get("workflowSetup").unwrap_or(&Value::Null);
@@ -11376,22 +14122,30 @@ fn task_mcp_execute_tool(app: &tauri::AppHandle, tool_name: &str, args: &Value) 
         }
 
         // â”€â”€ New write tools â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-
         "save_task_analysis" => {
             let task_id = args["taskId"].as_str().unwrap_or("").trim();
-            if task_id.is_empty() { return Err("Missing required argument: taskId".to_string()); }
-            let summary = task_mcp_normalize_small_text(args["summary"].as_str().unwrap_or(""), 3000);
-            if summary.is_empty() { return Err("summary cannot be empty after sanitization.".to_string()); }
+            if task_id.is_empty() {
+                return Err("Missing required argument: taskId".to_string());
+            }
+            let summary =
+                task_mcp_normalize_small_text(args["summary"].as_str().unwrap_or(""), 3000);
+            if summary.is_empty() {
+                return Err("summary cannot be empty after sanitization.".to_string());
+            }
             let requirements = task_mcp_collect_string_array(&args["requirements"], 20, 500);
-            let risks        = task_mcp_collect_string_array(&args["risks"], 10, 300);
-            let questions    = task_mcp_collect_string_array(&args["questions"], 10, 300);
-            let next_step    = task_mcp_normalize_small_text(args["suggestedNextStep"].as_str().unwrap_or(""), 300);
+            let risks = task_mcp_collect_string_array(&args["risks"], 10, 300);
+            let questions = task_mcp_collect_string_array(&args["questions"], 10, 300);
+            let next_step = task_mcp_normalize_small_text(
+                args["suggestedNextStep"].as_str().unwrap_or(""),
+                300,
+            );
 
             // Append open questions to summary if present
             let full_summary = if questions.is_empty() {
                 summary.clone()
             } else {
-                let q_lines: Vec<String> = questions.iter()
+                let q_lines: Vec<String> = questions
+                    .iter()
                     .filter_map(|v| v.as_str())
                     .map(|s| format!("- {s}"))
                     .collect();
@@ -11425,23 +14179,30 @@ fn task_mcp_execute_tool(app: &tauri::AppHandle, tool_name: &str, args: &Value) 
 
         "update_task_summary" => {
             let task_id = args["taskId"].as_str().unwrap_or("").trim();
-            if task_id.is_empty() { return Err("Missing required argument: taskId".to_string()); }
-            let summary = task_mcp_normalize_small_text(args["summary"].as_str().unwrap_or(""), 2000);
-            if summary.is_empty() { return Err("summary cannot be empty after sanitization.".to_string()); }
-            let next_step_raw = args["nextStep"].as_str()
+            if task_id.is_empty() {
+                return Err("Missing required argument: taskId".to_string());
+            }
+            let summary =
+                task_mcp_normalize_small_text(args["summary"].as_str().unwrap_or(""), 2000);
+            if summary.is_empty() {
+                return Err("summary cannot be empty after sanitization.".to_string());
+            }
+            let next_step_raw = args["nextStep"]
+                .as_str()
                 .map(|s| task_mcp_normalize_small_text(s, 300));
 
             let index = task_mcp_find_task_index(&tasks, task_id)
                 .ok_or_else(|| format!("Task not found: {task_id}"))?;
             let task = &mut tasks[index];
             if task["analysisResult"].is_null() {
-                task["analysisResult"] = serde_json::json!({"confidence": 0, "suggestedActions": []});
+                task["analysisResult"] =
+                    serde_json::json!({"confidence": 0, "suggestedActions": []});
             }
             task["analysisResult"]["summaryEn"] = serde_json::json!(summary.clone());
-            task["analysisResult"]["summary"]   = serde_json::json!(summary);
+            task["analysisResult"]["summary"] = serde_json::json!(summary);
             if let Some(ns) = next_step_raw.filter(|s| !s.is_empty()) {
                 task["analysisResult"]["nextStepEn"] = serde_json::json!(ns.clone());
-                task["analysisResult"]["nextStep"]   = serde_json::json!(ns);
+                task["analysisResult"]["nextStep"] = serde_json::json!(ns);
             }
             task_mcp_append_audit_note(task, "update_task_summary");
             updated = true;
@@ -11450,10 +14211,15 @@ fn task_mcp_execute_tool(app: &tauri::AppHandle, tool_name: &str, args: &Value) 
 
         "set_task_mode" => {
             let task_id = args["taskId"].as_str().unwrap_or("").trim();
-            if task_id.is_empty() { return Err("Missing required argument: taskId".to_string()); }
+            if task_id.is_empty() {
+                return Err("Missing required argument: taskId".to_string());
+            }
             let mode = args["mode"].as_str().unwrap_or("").trim();
             if !task_mcp_allowed_modes().contains(&mode) {
-                return Err(format!("Invalid mode '{mode}'. Allowed: {}", task_mcp_allowed_modes().join(", ")));
+                return Err(format!(
+                    "Invalid mode '{mode}'. Allowed: {}",
+                    task_mcp_allowed_modes().join(", ")
+                ));
             }
             let index = task_mcp_find_task_index(&tasks, task_id)
                 .ok_or_else(|| format!("Task not found: {task_id}"))?;
@@ -11466,69 +14232,137 @@ fn task_mcp_execute_tool(app: &tauri::AppHandle, tool_name: &str, args: &Value) 
 
         "set_task_work_classification" => {
             let task_id = args["taskId"].as_str().unwrap_or("").trim();
-            if task_id.is_empty() { return Err("Missing required argument: taskId".to_string()); }
-            let work_kind   = args["workKind"].as_str().unwrap_or("").trim();
+            if task_id.is_empty() {
+                return Err("Missing required argument: taskId".to_string());
+            }
+            let work_kind = args["workKind"].as_str().unwrap_or("").trim();
             let work_action = args["workAction"].as_str().unwrap_or("").trim();
             if !task_mcp_allowed_work_kinds().contains(&work_kind) {
-                return Err(format!("Invalid workKind '{work_kind}'. Allowed: {}", task_mcp_allowed_work_kinds().join(", ")));
+                return Err(format!(
+                    "Invalid workKind '{work_kind}'. Allowed: {}",
+                    task_mcp_allowed_work_kinds().join(", ")
+                ));
             }
             if !task_mcp_allowed_work_actions().contains(&work_action) {
-                return Err(format!("Invalid workAction '{work_action}'. Allowed: {}", task_mcp_allowed_work_actions().join(", ")));
+                return Err(format!(
+                    "Invalid workAction '{work_action}'. Allowed: {}",
+                    task_mcp_allowed_work_actions().join(", ")
+                ));
             }
             // plugin â†’ plugin target, ribbon/script â†’ script target, all others â†’ repo
             let dev_target_kind = match work_kind {
-                "plugin"   => "plugin",
-                "script"   => "script",
-                "ribbon"   => "script",
-                _          => "repo",
+                "plugin" => "plugin",
+                "script" => "script",
+                "ribbon" => "script",
+                _ => "repo",
             };
-            let work_intent = match work_action { "create" => "create", _ => "update" };
+            let work_intent = match work_action {
+                "create" => "create",
+                _ => "update",
+            };
 
             let index = task_mcp_find_task_index(&tasks, task_id)
                 .ok_or_else(|| format!("Task not found: {task_id}"))?;
             let task = &mut tasks[index];
-            if task["workflowSetup"].is_null() { task["workflowSetup"] = serde_json::json!({}); }
+            if task["workflowSetup"].is_null() {
+                task["workflowSetup"] = serde_json::json!({});
+            }
             task["workflowSetup"]["devTargetKind"] = serde_json::json!(dev_target_kind);
-            task["workflowSetup"]["workIntent"]    = serde_json::json!(work_intent);
+            task["workflowSetup"]["workIntent"] = serde_json::json!(work_intent);
             // Store the fine-grained work kind in CRM workflow state
             if task["crmDeveloperWorkflow"].is_null() {
                 task["crmDeveloperWorkflow"] = serde_json::json!({"createdAt": chrono_now_iso()});
             }
             task["crmDeveloperWorkflow"]["detectedWorkKind"] = serde_json::json!(work_kind);
             task["crmDeveloperWorkflow"]["updatedAt"] = serde_json::json!(chrono_now_iso());
-            task_mcp_append_audit_note(task, &format!("set_task_work_classification -> {work_kind}/{work_action}"));
+            task_mcp_append_audit_note(
+                task,
+                &format!("set_task_work_classification -> {work_kind}/{work_action}"),
+            );
             updated = true;
             serde_json::json!({"task": task_mcp_safe_task_summary(task)})
         }
 
         "set_task_developer_target" => {
             let task_id = args["taskId"].as_str().unwrap_or("").trim();
-            if task_id.is_empty() { return Err("Missing required argument: taskId".to_string()); }
+            if task_id.is_empty() {
+                return Err("Missing required argument: taskId".to_string());
+            }
 
             // Collect optional string fields
-            let repo_root           = args["repositoryRoot"].as_str().map(str::trim).filter(|s| !s.is_empty());
-            let plugin_proj         = args["selectedPluginProject"].as_str().map(str::trim).filter(|s| !s.is_empty());
-            let script_tgt          = args["selectedScriptTarget"].as_str().map(str::trim).filter(|s| !s.is_empty());
-            let customer_id         = args["customerId"].as_str().map(str::trim).filter(|s| !s.is_empty());
-            let primary_entity      = args["primaryEntityLogicalName"].as_str().map(str::trim).filter(|s| !s.is_empty());
-            let action_type         = args["actionType"].as_str().map(str::trim).filter(|s| !s.is_empty());
-            let event_name          = args["eventName"].as_str().map(str::trim).filter(|s| !s.is_empty());
-            let event_field_name    = args["eventFieldName"].as_str().map(str::trim).filter(|s| !s.is_empty());
-            let desired_script_file = args["desiredScriptFile"].as_str().map(str::trim).filter(|s| !s.is_empty());
-            let naming_source     = args["namingSource"].as_str().map(str::trim).filter(|s| !s.is_empty());
-            let on_load_fn        = args["onLoadFunctionName"].as_str().map(str::trim).filter(|s| !s.is_empty());
-            let on_change_fn      = args["onChangeFunctionName"].as_str().map(str::trim).filter(|s| !s.is_empty());
-            let main_helper          = args["mainHelperSuggestion"].as_str().map(str::trim).filter(|s| !s.is_empty());
-            let absolute_script_path = args["absoluteScriptPath"].as_str().map(str::trim).filter(|s| !s.is_empty());
-            let artifact_path        = args["artifactPath"].as_str().map(str::trim).filter(|s| !s.is_empty());
+            let repo_root = args["repositoryRoot"]
+                .as_str()
+                .map(str::trim)
+                .filter(|s| !s.is_empty());
+            let plugin_proj = args["selectedPluginProject"]
+                .as_str()
+                .map(str::trim)
+                .filter(|s| !s.is_empty());
+            let script_tgt = args["selectedScriptTarget"]
+                .as_str()
+                .map(str::trim)
+                .filter(|s| !s.is_empty());
+            let customer_id = args["customerId"]
+                .as_str()
+                .map(str::trim)
+                .filter(|s| !s.is_empty());
+            let primary_entity = args["primaryEntityLogicalName"]
+                .as_str()
+                .map(str::trim)
+                .filter(|s| !s.is_empty());
+            let action_type = args["actionType"]
+                .as_str()
+                .map(str::trim)
+                .filter(|s| !s.is_empty());
+            let event_name = args["eventName"]
+                .as_str()
+                .map(str::trim)
+                .filter(|s| !s.is_empty());
+            let event_field_name = args["eventFieldName"]
+                .as_str()
+                .map(str::trim)
+                .filter(|s| !s.is_empty());
+            let desired_script_file = args["desiredScriptFile"]
+                .as_str()
+                .map(str::trim)
+                .filter(|s| !s.is_empty());
+            let naming_source = args["namingSource"]
+                .as_str()
+                .map(str::trim)
+                .filter(|s| !s.is_empty());
+            let on_load_fn = args["onLoadFunctionName"]
+                .as_str()
+                .map(str::trim)
+                .filter(|s| !s.is_empty());
+            let on_change_fn = args["onChangeFunctionName"]
+                .as_str()
+                .map(str::trim)
+                .filter(|s| !s.is_empty());
+            let main_helper = args["mainHelperSuggestion"]
+                .as_str()
+                .map(str::trim)
+                .filter(|s| !s.is_empty());
+            let absolute_script_path = args["absoluteScriptPath"]
+                .as_str()
+                .map(str::trim)
+                .filter(|s| !s.is_empty());
+            let artifact_path = args["artifactPath"]
+                .as_str()
+                .map(str::trim)
+                .filter(|s| !s.is_empty());
 
             const VALID_ACTION_TYPES: &[&str] = &[
-                "create-new-script", "update-existing-script",
-                "create-new-plugin", "update-existing-plugin",
+                "create-new-script",
+                "update-existing-script",
+                "create-new-plugin",
+                "update-existing-plugin",
             ];
             if let Some(at) = action_type {
                 if !VALID_ACTION_TYPES.contains(&at) {
-                    return Err(format!("actionType must be one of: {}", VALID_ACTION_TYPES.join(", ")));
+                    return Err(format!(
+                        "actionType must be one of: {}",
+                        VALID_ACTION_TYPES.join(", ")
+                    ));
                 }
             }
 
@@ -11548,8 +14382,12 @@ fn task_mcp_execute_tool(app: &tauri::AppHandle, tool_name: &str, args: &Value) 
                 ("artifactPath", artifact_path),
             ] {
                 if let Some(v) = opt_val {
-                    if v.len() > 500 { return Err(format!("{name} exceeds 500 characters")); }
-                    if v.contains(|c: char| matches!(c, '|' | '&' | ';' | '`' | '$' | '>' | '<' | '\n' | '\r')) {
+                    if v.len() > 500 {
+                        return Err(format!("{name} exceeds 500 characters"));
+                    }
+                    if v.contains(|c: char| {
+                        matches!(c, '|' | '&' | ';' | '`' | '$' | '>' | '<' | '\n' | '\r')
+                    }) {
                         return Err(format!("{name} contains unsafe characters"));
                     }
                 }
@@ -11558,22 +14396,54 @@ fn task_mcp_execute_tool(app: &tauri::AppHandle, tool_name: &str, args: &Value) 
             let index = task_mcp_find_task_index(&tasks, task_id)
                 .ok_or_else(|| format!("Task not found: {task_id}"))?;
             let task = &mut tasks[index];
-            if task["workflowSetup"].is_null() { task["workflowSetup"] = serde_json::json!({}); }
-            if let Some(v) = repo_root           { task["workflowSetup"]["repositoryRoot"]           = serde_json::json!(v); }
-            if let Some(v) = plugin_proj         { task["workflowSetup"]["pluginProject"]            = serde_json::json!(v); }
-            if let Some(v) = script_tgt          { task["workflowSetup"]["scriptPath"]               = serde_json::json!(v); }
-            if let Some(v) = customer_id         { task["workflowSetup"]["customerId"]               = serde_json::json!(v); }
-            if let Some(v) = primary_entity      { task["workflowSetup"]["primaryEntityLogicalName"] = serde_json::json!(v); }
-            if let Some(v) = action_type         { task["workflowSetup"]["actionType"]               = serde_json::json!(v); }
-            if let Some(v) = event_name          { task["workflowSetup"]["eventName"]                = serde_json::json!(v); }
-            if let Some(v) = event_field_name    { task["workflowSetup"]["eventFieldName"]           = serde_json::json!(v); }
-            if let Some(v) = desired_script_file { task["workflowSetup"]["desiredScriptFile"]        = serde_json::json!(v); }
-            if let Some(v) = naming_source       { task["workflowSetup"]["namingSource"]             = serde_json::json!(v); }
-            if let Some(v) = on_load_fn          { task["workflowSetup"]["onLoadFunctionName"]       = serde_json::json!(v); }
-            if let Some(v) = on_change_fn        { task["workflowSetup"]["onChangeFunctionName"]     = serde_json::json!(v); }
-            if let Some(v) = main_helper          { task["workflowSetup"]["mainHelperSuggestion"]     = serde_json::json!(v); }
-            if let Some(v) = absolute_script_path { task["workflowSetup"]["absoluteScriptPath"]      = serde_json::json!(v); }
-            if let Some(v) = artifact_path        { task["workflowSetup"]["artifactPath"]             = serde_json::json!(v); }
+            if task["workflowSetup"].is_null() {
+                task["workflowSetup"] = serde_json::json!({});
+            }
+            if let Some(v) = repo_root {
+                task["workflowSetup"]["repositoryRoot"] = serde_json::json!(v);
+            }
+            if let Some(v) = plugin_proj {
+                task["workflowSetup"]["pluginProject"] = serde_json::json!(v);
+            }
+            if let Some(v) = script_tgt {
+                task["workflowSetup"]["scriptPath"] = serde_json::json!(v);
+            }
+            if let Some(v) = customer_id {
+                task["workflowSetup"]["customerId"] = serde_json::json!(v);
+            }
+            if let Some(v) = primary_entity {
+                task["workflowSetup"]["primaryEntityLogicalName"] = serde_json::json!(v);
+            }
+            if let Some(v) = action_type {
+                task["workflowSetup"]["actionType"] = serde_json::json!(v);
+            }
+            if let Some(v) = event_name {
+                task["workflowSetup"]["eventName"] = serde_json::json!(v);
+            }
+            if let Some(v) = event_field_name {
+                task["workflowSetup"]["eventFieldName"] = serde_json::json!(v);
+            }
+            if let Some(v) = desired_script_file {
+                task["workflowSetup"]["desiredScriptFile"] = serde_json::json!(v);
+            }
+            if let Some(v) = naming_source {
+                task["workflowSetup"]["namingSource"] = serde_json::json!(v);
+            }
+            if let Some(v) = on_load_fn {
+                task["workflowSetup"]["onLoadFunctionName"] = serde_json::json!(v);
+            }
+            if let Some(v) = on_change_fn {
+                task["workflowSetup"]["onChangeFunctionName"] = serde_json::json!(v);
+            }
+            if let Some(v) = main_helper {
+                task["workflowSetup"]["mainHelperSuggestion"] = serde_json::json!(v);
+            }
+            if let Some(v) = absolute_script_path {
+                task["workflowSetup"]["absoluteScriptPath"] = serde_json::json!(v);
+            }
+            if let Some(v) = artifact_path {
+                task["workflowSetup"]["artifactPath"] = serde_json::json!(v);
+            }
             task_mcp_append_audit_note(task, "set_task_developer_target");
             updated = true;
             serde_json::json!({"task": task_mcp_safe_task_summary(task)})
@@ -11581,11 +14451,15 @@ fn task_mcp_execute_tool(app: &tauri::AppHandle, tool_name: &str, args: &Value) 
 
         "confirm_task_setup" => {
             let task_id = args["taskId"].as_str().unwrap_or("").trim();
-            if task_id.is_empty() { return Err("Missing required argument: taskId".to_string()); }
+            if task_id.is_empty() {
+                return Err("Missing required argument: taskId".to_string());
+            }
             let index = task_mcp_find_task_index(&tasks, task_id)
                 .ok_or_else(|| format!("Task not found: {task_id}"))?;
             let task = &mut tasks[index];
-            if task["workflowSetup"].is_null() { task["workflowSetup"] = serde_json::json!({}); }
+            if task["workflowSetup"].is_null() {
+                task["workflowSetup"] = serde_json::json!({});
+            }
             task["workflowSetup"]["confirmedAt"] = serde_json::json!(chrono_now_iso());
             if task["status"].as_str() == Some("new") {
                 task["status"] = serde_json::json!("analyzed");
@@ -11597,10 +14471,15 @@ fn task_mcp_execute_tool(app: &tauri::AppHandle, tool_name: &str, args: &Value) 
 
         "set_task_phase" => {
             let task_id = args["taskId"].as_str().unwrap_or("").trim();
-            if task_id.is_empty() { return Err("Missing required argument: taskId".to_string()); }
+            if task_id.is_empty() {
+                return Err("Missing required argument: taskId".to_string());
+            }
             let phase = args["phase"].as_str().unwrap_or("").trim();
             if !task_mcp_allowed_phases().contains(&phase) {
-                return Err(format!("Invalid phase '{phase}'. Allowed: {}", task_mcp_allowed_phases().join(", ")));
+                return Err(format!(
+                    "Invalid phase '{phase}'. Allowed: {}",
+                    task_mcp_allowed_phases().join(", ")
+                ));
             }
             let index = task_mcp_find_task_index(&tasks, task_id)
                 .ok_or_else(|| format!("Task not found: {task_id}"))?;
@@ -11621,15 +14500,22 @@ fn task_mcp_execute_tool(app: &tauri::AppHandle, tool_name: &str, args: &Value) 
 
         "record_ai_implementation_completed" => {
             let task_id = args["taskId"].as_str().unwrap_or("").trim();
-            if task_id.is_empty() { return Err("Missing required argument: taskId".to_string()); }
+            if task_id.is_empty() {
+                return Err("Missing required argument: taskId".to_string());
+            }
 
-            let files_changed: Vec<&str> = args["filesChanged"].as_array()
+            let files_changed: Vec<&str> = args["filesChanged"]
+                .as_array()
                 .map(|a| a.iter().filter_map(|v| v.as_str()).collect())
                 .unwrap_or_default();
-            if files_changed.is_empty() { return Err("filesChanged must be a non-empty array".to_string()); }
+            if files_changed.is_empty() {
+                return Err("filesChanged must be a non-empty array".to_string());
+            }
 
             let summary = args["summary"].as_str().unwrap_or("").trim();
-            if summary.is_empty() { return Err("Missing required argument: summary".to_string()); }
+            if summary.is_empty() {
+                return Err("Missing required argument: summary".to_string());
+            }
 
             let index = task_mcp_find_task_index(&tasks, task_id)
                 .ok_or_else(|| format!("Task not found: {task_id}"))?;
@@ -11638,21 +14524,29 @@ fn task_mcp_execute_tool(app: &tauri::AppHandle, tool_name: &str, args: &Value) 
             if task["taskMode"].as_str() != Some("developer") {
                 return Err("Task is not in developer mode.".to_string());
             }
-            let plan_approved = task["crmDeveloperWorkflow"]["planApproval"]["approved"].as_bool().unwrap_or(false);
-            let plan_invalidated = !task["crmDeveloperWorkflow"]["planApproval"]["invalidatedAt"].is_null();
+            let plan_approved = task["crmDeveloperWorkflow"]["planApproval"]["approved"]
+                .as_bool()
+                .unwrap_or(false);
+            let plan_invalidated =
+                !task["crmDeveloperWorkflow"]["planApproval"]["invalidatedAt"].is_null();
             if !plan_approved || plan_invalidated {
                 return Err("Technical plan is not approved. Approve the plan before recording implementation.".to_string());
             }
 
             let now = chrono_now_iso();
-            let implementation_checks = args["implementationChecks"].as_array().cloned().unwrap_or_default();
+            let implementation_checks = args["implementationChecks"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default();
             task["crmDeveloperWorkflow"]["lastAiImplementation"] = serde_json::json!({
                 "filesChanged": files_changed,
                 "summary": summary,
                 "implementationChecks": implementation_checks,
                 "completedAt": now,
             });
-            if task["mcpChecklistOverrides"].is_null() { task["mcpChecklistOverrides"] = serde_json::json!({}); }
+            if task["mcpChecklistOverrides"].is_null() {
+                task["mcpChecklistOverrides"] = serde_json::json!({});
+            }
             task["mcpChecklistOverrides"]["implementation-done"] = serde_json::json!("done");
             task["localTestRecord"] = serde_json::json!({
                 "status":    "not-needed",
@@ -11677,11 +14571,24 @@ fn task_mcp_execute_tool(app: &tauri::AppHandle, tool_name: &str, args: &Value) 
             };
             // The implementation changed — any previous run_implementation_verification result is stale.
             if task["implementationVerification"]["mcpVerification"].is_object() {
-                task["implementationVerification"].as_object_mut().unwrap().remove("mcpVerification");
+                task["implementationVerification"]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("mcpVerification");
             }
 
-            task_mcp_append_audit_note(task, &format!("record_ai_implementation_completed: {}", files_changed.join(", ")));
-            task_mcp_apply_developer_workflow_transition(task, "ai_implementation_completed", &Value::Null);
+            task_mcp_append_audit_note(
+                task,
+                &format!(
+                    "record_ai_implementation_completed: {}",
+                    files_changed.join(", ")
+                ),
+            );
+            task_mcp_apply_developer_workflow_transition(
+                task,
+                "ai_implementation_completed",
+                &Value::Null,
+            );
             updated = true;
             serde_json::json!({
                 "recorded": true,
@@ -11694,7 +14601,9 @@ fn task_mcp_execute_tool(app: &tauri::AppHandle, tool_name: &str, args: &Value) 
 
         "run_implementation_verification" => {
             let task_id = args["taskId"].as_str().unwrap_or("").trim();
-            if task_id.is_empty() { return Err("Missing required argument: taskId".to_string()); }
+            if task_id.is_empty() {
+                return Err("Missing required argument: taskId".to_string());
+            }
             let index = task_mcp_find_task_index(&tasks, task_id)
                 .ok_or_else(|| format!("Task not found: {task_id}"))?;
 
@@ -11706,10 +14615,20 @@ fn task_mcp_execute_tool(app: &tauri::AppHandle, tool_name: &str, args: &Value) 
             }
             let is_plugin = task_mcp_is_plugin_dev_task(&tasks[index]);
 
-            let requested_checks: Option<std::collections::HashSet<String>> = args["checks"].as_array()
+            let requested_checks: Option<std::collections::HashSet<String>> = args["checks"]
+                .as_array()
                 .filter(|a| !a.is_empty())
-                .map(|a| a.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect());
-            let run_check = |key: &str| requested_checks.as_ref().map(|set| set.contains(key)).unwrap_or(true);
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                        .collect()
+                });
+            let run_check = |key: &str| {
+                requested_checks
+                    .as_ref()
+                    .map(|set| set.contains(key))
+                    .unwrap_or(true)
+            };
 
             let mut checks: Vec<Value> = Vec::new();
             let mut fixable_findings: Vec<Value> = Vec::new();
@@ -11717,11 +14636,21 @@ fn task_mcp_execute_tool(app: &tauri::AppHandle, tool_name: &str, args: &Value) 
             let mut readiness_finding: Option<String> = None;
             let mut file_content: Option<String> = None;
             let mut absolute_script_path: Option<String> = None;
-            let readiness_label = if is_plugin { "Plugin File Readiness" } else { "Script File Readiness" };
+            let readiness_label = if is_plugin {
+                "Plugin File Readiness"
+            } else {
+                "Script File Readiness"
+            };
 
             if run_check("scriptFileReadiness") {
                 let absolute_path = if is_plugin {
-                    match mcp_resolve_artifact_path(app, &tasks[index].clone(), true, &mut tasks, index) {
+                    match mcp_resolve_artifact_path(
+                        app,
+                        &tasks[index].clone(),
+                        true,
+                        &mut tasks,
+                        index,
+                    ) {
                         Ok((p, _inferred)) => Some(p),
                         Err(_) => None,
                     }
@@ -11771,10 +14700,20 @@ fn task_mcp_execute_tool(app: &tauri::AppHandle, tool_name: &str, args: &Value) 
                 if is_plugin {
                     checks.push(serde_json::json!({ "name": "Local Static/Business-Rule Verification", "status": "skipped", "findings": ["Not applicable — static rule templates currently cover JS/TS script tasks only."] }));
                 } else if let Some(content) = &file_content {
-                    let template = task_mcp_builtin_templates().into_iter()
-                        .find(|t| tasks[index]["title"].as_str().unwrap_or("").to_lowercase()
-                            .contains(&t["titlePattern"].as_str().unwrap_or("__none__").to_lowercase()));
-                    let (status, findings, fixable) = task_mcp_run_static_business_rule_checks(template.as_ref(), content);
+                    let template = task_mcp_builtin_templates().into_iter().find(|t| {
+                        tasks[index]["title"]
+                            .as_str()
+                            .unwrap_or("")
+                            .to_lowercase()
+                            .contains(
+                                &t["titlePattern"]
+                                    .as_str()
+                                    .unwrap_or("__none__")
+                                    .to_lowercase(),
+                            )
+                    });
+                    let (status, findings, fixable) =
+                        task_mcp_run_static_business_rule_checks(template.as_ref(), content);
                     checks.push(serde_json::json!({ "name": "Local Static/Business-Rule Verification", "status": status, "findings": findings }));
                     fixable_findings.extend(fixable);
                 } else {
@@ -11789,22 +14728,35 @@ fn task_mcp_execute_tool(app: &tauri::AppHandle, tool_name: &str, args: &Value) 
             // them (implementationVerification.dataverseCheck.warningsAccepted) — see
             // task_mcp_normalize_dataverse_gate.
             if run_check("dataverseMetadataCheck") {
-                if tasks[index]["implementationVerification"].is_null() { tasks[index]["implementationVerification"] = serde_json::json!({}); }
-                if tasks[index]["implementationVerification"]["dataverseCheck"].is_null() { tasks[index]["implementationVerification"]["dataverseCheck"] = serde_json::json!({}); }
+                if tasks[index]["implementationVerification"].is_null() {
+                    tasks[index]["implementationVerification"] = serde_json::json!({});
+                }
+                if tasks[index]["implementationVerification"]["dataverseCheck"].is_null() {
+                    tasks[index]["implementationVerification"]["dataverseCheck"] =
+                        serde_json::json!({});
+                }
                 // "needs_configuration" is only ever a transient override — clear a stale one from a
                 // prior run before deciding this run's outcome, so a since-fixed configuration
                 // doesn't leave the modal permanently stuck reporting needs_configuration.
-                if tasks[index]["implementationVerification"]["dataverseCheck"]["status"].as_str() == Some("needs_configuration") {
-                    tasks[index]["implementationVerification"]["dataverseCheck"]["status"] = Value::Null;
+                if tasks[index]["implementationVerification"]["dataverseCheck"]["status"].as_str()
+                    == Some("needs_configuration")
+                {
+                    tasks[index]["implementationVerification"]["dataverseCheck"]["status"] =
+                        Value::Null;
                 }
                 let settings = load_settings(app.clone())?;
                 let customers = task_mcp_load_customers(app).unwrap_or_default();
-                let expected_env = customers.iter()
+                let expected_env = customers
+                    .iter()
                     .find(|c| c["id"].as_str() == tasks[index]["customerId"].as_str())
-                    .and_then(|c| c["dataverseEnvironmentLabel"].as_str()).map(str::to_string);
-                let active_env = settings["primarchMcpEnvironmentLabel"].as_str()
-                    .filter(|s| !s.trim().is_empty()).map(str::to_string);
-                let env_mismatch = task_mcp_dataverse_environment_mismatch(&tasks[index], &customers, &settings);
+                    .and_then(|c| c["dataverseEnvironmentLabel"].as_str())
+                    .map(str::to_string);
+                let active_env = settings["primarchMcpEnvironmentLabel"]
+                    .as_str()
+                    .filter(|s| !s.trim().is_empty())
+                    .map(str::to_string);
+                let env_mismatch =
+                    task_mcp_dataverse_environment_mismatch(&tasks[index], &customers, &settings);
                 let environment_detail = serde_json::json!({
                     "expected": expected_env,
                     "active": active_env,
@@ -11825,8 +14777,10 @@ fn task_mcp_execute_tool(app: &tauri::AppHandle, tool_name: &str, args: &Value) 
                         let reason = format!(
                             "Active Primarch/Dataverse connection ('{active}') does not match this task's expected environment ('{expected}'). Switch the connection or update the task's customer environment label in Settings, then rerun the check. The check was NOT run against the wrong environment.",
                         );
-                        tasks[index]["implementationVerification"]["dataverseCheck"]["status"] = serde_json::json!("needs_configuration");
-                        tasks[index]["implementationVerification"]["dataverseCheck"]["message"] = serde_json::json!(reason);
+                        tasks[index]["implementationVerification"]["dataverseCheck"]["status"] =
+                            serde_json::json!("needs_configuration");
+                        tasks[index]["implementationVerification"]["dataverseCheck"]["message"] =
+                            serde_json::json!(reason);
                         checks.push(serde_json::json!({
                             "name": "Dataverse Metadata Check",
                             "status": "needs_configuration",
@@ -11834,34 +14788,65 @@ fn task_mcp_execute_tool(app: &tauri::AppHandle, tool_name: &str, args: &Value) 
                             "environment": environment_detail,
                         }));
                     }
-                    Some(path) => {
-                        match get_mcp_config(&settings) {
-                            Err(msg) => {
-                                let reason = format!("Dataverse Metadata Check is not configured: {msg}");
-                                tasks[index]["implementationVerification"]["dataverseCheck"]["status"] = serde_json::json!("needs_configuration");
-                                tasks[index]["implementationVerification"]["dataverseCheck"]["message"] = serde_json::json!(reason);
-                                checks.push(serde_json::json!({
-                                    "name": "Dataverse Metadata Check",
-                                    "status": "needs_configuration",
-                                    "findings": [reason],
-                                    "environment": environment_detail,
-                                }));
-                            }
-                            Ok(_) => {
-                                let scan_hint = tasks[index]["workflowSetup"]["primaryEntityLogicalName"].as_str()
-                                    .map(str::to_string)
-                                    .or_else(|| tasks[index]["crmDeveloperWorkflow"]["technicalPlan"]["target"]["entityLogicalName"].as_str().map(str::to_string));
-                                match task_mcp_run_dataverse_metadata_check(app, &mut tasks, index, path, scan_hint.as_deref(), None) {
-                                    Ok(report) => {
-                                        let (dv_status, finding, dv_fixable) = task_mcp_dataverse_check_from_report(&report);
-                                        let warnings_accepted = task_mcp_dataverse_warnings_accepted(&tasks[index]);
-                                        let gate_status = task_mcp_normalize_dataverse_gate(&dv_status, warnings_accepted);
-                                        fixable_findings.extend(dv_fixable);
-                                        let checked_references = task_mcp_build_verified_references_list(&report);
-                                        if tasks[index]["implementationVerification"].is_null() { tasks[index]["implementationVerification"] = serde_json::json!({}); }
-                                        if tasks[index]["implementationVerification"]["dataverseCheck"].is_null() { tasks[index]["implementationVerification"]["dataverseCheck"] = serde_json::json!({}); }
-                                        tasks[index]["implementationVerification"]["dataverseCheck"]["environment"] = environment_detail.clone();
-                                        checks.push(serde_json::json!({
+                    Some(path) => match get_mcp_config(&settings) {
+                        Err(msg) => {
+                            let reason =
+                                format!("Dataverse Metadata Check is not configured: {msg}");
+                            tasks[index]["implementationVerification"]["dataverseCheck"]
+                                ["status"] = serde_json::json!("needs_configuration");
+                            tasks[index]["implementationVerification"]["dataverseCheck"]
+                                ["message"] = serde_json::json!(reason);
+                            checks.push(serde_json::json!({
+                                "name": "Dataverse Metadata Check",
+                                "status": "needs_configuration",
+                                "findings": [reason],
+                                "environment": environment_detail,
+                            }));
+                        }
+                        Ok(_) => {
+                            let scan_hint = tasks[index]["workflowSetup"]
+                                ["primaryEntityLogicalName"]
+                                .as_str()
+                                .map(str::to_string)
+                                .or_else(|| {
+                                    tasks[index]["crmDeveloperWorkflow"]["technicalPlan"]["target"]
+                                        ["entityLogicalName"]
+                                        .as_str()
+                                        .map(str::to_string)
+                                });
+                            match task_mcp_run_dataverse_metadata_check(
+                                app,
+                                &mut tasks,
+                                index,
+                                path,
+                                scan_hint.as_deref(),
+                                None,
+                            ) {
+                                Ok(report) => {
+                                    let (dv_status, finding, dv_fixable) =
+                                        task_mcp_dataverse_check_from_report(&report);
+                                    let warnings_accepted =
+                                        task_mcp_dataverse_warnings_accepted(&tasks[index]);
+                                    let gate_status = task_mcp_normalize_dataverse_gate(
+                                        &dv_status,
+                                        warnings_accepted,
+                                    );
+                                    fixable_findings.extend(dv_fixable);
+                                    let checked_references =
+                                        task_mcp_build_verified_references_list(&report);
+                                    if tasks[index]["implementationVerification"].is_null() {
+                                        tasks[index]["implementationVerification"] =
+                                            serde_json::json!({});
+                                    }
+                                    if tasks[index]["implementationVerification"]["dataverseCheck"]
+                                        .is_null()
+                                    {
+                                        tasks[index]["implementationVerification"]
+                                            ["dataverseCheck"] = serde_json::json!({});
+                                    }
+                                    tasks[index]["implementationVerification"]["dataverseCheck"]
+                                        ["environment"] = environment_detail.clone();
+                                    checks.push(serde_json::json!({
                                             "name": "Dataverse Metadata Check",
                                             "status": gate_status,
                                             "rawStatus": dv_status,
@@ -11870,19 +14855,18 @@ fn task_mcp_execute_tool(app: &tauri::AppHandle, tool_name: &str, args: &Value) 
                                             "checkedReferences": checked_references,
                                             "warningsAccepted": tasks[index]["implementationVerification"]["dataverseCheck"]["warningsAccepted"].clone(),
                                         }));
-                                    }
-                                    Err(e) => {
-                                        checks.push(serde_json::json!({
+                                }
+                                Err(e) => {
+                                    checks.push(serde_json::json!({
                                             "name": "Dataverse Metadata Check",
                                             "status": "failed",
                                             "findings": [format!("Dataverse Metadata Check failed: {e}")],
                                             "environment": environment_detail,
                                         }));
-                                    }
                                 }
                             }
                         }
-                    }
+                    },
                 }
             }
 
@@ -11901,14 +14885,19 @@ fn task_mcp_execute_tool(app: &tauri::AppHandle, tool_name: &str, args: &Value) 
                     "passed" => {
                         let ai_raw_status = ai_review["status"].as_str().unwrap_or("");
                         let passed_finding = match ai_raw_status {
-                            "manually-verified" => "AI Kit review gate resolved via explicit manual verification.",
+                            "manually-verified" => {
+                                "AI Kit review gate resolved via explicit manual verification."
+                            }
                             "skipped" => "AI Kit review gate resolved via explicit manual skip.",
                             _ => "AI Kit review passed with full review details recorded.",
                         };
                         checks.push(serde_json::json!({ "name": "AI Internal Code Review", "status": "passed", "rawStatus": ai_raw_status, "findings": [passed_finding], "review": ai_review }));
                     }
                     "failed" => {
-                        let ai_fixable = ai_review["fixableFindings"].as_array().cloned().unwrap_or_default();
+                        let ai_fixable = ai_review["fixableFindings"]
+                            .as_array()
+                            .cloned()
+                            .unwrap_or_default();
                         if ai_fixable.is_empty() {
                             fixable_findings.push(serde_json::json!({ "id": "ai-kit-review-failed", "description": "AI Kit review verdict is 'failed'. Address the findings and call record_ai_kit_review_result again." }));
                         } else {
@@ -11947,17 +14936,23 @@ fn task_mcp_execute_tool(app: &tauri::AppHandle, tool_name: &str, args: &Value) 
                 checks.push(serde_json::json!({ "name": "Local Test", "status": status, "findings": [finding] }));
             }
 
-            let (status, next_action) = task_mcp_rollup_verification_status(&checks, fixable_findings.len());
+            let (status, next_action) =
+                task_mcp_rollup_verification_status(&checks, fixable_findings.len());
             // Fail-fast: never tell the agent to call record_ai_kit_review_result if this
             // toolset does not actually expose it — that produces a confusing "tool not
             // found"/"bridge not running" error after the fact instead of one clear instruction now.
-            let (status, next_action, missing_required_tools) = task_mcp_apply_tooling_availability_guard(
-                status, next_action, &task_mcp_missing_required_tools(),
-            );
+            let (status, next_action, missing_required_tools) =
+                task_mcp_apply_tooling_availability_guard(
+                    status,
+                    next_action,
+                    &task_mcp_missing_required_tools(),
+                );
 
             let now = chrono_now_iso();
             let task = &mut tasks[index];
-            if task["implementationVerification"].is_null() { task["implementationVerification"] = serde_json::json!({}); }
+            if task["implementationVerification"].is_null() {
+                task["implementationVerification"] = serde_json::json!({});
+            }
             task["implementationVerification"]["mcpVerification"] = serde_json::json!({
                 "status": status,
                 "checks": checks,
@@ -11973,21 +14968,28 @@ fn task_mcp_execute_tool(app: &tauri::AppHandle, tool_name: &str, args: &Value) 
                     "findings": [format!("{}|{}", if rstatus == "passed" { "pass" } else { "fail" }, rfinding)],
                 });
             }
-            task_mcp_append_audit_note(task, &format!("run_implementation_verification -> {status}/{next_action}"));
+            task_mcp_append_audit_note(
+                task,
+                &format!("run_implementation_verification -> {status}/{next_action}"),
+            );
             updated = true;
 
             // Modal-truth summary, built from the SAME canonical fields ImplementationVerification
             // Modal reads (now including the buildCheck we just wrote above, and the real
             // crmVerificationReports/aiCodeReview state the checks above may have just written).
             let mut implementation_verification = task_mcp_build_modal_verification_summary(task);
-            if let Some(static_check) = checks.iter().find(|c| c["name"] == "Local Static/Business-Rule Verification") {
+            if let Some(static_check) = checks
+                .iter()
+                .find(|c| c["name"] == "Local Static/Business-Rule Verification")
+            {
                 implementation_verification["staticBusinessRules"] = serde_json::json!({
                     "status": static_check["status"],
                     "label": static_check["name"],
                     "findings": static_check["findings"],
                 });
             }
-            let unresolved_required_rows = task_mcp_unresolved_modal_rows(&implementation_verification);
+            let unresolved_required_rows =
+                task_mcp_unresolved_modal_rows(&implementation_verification);
             let next_recommended_step = match next_action {
                 "reload_mcp_or_start_app" => "Stop. Ask the user to start Task Workbench and reload the MCP server. Do not claim AI Kit review must be done manually unless the tool capability check says AI review cannot be automated.".to_string(),
                 "needs_configuration" => checks.iter()
@@ -12019,13 +15021,21 @@ fn task_mcp_execute_tool(app: &tauri::AppHandle, tool_name: &str, args: &Value) 
 
         "get_implementation_verification_summary" => {
             let task_id = args["taskId"].as_str().unwrap_or("").trim();
-            if task_id.is_empty() { return Err("Missing required argument: taskId".to_string()); }
+            if task_id.is_empty() {
+                return Err("Missing required argument: taskId".to_string());
+            }
             let task = task_mcp_get_task(&tasks, task_id)
                 .ok_or_else(|| format!("Task not found: {task_id}"))?;
 
             let mut implementation_verification = task_mcp_build_modal_verification_summary(task);
-            let persisted_checks = task["implementationVerification"]["mcpVerification"]["checks"].as_array().cloned().unwrap_or_default();
-            if let Some(static_check) = persisted_checks.iter().find(|c| c["name"] == "Local Static/Business-Rule Verification") {
+            let persisted_checks = task["implementationVerification"]["mcpVerification"]["checks"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default();
+            if let Some(static_check) = persisted_checks
+                .iter()
+                .find(|c| c["name"] == "Local Static/Business-Rule Verification")
+            {
                 implementation_verification["staticBusinessRules"] = serde_json::json!({
                     "status": static_check["status"],
                     "label": static_check["name"],
@@ -12033,12 +15043,20 @@ fn task_mcp_execute_tool(app: &tauri::AppHandle, tool_name: &str, args: &Value) 
                 });
             }
 
-            let unresolved_required_rows = task_mcp_unresolved_modal_rows(&implementation_verification);
-            let fixable_findings = task["implementationVerification"]["mcpVerification"]["fixableFindings"].as_array().cloned().unwrap_or_default();
+            let unresolved_required_rows =
+                task_mcp_unresolved_modal_rows(&implementation_verification);
+            let fixable_findings = task["implementationVerification"]["mcpVerification"]
+                ["fixableFindings"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default();
             // Reuse the nextAction persisted by run_implementation_verification when available, so
             // this read-only summary never diverges from the actual last run (needs_configuration/
             // run_ai_kit_review/etc.) — only fall back to the simple derivation when nothing ran yet.
-            let persisted_next_action = task["implementationVerification"]["mcpVerification"]["nextAction"].as_str().map(str::to_string);
+            let persisted_next_action = task["implementationVerification"]["mcpVerification"]
+                ["nextAction"]
+                .as_str()
+                .map(str::to_string);
             let next_action = persisted_next_action.unwrap_or_else(|| {
                 if !fixable_findings.is_empty() {
                     "fix_code".to_string()
@@ -12077,12 +15095,19 @@ fn task_mcp_execute_tool(app: &tauri::AppHandle, tool_name: &str, args: &Value) 
 
         "get_deployment_testing_state" => {
             let task_id = args["taskId"].as_str().unwrap_or("").trim();
-            if task_id.is_empty() { return Err("Missing required argument: taskId".to_string()); }
+            if task_id.is_empty() {
+                return Err("Missing required argument: taskId".to_string());
+            }
             let task = task_mcp_get_task(&tasks, task_id)
                 .ok_or_else(|| format!("Task not found: {task_id}"))?;
             let gate = task_mcp_compute_deployment_testing_gate(task);
-            let unresolved_required_rows: Vec<String> = gate["blockingChecks"].as_array()
-                .map(|a| a.iter().filter_map(|c| c["check"].as_str().map(str::to_string)).collect())
+            let unresolved_required_rows: Vec<String> = gate["blockingChecks"]
+                .as_array()
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|c| c["check"].as_str().map(str::to_string))
+                        .collect()
+                })
                 .unwrap_or_default();
             serde_json::json!({
                 "taskId": task_id,
@@ -12097,7 +15122,9 @@ fn task_mcp_execute_tool(app: &tauri::AppHandle, tool_name: &str, args: &Value) 
 
         "get_pull_request_state" => {
             let task_id = args["taskId"].as_str().unwrap_or("").trim();
-            if task_id.is_empty() { return Err("Missing required argument: taskId".to_string()); }
+            if task_id.is_empty() {
+                return Err("Missing required argument: taskId".to_string());
+            }
             let task = task_mcp_get_task(&tasks, task_id)
                 .ok_or_else(|| format!("Task not found: {task_id}"))?;
             let readiness = task_mcp_compute_code_review_readiness_gate(task);
@@ -12114,7 +15141,9 @@ fn task_mcp_execute_tool(app: &tauri::AppHandle, tool_name: &str, args: &Value) 
 
         "record_manual_deployment" => {
             let task_id = args["taskId"].as_str().unwrap_or("").trim();
-            if task_id.is_empty() { return Err("Missing required argument: taskId".to_string()); }
+            if task_id.is_empty() {
+                return Err("Missing required argument: taskId".to_string());
+            }
             let status = args["status"].as_str().unwrap_or("").trim().to_string();
             if !matches!(status.as_str(), "deployed" | "failed" | "not-needed") {
                 return Err("status must be 'deployed', 'failed', or 'not-needed'".to_string());
@@ -12126,18 +15155,28 @@ fn task_mcp_execute_tool(app: &tauri::AppHandle, tool_name: &str, args: &Value) 
             let now = chrono_now_iso();
             {
                 let t = &mut tasks[index];
-                if t["deploymentTesting"].is_null() { t["deploymentTesting"] = serde_json::json!({}); }
+                if t["deploymentTesting"].is_null() {
+                    t["deploymentTesting"] = serde_json::json!({});
+                }
                 let mut record = serde_json::json!({
                     "status": status, "recordedAt": now, "recordedBy": "ai",
                 });
-                if !notes.is_empty() { record["notes"] = serde_json::json!(notes); }
+                if !notes.is_empty() {
+                    record["notes"] = serde_json::json!(notes);
+                }
                 for (key, arg_key) in [
-                    ("environmentId", "environmentId"), ("environmentName", "environmentName"),
-                    ("solutionUniqueName", "solutionUniqueName"), ("artifactType", "artifactType"),
-                    ("artifactPath", "artifactPath"), ("webResourceName", "webResourceName"),
-                    ("entityLogicalName", "entityLogicalName"), ("formName", "formName"),
+                    ("environmentId", "environmentId"),
+                    ("environmentName", "environmentName"),
+                    ("solutionUniqueName", "solutionUniqueName"),
+                    ("artifactType", "artifactType"),
+                    ("artifactPath", "artifactPath"),
+                    ("webResourceName", "webResourceName"),
+                    ("entityLogicalName", "entityLogicalName"),
+                    ("formName", "formName"),
                 ] {
-                    if let Some(v) = args[arg_key].as_str() { record[key] = serde_json::json!(v); }
+                    if let Some(v) = args[arg_key].as_str() {
+                        record[key] = serde_json::json!(v);
+                    }
                 }
                 t["deploymentTesting"]["deployment"] = record;
                 t["deploymentTesting"]["updatedAt"] = serde_json::json!(now);
@@ -12157,7 +15196,9 @@ fn task_mcp_execute_tool(app: &tauri::AppHandle, tool_name: &str, args: &Value) 
 
         "record_deployment_test" => {
             let task_id = args["taskId"].as_str().unwrap_or("").trim();
-            if task_id.is_empty() { return Err("Missing required argument: taskId".to_string()); }
+            if task_id.is_empty() {
+                return Err("Missing required argument: taskId".to_string());
+            }
             let status = args["status"].as_str().unwrap_or("").trim().to_string();
             if !matches!(status.as_str(), "passed" | "failed" | "not-needed") {
                 return Err("status must be 'passed', 'failed', or 'not-needed'".to_string());
@@ -12174,13 +15215,21 @@ fn task_mcp_execute_tool(app: &tauri::AppHandle, tool_name: &str, args: &Value) 
             let now = chrono_now_iso();
             {
                 let t = &mut tasks[index];
-                if t["deploymentTesting"].is_null() { t["deploymentTesting"] = serde_json::json!({}); }
+                if t["deploymentTesting"].is_null() {
+                    t["deploymentTesting"] = serde_json::json!({});
+                }
                 let mut record = serde_json::json!({
                     "status": status, "recordedAt": now, "recordedBy": "ai",
                 });
-                if !notes.is_empty() { record["notes"] = serde_json::json!(notes); }
-                if let Some(v) = args["testedEnvironment"].as_str() { record["testedEnvironment"] = serde_json::json!(v); }
-                if let Some(v) = args["testedAcceptanceCriteria"].as_array() { record["testedAcceptanceCriteria"] = serde_json::json!(v); }
+                if !notes.is_empty() {
+                    record["notes"] = serde_json::json!(notes);
+                }
+                if let Some(v) = args["testedEnvironment"].as_str() {
+                    record["testedEnvironment"] = serde_json::json!(v);
+                }
+                if let Some(v) = args["testedAcceptanceCriteria"].as_array() {
+                    record["testedAcceptanceCriteria"] = serde_json::json!(v);
+                }
                 t["deploymentTesting"]["test"] = record;
                 t["deploymentTesting"]["updatedAt"] = serde_json::json!(now);
                 if status == "failed" {
@@ -12199,17 +15248,25 @@ fn task_mcp_execute_tool(app: &tauri::AppHandle, tool_name: &str, args: &Value) 
 
         "record_pull_request_created" => {
             let task_id = args["taskId"].as_str().unwrap_or("").trim();
-            if task_id.is_empty() { return Err("Missing required argument: taskId".to_string()); }
+            if task_id.is_empty() {
+                return Err("Missing required argument: taskId".to_string());
+            }
             let pr_url = args["prUrl"].as_str().unwrap_or("").trim().to_string();
-            if pr_url.is_empty() { return Err("Missing required argument: prUrl".to_string()); }
+            if pr_url.is_empty() {
+                return Err("Missing required argument: prUrl".to_string());
+            }
             let index = task_mcp_find_task_index(&tasks, task_id)
                 .ok_or_else(|| format!("Task not found: {task_id}"))?;
             let now = chrono_now_iso();
             {
                 let t = &mut tasks[index];
-                if t["crmDeveloperWorkflow"].is_null() { t["crmDeveloperWorkflow"] = serde_json::json!({}); }
+                if t["crmDeveloperWorkflow"].is_null() {
+                    t["crmDeveloperWorkflow"] = serde_json::json!({});
+                }
                 let mut tracking = serde_json::json!({ "createdManually": true, "createdAt": now, "prUrl": pr_url });
-                if let Some(v) = args["notes"].as_str() { tracking["notes"] = serde_json::json!(v); }
+                if let Some(v) = args["notes"].as_str() {
+                    tracking["notes"] = serde_json::json!(v);
+                }
                 t["crmDeveloperWorkflow"]["pullRequestTracking"] = tracking;
                 task_mcp_append_audit_note(t, &format!("record_pull_request_created -> {pr_url}"));
             }
@@ -12236,12 +15293,18 @@ fn task_mcp_execute_tool(app: &tauri::AppHandle, tool_name: &str, args: &Value) 
 
         "record_local_test" => {
             let task_id = args["taskId"].as_str().unwrap_or("").trim();
-            if task_id.is_empty() { return Err("Missing required argument: taskId".to_string()); }
+            if task_id.is_empty() {
+                return Err("Missing required argument: taskId".to_string());
+            }
             let status = args["status"].as_str().unwrap_or("").trim();
             if !task_mcp_allowed_local_test_statuses().contains(&status) {
-                return Err(format!("Invalid status '{status}'. Allowed: {}", task_mcp_allowed_local_test_statuses().join(", ")));
+                return Err(format!(
+                    "Invalid status '{status}'. Allowed: {}",
+                    task_mcp_allowed_local_test_statuses().join(", ")
+                ));
             }
-            let note = args["note"].as_str()
+            let note = args["note"]
+                .as_str()
                 .map(|n| task_mcp_normalize_small_text(n, 500))
                 .filter(|s| !s.is_empty());
 
@@ -12255,12 +15318,14 @@ fn task_mcp_execute_tool(app: &tauri::AppHandle, tool_name: &str, args: &Value) 
             });
             // Reflect in checklist overrides
             let checklist_status = match status {
-                "passed"      => "done",
-                "failed"      => "warning",
-                "not-needed"  => "optional",
-                _             => "not-done",
+                "passed" => "done",
+                "failed" => "warning",
+                "not-needed" => "optional",
+                _ => "not-done",
             };
-            if task["mcpChecklistOverrides"].is_null() { task["mcpChecklistOverrides"] = serde_json::json!({}); }
+            if task["mcpChecklistOverrides"].is_null() {
+                task["mcpChecklistOverrides"] = serde_json::json!({});
+            }
             task["mcpChecklistOverrides"]["local-test-done"] = serde_json::json!(checklist_status);
             task_mcp_append_audit_note(task, &format!("record_local_test -> {status}"));
             updated = true;
@@ -12269,12 +15334,18 @@ fn task_mcp_execute_tool(app: &tauri::AppHandle, tool_name: &str, args: &Value) 
 
         "record_consultant_testing" => {
             let task_id = args["taskId"].as_str().unwrap_or("").trim();
-            if task_id.is_empty() { return Err("Missing required argument: taskId".to_string()); }
+            if task_id.is_empty() {
+                return Err("Missing required argument: taskId".to_string());
+            }
             let status = args["status"].as_str().unwrap_or("").trim();
             if !task_mcp_allowed_consultant_test_statuses().contains(&status) {
-                return Err(format!("Invalid status '{status}'. Allowed: {}", task_mcp_allowed_consultant_test_statuses().join(", ")));
+                return Err(format!(
+                    "Invalid status '{status}'. Allowed: {}",
+                    task_mcp_allowed_consultant_test_statuses().join(", ")
+                ));
             }
-            let note = args["note"].as_str()
+            let note = args["note"]
+                .as_str()
                 .map(|n| task_mcp_normalize_small_text(n, 500))
                 .filter(|s| !s.is_empty());
 
@@ -12321,13 +15392,17 @@ fn task_mcp_execute_tool(app: &tauri::AppHandle, tool_name: &str, args: &Value) 
 
         "set_task_estimate" => {
             let task_id = args["taskId"].as_str().unwrap_or("").trim();
-            if task_id.is_empty() { return Err("Missing required argument: taskId".to_string()); }
-            let hours = args["hours"].as_f64()
+            if task_id.is_empty() {
+                return Err("Missing required argument: taskId".to_string());
+            }
+            let hours = args["hours"]
+                .as_f64()
                 .ok_or_else(|| "hours must be a number".to_string())?;
             if hours <= 0.0 || hours > 1000.0 {
                 return Err("hours must be a positive number not greater than 1000".to_string());
             }
-            let budget_note = args["note"].as_str()
+            let budget_note = args["note"]
+                .as_str()
                 .map(|n| task_mcp_normalize_small_text(n, 300))
                 .filter(|s| !s.is_empty());
 
@@ -12335,7 +15410,9 @@ fn task_mcp_execute_tool(app: &tauri::AppHandle, tool_name: &str, args: &Value) 
                 .ok_or_else(|| format!("Task not found: {task_id}"))?;
             let task = &mut tasks[index];
             task["estimatedEffort"] = serde_json::json!(hours);
-            if let Some(n) = budget_note { task["budgetNote"] = serde_json::json!(n); }
+            if let Some(n) = budget_note {
+                task["budgetNote"] = serde_json::json!(n);
+            }
             task_mcp_append_audit_note(task, &format!("set_task_estimate -> {hours}h"));
             updated = true;
             serde_json::json!({"task": task_mcp_safe_task_summary(task)})
@@ -12343,14 +15420,19 @@ fn task_mcp_execute_tool(app: &tauri::AppHandle, tool_name: &str, args: &Value) 
 
         "save_technical_plan" => {
             let task_id = args["taskId"].as_str().unwrap_or("").trim();
-            if task_id.is_empty() { return Err("Missing required argument: taskId".to_string()); }
-            let plan_summary = task_mcp_normalize_small_text(args["planSummary"].as_str().unwrap_or(""), 3000);
-            if plan_summary.is_empty() { return Err("planSummary cannot be empty after sanitization.".to_string()); }
+            if task_id.is_empty() {
+                return Err("Missing required argument: taskId".to_string());
+            }
+            let plan_summary =
+                task_mcp_normalize_small_text(args["planSummary"].as_str().unwrap_or(""), 3000);
+            if plan_summary.is_empty() {
+                return Err("planSummary cannot be empty after sanitization.".to_string());
+            }
 
-            let impl_steps     = task_mcp_collect_string_array(&args["implementationSteps"], 20, 500);
-            let test_plan      = task_mcp_collect_string_array(&args["testPlan"], 20, 300);
-            let risks          = task_mcp_collect_string_array(&args["risks"], 10, 300);
-            let crm_entities   = task_mcp_collect_string_array(&args["crmEntities"], 20, 200);
+            let impl_steps = task_mcp_collect_string_array(&args["implementationSteps"], 20, 500);
+            let test_plan = task_mcp_collect_string_array(&args["testPlan"], 20, 300);
+            let risks = task_mcp_collect_string_array(&args["risks"], 10, 300);
+            let crm_entities = task_mcp_collect_string_array(&args["crmEntities"], 20, 200);
             let affected_files = task_mcp_collect_string_array(&args["affectedFiles"], 20, 300);
 
             // Merge entities and files into dataverseFindings
@@ -12369,8 +15451,11 @@ fn task_mcp_execute_tool(app: &tauri::AppHandle, tool_name: &str, args: &Value) 
                 let has_st = st.is_object() && !st.is_null();
                 if has_pt {
                     let sane_str = |v: &Value, max: usize| -> Value {
-                        v.as_str().map(|s| task_mcp_normalize_small_text(s, max)).filter(|s| !s.is_empty())
-                            .map(Value::String).unwrap_or(Value::Null)
+                        v.as_str()
+                            .map(|s| task_mcp_normalize_small_text(s, max))
+                            .filter(|s| !s.is_empty())
+                            .map(Value::String)
+                            .unwrap_or(Value::Null)
                     };
                     serde_json::json!({
                         "entityLogicalName":  sane_str(&pt["entityLogicalName"], 100),
@@ -12386,8 +15471,11 @@ fn task_mcp_execute_tool(app: &tauri::AppHandle, tool_name: &str, args: &Value) 
                     })
                 } else if has_st {
                     let sane_str = |v: &Value, max: usize| -> Value {
-                        v.as_str().map(|s| task_mcp_normalize_small_text(s, max)).filter(|s| !s.is_empty())
-                            .map(Value::String).unwrap_or(Value::Null)
+                        v.as_str()
+                            .map(|s| task_mcp_normalize_small_text(s, max))
+                            .filter(|s| !s.is_empty())
+                            .map(Value::String)
+                            .unwrap_or(Value::Null)
                     };
                     serde_json::json!({
                         "entityLogicalName": sane_str(&st["entityLogicalName"], 100),
@@ -12432,7 +15520,7 @@ fn task_mcp_execute_tool(app: &tauri::AppHandle, tool_name: &str, args: &Value) 
             task["crmDeveloperWorkflow"]["technicalPlan"] = plan;
             // Clear plan approval since plan changed
             task["crmDeveloperWorkflow"]["planApproval"] = Value::Null;
-            task["crmDeveloperWorkflow"]["updatedAt"]    = serde_json::json!(now);
+            task["crmDeveloperWorkflow"]["updatedAt"] = serde_json::json!(now);
             task_mcp_append_audit_note(task, "save_technical_plan");
             updated = true;
             serde_json::json!({"task": task_mcp_safe_task_summary(task)})
@@ -12440,15 +15528,19 @@ fn task_mcp_execute_tool(app: &tauri::AppHandle, tool_name: &str, args: &Value) 
 
         "mark_technical_plan_ready_for_approval" => {
             let task_id = args["taskId"].as_str().unwrap_or("").trim();
-            if task_id.is_empty() { return Err("Missing required argument: taskId".to_string()); }
+            if task_id.is_empty() {
+                return Err("Missing required argument: taskId".to_string());
+            }
             let index = task_mcp_find_task_index(&tasks, task_id)
                 .ok_or_else(|| format!("Task not found: {task_id}"))?;
             let task = &mut tasks[index];
             if task["crmDeveloperWorkflow"]["technicalPlan"].is_null() {
-                return Err("No technical plan saved yet. Use save_technical_plan first.".to_string());
+                return Err(
+                    "No technical plan saved yet. Use save_technical_plan first.".to_string(),
+                );
             }
             task["crmDeveloperWorkflow"]["currentStep"] = serde_json::json!("technical-plan");
-            task["crmDeveloperWorkflow"]["updatedAt"]   = serde_json::json!(chrono_now_iso());
+            task["crmDeveloperWorkflow"]["updatedAt"] = serde_json::json!(chrono_now_iso());
             task_mcp_append_audit_note(task, "mark_technical_plan_ready_for_approval");
             updated = true;
             serde_json::json!({"task": task_mcp_safe_task_summary(task)})
@@ -12456,22 +15548,30 @@ fn task_mcp_execute_tool(app: &tauri::AppHandle, tool_name: &str, args: &Value) 
 
         "approve_technical_plan_if_safe" => {
             let task_id = args["taskId"].as_str().unwrap_or("").trim();
-            if task_id.is_empty() { return Err("Missing required argument: taskId".to_string()); }
+            if task_id.is_empty() {
+                return Err("Missing required argument: taskId".to_string());
+            }
             let index = task_mcp_find_task_index(&tasks, task_id)
                 .ok_or_else(|| format!("Task not found: {task_id}"))?;
 
             // Compute packet pre-approval to evaluate safety conditions.
             let task_snapshot = tasks[index].clone();
-            let customer_id = task_snapshot["customerId"].as_str()
+            let customer_id = task_snapshot["customerId"]
+                .as_str()
                 .or_else(|| task_snapshot["workflowSetup"]["customerId"].as_str())
                 .unwrap_or("")
                 .to_string();
             let dev_defaults = task_mcp_find_customer(&customers, &customer_id)
                 .and_then(|c| task_mcp_customer_dev_defaults(c, &crm_base_dir));
-            let ai_kit_path = settings["powerPlatformAiKitPath"].as_str()
+            let ai_kit_path = settings["powerPlatformAiKitPath"]
+                .as_str()
                 .filter(|s| !s.trim().is_empty())
                 .map(str::to_string);
-            let packet = task_mcp_developer_work_packet(&task_snapshot, dev_defaults.as_ref(), ai_kit_path.as_deref());
+            let packet = task_mcp_developer_work_packet(
+                &task_snapshot,
+                dev_defaults.as_ref(),
+                ai_kit_path.as_deref(),
+            );
 
             let reasons = task_mcp_plan_approval_safety_check(&task_snapshot, &packet);
 
@@ -12480,8 +15580,8 @@ fn task_mcp_execute_tool(app: &tauri::AppHandle, tool_name: &str, args: &Value) 
             // replace the stale plan text with deterministic steps derived from the work
             // packet — then approve. This avoids requiring a full plan regeneration when the
             // implementation data in the packet is already complete and trustworthy.
-            let is_only_scaffold_blocker = reasons.len() == 1
-                && reasons[0].contains("TODO/scaffold/placeholder");
+            let is_only_scaffold_blocker =
+                reasons.len() == 1 && reasons[0].contains("TODO/scaffold/placeholder");
             let can_refresh = is_only_scaffold_blocker && task_mcp_can_safely_refresh_plan(&packet);
 
             if !reasons.is_empty() && !can_refresh {
@@ -12493,12 +15593,17 @@ fn task_mcp_execute_tool(app: &tauri::AppHandle, tool_name: &str, args: &Value) 
 
             if can_refresh {
                 // Replace stale scaffold steps/risks with concrete packet-derived content.
-                let existing_risks: Vec<Value> = task["crmDeveloperWorkflow"]["technicalPlan"]["risks"]
-                    .as_array().cloned().unwrap_or_default();
+                let existing_risks: Vec<Value> = task["crmDeveloperWorkflow"]["technicalPlan"]
+                    ["risks"]
+                    .as_array()
+                    .cloned()
+                    .unwrap_or_default();
                 let new_steps = task_mcp_generate_concrete_steps_from_packet(&packet);
                 let new_risks = task_mcp_generate_clean_risks_from_packet(&existing_risks, &packet);
-                task["crmDeveloperWorkflow"]["technicalPlan"]["implementationSteps"] = serde_json::json!(new_steps);
-                task["crmDeveloperWorkflow"]["technicalPlan"]["risks"] = serde_json::json!(new_risks);
+                task["crmDeveloperWorkflow"]["technicalPlan"]["implementationSteps"] =
+                    serde_json::json!(new_steps);
+                task["crmDeveloperWorkflow"]["technicalPlan"]["risks"] =
+                    serde_json::json!(new_risks);
                 task_mcp_append_audit_note(task, "approve_technical_plan_if_safe [safe plan refresh: stale scaffold steps/risks replaced from trusted work packet]");
             }
 
@@ -12508,7 +15613,10 @@ fn task_mcp_execute_tool(app: &tauri::AppHandle, tool_name: &str, args: &Value) 
                 "approvedAt": now,
             });
             task["crmDeveloperWorkflow"]["updatedAt"] = serde_json::json!(now);
-            task_mcp_append_audit_note(task, "approve_technical_plan_if_safe [AI safe auto-approval]");
+            task_mcp_append_audit_note(
+                task,
+                "approve_technical_plan_if_safe [AI safe auto-approval]",
+            );
             updated = true;
 
             // Determine whether code can now be written and advance the app-visible phase
@@ -12517,8 +15625,13 @@ fn task_mcp_execute_tool(app: &tauri::AppHandle, tool_name: &str, args: &Value) 
             let post_approval_snapshot = tasks[index].clone();
             let dev_defaults_post = task_mcp_find_customer(&customers, &customer_id)
                 .and_then(|c| task_mcp_customer_dev_defaults(c, &crm_base_dir));
-            let can_write_now = task_mcp_developer_work_packet(&post_approval_snapshot, dev_defaults_post.as_ref(), ai_kit_path.as_deref())
-                ["canWriteCode"].as_bool().unwrap_or(false);
+            let can_write_now = task_mcp_developer_work_packet(
+                &post_approval_snapshot,
+                dev_defaults_post.as_ref(),
+                ai_kit_path.as_deref(),
+            )["canWriteCode"]
+                .as_bool()
+                .unwrap_or(false);
             task_mcp_apply_developer_workflow_transition(
                 &mut tasks[index],
                 "technical_plan_approved",
@@ -12529,7 +15642,11 @@ fn task_mcp_execute_tool(app: &tauri::AppHandle, tool_name: &str, args: &Value) 
             let refreshed_task = tasks[index].clone();
             let dev_defaults2 = task_mcp_find_customer(&customers, &customer_id)
                 .and_then(|c| task_mcp_customer_dev_defaults(c, &crm_base_dir));
-            let refreshed_packet = task_mcp_developer_work_packet(&refreshed_task, dev_defaults2.as_ref(), ai_kit_path.as_deref());
+            let refreshed_packet = task_mcp_developer_work_packet(
+                &refreshed_task,
+                dev_defaults2.as_ref(),
+                ai_kit_path.as_deref(),
+            );
             serde_json::json!({
                 "canApprove": true,
                 "planRefreshed": can_refresh,
@@ -12541,17 +15658,24 @@ fn task_mcp_execute_tool(app: &tauri::AppHandle, tool_name: &str, args: &Value) 
 
         "record_manual_pr" => {
             let task_id = args["taskId"].as_str().unwrap_or("").trim();
-            if task_id.is_empty() { return Err("Missing required argument: taskId".to_string()); }
+            if task_id.is_empty() {
+                return Err("Missing required argument: taskId".to_string());
+            }
             let provider = args["provider"].as_str().unwrap_or("unknown").trim();
             if !matches!(provider, "github" | "azure-devops" | "unknown") {
-                return Err(format!("Invalid provider '{provider}'. Allowed: github, azure-devops, unknown"));
+                return Err(format!(
+                    "Invalid provider '{provider}'. Allowed: github, azure-devops, unknown"
+                ));
             }
             let url = task_mcp_normalize_small_text(args["url"].as_str().unwrap_or(""), 500);
-            if url.is_empty() { return Err("url cannot be empty.".to_string()); }
+            if url.is_empty() {
+                return Err("url cannot be empty.".to_string());
+            }
             if !url.starts_with("http://") && !url.starts_with("https://") {
                 return Err("url must start with http:// or https://".to_string());
             }
-            let title = args["title"].as_str()
+            let title = args["title"]
+                .as_str()
                 .map(|t| task_mcp_normalize_small_text(t, 300))
                 .filter(|s| !s.is_empty());
 
@@ -12571,7 +15695,7 @@ fn task_mcp_execute_tool(app: &tauri::AppHandle, tool_name: &str, args: &Value) 
             task["crmDeveloperWorkflow"]["updatedAt"] = serde_json::json!(now);
             // Advance task to review if currently in development
             if task["status"].as_str() == Some("in-progress") {
-                task["status"]       = serde_json::json!("ready-for-review");
+                task["status"] = serde_json::json!("ready-for-review");
                 task["waitingState"] = serde_json::json!("code-review");
             }
             task_mcp_append_audit_note(task, &format!("record_manual_pr -> {url}"));
@@ -12581,11 +15705,16 @@ fn task_mcp_execute_tool(app: &tauri::AppHandle, tool_name: &str, args: &Value) 
 
         "save_pr_review_analysis" => {
             let task_id = args["taskId"].as_str().unwrap_or("").trim();
-            if task_id.is_empty() { return Err("Missing required argument: taskId".to_string()); }
-            let summary      = task_mcp_normalize_small_text(args["summary"].as_str().unwrap_or(""), 2000);
-            if summary.is_empty() { return Err("summary cannot be empty after sanitization.".to_string()); }
+            if task_id.is_empty() {
+                return Err("Missing required argument: taskId".to_string());
+            }
+            let summary =
+                task_mcp_normalize_small_text(args["summary"].as_str().unwrap_or(""), 2000);
+            if summary.is_empty() {
+                return Err("summary cannot be empty after sanitization.".to_string());
+            }
             let action_items = task_mcp_collect_string_array(&args["actionItems"], 20, 300);
-            let warnings     = task_mcp_collect_string_array(&args["warnings"], 10, 300);
+            let warnings = task_mcp_collect_string_array(&args["warnings"], 10, 300);
 
             let index = task_mcp_find_task_index(&tasks, task_id)
                 .ok_or_else(|| format!("Task not found: {task_id}"))?;
@@ -12612,10 +15741,15 @@ fn task_mcp_execute_tool(app: &tauri::AppHandle, tool_name: &str, args: &Value) 
 
         "save_pr_fix_proposal" => {
             let task_id = args["taskId"].as_str().unwrap_or("").trim();
-            if task_id.is_empty() { return Err("Missing required argument: taskId".to_string()); }
-            let summary     = task_mcp_normalize_small_text(args["summary"].as_str().unwrap_or(""), 2000);
-            if summary.is_empty() { return Err("summary cannot be empty after sanitization.".to_string()); }
-            let impl_notes  = task_mcp_collect_string_array(&args["implementationNotes"], 10, 300);
+            if task_id.is_empty() {
+                return Err("Missing required argument: taskId".to_string());
+            }
+            let summary =
+                task_mcp_normalize_small_text(args["summary"].as_str().unwrap_or(""), 2000);
+            if summary.is_empty() {
+                return Err("summary cannot be empty after sanitization.".to_string());
+            }
+            let impl_notes = task_mcp_collect_string_array(&args["implementationNotes"], 10, 300);
             let proposed: Vec<Value> = args["proposedChanges"].as_array()
                 .map(|arr| arr.iter().take(10).map(|item| serde_json::json!({
                     "title":       task_mcp_normalize_small_text(item["title"].as_str().unwrap_or(""), 200),
@@ -12649,31 +15783,48 @@ fn task_mcp_execute_tool(app: &tauri::AppHandle, tool_name: &str, args: &Value) 
         }
 
         "update_task_checklist_item" => {
-            let task_id  = args["taskId"].as_str().unwrap_or("").trim();
-            if task_id.is_empty() { return Err("Missing required argument: taskId".to_string()); }
+            let task_id = args["taskId"].as_str().unwrap_or("").trim();
+            if task_id.is_empty() {
+                return Err("Missing required argument: taskId".to_string());
+            }
             let item_key = args["itemKey"].as_str().unwrap_or("").trim();
-            let status   = args["status"].as_str().unwrap_or("").trim();
+            let status = args["status"].as_str().unwrap_or("").trim();
             if !task_mcp_allowed_checklist_keys().contains(&item_key) {
-                return Err(format!("Invalid itemKey '{item_key}'. Allowed: {}", task_mcp_allowed_checklist_keys().join(", ")));
+                return Err(format!(
+                    "Invalid itemKey '{item_key}'. Allowed: {}",
+                    task_mcp_allowed_checklist_keys().join(", ")
+                ));
             }
             if !task_mcp_allowed_checklist_statuses().contains(&status) {
-                return Err(format!("Invalid status '{status}'. Allowed: {}", task_mcp_allowed_checklist_statuses().join(", ")));
+                return Err(format!(
+                    "Invalid status '{status}'. Allowed: {}",
+                    task_mcp_allowed_checklist_statuses().join(", ")
+                ));
             }
             let index = task_mcp_find_task_index(&tasks, task_id)
                 .ok_or_else(|| format!("Task not found: {task_id}"))?;
             let task = &mut tasks[index];
-            if task["mcpChecklistOverrides"].is_null() { task["mcpChecklistOverrides"] = serde_json::json!({}); }
+            if task["mcpChecklistOverrides"].is_null() {
+                task["mcpChecklistOverrides"] = serde_json::json!({});
+            }
             task["mcpChecklistOverrides"][item_key] = serde_json::json!(status);
-            task_mcp_append_audit_note(task, &format!("update_task_checklist_item -> {item_key}={status}"));
+            task_mcp_append_audit_note(
+                task,
+                &format!("update_task_checklist_item -> {item_key}={status}"),
+            );
             updated = true;
             serde_json::json!({"task": task_mcp_safe_task_summary(task)})
         }
 
         "set_task_next_step" => {
             let task_id = args["taskId"].as_str().unwrap_or("").trim();
-            if task_id.is_empty() { return Err("Missing required argument: taskId".to_string()); }
+            if task_id.is_empty() {
+                return Err("Missing required argument: taskId".to_string());
+            }
             let action = task_mcp_normalize_small_text(args["action"].as_str().unwrap_or(""), 300);
-            if action.is_empty() { return Err("action cannot be empty after sanitization.".to_string()); }
+            if action.is_empty() {
+                return Err("action cannot be empty after sanitization.".to_string());
+            }
             let reason = task_mcp_normalize_small_text(args["reason"].as_str().unwrap_or(""), 500);
 
             let index = task_mcp_find_task_index(&tasks, task_id)
@@ -12692,9 +15843,14 @@ fn task_mcp_execute_tool(app: &tauri::AppHandle, tool_name: &str, args: &Value) 
         // â”€â”€ run_dataverse_check_for_task â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         "run_dataverse_check_for_task" => {
             let task_id = args["taskId"].as_str().unwrap_or("").trim();
-            if task_id.is_empty() { return Err("Missing required argument: taskId".into()); }
-            let persist_inferred = args["persistInferredArtifactPath"].as_bool().unwrap_or(true);
-            let primary_override = args["primaryEntityOverride"].as_str()
+            if task_id.is_empty() {
+                return Err("Missing required argument: taskId".into());
+            }
+            let persist_inferred = args["persistInferredArtifactPath"]
+                .as_bool()
+                .unwrap_or(true);
+            let primary_override = args["primaryEntityOverride"]
+                .as_str()
                 .filter(|s| !s.trim().is_empty())
                 .map(str::to_string);
 
@@ -12706,22 +15862,37 @@ fn task_mcp_execute_tool(app: &tauri::AppHandle, tool_name: &str, args: &Value) 
 
             // Resolve artifact path (explicit or inferred).
             let (artifact_path, artifact_inferred) = mcp_resolve_artifact_path(
-                app, &task_snapshot, persist_inferred, &mut tasks, task_index
+                app,
+                &task_snapshot,
+                persist_inferred,
+                &mut tasks,
+                task_index,
             )?;
 
             // Scan logical names â€” C# via scan_cs_logical_names_for_mcp, JS/TS via
             // scan_js_logical_names_for_mcp (chosen by extension inside the shared helper).
-            let primary_entity_for_scan = primary_override.clone()
-                .or_else(|| task_snapshot["workflowSetup"]["primaryEntityLogicalName"].as_str().map(str::to_string))
+            let primary_entity_for_scan = primary_override
+                .clone()
+                .or_else(|| {
+                    task_snapshot["workflowSetup"]["primaryEntityLogicalName"]
+                        .as_str()
+                        .map(str::to_string)
+                })
                 .or_else(|| {
                     // From technical plan
-                    task_snapshot["crmDeveloperWorkflow"]["technicalPlan"]["target"]["entityLogicalName"]
-                        .as_str().map(str::to_string)
+                    task_snapshot["crmDeveloperWorkflow"]["technicalPlan"]["target"]
+                        ["entityLogicalName"]
+                        .as_str()
+                        .map(str::to_string)
                 });
 
             let report = task_mcp_run_dataverse_metadata_check(
-                app, &mut tasks, task_index, &artifact_path,
-                primary_entity_for_scan.as_deref(), primary_override,
+                app,
+                &mut tasks,
+                task_index,
+                &artifact_path,
+                primary_entity_for_scan.as_deref(),
+                primary_override,
             )?;
             updated = true;
 
@@ -12729,15 +15900,24 @@ fn task_mcp_execute_tool(app: &tauri::AppHandle, tool_name: &str, args: &Value) 
             let raw_scan = report["rawExtractedReferences"].clone();
 
             // Build compact result for MCP caller.
-            let confirmed = report["confirmedReferences"].as_array().map(|a| a.len()).unwrap_or(0);
-            let missing   = report["missingReferences"].as_array().map(|a| a.len()).unwrap_or(0);
-            let ambiguous = report["ambiguousReferences"].as_array().map(|a| a.len()).unwrap_or(0);
+            let confirmed = report["confirmedReferences"]
+                .as_array()
+                .map(|a| a.len())
+                .unwrap_or(0);
+            let missing = report["missingReferences"]
+                .as_array()
+                .map(|a| a.len())
+                .unwrap_or(0);
+            let ambiguous = report["ambiguousReferences"]
+                .as_array()
+                .map(|a| a.len())
+                .unwrap_or(0);
 
             let dv_status = match verdict.as_str() {
-                "pass"     => "passed",
+                "pass" => "passed",
                 "warnings" => "warnings",
-                "fail"     => "failed",
-                _          => "unknown",
+                "fail" => "failed",
+                _ => "unknown",
             };
 
             let verified = task_mcp_build_verified_references_list(&report);
@@ -12772,7 +15952,9 @@ fn task_mcp_execute_tool(app: &tauri::AppHandle, tool_name: &str, args: &Value) 
         // â”€â”€ Git commit/push MCP tools â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         "prepare_commit_for_task" => {
             let task_id = args["taskId"].as_str().unwrap_or("").trim();
-            if task_id.is_empty() { return Err("Missing required argument: taskId".into()); }
+            if task_id.is_empty() {
+                return Err("Missing required argument: taskId".into());
+            }
             let task_idx = task_mcp_find_task_index(&tasks, task_id)
                 .ok_or_else(|| format!("Task not found: {task_id}"))?;
             let task_snap = tasks[task_idx].clone();
@@ -12782,29 +15964,45 @@ fn task_mcp_execute_tool(app: &tauri::AppHandle, tool_name: &str, args: &Value) 
 
         "commit_task_changes" => {
             let task_id = args["taskId"].as_str().unwrap_or("").trim();
-            let (message, files, force_add_files, confirm_unrelated) = task_mcp_parse_commit_args(args);
-            if task_id.is_empty() { return Err("Missing required argument: taskId".into()); }
+            let (message, files, force_add_files, confirm_unrelated) =
+                task_mcp_parse_commit_args(args);
+            if task_id.is_empty() {
+                return Err("Missing required argument: taskId".into());
+            }
             let task_idx = task_mcp_find_task_index(&tasks, task_id)
                 .ok_or_else(|| format!("Task not found: {task_id}"))?;
             let task_snap = tasks[task_idx].clone();
             task_mcp_require_deployment_testing_gate_resolved(&task_snap)?;
             let repo_root = mcp_resolve_repo_root_for_task(app, &task_snap)?;
             let related_files = task_mcp_related_implementation_files(&task_snap);
-            let result = git_commit_impl(&repo_root, &files, &message, &force_add_files, &related_files, confirm_unrelated)?;
+            let result = git_commit_impl(
+                &repo_root,
+                &files,
+                &message,
+                &force_add_files,
+                &related_files,
+                confirm_unrelated,
+            )?;
             let hash = result["commitHash"].as_str().unwrap_or("?").to_string();
-            { let t = &mut tasks[task_idx];
-              if t["gitWorkflow"].is_null() { t["gitWorkflow"] = serde_json::json!({}); }
-              t["gitWorkflow"]["lastCommitHash"] = serde_json::json!(hash);
-              t["gitWorkflow"]["lastCommitAt"] = serde_json::json!(chrono_now_iso());
-              t["gitWorkflow"]["lastCommitBranch"] = result["branch"].clone();
-              task_mcp_append_audit_note(t, &format!("commit_task_changes -> {hash}")); }
+            {
+                let t = &mut tasks[task_idx];
+                if t["gitWorkflow"].is_null() {
+                    t["gitWorkflow"] = serde_json::json!({});
+                }
+                t["gitWorkflow"]["lastCommitHash"] = serde_json::json!(hash);
+                t["gitWorkflow"]["lastCommitAt"] = serde_json::json!(chrono_now_iso());
+                t["gitWorkflow"]["lastCommitBranch"] = result["branch"].clone();
+                task_mcp_append_audit_note(t, &format!("commit_task_changes -> {hash}"));
+            }
             updated = true;
             result
         }
 
         "push_task_branch" => {
             let task_id = args["taskId"].as_str().unwrap_or("").trim();
-            if task_id.is_empty() { return Err("Missing required argument: taskId".into()); }
+            if task_id.is_empty() {
+                return Err("Missing required argument: taskId".into());
+            }
             let task_idx = task_mcp_find_task_index(&tasks, task_id)
                 .ok_or_else(|| format!("Task not found: {task_id}"))?;
             let task_snap = tasks[task_idx].clone();
@@ -12814,7 +16012,9 @@ fn task_mcp_execute_tool(app: &tauri::AppHandle, tool_name: &str, args: &Value) 
             let branch = result["branch"].as_str().unwrap_or("?").to_string();
             {
                 let t = &mut tasks[task_idx];
-                if t["gitWorkflow"].is_null() { t["gitWorkflow"] = serde_json::json!({}); }
+                if t["gitWorkflow"].is_null() {
+                    t["gitWorkflow"] = serde_json::json!({});
+                }
                 t["gitWorkflow"]["lastPushedBranch"] = serde_json::json!(branch);
                 t["gitWorkflow"]["lastPushedAt"] = serde_json::json!(chrono_now_iso());
                 task_mcp_append_audit_note(t, &format!("push_task_branch -> {branch}"));
@@ -12825,9 +16025,12 @@ fn task_mcp_execute_tool(app: &tauri::AppHandle, tool_name: &str, args: &Value) 
 
         "commit_and_push_task_changes" => {
             let task_id = args["taskId"].as_str().unwrap_or("").trim();
-            let (message, files, force_add_files, confirm_unrelated) = task_mcp_parse_commit_args(args);
+            let (message, files, force_add_files, confirm_unrelated) =
+                task_mcp_parse_commit_args(args);
             let move_to_review = args["moveToReviewAfterPush"].as_bool().unwrap_or(false);
-            if task_id.is_empty() { return Err("Missing required argument: taskId".into()); }
+            if task_id.is_empty() {
+                return Err("Missing required argument: taskId".into());
+            }
             let task_idx = task_mcp_find_task_index(&tasks, task_id)
                 .ok_or_else(|| format!("Task not found: {task_id}"))?;
             let task_snap = tasks[task_idx].clone();
@@ -12849,20 +16052,32 @@ fn task_mcp_execute_tool(app: &tauri::AppHandle, tool_name: &str, args: &Value) 
                 }
             }
 
-            let commit = git_commit_impl(&repo_root, &files, &message, &force_add_files, &related_files, confirm_unrelated)?;
-            let hash   = commit["commitHash"].as_str().unwrap_or("?").to_string();
-            let push   = git_push_impl(&repo_root)?;
+            let commit = git_commit_impl(
+                &repo_root,
+                &files,
+                &message,
+                &force_add_files,
+                &related_files,
+                confirm_unrelated,
+            )?;
+            let hash = commit["commitHash"].as_str().unwrap_or("?").to_string();
+            let push = git_push_impl(&repo_root)?;
             let branch = push["branch"].as_str().unwrap_or("?").to_string();
             {
                 let t = &mut tasks[task_idx];
-                if t["gitWorkflow"].is_null() { t["gitWorkflow"] = serde_json::json!({}); }
+                if t["gitWorkflow"].is_null() {
+                    t["gitWorkflow"] = serde_json::json!({});
+                }
                 let now = chrono_now_iso();
                 t["gitWorkflow"]["lastCommitHash"] = serde_json::json!(hash);
                 t["gitWorkflow"]["lastCommitAt"] = serde_json::json!(now);
                 t["gitWorkflow"]["lastCommitBranch"] = serde_json::json!(branch);
                 t["gitWorkflow"]["lastPushedBranch"] = serde_json::json!(branch);
                 t["gitWorkflow"]["lastPushedAt"] = serde_json::json!(now);
-                task_mcp_append_audit_note(t, &format!("commit_and_push_task_changes -> {hash} {branch}"));
+                task_mcp_append_audit_note(
+                    t,
+                    &format!("commit_and_push_task_changes -> {hash} {branch}"),
+                );
             }
             // Commit+push never jumps straight to Code Review — a pull request must still be
             // created/recorded (see prepare_pull_request_for_task / record_pull_request_created).
@@ -12875,7 +16090,10 @@ fn task_mcp_execute_tool(app: &tauri::AppHandle, tool_name: &str, args: &Value) 
                     "reason":    "Commit verified and pushed. Create a pull request before code review.",
                     "updatedAt": now,
                 });
-                task_mcp_append_audit_note(t, "commit_and_push_task_changes -> prepare pull request (not moved to review)");
+                task_mcp_append_audit_note(
+                    t,
+                    "commit_and_push_task_changes -> prepare pull request (not moved to review)",
+                );
             }
             updated = true;
             let summary = format!("Commit {hash} created and branch '{branch}' pushed. A pull request is still required before code review.");
@@ -12885,7 +16103,9 @@ fn task_mcp_execute_tool(app: &tauri::AppHandle, tool_name: &str, args: &Value) 
         // Read-only PR preview — never creates a pull request or calls GitHub/Azure DevOps.
         "prepare_pull_request_for_task" => {
             let task_id = args["taskId"].as_str().unwrap_or("").trim();
-            if task_id.is_empty() { return Err("Missing required argument: taskId".into()); }
+            if task_id.is_empty() {
+                return Err("Missing required argument: taskId".into());
+            }
             let task_idx = task_mcp_find_task_index(&tasks, task_id)
                 .ok_or_else(|| format!("Task not found: {task_id}"))?;
             let task_snap = tasks[task_idx].clone();
@@ -12896,11 +16116,16 @@ fn task_mcp_execute_tool(app: &tauri::AppHandle, tool_name: &str, args: &Value) 
             let target_branch = preview["baseBranch"].as_str().unwrap_or("main").to_string();
             let remote_url = preview["remoteUrl"].as_str().map(str::to_string);
             let provider = match &remote_url {
-                Some(u) if u.contains("dev.azure.com") || u.contains("visualstudio.com") => "azure-devops",
+                Some(u) if u.contains("dev.azure.com") || u.contains("visualstudio.com") => {
+                    "azure-devops"
+                }
                 Some(u) if u.contains("github.com") => "github",
                 _ => "unknown",
             };
-            let title = task_snap["title"].as_str().unwrap_or("Task changes").to_string();
+            let title = task_snap["title"]
+                .as_str()
+                .unwrap_or("Task changes")
+                .to_string();
             let existing_pr = task_snap["crmDeveloperWorkflow"]["pullRequestTracking"].clone();
 
             serde_json::json!({
@@ -12921,7 +16146,9 @@ fn task_mcp_execute_tool(app: &tauri::AppHandle, tool_name: &str, args: &Value) 
         // stages files, commits, pushes, deletes lock files, or runs destructive reset operations.
         "reconcile_task_git_state" => {
             let task_id = args["taskId"].as_str().unwrap_or("").trim();
-            if task_id.is_empty() { return Err("Missing required argument: taskId".into()); }
+            if task_id.is_empty() {
+                return Err("Missing required argument: taskId".into());
+            }
             let task_idx = task_mcp_find_task_index(&tasks, task_id)
                 .ok_or_else(|| format!("Task not found: {task_id}"))?;
             let task_snap = tasks[task_idx].clone();
@@ -12929,15 +16156,24 @@ fn task_mcp_execute_tool(app: &tauri::AppHandle, tool_name: &str, args: &Value) 
 
             let current_branch = run_git_ro(&repo_root, &["rev-parse", "--abbrev-ref", "HEAD"]);
             let head_sha = run_git_ro(&repo_root, &["rev-parse", "HEAD"]);
-            let upstream = run_git_ro(&repo_root, &["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"]);
+            let upstream = run_git_ro(
+                &repo_root,
+                &["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"],
+            );
             // Remote branches that contain HEAD — a non-empty result means HEAD is present remotely.
-            let remote_branches_containing_head = run_git_ro(&repo_root, &["branch", "-r", "--contains", "HEAD"])
-                .map(|s| !s.trim().is_empty())
-                .unwrap_or(false);
+            let remote_branches_containing_head =
+                run_git_ro(&repo_root, &["branch", "-r", "--contains", "HEAD"])
+                    .map(|s| !s.trim().is_empty())
+                    .unwrap_or(false);
 
-            let expected_hash = task_snap["gitWorkflow"]["lastCommitHash"].as_str().map(str::to_string);
-            let expected_branch = task_snap["gitWorkflow"]["lastCommitBranch"].as_str().map(str::to_string);
-            let head_matches_expected = matches!((&head_sha, &expected_hash), (Some(h), Some(e)) if h == e);
+            let expected_hash = task_snap["gitWorkflow"]["lastCommitHash"]
+                .as_str()
+                .map(str::to_string);
+            let expected_branch = task_snap["gitWorkflow"]["lastCommitBranch"]
+                .as_str()
+                .map(str::to_string);
+            let head_matches_expected =
+                matches!((&head_sha, &expected_hash), (Some(h), Some(e)) if h == e);
 
             // Repair local tracking ONLY: if HEAD is verifiably present on a remote branch and the
             // persisted gitWorkflow disagrees (missing or stale), correct it. Never touches Git itself.
@@ -12946,7 +16182,9 @@ fn task_mcp_execute_tool(app: &tauri::AppHandle, tool_name: &str, args: &Value) 
             if remote_branches_containing_head {
                 if let (Some(sha), Some(branch)) = (&head_sha, &current_branch) {
                     let t = &mut tasks[task_idx];
-                    if t["gitWorkflow"].is_null() { t["gitWorkflow"] = serde_json::json!({}); }
+                    if t["gitWorkflow"].is_null() {
+                        t["gitWorkflow"] = serde_json::json!({});
+                    }
                     if t["gitWorkflow"]["lastCommitHash"].as_str() != Some(sha.as_str()) {
                         t["gitWorkflow"]["lastCommitHash"] = serde_json::json!(sha);
                         t["gitWorkflow"]["lastCommitAt"] = serde_json::json!(chrono_now_iso());
@@ -12961,11 +16199,16 @@ fn task_mcp_execute_tool(app: &tauri::AppHandle, tool_name: &str, args: &Value) 
                         repair_notes.push(format!("Repaired gitWorkflow.lastPushedBranch to {branch} (verified present on a remote branch)."));
                     }
                     if repaired {
-                        task_mcp_append_audit_note(t, "reconcile_task_git_state -> repaired local tracking state");
+                        task_mcp_append_audit_note(
+                            t,
+                            "reconcile_task_git_state -> repaired local tracking state",
+                        );
                     }
                 }
             }
-            if repaired { updated = true; }
+            if repaired {
+                updated = true;
+            }
 
             serde_json::json!({
                 "taskId": task_id,
@@ -12982,17 +16225,24 @@ fn task_mcp_execute_tool(app: &tauri::AppHandle, tool_name: &str, args: &Value) 
         }
 
         "create_branch_for_task" => {
-            let task_id     = args["taskId"].as_str().unwrap_or("").trim();
+            let task_id = args["taskId"].as_str().unwrap_or("").trim();
             let branch_name = args["branchName"].as_str().unwrap_or("").trim();
-            if task_id.is_empty()     { return Err("Missing required argument: taskId".into()); }
-            if branch_name.is_empty() { return Err("Missing required argument: branchName".into()); }
+            if task_id.is_empty() {
+                return Err("Missing required argument: taskId".into());
+            }
+            if branch_name.is_empty() {
+                return Err("Missing required argument: branchName".into());
+            }
             let task_idx = task_mcp_find_task_index(&tasks, task_id)
                 .ok_or_else(|| format!("Task not found: {task_id}"))?;
             let task_snap = tasks[task_idx].clone();
             let repo_root = mcp_resolve_repo_root_for_task(app, &task_snap)?;
             let result = create_git_branch_impl(&repo_root, branch_name)?;
             let branch = result["branch"].as_str().unwrap_or("?").to_string();
-            { let t = &mut tasks[task_idx]; task_mcp_append_audit_note(t, &format!("create_branch_for_task -> {branch}")); }
+            {
+                let t = &mut tasks[task_idx];
+                task_mcp_append_audit_note(t, &format!("create_branch_for_task -> {branch}"));
+            }
             updated = true;
             result
         }
@@ -13002,11 +16252,17 @@ fn task_mcp_execute_tool(app: &tauri::AppHandle, tool_name: &str, args: &Value) 
         // remote base, never pushes/commits/modifies files. See checkout_or_create_task_branch_impl
         // for the full safety contract (never forces checkout).
         "create_or_checkout_task_branch" => {
-            let task_id     = args["taskId"].as_str().unwrap_or("").trim();
+            let task_id = args["taskId"].as_str().unwrap_or("").trim();
             let branch_name = args["branchName"].as_str().unwrap_or("").trim();
-            let mode        = args["mode"].as_str().unwrap_or("create_if_missing_and_checkout");
-            if task_id.is_empty()     { return Err("Missing required argument: taskId".into()); }
-            if branch_name.is_empty() { return Err("Missing required argument: branchName".into()); }
+            let mode = args["mode"]
+                .as_str()
+                .unwrap_or("create_if_missing_and_checkout");
+            if task_id.is_empty() {
+                return Err("Missing required argument: taskId".into());
+            }
+            if branch_name.is_empty() {
+                return Err("Missing required argument: branchName".into());
+            }
             if mode != "create_if_missing_and_checkout" {
                 return Err(format!("Unsupported mode '{mode}'. Only 'create_if_missing_and_checkout' is supported."));
             }
@@ -13020,14 +16276,21 @@ fn task_mcp_execute_tool(app: &tauri::AppHandle, tool_name: &str, args: &Value) 
             let branch_created = result["branchCreated"].as_bool().unwrap_or(false);
             {
                 let t = &mut tasks[task_idx];
-                if t["gitWorkflow"].is_null() { t["gitWorkflow"] = serde_json::json!({}); }
+                if t["gitWorkflow"].is_null() {
+                    t["gitWorkflow"] = serde_json::json!({});
+                }
                 t["gitWorkflow"]["confirmedBranch"] = serde_json::json!(branch_name);
                 t["gitWorkflow"]["confirmedAt"] = serde_json::json!(now);
-                if branch_created { t["gitWorkflow"]["branchCreatedAt"] = serde_json::json!(now); }
-                task_mcp_append_audit_note(t, &format!(
+                if branch_created {
+                    t["gitWorkflow"]["branchCreatedAt"] = serde_json::json!(now);
+                }
+                task_mcp_append_audit_note(
+                    t,
+                    &format!(
                     "create_or_checkout_task_branch -> {branch_name} (created={}, checkedOut={})",
                     result["branchCreated"], result["branchCheckedOut"]
-                ));
+                ),
+                );
             }
             updated = true;
 
@@ -13040,8 +16303,11 @@ fn task_mcp_execute_tool(app: &tauri::AppHandle, tool_name: &str, args: &Value) 
 
         "mark_testing_confirmed_prepare_commit" => {
             let task_id = args["taskId"].as_str().unwrap_or("").trim();
-            if task_id.is_empty() { return Err("Missing required argument: taskId".to_string()); }
-            let note = args["note"].as_str()
+            if task_id.is_empty() {
+                return Err("Missing required argument: taskId".to_string());
+            }
+            let note = args["note"]
+                .as_str()
                 .map(|n| task_mcp_normalize_small_text(n, 500))
                 .filter(|s| !s.is_empty());
 
@@ -13075,10 +16341,13 @@ fn task_mcp_execute_tool(app: &tauri::AppHandle, tool_name: &str, args: &Value) 
         // â”€â”€ get_dataverse_verification_report â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         "get_dataverse_verification_report" => {
             let task_id = args["id"].as_str().unwrap_or("").trim();
-            if task_id.is_empty() { return Err("Missing required argument: id".to_string()); }
+            if task_id.is_empty() {
+                return Err("Missing required argument: id".to_string());
+            }
             let task = task_mcp_get_task(&tasks, task_id)
                 .ok_or_else(|| format!("Task not found: {task_id}"))?;
-            let reports: Vec<&Value> = task.get("crmVerificationReports")
+            let reports: Vec<&Value> = task
+                .get("crmVerificationReports")
                 .and_then(|v| v.as_array())
                 .map(|arr| arr.iter().collect())
                 .unwrap_or_default();
@@ -13114,15 +16383,19 @@ fn task_mcp_execute_tool(app: &tauri::AppHandle, tool_name: &str, args: &Value) 
         // â”€â”€ get_external_action_proposal â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         "get_external_action_proposal" => {
             let task_id = args["id"].as_str().unwrap_or("").trim();
-            if task_id.is_empty() { return Err("Missing required argument: id".to_string()); }
+            if task_id.is_empty() {
+                return Err("Missing required argument: id".to_string());
+            }
             let task = task_mcp_get_task(&tasks, task_id)
                 .ok_or_else(|| format!("Task not found: {task_id}"))?;
             let wf = task.get("crmDeveloperWorkflow").unwrap_or(&Value::Null);
             let preview: Vec<Value> = wf["technicalPlan"]["externalActionPreview"]
-                .as_array().cloned().unwrap_or_default();
+                .as_array()
+                .cloned()
+                .unwrap_or_default();
             let approval_gate = &wf["externalActionApproval"];
-            let execution     = &wf["externalExecution"];
-            let has_proposal  = !preview.is_empty() || !approval_gate.is_null();
+            let execution = &wf["externalExecution"];
+            let has_proposal = !preview.is_empty() || !approval_gate.is_null();
             if !has_proposal && execution.is_null() {
                 return Ok(serde_json::json!({
                     "taskId": task_id,
@@ -13156,15 +16429,22 @@ fn task_mcp_execute_tool(app: &tauri::AppHandle, tool_name: &str, args: &Value) 
         // â”€â”€ record_external_action_completed â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         "record_external_action_completed" => {
             let task_id = args["taskId"].as_str().unwrap_or("").trim();
-            if task_id.is_empty() { return Err("Missing required argument: taskId".to_string()); }
+            if task_id.is_empty() {
+                return Err("Missing required argument: taskId".to_string());
+            }
             let action_type = args["actionType"].as_str().unwrap_or("").trim();
             if !task_mcp_allowed_external_action_types().contains(&action_type) {
-                return Err(format!("Invalid actionType '{action_type}'. Allowed: {}", task_mcp_allowed_external_action_types().join(", ")));
+                return Err(format!(
+                    "Invalid actionType '{action_type}'. Allowed: {}",
+                    task_mcp_allowed_external_action_types().join(", ")
+                ));
             }
-            let note = args["note"].as_str()
+            let note = args["note"]
+                .as_str()
                 .map(|n| task_mcp_normalize_small_text(n, 500))
                 .filter(|s| !s.is_empty());
-            let completed_at = args["completedAt"].as_str()
+            let completed_at = args["completedAt"]
+                .as_str()
                 .filter(|s| !s.trim().is_empty())
                 .map(str::to_string)
                 .unwrap_or_else(chrono_now_iso);
@@ -13177,15 +16457,22 @@ fn task_mcp_execute_tool(app: &tauri::AppHandle, tool_name: &str, args: &Value) 
                 task["crmDeveloperWorkflow"] = serde_json::json!({"createdAt": now});
             }
             // Append actionType to completedActionIds (deduplicated)
-            let existing_ids: Vec<String> = task["crmDeveloperWorkflow"]["externalExecution"]["completedActionIds"]
+            let existing_ids: Vec<String> = task["crmDeveloperWorkflow"]["externalExecution"]
+                ["completedActionIds"]
                 .as_array()
-                .map(|arr| arr.iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.as_str().map(str::to_string))
+                        .collect()
+                })
                 .unwrap_or_default();
             let mut new_ids = existing_ids;
             if !new_ids.contains(&action_type.to_string()) {
                 new_ids.push(action_type.to_string());
             }
-            let audit_note_text = note.clone().unwrap_or_else(|| format!("Completed: {action_type}"));
+            let audit_note_text = note
+                .clone()
+                .unwrap_or_else(|| format!("Completed: {action_type}"));
             task["crmDeveloperWorkflow"]["externalExecution"] = serde_json::json!({
                 "completed":          true,
                 "completedAt":        completed_at,
@@ -13193,16 +16480,24 @@ fn task_mcp_execute_tool(app: &tauri::AppHandle, tool_name: &str, args: &Value) 
                 "completedActionIds": new_ids,
             });
             task["crmDeveloperWorkflow"]["updatedAt"] = serde_json::json!(now);
-            task_mcp_append_audit_note(task, &format!("record_external_action_completed -> {action_type}"));
+            task_mcp_append_audit_note(
+                task,
+                &format!("record_external_action_completed -> {action_type}"),
+            );
             // Web resource upload / plugin registration is the manual CRM step that unblocks
             // DEVELOPMENT / Verify Implementation. Once recorded, hand the task off to testing
             // instead of leaving it stuck on Development indefinitely.
-            let unblocks_testing = matches!(action_type, "web-resource-upload" | "plugin-registration")
-                && task["taskMode"].as_str() == Some("developer")
-                && task["status"].as_str() == Some("in-progress")
-                && task["waitingState"].as_str() != Some("consultant-testing");
+            let unblocks_testing =
+                matches!(action_type, "web-resource-upload" | "plugin-registration")
+                    && task["taskMode"].as_str() == Some("developer")
+                    && task["status"].as_str() == Some("in-progress")
+                    && task["waitingState"].as_str() != Some("consultant-testing");
             if unblocks_testing {
-                task_mcp_apply_developer_workflow_transition(task, "manual_crm_verification_completed", &Value::Null);
+                task_mcp_apply_developer_workflow_transition(
+                    task,
+                    "manual_crm_verification_completed",
+                    &Value::Null,
+                );
             }
             updated = true;
             serde_json::json!({
@@ -13220,7 +16515,9 @@ fn task_mcp_execute_tool(app: &tauri::AppHandle, tool_name: &str, args: &Value) 
         // separate pre-branch AI Kit gate resolves too. Local task state only.
         "record_ai_kit_review_result" => {
             let task_id = args["taskId"].as_str().unwrap_or("").trim();
-            if task_id.is_empty() { return Err("Missing required argument: taskId".to_string()); }
+            if task_id.is_empty() {
+                return Err("Missing required argument: taskId".to_string());
+            }
 
             let index = task_mcp_find_task_index(&tasks, task_id)
                 .ok_or_else(|| format!("Task not found: {task_id}"))?;
@@ -13232,9 +16529,11 @@ fn task_mcp_execute_tool(app: &tauri::AppHandle, tool_name: &str, args: &Value) 
             task_mcp_append_audit_note(task, &format!("record_ai_kit_review_result -> {status}"));
             updated = true;
 
-            let (gate_status, missing_details) = task_mcp_ai_kit_review_gate(&task["implementationVerification"]["aiCodeReview"]);
+            let (gate_status, missing_details) =
+                task_mcp_ai_kit_review_gate(&task["implementationVerification"]["aiCodeReview"]);
             let implementation_verification = task_mcp_build_modal_verification_summary(task);
-            let unresolved_required_rows = task_mcp_unresolved_modal_rows(&implementation_verification);
+            let unresolved_required_rows =
+                task_mcp_unresolved_modal_rows(&implementation_verification);
             let next_recommended_step = if gate_status == "passed" {
                 "Call run_implementation_verification again to confirm all automated checks are resolved.".to_string()
             } else {
@@ -13257,10 +16556,14 @@ fn task_mcp_execute_tool(app: &tauri::AppHandle, tool_name: &str, args: &Value) 
         // â”€â”€ get_implementation_verification_state â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         "get_implementation_verification_state" => {
             let task_id = args["id"].as_str().unwrap_or("").trim();
-            if task_id.is_empty() { return Err("Missing required argument: id".to_string()); }
+            if task_id.is_empty() {
+                return Err("Missing required argument: id".to_string());
+            }
             let task = task_mcp_get_task(&tasks, task_id)
                 .ok_or_else(|| format!("Task not found: {task_id}"))?;
-            let impl_v = task.get("implementationVerification").unwrap_or(&Value::Null);
+            let impl_v = task
+                .get("implementationVerification")
+                .unwrap_or(&Value::Null);
             serde_json::json!({
                 "taskId":              task_id,
                 "buildCheck":          impl_v.get("buildCheck").cloned().unwrap_or(Value::Null),
@@ -13276,7 +16579,9 @@ fn task_mcp_execute_tool(app: &tauri::AppHandle, tool_name: &str, args: &Value) 
         // â”€â”€ get_implementation_readiness â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         "get_implementation_readiness" => {
             let task_id = args["id"].as_str().unwrap_or("").trim();
-            if task_id.is_empty() { return Err("Missing required argument: id".to_string()); }
+            if task_id.is_empty() {
+                return Err("Missing required argument: id".to_string());
+            }
             let task = task_mcp_get_task(&tasks, task_id)
                 .ok_or_else(|| format!("Task not found: {task_id}"))?;
             let readiness = task_mcp_implementation_readiness(task);
@@ -13291,13 +16596,18 @@ fn task_mcp_execute_tool(app: &tauri::AppHandle, tool_name: &str, args: &Value) 
 
         "continue_developer_workflow" => {
             let task_id = args["taskId"].as_str().unwrap_or("").trim();
-            if task_id.is_empty() { return Err("Missing required argument: taskId".to_string()); }
+            if task_id.is_empty() {
+                return Err("Missing required argument: taskId".to_string());
+            }
             let index = task_mcp_find_task_index(&tasks, task_id)
                 .ok_or_else(|| format!("Task not found: {task_id}"))?;
             let step = task_mcp_compute_continue_workflow_step(&tasks[index]);
             let next_action = step["nextAction"].as_str().unwrap_or("").to_string();
-            let transitioned = task_mcp_apply_deployment_testing_transition(&mut tasks[index], &next_action);
-            if transitioned { updated = true; }
+            let transitioned =
+                task_mcp_apply_deployment_testing_transition(&mut tasks[index], &next_action);
+            if transitioned {
+                updated = true;
+            }
 
             let mut result = step;
             result["taskId"] = serde_json::json!(task_id);
@@ -13319,12 +16629,14 @@ fn task_mcp_execute_tool(app: &tauri::AppHandle, tool_name: &str, args: &Value) 
 }
 
 fn task_mcp_http_response(status_code: u16, payload: &Value) -> String {
-    let body = serde_json::to_string(payload).unwrap_or_else(|_| "{\"error\":\"serialization failed\"}".to_string());
+    let body = serde_json::to_string(payload)
+        .unwrap_or_else(|_| "{\"error\":\"serialization failed\"}".to_string());
     let status_text = match status_code {
         200 => "OK",
         400 => "Bad Request",
         401 => "Unauthorized",
         404 => "Not Found",
+        409 => "Conflict",
         _ => "Internal Server Error",
     };
 
@@ -13335,12 +16647,79 @@ fn task_mcp_http_response(status_code: u16, payload: &Value) -> String {
     )
 }
 
-fn task_mcp_handle_http_connection(app: &tauri::AppHandle, mut stream: TcpStream) -> Result<(), String> {
+fn canonical_http_query(path: &str) -> (String, std::collections::HashMap<String, String>) {
+    let mut parts = path.splitn(2, '?');
+    let route = parts.next().unwrap_or_default().to_string();
+    let mut values = std::collections::HashMap::new();
+    for pair in parts.next().unwrap_or_default().split('&').filter(|p| !p.is_empty()) {
+        let mut kv = pair.splitn(2, '=');
+        values.insert(kv.next().unwrap_or_default().to_string(), kv.next().unwrap_or_default().to_string());
+    }
+    (route, values)
+}
+
+fn canonical_http_envelope(ok: bool, value: Value, correlation_id: &str) -> Value {
+    if ok { serde_json::json!({"ok":true,"apiVersion":"1","correlationId":correlation_id,"result":value}) }
+    else { serde_json::json!({"ok":false,"apiVersion":"1","correlationId":correlation_id,"error":value}) }
+}
+
+fn handle_canonical_http(app: &tauri::AppHandle, method: &str, raw_path: &str, body: &str, request_token: &str) -> Option<(u16, Value)> {
+    let request_started = std::time::Instant::now();
+    let (path, query) = canonical_http_query(raw_path);
+    if !path.starts_with("/api/v1/") { return None; }
+    let correlation_id = format!("req-{}-{}", now_unix(), rand::thread_rng().gen::<u64>());
+    eprintln!("[task-mcp-bridge] canonical request accepted correlationId={} method={} endpoint={}", correlation_id, method, path);
+    if request_token != task_mcp_bridge_token() {
+        eprintln!("[task-mcp-bridge] canonical authentication failed correlationId={} elapsedMs={}", correlation_id, request_started.elapsed().as_millis());
+        return Some((401, canonical_http_envelope(false, serde_json::json!({"code":"unauthorized","message":"Missing or invalid bridge token."}), &correlation_id)));
+    }
+    eprintln!("[task-mcp-bridge] canonical authentication completed correlationId={}", correlation_id);
+    if method == "GET" && path == "/api/v1/health" {
+        if let Err(error) = canonical_storage_ready(app) {
+            return Some((503, canonical_http_envelope(false, serde_json::json!({"code":"work_item_storage_unavailable","message":error}), &correlation_id)));
+        }
+        return Some((200, canonical_http_envelope(true, serde_json::json!({"status":"ok","runtime":"tauri-rust","canonical":true}), &correlation_id)));
+    }
+    if method == "GET" && path == "/api/v1/capabilities" {
+        if let Err(error) = canonical_storage_ready(app) {
+            return Some((503, canonical_http_envelope(false, serde_json::json!({"code":"work_item_storage_unavailable","message":error}), &correlation_id)));
+        }
+        return Some((200, canonical_http_envelope(true, serde_json::json!({"capabilities":["work-items.list","work-items.detail","work-items.changes","work-items.create","work-items.update","work-items.transition","work-items.notes","planning.today","mcp.canonical-v1"]}), &correlation_id)));
+    }
+    let json: Value = serde_json::from_str(body).unwrap_or_else(|_| serde_json::json!({}));
+    eprintln!("[task-mcp-bridge] canonical route selected correlationId={} endpoint={}", correlation_id, path);
+    let result: Result<Value, String> = if method == "GET" && path == "/api/v1/work-items" {
+        list_work_items(app.clone(), query.get("includeArchived").and_then(|v| v.parse().ok()), query.get("limit").and_then(|v| v.parse().ok()), query.get("status").cloned(), query.get("kind").cloned(), query.get("owner").cloned(), query.get("area").cloned(), query.get("source").cloned(), query.get("planningBucket").cloned(), query.get("dueBefore").cloned(), query.get("dueAfter").cloned(), query.get("updatedAfter").cloned(), query.get("cursor").cloned())
+    } else if method == "GET" && path == "/api/v1/work-items/changes" {
+        list_work_item_changes(app.clone(), query.get("afterRevision").or_else(|| query.get("after")).and_then(|v| v.parse().ok()), query.get("limit").and_then(|v| v.parse().ok()))
+    } else if method == "GET" && path == "/api/v1/planning/today" {
+        get_planning_today(app.clone(), query.get("timezone").cloned())
+    } else if method == "POST" && path == "/api/v1/work-items" {
+        serde_json::from_value::<WorkItem>(json.get("item").cloned().unwrap_or(json.clone())).map_err(|e| e.to_string()).and_then(|item| create_work_item(app.clone(), item, json["idempotencyKey"].as_str().map(str::to_string)))
+    } else if let Some(id) = path.strip_prefix("/api/v1/work-items/") {
+        if method == "GET" && !id.contains('/') { get_work_item(app.clone(), id.to_string()) }
+        else if method == "PATCH" && !id.contains('/') { serde_json::from_value::<WorkItem>(json["item"].clone()).map_err(|e| e.to_string()).and_then(|item| update_work_item(app.clone(), id.to_string(), item, json["expectedRevision"].as_i64().unwrap_or(0), json["actorName"].as_str().map(str::to_string))) }
+        else if method == "POST" && id.ends_with("/transitions") { let work_id = id.trim_end_matches("/transitions"); transition_work_item(app.clone(), work_id.to_string(), json["status"].as_str().unwrap_or_default().to_string(), json["reason"].as_str().map(str::to_string), json["expectedRevision"].as_i64().unwrap_or(0), json["actorName"].as_str().map(str::to_string)) }
+        else if method == "POST" && id.ends_with("/notes") { let work_id = id.trim_end_matches("/notes"); append_work_item_note(app.clone(), work_id.to_string(), json["text"].as_str().unwrap_or_default().to_string(), json["expectedRevision"].as_i64().unwrap_or(0), json["actorName"].as_str().map(str::to_string)) }
+        else { Err("Endpoint not found.".to_string()) }
+    } else { Err("Endpoint not found.".to_string()) };
+    match result {
+        Ok(value) => { eprintln!("[task-mcp-bridge] canonical response ready correlationId={} status=200 elapsedMs={}", correlation_id, request_started.elapsed().as_millis()); Some((200, canonical_http_envelope(true, value, &correlation_id))) },
+        Err(message) => { let error = serde_json::from_str::<Value>(&message).unwrap_or_else(|_| serde_json::json!({"code":"application_error","message":message})); let status = if error["code"] == "revision_conflict" { 409 } else if error["code"] == "not_found" { 404 } else if error["code"] == "storage_error" { 503 } else { 400 }; eprintln!("[task-mcp-bridge] canonical response ready correlationId={} status={} elapsedMs={}", correlation_id, status, request_started.elapsed().as_millis()); Some((status, canonical_http_envelope(false, error, &correlation_id))) }
+    }
+}
+
+fn task_mcp_handle_http_connection(
+    app: &tauri::AppHandle,
+    mut stream: TcpStream,
+) -> Result<(), String> {
     let stream_reader = stream.try_clone().map_err(|e| e.to_string())?;
     let mut reader = io::BufReader::new(stream_reader);
 
     let mut request_line = String::new();
-    reader.read_line(&mut request_line).map_err(|e| e.to_string())?;
+    reader
+        .read_line(&mut request_line)
+        .map_err(|e| e.to_string())?;
     if request_line.trim().is_empty() {
         return Ok(());
     }
@@ -13353,7 +16732,9 @@ fn task_mcp_handle_http_connection(app: &tauri::AppHandle, mut stream: TcpStream
     let mut request_token = String::new();
     loop {
         let mut header_line = String::new();
-        reader.read_line(&mut header_line).map_err(|e| e.to_string())?;
+        reader
+            .read_line(&mut header_line)
+            .map_err(|e| e.to_string())?;
         let trimmed = header_line.trim();
         if trimmed.is_empty() {
             break;
@@ -13368,43 +16749,68 @@ fn task_mcp_handle_http_connection(app: &tauri::AppHandle, mut stream: TcpStream
     }
 
     if content_length > TASK_MCP_MAX_BODY_BYTES {
-        let response = task_mcp_http_response(400, &serde_json::json!({"ok": false, "error": "Request body too large."}));
-        stream.write_all(response.as_bytes()).map_err(|e| e.to_string())?;
+        let response = task_mcp_http_response(
+            400,
+            &serde_json::json!({"ok": false, "error": "Request body too large."}),
+        );
+        stream
+            .write_all(response.as_bytes())
+            .map_err(|e| e.to_string())?;
         stream.flush().map_err(|e| e.to_string())?;
         return Ok(());
     }
     let mut body_buf = vec![0u8; content_length];
     if content_length > 0 {
-        reader.read_exact(&mut body_buf).map_err(|e| e.to_string())?;
+        reader
+            .read_exact(&mut body_buf)
+            .map_err(|e| e.to_string())?;
     }
     let body_text = String::from_utf8(body_buf).unwrap_or_default();
 
+    if let Some((status, payload)) = handle_canonical_http(app, &method, path, &body_text, &request_token) {
+        let response = task_mcp_http_response(status, &payload);
+        stream.write_all(response.as_bytes()).map_err(|e| e.to_string())?;
+        stream.flush().map_err(|e| e.to_string())?;
+        return Ok(());
+    }
+
     let (status, payload) = match (method.as_str(), path) {
-        ("GET", "/mcp/status") => {
-            (200, serde_json::json!({
+        ("GET", "/mcp/status") => (
+            200,
+            serde_json::json!({
                 "ok": true,
                 "result": task_mcp_current_bridge_state(),
-            }))
-        }
-        ("GET", "/mcp/tools") => {
-            (200, serde_json::json!({
+            }),
+        ),
+        ("GET", "/mcp/tools") => (
+            200,
+            serde_json::json!({
                 "ok": true,
                 "result": {
-                    "tools": task_mcp_tool_definitions(),
+                    "tools": canonical_mcp_tool_definitions(),
                     "readOnlyMode": false,
                     "localWriteMode": true,
                 },
-            }))
-        }
+            }),
+        ),
         ("POST", "/mcp/tools/call") => {
             if request_token != task_mcp_bridge_token() {
-                (401, serde_json::json!({"ok": false, "error": "Missing or invalid bridge token. Fetch GET /mcp/status to obtain the session token."}))
+                (
+                    401,
+                    serde_json::json!({"ok": false, "error": "Missing or invalid bridge token. Fetch GET /mcp/status to obtain the session token."}),
+                )
             } else {
                 let parsed: Value = serde_json::from_str(&body_text).unwrap_or(Value::Null);
                 let name = parsed["name"].as_str().unwrap_or("").to_string();
-                let args = parsed.get("args").cloned().unwrap_or_else(|| serde_json::json!({}));
+                let args = parsed
+                    .get("args")
+                    .cloned()
+                    .unwrap_or_else(|| serde_json::json!({}));
                 if name.trim().is_empty() {
-                    (400, serde_json::json!({"ok": false, "error": "Missing required property: name"}))
+                    (
+                        400,
+                        serde_json::json!({"ok": false, "error": "Missing required property: name"}),
+                    )
                 } else {
                     match task_mcp_execute_tool(app, &name, &args) {
                         Ok(result) => (200, serde_json::json!({"ok": true, "result": result})),
@@ -13413,24 +16819,44 @@ fn task_mcp_handle_http_connection(app: &tauri::AppHandle, mut stream: TcpStream
                 }
             }
         }
-        _ => {
-            (404, serde_json::json!({"ok": false, "error": "Endpoint not found."}))
-        }
+        _ => (
+            404,
+            serde_json::json!({"ok": false, "error": "Endpoint not found."}),
+        ),
     };
 
     let response = task_mcp_http_response(status, &payload);
-    stream.write_all(response.as_bytes()).map_err(|e| e.to_string())?;
+    stream
+        .write_all(response.as_bytes())
+        .map_err(|e| e.to_string())?;
     stream.flush().map_err(|e| e.to_string())?;
     Ok(())
 }
 
 fn start_task_mcp_bridge(app: tauri::AppHandle) {
+    if let Err(error) = canonical_storage_ready(&app) {
+        task_mcp_update_bridge_state(|state| {
+            state["canonicalStorage"] = serde_json::json!({"ready": false, "error": error});
+        });
+    } else {
+        task_mcp_update_bridge_state(|state| {
+            state["canonicalStorage"] = serde_json::json!({"ready": true});
+        });
+    }
+    if let Ok(dir) = app_data_dir(&app) {
+        if fs::create_dir_all(&dir).is_ok() {
+            let _ = fs::write(dir.join("mcp-bridge-token"), task_mcp_bridge_token());
+        }
+    }
     let app_for_thread = app.clone();
     thread::spawn(move || {
         let listener = match TcpListener::bind((TASK_MCP_BRIDGE_HOST, TASK_MCP_BRIDGE_PORT)) {
             Ok(listener) => listener,
             Err(err) => {
-                let msg = format!("Failed to start local MCP bridge on {}:{}: {err}", TASK_MCP_BRIDGE_HOST, TASK_MCP_BRIDGE_PORT);
+                let msg = format!(
+                    "Failed to start local MCP bridge on {}:{}: {err}",
+                    TASK_MCP_BRIDGE_HOST, TASK_MCP_BRIDGE_PORT
+                );
                 eprintln!("[task-mcp-bridge] {msg}");
                 task_mcp_update_bridge_state(|state| {
                     state["active"] = Value::Bool(false);
@@ -13440,7 +16866,10 @@ fn start_task_mcp_bridge(app: tauri::AppHandle) {
             }
         };
 
-        eprintln!("[task-mcp-bridge] active on {}:{}", TASK_MCP_BRIDGE_HOST, TASK_MCP_BRIDGE_PORT);
+        eprintln!(
+            "[task-mcp-bridge] active on {}:{}",
+            TASK_MCP_BRIDGE_HOST, TASK_MCP_BRIDGE_PORT
+        );
         task_mcp_update_bridge_state(|state| {
             state["active"] = Value::Bool(true);
             state["lastError"] = Value::Null;
@@ -13481,11 +16910,19 @@ fn primarch_tool_cache() -> &'static Mutex<HashMap<String, Vec<Value>>> {
 }
 
 fn primarch_cache_key(cmd_str: &str, args: &[String], working_dir: Option<&str>) -> String {
-    format!("{}|{}|{}", cmd_str, args.join("\u{1f}"), working_dir.unwrap_or(""))
+    format!(
+        "{}|{}|{}",
+        cmd_str,
+        args.join("\u{1f}"),
+        working_dir.unwrap_or("")
+    )
 }
 
 fn get_cached_safe_tools(cache_key: &str) -> Option<Vec<Value>> {
-    primarch_tool_cache().lock().ok().and_then(|cache| cache.get(cache_key).cloned())
+    primarch_tool_cache()
+        .lock()
+        .ok()
+        .and_then(|cache| cache.get(cache_key).cloned())
 }
 
 fn set_cached_safe_tools(cache_key: String, tools: Vec<Value>) {
@@ -13529,7 +16966,12 @@ async fn discover_safe_tools(
         return Ok(cached);
     }
 
-    let raw = match timeout(Duration::from_secs(10), mcp_list_tools_raw(cmd_str, args, working_dir)).await {
+    let raw = match timeout(
+        Duration::from_secs(10),
+        mcp_list_tools_raw(cmd_str, args, working_dir),
+    )
+    .await
+    {
         Ok(result) => result?,
         Err(_) => return Err("MCP tool discovery timed out after 10 seconds".to_string()),
     };
@@ -13539,9 +16981,15 @@ async fn discover_safe_tools(
     // A tools list that contains only primarch_status (Primarch not yet connected)
     // must not be cached â€” it would block all future attempts even after Primarch connects.
     let metadata_names = [
-        "list_columns", "list_attributes", "search_columns",
-        "get_entity_schema", "entity_schema", "get_table_schema",
-        "metadata_query", "describe_table", "describe_entity",
+        "list_columns",
+        "list_attributes",
+        "search_columns",
+        "get_entity_schema",
+        "entity_schema",
+        "get_table_schema",
+        "metadata_query",
+        "describe_table",
+        "describe_entity",
     ];
     let has_metadata_tool = safe_tools.iter().any(|t| {
         let n = t["name"].as_str().unwrap_or("");
@@ -13558,10 +17006,12 @@ fn is_read_only_tool(name: &str, description: &str) -> bool {
     let name_lc = name.to_lowercase();
     let desc_lc = description.to_lowercase();
     let write_signals = [
-        "create", "update", "delete", "publish", "import", "deploy",
-        "assign", "modify", "upsert", "remove", "add", "set", "write", "install",
+        "create", "update", "delete", "publish", "import", "deploy", "assign", "modify", "upsert",
+        "remove", "add", "set", "write", "install",
     ];
-    !write_signals.iter().any(|s| name_lc.contains(s) || desc_lc.contains(s))
+    !write_signals
+        .iter()
+        .any(|s| name_lc.contains(s) || desc_lc.contains(s))
 }
 
 /// Parses a shell-style argument string into tokens (respects double-quoted strings).
@@ -13573,12 +17023,16 @@ fn parse_mcp_args(args_raw: &str) -> Vec<String> {
         match ch {
             '"' => in_quotes = !in_quotes,
             ' ' | '\t' if !in_quotes => {
-                if !current.is_empty() { result.push(std::mem::take(&mut current)); }
+                if !current.is_empty() {
+                    result.push(std::mem::take(&mut current));
+                }
             }
             other => current.push(other),
         }
     }
-    if !current.is_empty() { result.push(current); }
+    if !current.is_empty() {
+        result.push(current);
+    }
     result
 }
 
@@ -13604,7 +17058,9 @@ fn validate_working_directory(wd: &str) -> Result<Option<String>, String> {
                      Path: {trimmed}"
                 ));
             }
-            Err(format!("Working directory does not exist.\nPath: {trimmed}\nError: {e}"))
+            Err(format!(
+                "Working directory does not exist.\nPath: {trimmed}\nError: {e}"
+            ))
         }
     }
 }
@@ -13619,17 +17075,31 @@ fn extract_logical_names_from_text(text: &str) -> Vec<String> {
             current.push(ch);
         } else {
             let len = current.len();
-            let ok = len >= 3 && len <= 80
-                && current.chars().next().map(|c| c.is_ascii_lowercase()).unwrap_or(false);
-            if ok { results.insert(current.clone()); }
+            let ok = len >= 3
+                && len <= 80
+                && current
+                    .chars()
+                    .next()
+                    .map(|c| c.is_ascii_lowercase())
+                    .unwrap_or(false);
+            if ok {
+                results.insert(current.clone());
+            }
             current.clear();
         }
     }
     if !current.is_empty() {
         let len = current.len();
-        let ok = len >= 3 && len <= 80
-            && current.chars().next().map(|c| c.is_ascii_lowercase()).unwrap_or(false);
-        if ok { results.insert(current); }
+        let ok = len >= 3
+            && len <= 80
+            && current
+                .chars()
+                .next()
+                .map(|c| c.is_ascii_lowercase())
+                .unwrap_or(false);
+        if ok {
+            results.insert(current);
+        }
     }
     results.into_iter().collect()
 }
@@ -13784,7 +17254,17 @@ fn collect_logical_names_from_json(value: &Value, names: &mut HashSet<String>) {
 fn collect_column_names(value: &Value, names: &mut HashSet<String>) {
     match value {
         Value::Object(map) => {
-            for key in ["logicalName", "logical_name", "schemaName", "schema_name", "attributeName", "attribute_name", "columnName", "column_name", "name"] {
+            for key in [
+                "logicalName",
+                "logical_name",
+                "schemaName",
+                "schema_name",
+                "attributeName",
+                "attribute_name",
+                "columnName",
+                "column_name",
+                "name",
+            ] {
                 if let Some(v) = map.get(key).and_then(|x| x.as_str()) {
                     if let Some(logical) = normalize_logical_name(v) {
                         names.insert(logical);
@@ -13792,7 +17272,21 @@ fn collect_column_names(value: &Value, names: &mut HashSet<String>) {
                 }
             }
             for (key, inner) in map {
-                if ["result", "payload", "output", "data", "columns", "attributes", "items", "value", "results", "records", "content"].contains(&key.as_str()) {
+                if [
+                    "result",
+                    "payload",
+                    "output",
+                    "data",
+                    "columns",
+                    "attributes",
+                    "items",
+                    "value",
+                    "results",
+                    "records",
+                    "content",
+                ]
+                .contains(&key.as_str())
+                {
                     collect_column_names(inner, names);
                 }
             }
@@ -13814,8 +17308,13 @@ fn normalize_logical_name(value: &str) -> Option<String> {
     if trimmed.len() > 80 {
         return None;
     }
-    if trimmed.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
-        && trimmed.chars().next().is_some_and(|c| c.is_ascii_lowercase())
+    if trimmed
+        .chars()
+        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+        && trimmed
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_lowercase())
     {
         return Some(trimmed.to_string());
     }
@@ -13879,9 +17378,21 @@ fn find_count_key(value: &Value, keys: &[&str]) -> Option<u64> {
 fn has_next_page_token(value: &Value) -> bool {
     match value {
         Value::Object(map) => {
-            for key in ["nextPage", "next_page", "nextToken", "next_token", "nextPageToken", "continuationToken", "continuation_token", "@odata.nextLink", "nextLink"] {
+            for key in [
+                "nextPage",
+                "next_page",
+                "nextToken",
+                "next_token",
+                "nextPageToken",
+                "continuationToken",
+                "continuation_token",
+                "@odata.nextLink",
+                "nextLink",
+            ] {
                 if let Some(v) = map.get(key) {
-                    if (v.is_string() && !v.as_str().unwrap_or("").trim().is_empty()) || (v.is_number()) {
+                    if (v.is_string() && !v.as_str().unwrap_or("").trim().is_empty())
+                        || (v.is_number())
+                    {
                         return true;
                     }
                 }
@@ -13900,11 +17411,20 @@ fn collect_raw_attribute_metadata(value: &Value, attrs: &mut HashMap<String, Val
         Value::Array(items) => {
             for item in items {
                 if let Value::Object(_) = item {
-                    let ln = ["logicalName", "logical_name", "attributeName", "attribute_name",
-                              "schemaName", "schema_name", "columnName", "column_name", "name"]
-                        .iter()
-                        .find_map(|k| item.get(k).and_then(|v| v.as_str()))
-                        .and_then(normalize_logical_name);
+                    let ln = [
+                        "logicalName",
+                        "logical_name",
+                        "attributeName",
+                        "attribute_name",
+                        "schemaName",
+                        "schema_name",
+                        "columnName",
+                        "column_name",
+                        "name",
+                    ]
+                    .iter()
+                    .find_map(|k| item.get(k).and_then(|v| v.as_str()))
+                    .and_then(normalize_logical_name);
                     if let Some(logical) = ln {
                         attrs.entry(logical).or_insert_with(|| item.clone());
                     }
@@ -13914,8 +17434,20 @@ fn collect_raw_attribute_metadata(value: &Value, attrs: &mut HashMap<String, Val
         }
         Value::Object(map) => {
             for (key, inner) in map {
-                if ["columns", "attributes", "items", "data", "results", "value", "records",
-                    "content", "payload", "output", "result"].contains(&key.as_str())
+                if [
+                    "columns",
+                    "attributes",
+                    "items",
+                    "data",
+                    "results",
+                    "value",
+                    "records",
+                    "content",
+                    "payload",
+                    "output",
+                    "result",
+                ]
+                .contains(&key.as_str())
                 {
                     collect_raw_attribute_metadata(inner, attrs);
                 }
@@ -13928,24 +17460,37 @@ fn collect_raw_attribute_metadata(value: &Value, attrs: &mut HashMap<String, Val
 /// Returns allowed target entity logical names for a Lookup/Customer/Owner attribute.
 fn attr_lookup_targets(attr: &Value) -> Vec<String> {
     let mut targets = Vec::new();
-    for key in &["targets", "target", "referencedEntity", "referenced_entity",
-                 "targetEntities", "target_entities", "lookupEntity", "referencedEntities"] {
+    for key in &[
+        "targets",
+        "target",
+        "referencedEntity",
+        "referenced_entity",
+        "targetEntities",
+        "target_entities",
+        "lookupEntity",
+        "referencedEntities",
+    ] {
         match attr.get(key) {
             Some(Value::Array(arr)) => {
                 for item in arr {
-                    let s = item.as_str()
+                    let s = item
+                        .as_str()
                         .or_else(|| item.get("logicalName").and_then(|v| v.as_str()))
                         .or_else(|| item.get("entityLogicalName").and_then(|v| v.as_str()))
                         .or_else(|| item.get("name").and_then(|v| v.as_str()));
                     if let Some(ln) = s.and_then(normalize_logical_name) {
-                        if !targets.contains(&ln) { targets.push(ln); }
+                        if !targets.contains(&ln) {
+                            targets.push(ln);
+                        }
                     }
                 }
             }
             Some(Value::String(s)) => {
                 for part in s.split(',') {
                     if let Some(ln) = normalize_logical_name(part.trim()) {
-                        if !targets.contains(&ln) { targets.push(ln); }
+                        if !targets.contains(&ln) {
+                            targets.push(ln);
+                        }
                     }
                 }
             }
@@ -13958,16 +17503,30 @@ fn attr_lookup_targets(attr: &Value) -> Vec<String> {
 /// Returns allowed integer option values for a Picklist/State/Status attribute.
 fn attr_option_values(attr: &Value) -> Vec<i64> {
     let mut values = Vec::new();
-    for key in &["options", "optionSet", "option_set", "choices", "picklist",
-                 "picklistValues", "optionValues", "option_values", "optionSetValues"] {
+    for key in &[
+        "options",
+        "optionSet",
+        "option_set",
+        "choices",
+        "picklist",
+        "picklistValues",
+        "optionValues",
+        "option_values",
+        "optionSetValues",
+    ] {
         if let Some(arr) = attr.get(key).and_then(|v| v.as_array()) {
             for item in arr {
-                let v = item.get("value").or_else(|| item.get("Value"))
-                    .or_else(|| item.get("intValue")).or_else(|| item.get("optionValue"))
+                let v = item
+                    .get("value")
+                    .or_else(|| item.get("Value"))
+                    .or_else(|| item.get("intValue"))
+                    .or_else(|| item.get("optionValue"))
                     .and_then(|v| v.as_i64())
                     .or_else(|| item.as_i64());
                 if let Some(val) = v {
-                    if !values.contains(&val) { values.push(val); }
+                    if !values.contains(&val) {
+                        values.push(val);
+                    }
                 }
             }
         }
@@ -13978,12 +17537,35 @@ fn attr_option_values(attr: &Value) -> Vec<i64> {
 /// Returns `Some(bool)` for a `validFor*` property if the attribute metadata exposes it.
 fn attr_valid_for(attr: &Value, direction: &str) -> Option<bool> {
     let keys: &[&str] = match direction {
-        "create" => &["validForCreate", "valid_for_create", "isValidForCreate", "createable", "isCreateable", "canCreate"],
-        "update" => &["validForUpdate", "valid_for_update", "isValidForUpdate", "updateable", "isUpdateable", "canUpdate"],
-        "read"   => &["validForRead", "valid_for_read", "isValidForRead", "readable", "isReadable", "isRetrievable", "retrievable"],
+        "create" => &[
+            "validForCreate",
+            "valid_for_create",
+            "isValidForCreate",
+            "createable",
+            "isCreateable",
+            "canCreate",
+        ],
+        "update" => &[
+            "validForUpdate",
+            "valid_for_update",
+            "isValidForUpdate",
+            "updateable",
+            "isUpdateable",
+            "canUpdate",
+        ],
+        "read" => &[
+            "validForRead",
+            "valid_for_read",
+            "isValidForRead",
+            "readable",
+            "isReadable",
+            "isRetrievable",
+            "retrievable",
+        ],
         _ => return None,
     };
-    keys.iter().find_map(|k| attr.get(k).and_then(|v| v.as_bool()))
+    keys.iter()
+        .find_map(|k| attr.get(k).and_then(|v| v.as_bool()))
 }
 
 fn build_entity_metadata_cache_entry(
@@ -14002,7 +17584,17 @@ fn build_entity_metadata_cache_entry(
 
     let column_count = attributes.len();
     let has_more = find_bool_key(value, &["hasMore", "has_more", "more"]).unwrap_or(false);
-    let total_count = find_count_key(value, &["totalCount", "total_count", "count", "total", "totalColumns", "total_columns"]);
+    let total_count = find_count_key(
+        value,
+        &[
+            "totalCount",
+            "total_count",
+            "count",
+            "total",
+            "totalColumns",
+            "total_columns",
+        ],
+    );
     let has_next_token = has_next_page_token(value);
 
     let mut schema_completeness = "unknown".to_string();
@@ -14014,7 +17606,9 @@ fn build_entity_metadata_cache_entry(
     } else if let Some(total) = total_count {
         if total as usize > column_count {
             schema_completeness = "incomplete".to_string();
-            note = Some(format!("Metadata reported total columns {total}, but only {column_count} were returned."));
+            note = Some(format!(
+                "Metadata reported total columns {total}, but only {column_count} were returned."
+            ));
         } else {
             schema_completeness = "complete".to_string();
         }
@@ -14054,12 +17648,17 @@ fn get_mcp_config(settings: &Value) -> Result<(String, Vec<String>, Option<Strin
     if !enabled {
         return Err("CRM metadata assistant is not enabled. Go to Settings \u{2192} CRM Metadata and enable it.".to_string());
     }
-    let cmd_str = settings["primarchMcpCommand"].as_str().unwrap_or("").to_string();
+    let cmd_str = settings["primarchMcpCommand"]
+        .as_str()
+        .unwrap_or("")
+        .to_string();
     if cmd_str.is_empty() {
         return Err("MCP command is not configured. Go to Settings \u{2192} CRM Metadata and set the server command.".to_string());
     }
     let args = parse_mcp_args(settings["primarchMcpArgs"].as_str().unwrap_or(""));
-    let wd_raw = settings["primarchMcpWorkingDirectory"].as_str().unwrap_or("");
+    let wd_raw = settings["primarchMcpWorkingDirectory"]
+        .as_str()
+        .unwrap_or("");
     let working_dir = validate_working_directory(wd_raw)
         .map_err(|e| format!("MCP working directory error: {e}"))?;
     Ok((cmd_str, args, working_dir))
@@ -14069,8 +17668,14 @@ fn get_mcp_config(settings: &Value) -> Result<(String, Vec<String>, Option<Strin
 fn find_safe_tool<'a>(tools: &'a [Value], preferred: &[&str]) -> Option<&'a Value> {
     // Exact name match first
     for p in preferred {
-        if let Some(t) = tools.iter().find(|t| t["name"].as_str().unwrap_or("") == *p) {
-            if is_read_only_tool(t["name"].as_str().unwrap_or(""), t["description"].as_str().unwrap_or("")) {
+        if let Some(t) = tools
+            .iter()
+            .find(|t| t["name"].as_str().unwrap_or("") == *p)
+        {
+            if is_read_only_tool(
+                t["name"].as_str().unwrap_or(""),
+                t["description"].as_str().unwrap_or(""),
+            ) {
                 return Some(t);
             }
         }
@@ -14089,12 +17694,25 @@ fn find_safe_tool<'a>(tools: &'a [Value], preferred: &[&str]) -> Option<&'a Valu
 }
 
 /// Runs the MCP server, sends initialize + tools/list, then kills the process.
-async fn mcp_list_tools_raw(cmd_str: &str, args: &[String], working_dir: Option<&str>) -> Result<Vec<Value>, String> {
+async fn mcp_list_tools_raw(
+    cmd_str: &str,
+    args: &[String],
+    working_dir: Option<&str>,
+) -> Result<Vec<Value>, String> {
     let mut cmd = tokio::process::Command::new(cmd_str);
-    cmd.args(args).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null());
-    if let Some(dir) = working_dir { if !dir.is_empty() { cmd.current_dir(dir); } }
+    cmd.args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    if let Some(dir) = working_dir {
+        if !dir.is_empty() {
+            cmd.current_dir(dir);
+        }
+    }
     #[cfg(target_os = "windows")]
-    { cmd.creation_flags(CREATE_NO_WINDOW); }
+    {
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
 
     let mut child = cmd.spawn().map_err(|e| {
         let wd_info = working_dir.map(|d| format!("\n  Working directory: {d}")).unwrap_or_default();
@@ -14104,8 +17722,14 @@ async fn mcp_list_tools_raw(cmd_str: &str, args: &[String], working_dir: Option<
         } else { "" };
         format!("Failed to start MCP server\n  Command: {cmd_str}\n  Args: {args:?}{wd_info}\n  Error: {e}{hint}")
     })?;
-    let mut stdin  = child.stdin.take().ok_or_else(|| "MCP: no stdin".to_string())?;
-    let stdout = child.stdout.take().ok_or_else(|| "MCP: no stdout".to_string())?;
+    let mut stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| "MCP: no stdin".to_string())?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| "MCP: no stdout".to_string())?;
 
     let result = timeout(Duration::from_secs(10), async {
         let mut reader = TokioBufReader::new(stdout).lines();
@@ -14150,14 +17774,26 @@ async fn mcp_list_tools_raw(cmd_str: &str, args: &[String], working_dir: Option<
 
 /// Calls a single MCP tool; starts and kills a process per call (stateless MVP).
 async fn mcp_call_tool_raw(
-    cmd_str: &str, args: &[String], working_dir: Option<&str>,
-    tool_name: &str, arguments: Value,
+    cmd_str: &str,
+    args: &[String],
+    working_dir: Option<&str>,
+    tool_name: &str,
+    arguments: Value,
 ) -> Result<Value, String> {
     let mut cmd = tokio::process::Command::new(cmd_str);
-    cmd.args(args).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null());
-    if let Some(dir) = working_dir { if !dir.is_empty() { cmd.current_dir(dir); } }
+    cmd.args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    if let Some(dir) = working_dir {
+        if !dir.is_empty() {
+            cmd.current_dir(dir);
+        }
+    }
     #[cfg(target_os = "windows")]
-    { cmd.creation_flags(CREATE_NO_WINDOW); }
+    {
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
 
     let mut child = cmd.spawn().map_err(|e| {
         let wd_info = working_dir.map(|d| format!("\n  Working directory: {d}")).unwrap_or_default();
@@ -14167,8 +17803,14 @@ async fn mcp_call_tool_raw(
         } else { "" };
         format!("Failed to start MCP server\n  Command: {cmd_str}\n  Args: {args:?}{wd_info}\n  Error: {e}{hint}")
     })?;
-    let mut stdin  = child.stdin.take().ok_or_else(|| "MCP: no stdin".to_string())?;
-    let stdout = child.stdout.take().ok_or_else(|| "MCP: no stdout".to_string())?;
+    let mut stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| "MCP: no stdin".to_string())?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| "MCP: no stdout".to_string())?;
 
     let result = timeout(Duration::from_secs(20), async {
         let mut reader = TokioBufReader::new(stdout).lines();
@@ -14219,17 +17861,29 @@ async fn fetch_entity_schema_metadata(
 ) -> Result<EntityMetadataCacheEntry, String> {
     let mut base_args = serde_json::Map::new();
     if schema_property_exists(tool, &["entityName"]) {
-        base_args.insert("entityName".to_string(), Value::String(entity_name.to_string()));
+        base_args.insert(
+            "entityName".to_string(),
+            Value::String(entity_name.to_string()),
+        );
     } else if schema_property_exists(tool, &["logicalName"]) {
-        base_args.insert("logicalName".to_string(), Value::String(entity_name.to_string()));
+        base_args.insert(
+            "logicalName".to_string(),
+            Value::String(entity_name.to_string()),
+        );
     } else if schema_property_exists(tool, &["tableName"]) {
-        base_args.insert("tableName".to_string(), Value::String(entity_name.to_string()));
+        base_args.insert(
+            "tableName".to_string(),
+            Value::String(entity_name.to_string()),
+        );
     } else if schema_property_exists(tool, &["entity"]) {
         base_args.insert("entity".to_string(), Value::String(entity_name.to_string()));
     } else if schema_property_exists(tool, &["table"]) {
         base_args.insert("table".to_string(), Value::String(entity_name.to_string()));
     } else {
-        base_args.insert("entityName".to_string(), Value::String(entity_name.to_string()));
+        base_args.insert(
+            "entityName".to_string(),
+            Value::String(entity_name.to_string()),
+        );
     }
 
     let mut paging_parts: Vec<String> = Vec::new();
@@ -14249,22 +17903,35 @@ async fn fetch_entity_schema_metadata(
     }
 
     let supports_page = schema_property_exists(tool, &["page", "pageNumber", "page_number"]);
-    let supports_page_size = schema_property_exists(tool, &["pageSize", "page_size", "limit", "top"]);
+    let supports_page_size =
+        schema_property_exists(tool, &["pageSize", "page_size", "limit", "top"]);
     if supports_page_size {
         if schema_property_exists(tool, &["pageSize"]) {
-            base_args.insert("pageSize".to_string(), Value::Number(serde_json::Number::from(5000)));
+            base_args.insert(
+                "pageSize".to_string(),
+                Value::Number(serde_json::Number::from(5000)),
+            );
             paging_parts.push("pageSize=5000".to_string());
         }
         if schema_property_exists(tool, &["page_size"]) {
-            base_args.insert("page_size".to_string(), Value::Number(serde_json::Number::from(5000)));
+            base_args.insert(
+                "page_size".to_string(),
+                Value::Number(serde_json::Number::from(5000)),
+            );
             paging_parts.push("page_size=5000".to_string());
         }
         if schema_property_exists(tool, &["limit"]) {
-            base_args.insert("limit".to_string(), Value::Number(serde_json::Number::from(5000)));
+            base_args.insert(
+                "limit".to_string(),
+                Value::Number(serde_json::Number::from(5000)),
+            );
             paging_parts.push("limit=5000".to_string());
         }
         if schema_property_exists(tool, &["top"]) {
-            base_args.insert("top".to_string(), Value::Number(serde_json::Number::from(5000)));
+            base_args.insert(
+                "top".to_string(),
+                Value::Number(serde_json::Number::from(5000)),
+            );
             paging_parts.push("top=5000".to_string());
         }
     }
@@ -14279,21 +17946,41 @@ async fn fetch_entity_schema_metadata(
         let mut call_args = base_args.clone();
         if supports_page {
             if schema_property_exists(tool, &["page"]) {
-                call_args.insert("page".to_string(), Value::Number(serde_json::Number::from(page)));
+                call_args.insert(
+                    "page".to_string(),
+                    Value::Number(serde_json::Number::from(page)),
+                );
             }
             if schema_property_exists(tool, &["pageNumber"]) {
-                call_args.insert("pageNumber".to_string(), Value::Number(serde_json::Number::from(page)));
+                call_args.insert(
+                    "pageNumber".to_string(),
+                    Value::Number(serde_json::Number::from(page)),
+                );
             }
             if schema_property_exists(tool, &["page_number"]) {
-                call_args.insert("page_number".to_string(), Value::Number(serde_json::Number::from(page)));
+                call_args.insert(
+                    "page_number".to_string(),
+                    Value::Number(serde_json::Number::from(page)),
+                );
             }
         }
 
-        let schema_val = mcp_call_tool_raw(cmd_str, args, working_dir, tool_name, Value::Object(call_args)).await?;
+        let schema_val = mcp_call_tool_raw(
+            cmd_str,
+            args,
+            working_dir,
+            tool_name,
+            Value::Object(call_args),
+        )
+        .await?;
         let entry = build_entity_metadata_cache_entry(
             &schema_val,
             tool_name,
-            if paging_parts.is_empty() { None } else { Some(paging_parts.join(", ")) },
+            if paging_parts.is_empty() {
+                None
+            } else {
+                Some(paging_parts.join(", "))
+            },
             supports_paging,
             true,
         );
@@ -14303,14 +17990,17 @@ async fn fetch_entity_schema_metadata(
         for (k, v) in entry.raw_attrs {
             merged_raw_attrs.entry(k).or_insert(v);
         }
-        let has_more = find_bool_key(&schema_val, &["hasMore", "has_more", "more"]).unwrap_or(false);
+        let has_more =
+            find_bool_key(&schema_val, &["hasMore", "has_more", "more"]).unwrap_or(false);
         let has_next = has_next_page_token(&schema_val);
         let should_continue = supports_page && (has_more || has_next);
 
         if should_continue {
             page += 1;
             if page > 25 {
-                note = Some("Paging exceeded 25 pages; metadata collection stopped early.".to_string());
+                note = Some(
+                    "Paging exceeded 25 pages; metadata collection stopped early.".to_string(),
+                );
                 break "incomplete".to_string();
             }
             continue;
@@ -14344,7 +18034,10 @@ async fn fetch_entity_schema_metadata(
     }
 
     if schema_completeness == "unknown" {
-        note = note.or(Some("Column metadata completeness could not be proven from tool response metadata.".to_string()));
+        note = note.or(Some(
+            "Column metadata completeness could not be proven from tool response metadata."
+                .to_string(),
+        ));
     }
 
     Ok(EntityMetadataCacheEntry {
@@ -14353,15 +18046,23 @@ async fn fetch_entity_schema_metadata(
         column_count,
         schema_completeness,
         tool_used: tool_name.to_string(),
-        paging: if paging_parts.is_empty() { None } else { Some(paging_parts.join(", ")) },
+        paging: if paging_parts.is_empty() {
+            None
+        } else {
+            Some(paging_parts.join(", "))
+        },
         note,
     })
 }
 
 /// Tests connectivity to the Primarch MCP server (tools/list only â€” no Dataverse read).
 #[tauri::command]
-async fn test_primarch_mcp_connection(app: tauri::AppHandle, settings_override: Option<Value>) -> Result<Value, String> {
-    let settings = settings_override.unwrap_or(read_json(&app_data_dir(&app)?.join("settings.json"))?);
+async fn test_primarch_mcp_connection(
+    app: tauri::AppHandle,
+    settings_override: Option<Value>,
+) -> Result<Value, String> {
+    let settings =
+        settings_override.unwrap_or(read_json(&app_data_dir(&app)?.join("settings.json"))?);
     let (cmd_str, args, working_dir) = match get_mcp_config(&settings) {
         Ok(v) => v,
         Err(msg) => return Ok(serde_json::json!({ "status": "not_configured", "message": msg })),
@@ -14394,41 +18095,67 @@ async fn list_primarch_mcp_tools(app: tauri::AppHandle) -> Result<Value, String>
 /// Generates a CRM skeleton (pseudo-code proposal) using Primarch MCP metadata + AI.
 /// Read-only: only calls metadata query tools on the MCP server, never writes to Dataverse.
 #[tauri::command]
-async fn generate_crm_skeleton(app: tauri::AppHandle, task: Value, customer: Value, workflow_setup: Value) -> Result<Value, String> {
+async fn generate_crm_skeleton(
+    app: tauri::AppHandle,
+    task: Value,
+    customer: Value,
+    workflow_setup: Value,
+) -> Result<Value, String> {
     let settings = read_json(&app_data_dir(&app)?.join("settings.json"))?;
     let (cmd_str, args, working_dir) = match get_mcp_config(&settings) {
         Ok(v) => v,
-        Err(msg) => return Ok(serde_json::json!({
-            "mode": "script",
-            "summary": msg,
-            "pseudoCode": "",
-            "logicalNamesUsed": [],
-            "metadataInspected": {"entityLogicalNames":[],"attributeLogicalNames":{},"toolsUsed":[]}
-        })),
+        Err(msg) => {
+            return Ok(serde_json::json!({
+                "mode": "script",
+                "summary": msg,
+                "pseudoCode": "",
+                "logicalNamesUsed": [],
+                "metadataInspected": {"entityLogicalNames":[],"attributeLogicalNames":{},"toolsUsed":[]}
+            }))
+        }
     };
 
-    let title    = task["title"].as_str().unwrap_or("").to_string();
-    let message  = task["originalMessage"].as_str().unwrap_or("").to_string();
-    let ns       = customer["namespace"].as_str().unwrap_or("").to_string();
-    let dev_kind = workflow_setup["devTargetKind"].as_str().unwrap_or("script").to_string();
-    let mode     = if dev_kind == "plugin" { "plugin" } else { "script" };
+    let title = task["title"].as_str().unwrap_or("").to_string();
+    let message = task["originalMessage"].as_str().unwrap_or("").to_string();
+    let ns = customer["namespace"].as_str().unwrap_or("").to_string();
+    let dev_kind = workflow_setup["devTargetKind"]
+        .as_str()
+        .unwrap_or("script")
+        .to_string();
+    let mode = if dev_kind == "plugin" {
+        "plugin"
+    } else {
+        "script"
+    };
 
-    let candidate_entities: Vec<String> = extract_logical_names_from_text(&format!("{title} {message}"))
-        .into_iter().take(5).collect();
+    let candidate_entities: Vec<String> =
+        extract_logical_names_from_text(&format!("{title} {message}"))
+            .into_iter()
+            .take(5)
+            .collect();
 
     let tools = match discover_safe_tools(&cmd_str, &args, working_dir.as_deref()).await {
         Ok(tools) => tools,
-        Err(msg) => return Ok(serde_json::json!({
-            "mode": mode,
-            "summary": msg,
-            "pseudoCode": "",
-            "logicalNamesUsed": [],
-            "metadataInspected": {"entityLogicalNames":[],"attributeLogicalNames":{},"toolsUsed":[]}
-        })),
+        Err(msg) => {
+            return Ok(serde_json::json!({
+                "mode": mode,
+                "summary": msg,
+                "pseudoCode": "",
+                "logicalNamesUsed": [],
+                "metadataInspected": {"entityLogicalNames":[],"attributeLogicalNames":{},"toolsUsed":[]}
+            }))
+        }
     };
-    let schema_tool = find_safe_tool(&tools, &[
-        "get_entity_schema", "entity_schema", "get_table_schema", "metadata_query", "list_columns",
-    ]);
+    let schema_tool = find_safe_tool(
+        &tools,
+        &[
+            "get_entity_schema",
+            "entity_schema",
+            "get_table_schema",
+            "metadata_query",
+            "list_columns",
+        ],
+    );
 
     let mut metadata_sections: Vec<String> = Vec::new();
     let mut tools_used: Vec<String> = Vec::new();
@@ -14440,10 +18167,15 @@ async fn generate_crm_skeleton(app: tauri::AppHandle, task: Value, customer: Val
         tools_used.push(tn.clone());
         for entity in &candidate_entities {
             let arg = serde_json::json!({"entityName": entity});
-            if let Ok(schema_val) = mcp_call_tool_raw(&cmd_str, &args, working_dir.as_deref(), &tn, arg).await {
+            if let Ok(schema_val) =
+                mcp_call_tool_raw(&cmd_str, &args, working_dir.as_deref(), &tn, arg).await
+            {
                 inspected_entities.push(entity.clone());
                 let s = serde_json::to_string(&schema_val).unwrap_or_default();
-                let attrs: Vec<String> = extract_logical_names_from_text(&s).into_iter().take(20).collect();
+                let attrs: Vec<String> = extract_logical_names_from_text(&s)
+                    .into_iter()
+                    .take(20)
+                    .collect();
                 inspected_attrs.insert(entity.clone(), attrs);
                 let short = &s[..s.len().min(1500)];
                 metadata_sections.push(format!("Entity '{entity}' schema:\n{short}"));
@@ -14458,7 +18190,10 @@ async fn generate_crm_skeleton(app: tauri::AppHandle, task: Value, customer: Val
             "No entity schemas retrieved from task context. Skeleton uses placeholder logical names.".to_string()
         }
     } else {
-        format!("CRM metadata from Primarch MCP:\n\n{}", metadata_sections.join("\n\n"))
+        format!(
+            "CRM metadata from Primarch MCP:\n\n{}",
+            metadata_sections.join("\n\n")
+        )
     };
 
     let mode_hint = if mode == "plugin" {
@@ -14477,11 +18212,13 @@ Return ONLY this JSON:\n{{\"summary\":\"one-sentence what this skeleton does\",\
 
     let ai_config = get_ai_config(&app).map_err(|e| format!("AI not configured: {e}"))?;
     let text = call_ai_text(&ai_config, &instructions, &prompt).await?;
-    let parsed: Value = serde_json::from_str(strip_fences(&text)).unwrap_or_else(|_| serde_json::json!({
-        "summary": "Skeleton generation failed â€” could not parse AI response.",
-        "pseudoCode": &text[..text.len().min(2000)],
-        "logicalNamesUsed": []
-    }));
+    let parsed: Value = serde_json::from_str(strip_fences(&text)).unwrap_or_else(|_| {
+        serde_json::json!({
+            "summary": "Skeleton generation failed â€” could not parse AI response.",
+            "pseudoCode": &text[..text.len().min(2000)],
+            "logicalNamesUsed": []
+        })
+    });
 
     Ok(serde_json::json!({
         "mode": mode,
@@ -14502,7 +18239,10 @@ Return ONLY this JSON:\n{{\"summary\":\"one-sentence what this skeleton does\",\
 /// attribute references exist but no entity was inferred; otherwise "unknown".
 fn compute_static_inference_confidence(scan: &CrmScanResult) -> &'static str {
     if let Some(plugin_context) = &scan.plugin_context {
-        match (plugin_context.primary_entity_name.is_some(), plugin_context.primary_entity_source.as_deref()) {
+        match (
+            plugin_context.primary_entity_name.is_some(),
+            plugin_context.primary_entity_source.as_deref(),
+        ) {
             (true, Some("manual_override")) => "high",
             (true, _) if scan.ambiguous_attributes.is_empty() => "high",
             (true, _) => "medium",
@@ -14510,7 +18250,9 @@ fn compute_static_inference_confidence(scan: &CrmScanResult) -> &'static str {
             _ => "unknown",
         }
     } else {
-        let has_primary_form_entity = scan.entity_references.iter()
+        let has_primary_form_entity = scan
+            .entity_references
+            .iter()
             .any(|r| r.context_type == "primary_form_entity");
         if has_primary_form_entity {
             "inferred"
@@ -14526,11 +18268,16 @@ fn compute_static_inference_confidence(scan: &CrmScanResult) -> &'static str {
 fn response_text_says_not_found(response: &Value) -> bool {
     if let Some(content) = response.get("content") {
         if let Some(arr) = content.as_array() {
-            if arr.is_empty() { return true; }
+            if arr.is_empty() {
+                return true;
+            }
             return arr.iter().all(|item| {
                 let text = item["text"].as_str().unwrap_or("").to_lowercase();
-                text.is_empty() || text.contains("not found") || text.contains("does not exist")
-                    || text.contains("no attribute") || text.contains("no column")
+                text.is_empty()
+                    || text.contains("not found")
+                    || text.contains("does not exist")
+                    || text.contains("no attribute")
+                    || text.contains("no column")
             });
         }
         return content.is_null();
@@ -14556,10 +18303,18 @@ async fn try_exact_column_lookup(
     attribute_name: &str,
 ) -> (Option<bool>, String, String) {
     // â”€â”€ 1. Dedicated get/describe-attribute tool â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-    if let Some(tool) = find_safe_tool(tools, &[
-        "get_column", "get_attribute", "describe_column", "describe_attribute",
-        "column_metadata", "attribute_metadata", "get_table_column",
-    ]) {
+    if let Some(tool) = find_safe_tool(
+        tools,
+        &[
+            "get_column",
+            "get_attribute",
+            "describe_column",
+            "describe_attribute",
+            "column_metadata",
+            "attribute_metadata",
+            "get_table_column",
+        ],
+    ) {
         let tname = tool["name"].as_str().unwrap_or("").to_string();
         let mut call_args = serde_json::Map::new();
         for key in &["entityName", "entity", "tableName", "table", "logicalName"] {
@@ -14568,7 +18323,13 @@ async fn try_exact_column_lookup(
                 break;
             }
         }
-        let attr_keys: &[&str] = &["attributeName", "attribute_name", "columnName", "column_name", "name"];
+        let attr_keys: &[&str] = &[
+            "attributeName",
+            "attribute_name",
+            "columnName",
+            "column_name",
+            "name",
+        ];
         let mut attr_param_set = false;
         for key in attr_keys {
             if schema_property_exists(tool, &[key]) {
@@ -14582,42 +18343,72 @@ async fn try_exact_column_lookup(
             match timeout(
                 Duration::from_secs(15),
                 mcp_call_tool_raw(cmd_str, args, working_dir, &tname, Value::Object(call_args)),
-            ).await {
+            )
+            .await
+            {
                 Ok(Ok(response)) => {
                     let mut found_names: HashSet<String> = HashSet::new();
                     collect_column_names(&response, &mut found_names);
                     if found_names.contains(attribute_name) {
-                        return (Some(true), tname.clone(), format!("tool={tname} args={args_json} â†’ found in response"));
+                        return (
+                            Some(true),
+                            tname.clone(),
+                            format!("tool={tname} args={args_json} â†’ found in response"),
+                        );
                     }
                     if response_text_says_not_found(&response) || found_names.is_empty() {
-                        return (Some(false), tname.clone(), format!("tool={tname} args={args_json} â†’ empty/not-found response"));
+                        return (
+                            Some(false),
+                            tname.clone(),
+                            format!("tool={tname} args={args_json} â†’ empty/not-found response"),
+                        );
                     }
                     return (None, tname.clone(), format!("tool={tname} args={args_json} â†’ response contained other columns but not '{attribute_name}' (possible partial result)"));
                 }
                 Ok(Err(e)) => {
-                    return (None, tname.clone(), format!("tool={tname} args={args_json} â†’ call error: {e}"));
+                    return (
+                        None,
+                        tname.clone(),
+                        format!("tool={tname} args={args_json} â†’ call error: {e}"),
+                    );
                 }
                 Err(_) => {
-                    return (None, tname.clone(), format!("tool={tname} args={args_json} â†’ timed out"));
+                    return (
+                        None,
+                        tname.clone(),
+                        format!("tool={tname} args={args_json} â†’ timed out"),
+                    );
                 }
             }
         }
     }
 
     // â”€â”€ 2. list_columns / search_columns with filter/search param â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-    if let Some(tool) = find_safe_tool(tools, &[
-        "search_columns", "list_columns", "list_attributes", "search_attributes",
-    ]) {
+    if let Some(tool) = find_safe_tool(
+        tools,
+        &[
+            "search_columns",
+            "list_columns",
+            "list_attributes",
+            "search_attributes",
+        ],
+    ) {
         let tname = tool["name"].as_str().unwrap_or("").to_string();
         let params: Vec<String> = tool["inputSchema"]["properties"]
             .as_object()
             .map(|p| p.keys().cloned().collect())
             .unwrap_or_default();
-        let search_param = if schema_property_exists(tool, &["searchTerm"]) { Some("searchTerm") }
-            else if schema_property_exists(tool, &["search_term"]) { Some("search_term") }
-            else if schema_property_exists(tool, &["search"]) { Some("search") }
-            else if schema_property_exists(tool, &["filter"]) { Some("filter") }
-            else { None };
+        let search_param = if schema_property_exists(tool, &["searchTerm"]) {
+            Some("searchTerm")
+        } else if schema_property_exists(tool, &["search_term"]) {
+            Some("search_term")
+        } else if schema_property_exists(tool, &["search"]) {
+            Some("search")
+        } else if schema_property_exists(tool, &["filter"]) {
+            Some("filter")
+        } else {
+            None
+        };
         if let Some(sparam) = search_param {
             let mut call_args = serde_json::Map::new();
             for key in &["entityName", "entity", "logicalName", "tableName", "table"] {
@@ -14626,12 +18417,17 @@ async fn try_exact_column_lookup(
                     break;
                 }
             }
-            call_args.insert(sparam.to_string(), Value::String(attribute_name.to_string()));
+            call_args.insert(
+                sparam.to_string(),
+                Value::String(attribute_name.to_string()),
+            );
             let args_json = serde_json::to_string(&call_args).unwrap_or_default();
             match timeout(
                 Duration::from_secs(15),
                 mcp_call_tool_raw(cmd_str, args, working_dir, &tname, Value::Object(call_args)),
-            ).await {
+            )
+            .await
+            {
                 Ok(Ok(response)) => {
                     let mut found_names: HashSet<String> = HashSet::new();
                     collect_column_names(&response, &mut found_names);
@@ -14647,7 +18443,13 @@ async fn try_exact_column_lookup(
                     return (None, tname.clone(), format!("tool={tname} {sparam}={attribute_name} args={args_json} â†’ call error: {e}"));
                 }
                 Err(_) => {
-                    return (None, tname.clone(), format!("tool={tname} {sparam}={attribute_name} args={args_json} â†’ timed out"));
+                    return (
+                        None,
+                        tname.clone(),
+                        format!(
+                            "tool={tname} {sparam}={attribute_name} args={args_json} â†’ timed out"
+                        ),
+                    );
                 }
             }
         } else {
@@ -14659,7 +18461,12 @@ async fn try_exact_column_lookup(
         }
     }
 
-    (None, "none".to_string(), "No dedicated exact-attribute tool or filterable search tool found in Primarch tool list".to_string())
+    (
+        None,
+        "none".to_string(),
+        "No dedicated exact-attribute tool or filterable search tool found in Primarch tool list"
+            .to_string(),
+    )
 }
 
 /// True for local-scanner notes that describe how the primary entity/context was assumed (form,
@@ -15584,11 +19391,16 @@ async fn run_crm_verification_for_scan(
 
     match verification {
         Ok(Ok(report)) => Ok(report),
-        Ok(Err(err)) => Ok(default_report("error", "unknown", format!("Verification could not be completed. {err}"))),
+        Ok(Err(err)) => Ok(default_report(
+            "error",
+            "unknown",
+            format!("Verification could not be completed. {err}"),
+        )),
         Err(_) => Ok(default_report(
             "error",
             "unknown",
-            "Verification could not confirm enough metadata to make a reliable decision.".to_string(),
+            "Verification could not confirm enough metadata to make a reliable decision."
+                .to_string(),
         )),
     }
 }
@@ -15597,7 +19409,9 @@ async fn run_crm_verification_for_scan(
 /// (implementationVerification.dataverseCheck.warningsAccepted.accepted). Never true unless a
 /// prior accept_dataverse_warnings call set it — the AI cannot set this itself.
 fn task_mcp_dataverse_warnings_accepted(task: &Value) -> bool {
-    task["implementationVerification"]["dataverseCheck"]["warningsAccepted"]["accepted"].as_bool().unwrap_or(false)
+    task["implementationVerification"]["dataverseCheck"]["warningsAccepted"]["accepted"]
+        .as_bool()
+        .unwrap_or(false)
 }
 
 /// Builds the flat "kind/logicalName/entity/attribute/status" reference list the Implementation
@@ -15668,10 +19482,19 @@ fn task_mcp_dataverse_check_from_report(report: &Value) -> (String, String, Vec<
 /// already do right now. needs_configuration only wins once there is nothing left for the agent
 /// itself to act on. needs_manual_action/wait_for_user is reserved for the genuinely manual rows
 /// (Local Test) — never for Dataverse Check or AI Review merely because this is a JS/TS task.
-fn task_mcp_rollup_verification_status(checks: &[Value], fixable_findings_count: usize) -> (&'static str, &'static str) {
-    let has_needs_configuration = checks.iter().any(|c| c["status"].as_str() == Some("needs_configuration"));
-    let has_needs_ai_review = checks.iter().any(|c| c["status"].as_str() == Some("needs_ai_kit_review"));
-    let has_warnings_unaccepted = checks.iter().any(|c| c["status"].as_str() == Some("warnings_unaccepted"));
+fn task_mcp_rollup_verification_status(
+    checks: &[Value],
+    fixable_findings_count: usize,
+) -> (&'static str, &'static str) {
+    let has_needs_configuration = checks
+        .iter()
+        .any(|c| c["status"].as_str() == Some("needs_configuration"));
+    let has_needs_ai_review = checks
+        .iter()
+        .any(|c| c["status"].as_str() == Some("needs_ai_kit_review"));
+    let has_warnings_unaccepted = checks
+        .iter()
+        .any(|c| c["status"].as_str() == Some("warnings_unaccepted"));
     if fixable_findings_count > 0 {
         ("failed", "fix_code")
     } else if has_needs_ai_review {
@@ -15682,7 +19505,12 @@ fn task_mcp_rollup_verification_status(checks: &[Value], fixable_findings_count:
         // The Dataverse Metadata Check completed with non-blocking warnings, but the user has not
         // explicitly accepted them yet — this requires user action, not further agent work.
         ("warnings_unaccepted", "review_dataverse_warnings")
-    } else if checks.iter().any(|c| matches!(c["status"].as_str(), Some("needs_manual_action") | Some("failed") | Some("skipped") | Some("not_run"))) {
+    } else if checks.iter().any(|c| {
+        matches!(
+            c["status"].as_str(),
+            Some("needs_manual_action") | Some("failed") | Some("skipped") | Some("not_run")
+        )
+    }) {
         ("needs_manual_action", "wait_for_user")
     } else {
         ("passed", "continue_workflow")
@@ -15698,15 +19526,23 @@ fn task_mcp_rollup_verification_status(checks: &[Value], fixable_findings_count:
 /// review missing those details can be told apart from a genuinely complete one (see
 /// task_mcp_ai_kit_review_gate). Pure mutation — no I/O — so this is unit testable without a
 /// Tauri AppHandle.
-fn task_mcp_apply_ai_kit_review_result(task: &mut Value, args: &Value, now: &str) -> Result<(), String> {
+fn task_mcp_apply_ai_kit_review_result(
+    task: &mut Value,
+    args: &Value,
+    now: &str,
+) -> Result<(), String> {
     let status = args["status"].as_str().unwrap_or("").trim();
     if !matches!(status, "passed" | "failed" | "warnings") {
-        return Err(format!("Invalid status '{status}'. Allowed: passed, failed, warnings"));
+        return Err(format!(
+            "Invalid status '{status}'. Allowed: passed, failed, warnings"
+        ));
     }
     let arr = |key: &str| args[key].as_array().cloned().unwrap_or_default();
     let summary = args["summary"].as_str().unwrap_or("").to_string();
 
-    if task["implementationVerification"].is_null() { task["implementationVerification"] = serde_json::json!({}); }
+    if task["implementationVerification"].is_null() {
+        task["implementationVerification"] = serde_json::json!({});
+    }
     task["implementationVerification"]["aiCodeReview"] = serde_json::json!({
         "status":             status,
         "reviewSource":       "claude-ai-kit",
@@ -15777,7 +19613,10 @@ fn task_mcp_run_dataverse_metadata_check(
 
     {
         let task = &mut tasks[task_index];
-        let existing: Vec<Value> = task["crmVerificationReports"].as_array().cloned().unwrap_or_default();
+        let existing: Vec<Value> = task["crmVerificationReports"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
         let mut enriched = report.clone();
         enriched["id"] = Value::String(report_id);
         enriched["createdAt"] = Value::String(now.clone());
@@ -15786,10 +19625,10 @@ fn task_mcp_run_dataverse_metadata_check(
         task["crmVerificationReports"] = Value::Array(reports);
 
         let next_action = match verdict.as_str() {
-            "pass"     => "Run AI code review or local test",
+            "pass" => "Run AI code review or local test",
             "warnings" => "Review Dataverse warnings before proceeding",
-            "fail"     => "Fix Dataverse metadata issues before development continues",
-            _          => "Confirm setup or entity binding and rerun Dataverse check",
+            "fail" => "Fix Dataverse metadata issues before development continues",
+            _ => "Confirm setup or entity binding and rerun Dataverse check",
         };
         task["mcpNextStep"] = serde_json::json!({
             "action":    next_action,
@@ -15816,7 +19655,14 @@ async fn verify_against_crm(
 ) -> Result<Value, String> {
     let raw_scan_result = scan_result.clone();
     let scan: CrmScanResult = serde_json::from_value(scan_result).unwrap_or_default();
-    run_crm_verification_for_scan(&app, scan, raw_scan_result, file_path, primary_entity_override).await
+    run_crm_verification_for_scan(
+        &app,
+        scan,
+        raw_scan_result,
+        file_path,
+        primary_entity_override,
+    )
+    .await
 }
 
 // ---------------------------------------------------------------------------
@@ -15830,26 +19676,77 @@ fn scan_cs_file_for_crm(
     path: String,
     primary_entity_override: Option<String>,
 ) -> Result<Value, String> {
-    let content = std::fs::read_to_string(&path)
-        .map_err(|e| format!("Cannot read file '{path}': {e}"))?;
-    Ok(scan_cs_logical_names_for_mcp(&content, primary_entity_override.as_deref()))
+    let content =
+        std::fs::read_to_string(&path).map_err(|e| format!("Cannot read file '{path}': {e}"))?;
+    Ok(scan_cs_logical_names_for_mcp(
+        &content,
+        primary_entity_override.as_deref(),
+    ))
 }
 
 /// Returns true when `s` looks like a Dataverse logical name:
 /// all-lowercase ASCII, 2â€“64 chars, starts with a letter, only letters/digits/underscores.
 /// Excludes common C# keywords and plugin context parameter names.
 fn is_cs_logical_name(s: &str) -> bool {
-    if s.len() < 2 || s.len() > 64 { return false; }
+    if s.len() < 2 || s.len() > 64 {
+        return false;
+    }
     let mut chars = s.chars();
-    if !chars.next().map_or(false, |c| c.is_ascii_lowercase()) { return false; }
-    if !s.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_') { return false; }
-    !matches!(s,
-        "target" | "input" | "output" | "shared" | "none" | "null" | "true" | "false" |
-        "string" | "object" | "type" | "var" | "int" | "bool" | "value" | "entity" |
-        "attribute" | "condition" | "query" | "column" | "result" | "new" | "class" |
-        "if" | "else" | "for" | "while" | "return" | "void" | "public" | "private" |
-        "static" | "readonly" | "const" | "using" | "namespace" | "base" | "this" |
-        "override" | "virtual" | "abstract" | "internal" | "protected" | "sealed"
+    if !chars.next().map_or(false, |c| c.is_ascii_lowercase()) {
+        return false;
+    }
+    if !s
+        .chars()
+        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+    {
+        return false;
+    }
+    !matches!(
+        s,
+        "target"
+            | "input"
+            | "output"
+            | "shared"
+            | "none"
+            | "null"
+            | "true"
+            | "false"
+            | "string"
+            | "object"
+            | "type"
+            | "var"
+            | "int"
+            | "bool"
+            | "value"
+            | "entity"
+            | "attribute"
+            | "condition"
+            | "query"
+            | "column"
+            | "result"
+            | "new"
+            | "class"
+            | "if"
+            | "else"
+            | "for"
+            | "while"
+            | "return"
+            | "void"
+            | "public"
+            | "private"
+            | "static"
+            | "readonly"
+            | "const"
+            | "using"
+            | "namespace"
+            | "base"
+            | "this"
+            | "override"
+            | "virtual"
+            | "abstract"
+            | "internal"
+            | "protected"
+            | "sealed"
     )
 }
 
@@ -15866,13 +19763,17 @@ fn extract_after_cs_keyword(line: &str, keyword: &str) -> Option<String> {
 /// Extracts all double-quoted strings found after `keyword` (up to end of line).
 fn extract_all_cs_string_args(line: &str, keyword: &str) -> Vec<String> {
     let mut results = Vec::new();
-    let lower  = line.to_lowercase();
-    let kw     = keyword.to_lowercase();
-    let Some(pos) = lower.find(&kw) else { return results; };
+    let lower = line.to_lowercase();
+    let kw = keyword.to_lowercase();
+    let Some(pos) = lower.find(&kw) else {
+        return results;
+    };
     let mut rest = &line[pos + keyword.len()..];
     while let Some(q1) = rest.find('"') {
         let inner = &rest[q1 + 1..];
-        let Some(q2) = inner.find('"') else { break; };
+        let Some(q2) = inner.find('"') else {
+            break;
+        };
         results.push(inner[..q2].to_string());
         rest = &inner[q2 + 1..];
     }
@@ -15884,10 +19785,14 @@ fn extract_cs_const_assignment(line: &str) -> Option<(String, String)> {
     let eq_pos = line.find(" = \"")?;
     let lhs = line[..eq_pos].trim();
     let var = lhs.split_whitespace().last()?.trim_end_matches(';').trim();
-    if var.is_empty() || !var.chars().next().map_or(false, |c| c.is_alphabetic()) { return None; }
-    if !var.chars().all(|c| c.is_alphanumeric() || c == '_') { return None; }
+    if var.is_empty() || !var.chars().next().map_or(false, |c| c.is_alphabetic()) {
+        return None;
+    }
+    if !var.chars().all(|c| c.is_alphanumeric() || c == '_') {
+        return None;
+    }
     let after = &line[eq_pos + 4..];
-    let end   = after.find('"')?;
+    let end = after.find('"')?;
     Some((var.to_string(), after[..end].to_string()))
 }
 
@@ -15920,7 +19825,8 @@ fn infer_entity_for_cs_method(
     let lower = line.to_lowercase();
     if let Some(pos) = lower.find(&format!(".{method_lower}")) {
         let before = &line[..pos];
-        let var: &str = before.split(|c: char| !c.is_alphanumeric() && c != '_')
+        let var: &str = before
+            .split(|c: char| !c.is_alphanumeric() && c != '_')
             .filter(|s| !s.is_empty())
             .last()
             .unwrap_or("");
@@ -15933,7 +19839,10 @@ fn infer_entity_for_cs_method(
 
 /// Deduplicates and adds an entity reference.
 fn cs_add_entity_ref(entity: &str, source: &str, refs: &mut Vec<Value>) {
-    if !refs.iter().any(|r| r["logicalName"].as_str() == Some(entity)) {
+    if !refs
+        .iter()
+        .any(|r| r["logicalName"].as_str() == Some(entity))
+    {
         refs.push(serde_json::json!({
             "logicalName": entity,
             "sourceReason": source,
@@ -15964,7 +19873,9 @@ fn cs_add_attr_ref(
             "contextType": "C# scanner",
         }));
     } else {
-        if !ambiguous.contains(&attr.to_string()) { ambiguous.push(attr.to_string()); }
+        if !ambiguous.contains(&attr.to_string()) {
+            ambiguous.push(attr.to_string());
+        }
         attr_refs.push(serde_json::json!({
             "logicalName": attr,
             "sourceReason": source,
@@ -15979,7 +19890,9 @@ fn cs_build_attrs_map(attr_refs: &[Value]) -> Value {
     for r in attr_refs {
         if let (Some(e), Some(a)) = (r["entityLogicalName"].as_str(), r["logicalName"].as_str()) {
             let entry = map.entry(e.to_string()).or_default();
-            if !entry.contains(&a.to_string()) { entry.push(a.to_string()); }
+            if !entry.contains(&a.to_string()) {
+                entry.push(a.to_string());
+            }
         }
     }
     serde_json::to_value(map).unwrap_or(serde_json::json!({}))
@@ -15998,10 +19911,16 @@ fn cs_resolve_identifier_arg(
     let pos = lower.find(&kw_lower)?;
     let raw_after = &line[pos + keyword.len()..];
     let after = raw_after.trim_start();
-    if after.starts_with('"') { return None; }
-    let end = after.find(|c: char| !c.is_alphanumeric() && c != '_').unwrap_or(after.len());
+    if after.starts_with('"') {
+        return None;
+    }
+    let end = after
+        .find(|c: char| !c.is_alphanumeric() && c != '_')
+        .unwrap_or(after.len());
     let ident = &after[..end];
-    if ident.is_empty() { return None; }
+    if ident.is_empty() {
+        return None;
+    }
     const_map.get(ident).cloned()
 }
 
@@ -16012,17 +19931,26 @@ fn cs_col_var_args(
     const_map: &std::collections::HashMap<String, String>,
 ) -> Vec<String> {
     let lower = line.to_lowercase();
-    let Some(kw_pos) = lower.find("columnset(") else { return Vec::new(); };
+    let Some(kw_pos) = lower.find("columnset(") else {
+        return Vec::new();
+    };
     let content_start = kw_pos + "columnset(".len();
     let rest = &line[content_start..];
     // Find the matching closing paren (simple: first `)`)
-    let Some(close) = rest.find(')') else { return Vec::new(); };
+    let Some(close) = rest.find(')') else {
+        return Vec::new();
+    };
     let content = &rest[..close];
     let mut results = Vec::new();
     for part in content.split(',') {
         let part = part.trim();
-        if part.is_empty() || part.starts_with('"') { continue; }
-        let ident: String = part.chars().take_while(|c| c.is_alphanumeric() || *c == '_').collect();
+        if part.is_empty() || part.starts_with('"') {
+            continue;
+        }
+        let ident: String = part
+            .chars()
+            .take_while(|c| c.is_alphanumeric() || *c == '_')
+            .collect();
         if !ident.is_empty() {
             if let Some(val) = const_map.get(&ident) {
                 results.push(val.clone());
@@ -16043,8 +19971,10 @@ fn cs_infer_entity_before_method(
 ) -> Option<String> {
     let pos = lower.find(&format!(".{method_lower}"))?;
     let before = &line[..pos];
-    let var: &str = before.split(|c: char| !c.is_alphanumeric() && c != '_')
-        .filter(|s| !s.is_empty()).last()?;
+    let var: &str = before
+        .split(|c: char| !c.is_alphanumeric() && c != '_')
+        .filter(|s| !s.is_empty())
+        .last()?;
     entity_var_map.get(var).cloned()
 }
 
@@ -16052,21 +19982,21 @@ fn cs_infer_entity_before_method(
 /// Returns a JSON Value shaped as CrmScanResult (camelCase keys) for use with
 /// run_crm_verification_for_scan.  Pure Rust implementation, no TypeScript required.
 fn scan_cs_logical_names_for_mcp(content: &str, primary_entity_hint: Option<&str>) -> Value {
-    let mut const_map:      std::collections::HashMap<String, String> = Default::default();
-    let mut int_const_map:  std::collections::HashMap<String, i64>    = Default::default();
+    let mut const_map: std::collections::HashMap<String, String> = Default::default();
+    let mut int_const_map: std::collections::HashMap<String, i64> = Default::default();
     let mut entity_var_map: std::collections::HashMap<String, String> = Default::default();
     // Tracks EntityReference variable â†’ target entity (e.g. ownerRef â†’ systemuser)
     let mut entity_ref_targets: std::collections::HashMap<String, String> = Default::default();
-    let mut entity_refs:    Vec<Value>  = Vec::new();
-    let mut attr_refs:      Vec<Value>  = Vec::new();
+    let mut entity_refs: Vec<Value> = Vec::new();
+    let mut attr_refs: Vec<Value> = Vec::new();
     let mut ambiguous_attrs: Vec<String> = Vec::new();
-    let mut lookup_assignments:    Vec<Value> = Vec::new();
+    let mut lookup_assignments: Vec<Value> = Vec::new();
     let mut option_set_assignments: Vec<Value> = Vec::new();
-    let mut field_accesses:        Vec<Value> = Vec::new();
+    let mut field_accesses: Vec<Value> = Vec::new();
     let mut primary_entity: Option<String> = primary_entity_hint.map(|s| s.to_lowercase());
-    let mut message_checks: Vec<String>  = Vec::new();
-    let mut scanner_stage: Option<i32>   = None;
-    let mut scanner_mode:  Option<i32>   = None;
+    let mut message_checks: Vec<String> = Vec::new();
+    let mut scanner_stage: Option<i32> = None;
+    let mut scanner_mode: Option<i32> = None;
     // Tracks the entity most recently set via QueryExpression / new Entity, for use in
     // multi-line object initializers (ColumnSet, ConditionExpression).
     let mut last_entity_context: Option<String> = None;
@@ -16081,7 +20011,9 @@ fn scan_cs_logical_names_for_mcp(content: &str, primary_entity_hint: Option<&str
         // â”€â”€ 1. String constants: (const )? string Var = "value"; â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         if (lower.contains("string ") || lower.contains("const ")) && lower.contains(" = \"") {
             if let Some((var, val)) = extract_cs_const_assignment(t) {
-                if is_cs_logical_name(&val) { const_map.insert(var, val); }
+                if is_cs_logical_name(&val) {
+                    const_map.insert(var, val);
+                }
             }
         }
 
@@ -16090,9 +20022,14 @@ fn scan_cs_logical_names_for_mcp(content: &str, primary_entity_hint: Option<&str
             if lower.contains("int ") || lower.contains("const ") {
                 if let Some(eq_pos) = t.find(" = ") {
                     let lhs = t[..eq_pos].trim();
-                    let var = lhs.split_whitespace().last().unwrap_or("").trim_end_matches(';');
+                    let var = lhs
+                        .split_whitespace()
+                        .last()
+                        .unwrap_or("")
+                        .trim_end_matches(';');
                     let rhs = t[eq_pos + 3..].trim().trim_end_matches(';').trim();
-                    if !var.is_empty() && var.chars().all(|c| c.is_alphanumeric() || c == '_')
+                    if !var.is_empty()
+                        && var.chars().all(|c| c.is_alphanumeric() || c == '_')
                         && var.chars().next().map_or(false, |c| c.is_alphabetic())
                     {
                         if let Ok(n) = rhs.parse::<i64>() {
@@ -16109,17 +20046,25 @@ fn scan_cs_logical_names_for_mcp(content: &str, primary_entity_hint: Option<&str
                 .or_else(|| extract_after_cs_keyword(t, "LogicalName != \""));
             if let Some(e) = entity {
                 if is_cs_logical_name(&e) {
-                    if primary_entity.is_none() { primary_entity = Some(e.clone()); }
+                    if primary_entity.is_none() {
+                        primary_entity = Some(e.clone());
+                    }
                     cs_add_entity_ref(&e, "entity-guard", &mut entity_refs);
-                    entity_var_map.entry("contextentity".to_string()).or_insert_with(|| e.clone());
+                    entity_var_map
+                        .entry("contextentity".to_string())
+                        .or_insert_with(|| e.clone());
                     // Capture the actual variable name before .LogicalName (e.g. "contextEntity", "target")
                     if let Some(dot_pos) = lower.find(".logicalname") {
                         let before_dot = t[..dot_pos].trim();
                         let actual_var: &str = before_dot
                             .split(|c: char| !c.is_alphanumeric() && c != '_')
-                            .filter(|s| !s.is_empty()).last().unwrap_or("");
+                            .filter(|s| !s.is_empty())
+                            .last()
+                            .unwrap_or("");
                         if !actual_var.is_empty() {
-                            entity_var_map.entry(actual_var.to_string()).or_insert_with(|| e.clone());
+                            entity_var_map
+                                .entry(actual_var.to_string())
+                                .or_insert_with(|| e.clone());
                         }
                     }
                 }
@@ -16136,24 +20081,36 @@ fn scan_cs_logical_names_for_mcp(content: &str, primary_entity_hint: Option<&str
                         let rest_lower = &lower[pos + "messagename".len()..];
                         let eq_pos = rest_lower.find("== ")?;
                         let after_eq = rest_lower[eq_pos + 3..].trim_start();
-                        if after_eq.starts_with('"') { return None; }
-                        let end = after_eq.find(|c: char| !c.is_alphanumeric() && c != '_').unwrap_or(after_eq.len());
+                        if after_eq.starts_with('"') {
+                            return None;
+                        }
+                        let end = after_eq
+                            .find(|c: char| !c.is_alphanumeric() && c != '_')
+                            .unwrap_or(after_eq.len());
                         let var_name_lower = &after_eq[..end];
                         // Find original-case var name by same offset in t
                         let t_offset = pos + "messagename".len() + eq_pos + 3;
                         if t_offset < t.len() {
                             let t_rest = t[t_offset..].trim_start();
-                            let t_end = t_rest.find(|c: char| !c.is_alphanumeric() && c != '_').unwrap_or(t_rest.len());
+                            let t_end = t_rest
+                                .find(|c: char| !c.is_alphanumeric() && c != '_')
+                                .unwrap_or(t_rest.len());
                             let var_name = &t_rest[..t_end];
                             if !var_name.is_empty() && var_name.to_lowercase() == *var_name_lower {
                                 const_map.get(var_name).cloned()
-                            } else { None }
-                        } else { None }
+                            } else {
+                                None
+                            }
+                        } else {
+                            None
+                        }
                     })
                 });
             if let Some(m) = msg {
                 if !m.is_empty() && m.len() <= 50 && m.chars().all(|c| c.is_alphanumeric()) {
-                    if !message_checks.contains(&m) { message_checks.push(m); }
+                    if !message_checks.contains(&m) {
+                        message_checks.push(m);
+                    }
                 }
             }
         }
@@ -16162,10 +20119,14 @@ fn scan_cs_logical_names_for_mcp(content: &str, primary_entity_hint: Option<&str
         if lower.contains(".stage") && lower.contains("== ") {
             if let Some(eq_pos) = lower.find("== ") {
                 let val_str = t[eq_pos + 3..].trim_start();
-                let end = val_str.find(|c: char| !c.is_ascii_digit()).unwrap_or(val_str.len());
+                let end = val_str
+                    .find(|c: char| !c.is_ascii_digit())
+                    .unwrap_or(val_str.len());
                 if !end == 0 {
                     if let Ok(s) = val_str[..end].parse::<i32>() {
-                        if scanner_stage.is_none() { scanner_stage = Some(s); }
+                        if scanner_stage.is_none() {
+                            scanner_stage = Some(s);
+                        }
                     }
                 }
             }
@@ -16175,10 +20136,14 @@ fn scan_cs_logical_names_for_mcp(content: &str, primary_entity_hint: Option<&str
         if lower.contains(".mode") && lower.contains("== ") {
             if let Some(eq_pos) = lower.find("== ") {
                 let val_str = t[eq_pos + 3..].trim_start();
-                let end = val_str.find(|c: char| !c.is_ascii_digit()).unwrap_or(val_str.len());
+                let end = val_str
+                    .find(|c: char| !c.is_ascii_digit())
+                    .unwrap_or(val_str.len());
                 if !end == 0 {
                     if let Ok(m) = val_str[..end].parse::<i32>() {
-                        if scanner_mode.is_none() { scanner_mode = Some(m); }
+                        if scanner_mode.is_none() {
+                            scanner_mode = Some(m);
+                        }
                     }
                 }
             }
@@ -16189,12 +20154,16 @@ fn scan_cs_logical_names_for_mcp(content: &str, primary_entity_hint: Option<&str
             let entity = extract_after_cs_keyword(t, "Entity(\"")
                 .or_else(|| extract_after_cs_keyword(t, "Entity (\""))
                 .filter(|s| is_cs_logical_name(s))
-                .or_else(|| cs_resolve_identifier_arg(t, &lower, "Entity(", &const_map)
-                    .filter(|s| is_cs_logical_name(s)));
+                .or_else(|| {
+                    cs_resolve_identifier_arg(t, &lower, "Entity(", &const_map)
+                        .filter(|s| is_cs_logical_name(s))
+                });
             if let Some(entity) = entity {
                 let var = extract_cs_lhs_var(t);
                 cs_add_entity_ref(&entity, "new-entity", &mut entity_refs);
-                if let Some(v) = var { entity_var_map.insert(v, entity.clone()); }
+                if let Some(v) = var {
+                    entity_var_map.insert(v, entity.clone());
+                }
                 last_entity_context = Some(entity);
             }
         }
@@ -16203,8 +20172,10 @@ fn scan_cs_logical_names_for_mcp(content: &str, primary_entity_hint: Option<&str
         if lower.contains("entityreference(") {
             let entity = extract_after_cs_keyword(t, "EntityReference(\"")
                 .filter(|s| is_cs_logical_name(s))
-                .or_else(|| cs_resolve_identifier_arg(t, &lower, "EntityReference(", &const_map)
-                    .filter(|s| is_cs_logical_name(s)));
+                .or_else(|| {
+                    cs_resolve_identifier_arg(t, &lower, "EntityReference(", &const_map)
+                        .filter(|s| is_cs_logical_name(s))
+                });
             if let Some(ref entity) = entity {
                 let var = extract_cs_lhs_var(t);
                 cs_add_entity_ref(entity, "entity-reference", &mut entity_refs);
@@ -16228,13 +20199,20 @@ fn scan_cs_logical_names_for_mcp(content: &str, primary_entity_hint: Option<&str
             }
             .filter(|s| is_cs_logical_name(s))
             .or_else(|| {
-                let kw = if lower.contains("queryexpression(") { "QueryExpression(" } else { "QueryByAttribute(" };
-                cs_resolve_identifier_arg(t, &lower, kw, &const_map).filter(|s| is_cs_logical_name(s))
+                let kw = if lower.contains("queryexpression(") {
+                    "QueryExpression("
+                } else {
+                    "QueryByAttribute("
+                };
+                cs_resolve_identifier_arg(t, &lower, kw, &const_map)
+                    .filter(|s| is_cs_logical_name(s))
             });
             if let Some(entity) = e {
                 let var = extract_cs_lhs_var(t);
                 cs_add_entity_ref(&entity, "query-expression", &mut entity_refs);
-                if let Some(v) = var { entity_var_map.insert(v, entity.clone()); }
+                if let Some(v) = var {
+                    entity_var_map.insert(v, entity.clone());
+                }
                 last_entity_context = Some(entity);
             }
         }
@@ -16251,14 +20229,27 @@ fn scan_cs_logical_names_for_mcp(content: &str, primary_entity_hint: Option<&str
                         // Find the variable before `["` (strip `.Attributes` if present)
                         let before = &search[..pos];
                         let before = before.trim_end_matches(".Attributes");
-                        let var: &str = before.split(|c: char| !c.is_alphanumeric() && c != '_')
-                            .filter(|s| !s.is_empty()).last().unwrap_or("");
-                        let entity = entity_var_map.get(var).cloned()
+                        let var: &str = before
+                            .split(|c: char| !c.is_alphanumeric() && c != '_')
+                            .filter(|s| !s.is_empty())
+                            .last()
+                            .unwrap_or("");
+                        let entity = entity_var_map
+                            .get(var)
+                            .cloned()
                             .or_else(|| primary_entity.clone());
-                        cs_add_attr_ref(&entity, &attr, "bracket-access", &mut attr_refs, &mut ambiguous_attrs);
+                        cs_add_attr_ref(
+                            &entity,
+                            &attr,
+                            "bracket-access",
+                            &mut attr_refs,
+                            &mut ambiguous_attrs,
+                        );
                     }
                     search = &search[pos + 2..];
-                } else { break; }
+                } else {
+                    break;
+                }
             }
         }
 
@@ -16273,7 +20264,10 @@ fn scan_cs_logical_names_for_mcp(content: &str, primary_entity_hint: Option<&str
                     if let Some(close) = after.find(']') {
                         let raw = after[..close].trim();
                         if !raw.is_empty()
-                            && raw.chars().next().map_or(false, |c| c.is_alphabetic() || c == '_')
+                            && raw
+                                .chars()
+                                .next()
+                                .map_or(false, |c| c.is_alphabetic() || c == '_')
                             && raw.chars().all(|c| c.is_alphanumeric() || c == '_')
                         {
                             if let Some(resolved) = const_map.get(raw) {
@@ -16286,9 +20280,17 @@ fn scan_cs_logical_names_for_mcp(content: &str, primary_entity_hint: Option<&str
                                         .filter(|s| !s.is_empty())
                                         .last()
                                         .unwrap_or("");
-                                    let entity = entity_var_map.get(obj_var).cloned()
+                                    let entity = entity_var_map
+                                        .get(obj_var)
+                                        .cloned()
                                         .or_else(|| primary_entity.clone());
-                                    cs_add_attr_ref(&entity, &attr, "bracket-access-var", &mut attr_refs, &mut ambiguous_attrs);
+                                    cs_add_attr_ref(
+                                        &entity,
+                                        &attr,
+                                        "bracket-access-var",
+                                        &mut attr_refs,
+                                        &mut ambiguous_attrs,
+                                    );
                                 }
                             }
                         }
@@ -16304,24 +20306,45 @@ fn scan_cs_logical_names_for_mcp(content: &str, primary_entity_hint: Option<&str
 
         // â”€â”€ 8. .GetAttributeValue<T>("attr") / .GetAttributeValue<T>(ConstVar) â”€
         if lower.contains("getattributevalue") {
-            let raw_attr_opt = extract_all_cs_string_args(t, "GetAttributeValue").into_iter().next()
+            let raw_attr_opt = extract_all_cs_string_args(t, "GetAttributeValue")
+                .into_iter()
+                .next()
                 .or_else(|| {
                     // Variable form: find opening ( after the keyword (possibly after <T>), extract identifier
                     lower.find("getattributevalue").and_then(|kw_pos| {
                         let after_kw = &t[kw_pos + "getattributevalue".len()..];
                         let paren_pos = after_kw.find('(')?;
                         let after_paren = after_kw[paren_pos + 1..].trim_start();
-                        if after_paren.starts_with('"') { return None; }
-                        let end = after_paren.find(|c: char| !c.is_alphanumeric() && c != '_').unwrap_or(after_paren.len());
+                        if after_paren.starts_with('"') {
+                            return None;
+                        }
+                        let end = after_paren
+                            .find(|c: char| !c.is_alphanumeric() && c != '_')
+                            .unwrap_or(after_paren.len());
                         let var_name = &after_paren[..end];
-                        if !var_name.is_empty() { const_map.get(var_name).cloned() } else { None }
+                        if !var_name.is_empty() {
+                            const_map.get(var_name).cloned()
+                        } else {
+                            None
+                        }
                     })
                 });
             if let Some(raw_attr) = raw_attr_opt {
                 let attr = cs_resolve_const(&const_map, &raw_attr).to_string();
                 if is_cs_logical_name(&attr) {
-                    let entity = infer_entity_for_cs_method(t, "getattributevalue", &entity_var_map, &primary_entity);
-                    cs_add_attr_ref(&entity, &attr, "get-attribute-value", &mut attr_refs, &mut ambiguous_attrs);
+                    let entity = infer_entity_for_cs_method(
+                        t,
+                        "getattributevalue",
+                        &entity_var_map,
+                        &primary_entity,
+                    );
+                    cs_add_attr_ref(
+                        &entity,
+                        &attr,
+                        "get-attribute-value",
+                        &mut attr_refs,
+                        &mut ambiguous_attrs,
+                    );
                 }
             }
         }
@@ -16334,16 +20357,33 @@ fn scan_cs_logical_names_for_mcp(content: &str, primary_entity_hint: Option<&str
                 lower.find("setattributevalue(").and_then(|pos| {
                     let arg_start = pos + "setattributevalue(".len();
                     let rest = &t[arg_start..];
-                    let end = rest.find(|c: char| !c.is_alphanumeric() && c != '_').unwrap_or(rest.len());
+                    let end = rest
+                        .find(|c: char| !c.is_alphanumeric() && c != '_')
+                        .unwrap_or(rest.len());
                     let var_name = &rest[..end];
-                    if !var_name.is_empty() { const_map.get(var_name).cloned() } else { None }
+                    if !var_name.is_empty() {
+                        const_map.get(var_name).cloned()
+                    } else {
+                        None
+                    }
                 })
             };
             if let Some(raw_attr) = raw_attr_opt {
                 let attr = cs_resolve_const(&const_map, &raw_attr).to_string();
                 if is_cs_logical_name(&attr) {
-                    let entity = infer_entity_for_cs_method(t, "setattributevalue", &entity_var_map, &primary_entity);
-                    cs_add_attr_ref(&entity, &attr, "set-attribute-value", &mut attr_refs, &mut ambiguous_attrs);
+                    let entity = infer_entity_for_cs_method(
+                        t,
+                        "setattributevalue",
+                        &entity_var_map,
+                        &primary_entity,
+                    );
+                    cs_add_attr_ref(
+                        &entity,
+                        &attr,
+                        "set-attribute-value",
+                        &mut attr_refs,
+                        &mut ambiguous_attrs,
+                    );
                 }
             }
         }
@@ -16356,16 +20396,33 @@ fn scan_cs_logical_names_for_mcp(content: &str, primary_entity_hint: Option<&str
                 lower.find("attributes.contains(").and_then(|pos| {
                     let arg_start = pos + "attributes.contains(".len();
                     let rest = &t[arg_start..];
-                    let end = rest.find(|c: char| !c.is_alphanumeric() && c != '_').unwrap_or(rest.len());
+                    let end = rest
+                        .find(|c: char| !c.is_alphanumeric() && c != '_')
+                        .unwrap_or(rest.len());
                     let var_name = &rest[..end];
-                    if !var_name.is_empty() { const_map.get(var_name).cloned() } else { None }
+                    if !var_name.is_empty() {
+                        const_map.get(var_name).cloned()
+                    } else {
+                        None
+                    }
                 })
             };
             if let Some(raw_attr) = raw_attr_opt {
                 let attr = cs_resolve_const(&const_map, &raw_attr).to_string();
                 if is_cs_logical_name(&attr) {
-                    let entity = infer_entity_for_cs_method(t, "attributes.contains", &entity_var_map, &primary_entity);
-                    cs_add_attr_ref(&entity, &attr, "attributes-contains", &mut attr_refs, &mut ambiguous_attrs);
+                    let entity = infer_entity_for_cs_method(
+                        t,
+                        "attributes.contains",
+                        &entity_var_map,
+                        &primary_entity,
+                    );
+                    cs_add_attr_ref(
+                        &entity,
+                        &attr,
+                        "attributes-contains",
+                        &mut attr_refs,
+                        &mut ambiguous_attrs,
+                    );
                 }
             }
         }
@@ -16381,11 +20438,16 @@ fn scan_cs_logical_names_for_mcp(content: &str, primary_entity_hint: Option<&str
             let entity_for_col: Option<String> = if lower.contains("columnset = new columnset(") {
                 // Object-initializer or property-assignment form: find the variable before .ColumnSet
                 let col_pos = lower.find("columnset = new columnset(").unwrap_or(0);
-                let before_col = t[..col_pos].trim_end_matches(|c: char| c == '.' || c.is_whitespace());
+                let before_col =
+                    t[..col_pos].trim_end_matches(|c: char| c == '.' || c.is_whitespace());
                 let var: &str = before_col
                     .split(|c: char| !c.is_alphanumeric() && c != '_')
-                    .filter(|s| !s.is_empty()).last().unwrap_or("");
-                entity_var_map.get(var).cloned()
+                    .filter(|s| !s.is_empty())
+                    .last()
+                    .unwrap_or("");
+                entity_var_map
+                    .get(var)
+                    .cloned()
                     .or_else(|| last_entity_context.clone())
                     .or_else(|| primary_entity.clone())
             } else {
@@ -16396,13 +20458,25 @@ fn scan_cs_logical_names_for_mcp(content: &str, primary_entity_hint: Option<&str
             for raw_attr in extract_all_cs_string_args(t, "ColumnSet(") {
                 let attr = cs_resolve_const(&const_map, &raw_attr).to_string();
                 if is_cs_logical_name(&attr) {
-                    cs_add_attr_ref(&entity_for_col, &attr, "column-set", &mut attr_refs, &mut ambiguous_attrs);
+                    cs_add_attr_ref(
+                        &entity_for_col,
+                        &attr,
+                        "column-set",
+                        &mut attr_refs,
+                        &mut ambiguous_attrs,
+                    );
                 }
             }
             // Const-variable args: resolve identifiers inside ColumnSet(â€¦) through const_map
             for resolved_attr in cs_col_var_args(t, &const_map) {
                 if is_cs_logical_name(&resolved_attr) {
-                    cs_add_attr_ref(&entity_for_col, &resolved_attr, "column-set-var", &mut attr_refs, &mut ambiguous_attrs);
+                    cs_add_attr_ref(
+                        &entity_for_col,
+                        &resolved_attr,
+                        "column-set-var",
+                        &mut attr_refs,
+                        &mut ambiguous_attrs,
+                    );
                 }
             }
         }
@@ -16419,21 +20493,47 @@ fn scan_cs_logical_names_for_mcp(content: &str, primary_entity_hint: Option<&str
                 lower.find("conditionexpression(").and_then(|pos| {
                     let arg_start = pos + "conditionexpression(".len();
                     let rest = &t[arg_start..];
-                    let end = rest.find(|c: char| !c.is_alphanumeric() && c != '_').unwrap_or(rest.len());
+                    let end = rest
+                        .find(|c: char| !c.is_alphanumeric() && c != '_')
+                        .unwrap_or(rest.len());
                     let var_name = &rest[..end];
-                    if !var_name.is_empty() { const_map.get(var_name).cloned() } else { None }
+                    if !var_name.is_empty() {
+                        const_map.get(var_name).cloned()
+                    } else {
+                        None
+                    }
                 })
             };
             if let Some(raw_attr) = raw_attr_opt {
                 let attr = cs_resolve_const(&const_map, &raw_attr).to_string();
                 if is_cs_logical_name(&attr) {
                     // Single-line: try to find the query variable before .Criteria.AddCondition / .Criteria
-                    let entity = cs_infer_entity_before_method(t, &lower, "criteria.addcondition", &entity_var_map)
-                        .or_else(|| cs_infer_entity_before_method(t, &lower, "criteria.conditions", &entity_var_map))
-                        .or_else(|| cs_infer_entity_before_method(t, &lower, "addcondition", &entity_var_map))
-                        .or_else(|| last_entity_context.clone())
-                        .or_else(|| primary_entity.clone());
-                    cs_add_attr_ref(&entity, &attr, "condition-expression", &mut attr_refs, &mut ambiguous_attrs);
+                    let entity = cs_infer_entity_before_method(
+                        t,
+                        &lower,
+                        "criteria.addcondition",
+                        &entity_var_map,
+                    )
+                    .or_else(|| {
+                        cs_infer_entity_before_method(
+                            t,
+                            &lower,
+                            "criteria.conditions",
+                            &entity_var_map,
+                        )
+                    })
+                    .or_else(|| {
+                        cs_infer_entity_before_method(t, &lower, "addcondition", &entity_var_map)
+                    })
+                    .or_else(|| last_entity_context.clone())
+                    .or_else(|| primary_entity.clone());
+                    cs_add_attr_ref(
+                        &entity,
+                        &attr,
+                        "condition-expression",
+                        &mut attr_refs,
+                        &mut ambiguous_attrs,
+                    );
                 }
             }
         }
@@ -16443,7 +20543,13 @@ fn scan_cs_logical_names_for_mcp(content: &str, primary_entity_hint: Option<&str
             if let Some(raw_attr) = extract_after_cs_keyword(t, "OrderExpression(\"") {
                 let attr = cs_resolve_const(&const_map, &raw_attr).to_string();
                 if is_cs_logical_name(&attr) {
-                    cs_add_attr_ref(&primary_entity, &attr, "order-expression", &mut attr_refs, &mut ambiguous_attrs);
+                    cs_add_attr_ref(
+                        &primary_entity,
+                        &attr,
+                        "order-expression",
+                        &mut attr_refs,
+                        &mut ambiguous_attrs,
+                    );
                 }
             }
         }
@@ -16454,21 +20560,36 @@ fn scan_cs_logical_names_for_mcp(content: &str, primary_entity_hint: Option<&str
             if let Some(ov_pos) = lower.find("optionsetvalue(") {
                 let arg_start = ov_pos + "optionsetvalue(".len();
                 let rest = &t[arg_start..];
-                let end = rest.find(|c: char| !c.is_ascii_digit() && c != '-').unwrap_or(0);
-                let raw_val_str = rest[..end.max(1)].trim_end_matches(|c: char| !c.is_ascii_digit() && c != '-');
+                let end = rest
+                    .find(|c: char| !c.is_ascii_digit() && c != '-')
+                    .unwrap_or(0);
+                let raw_val_str =
+                    rest[..end.max(1)].trim_end_matches(|c: char| !c.is_ascii_digit() && c != '-');
                 let value_opt: Option<i64> = rest
                     .find(|c: char| !c.is_alphanumeric() && c != '_' && c != '-')
                     .and_then(|end2| {
                         let raw = rest[..end2].trim();
-                        raw.parse::<i64>().ok().or_else(|| int_const_map.get(raw).copied())
+                        raw.parse::<i64>()
+                            .ok()
+                            .or_else(|| int_const_map.get(raw).copied())
                     })
                     .or_else(|| raw_val_str.parse().ok());
                 if let Some(val) = value_opt {
                     // Find attribute on LHS (before `= new OptionSetValue`)
-                    let eq_pos = lower.find("= new optionsetvalue").or_else(|| lower.find("=new optionsetvalue"));
+                    let eq_pos = lower
+                        .find("= new optionsetvalue")
+                        .or_else(|| lower.find("=new optionsetvalue"));
                     if let Some(eq) = eq_pos {
-                        if let Some((entity, attr)) = cs_extract_bracket_lhs(&t[..eq], &const_map, &entity_var_map, &primary_entity) {
-                            if !option_set_assignments.iter().any(|r| r["attributeLogicalName"].as_str() == Some(&attr) && r["value"].as_i64() == Some(val)) {
+                        if let Some((entity, attr)) = cs_extract_bracket_lhs(
+                            &t[..eq],
+                            &const_map,
+                            &entity_var_map,
+                            &primary_entity,
+                        ) {
+                            if !option_set_assignments.iter().any(|r| {
+                                r["attributeLogicalName"].as_str() == Some(&attr)
+                                    && r["value"].as_i64() == Some(val)
+                            }) {
                                 option_set_assignments.push(serde_json::json!({
                                     "entityLogicalName": entity,
                                     "attributeLogicalName": attr,
@@ -16495,20 +20616,33 @@ fn scan_cs_logical_names_for_mcp(content: &str, primary_entity_hint: Option<&str
                 // RHS: explicit new EntityReference(target, ...)
                 let target_from_rhs = extract_after_cs_keyword(rhs, "EntityReference(\"")
                     .filter(|s| is_cs_logical_name(s))
-                    .or_else(|| cs_resolve_identifier_arg(rhs, rhs_lower, "EntityReference(", &const_map)
-                        .filter(|s| is_cs_logical_name(s)));
+                    .or_else(|| {
+                        cs_resolve_identifier_arg(rhs, rhs_lower, "EntityReference(", &const_map)
+                            .filter(|s| is_cs_logical_name(s))
+                    });
 
                 // RHS: variable that was previously assigned from EntityReference
                 let target_from_var = target_from_rhs.clone().or_else(|| {
                     let rhs_trimmed = rhs.trim_start();
-                    let var_end = rhs_trimmed.find(|c: char| !c.is_alphanumeric() && c != '_').unwrap_or(rhs_trimmed.len());
+                    let var_end = rhs_trimmed
+                        .find(|c: char| !c.is_alphanumeric() && c != '_')
+                        .unwrap_or(rhs_trimmed.len());
                     let var_name = &rhs_trimmed[..var_end];
-                    if !var_name.is_empty() { entity_ref_targets.get(var_name).cloned() } else { None }
+                    if !var_name.is_empty() {
+                        entity_ref_targets.get(var_name).cloned()
+                    } else {
+                        None
+                    }
                 });
 
                 if let Some(target) = target_from_var {
-                    if let Some((entity, attr)) = cs_extract_bracket_lhs(lhs, &const_map, &entity_var_map, &primary_entity) {
-                        if !lookup_assignments.iter().any(|r| r["attributeLogicalName"].as_str() == Some(&attr) && r["targetEntityLogicalName"].as_str() == Some(&target)) {
+                    if let Some((entity, attr)) =
+                        cs_extract_bracket_lhs(lhs, &const_map, &entity_var_map, &primary_entity)
+                    {
+                        if !lookup_assignments.iter().any(|r| {
+                            r["attributeLogicalName"].as_str() == Some(&attr)
+                                && r["targetEntityLogicalName"].as_str() == Some(&target)
+                        }) {
                             lookup_assignments.push(serde_json::json!({
                                 "entityLogicalName": entity,
                                 "attributeLogicalName": attr,
@@ -16520,8 +20654,14 @@ fn scan_cs_logical_names_for_mcp(content: &str, primary_entity_hint: Option<&str
                 }
 
                 // Track the write as a field access regardless of RHS type
-                if let Some((entity, attr)) = cs_extract_bracket_lhs(lhs, &const_map, &entity_var_map, &primary_entity) {
-                    if !field_accesses.iter().any(|r| r["attributeLogicalName"].as_str() == Some(&attr) && r["access"].as_str() == Some("write") && r["entityLogicalName"].as_str() == entity.as_deref()) {
+                if let Some((entity, attr)) =
+                    cs_extract_bracket_lhs(lhs, &const_map, &entity_var_map, &primary_entity)
+                {
+                    if !field_accesses.iter().any(|r| {
+                        r["attributeLogicalName"].as_str() == Some(&attr)
+                            && r["access"].as_str() == Some("write")
+                            && r["entityLogicalName"].as_str() == entity.as_deref()
+                    }) {
                         field_accesses.push(serde_json::json!({
                             "entityLogicalName": entity,
                             "attributeLogicalName": attr,
@@ -16536,23 +20676,42 @@ fn scan_cs_logical_names_for_mcp(content: &str, primary_entity_hint: Option<&str
         // â”€â”€ 16. Field read accesses (GetAttributeValue, Attributes.Contains) â”€
         if lower.contains("getattributevalue") {
             // Already handled in section 8; add read access record here
-            let raw_attr_opt = extract_all_cs_string_args(t, "GetAttributeValue").into_iter().next()
+            let raw_attr_opt = extract_all_cs_string_args(t, "GetAttributeValue")
+                .into_iter()
+                .next()
                 .or_else(|| {
                     lower.find("getattributevalue").and_then(|kw_pos| {
                         let after_kw = &t[kw_pos + "getattributevalue".len()..];
                         let paren_pos = after_kw.find('(')?;
                         let after_paren = after_kw[paren_pos + 1..].trim_start();
-                        if after_paren.starts_with('"') { return None; }
-                        let end = after_paren.find(|c: char| !c.is_alphanumeric() && c != '_').unwrap_or(after_paren.len());
+                        if after_paren.starts_with('"') {
+                            return None;
+                        }
+                        let end = after_paren
+                            .find(|c: char| !c.is_alphanumeric() && c != '_')
+                            .unwrap_or(after_paren.len());
                         let var_name = &after_paren[..end];
-                        if !var_name.is_empty() { const_map.get(var_name).cloned() } else { None }
+                        if !var_name.is_empty() {
+                            const_map.get(var_name).cloned()
+                        } else {
+                            None
+                        }
                     })
                 });
             if let Some(raw_attr) = raw_attr_opt {
                 let attr = cs_resolve_const(&const_map, &raw_attr).to_string();
                 if is_cs_logical_name(&attr) {
-                    let entity = infer_entity_for_cs_method(t, "getattributevalue", &entity_var_map, &primary_entity);
-                    if !field_accesses.iter().any(|r| r["attributeLogicalName"].as_str() == Some(&attr) && r["access"].as_str() == Some("read") && r["entityLogicalName"].as_str() == entity.as_deref()) {
+                    let entity = infer_entity_for_cs_method(
+                        t,
+                        "getattributevalue",
+                        &entity_var_map,
+                        &primary_entity,
+                    );
+                    if !field_accesses.iter().any(|r| {
+                        r["attributeLogicalName"].as_str() == Some(&attr)
+                            && r["access"].as_str() == Some("read")
+                            && r["entityLogicalName"].as_str() == entity.as_deref()
+                    }) {
                         field_accesses.push(serde_json::json!({
                             "entityLogicalName": entity,
                             "attributeLogicalName": attr,
@@ -16566,10 +20725,12 @@ fn scan_cs_logical_names_for_mcp(content: &str, primary_entity_hint: Option<&str
     }
 
     // Collect unique entity logical names
-    let mut entities: Vec<String> = entity_refs.iter()
+    let mut entities: Vec<String> = entity_refs
+        .iter()
         .filter_map(|r| r["logicalName"].as_str().map(str::to_string))
         .collect();
-    entities.sort(); entities.dedup();
+    entities.sort();
+    entities.dedup();
 
     let attrs_map = cs_build_attrs_map(&attr_refs);
 
@@ -16577,7 +20738,7 @@ fn scan_cs_logical_names_for_mcp(content: &str, primary_entity_hint: Option<&str
         10 => Some("PreValidation"),
         20 => Some("PreOperation"),
         40 => Some("PostOperation"),
-        _  => None,
+        _ => None,
     });
     let mode_name: Option<&str> = scanner_mode.and_then(|m| match m {
         0 => Some("Synchronous"),
@@ -16637,10 +20798,17 @@ fn js_skip_past_quoted(s: &str) -> Option<&str> {
 /// Returns the identifier (letters/digits/_/$, not starting with a digit) immediately preceding
 /// the end of `s`, or `None` if the trailing characters do not form a valid identifier.
 fn js_trailing_ident(s: &str) -> Option<String> {
-    let ident: String = s.chars().rev()
+    let ident: String = s
+        .chars()
+        .rev()
         .take_while(|c| c.is_alphanumeric() || *c == '_' || *c == '$')
-        .collect::<Vec<char>>().into_iter().rev().collect();
-    if ident.is_empty() || ident.chars().next().is_some_and(|c| c.is_ascii_digit()) { return None; }
+        .collect::<Vec<char>>()
+        .into_iter()
+        .rev()
+        .collect();
+    if ident.is_empty() || ident.chars().next().is_some_and(|c| c.is_ascii_digit()) {
+        return None;
+    }
     Some(ident)
 }
 
@@ -16648,15 +20816,23 @@ fn js_trailing_ident(s: &str) -> Option<String> {
 /// whitespace), or `None` if `s` does not start with an identifier character.
 fn js_leading_ident(s: &str) -> Option<String> {
     let trimmed = s.trim_start();
-    let ident: String = trimmed.chars().take_while(|c| c.is_alphanumeric() || *c == '_' || *c == '$').collect();
-    if ident.is_empty() { return None; }
+    let ident: String = trimmed
+        .chars()
+        .take_while(|c| c.is_alphanumeric() || *c == '_' || *c == '$')
+        .collect();
+    if ident.is_empty() {
+        return None;
+    }
     Some(ident)
 }
 
 /// Finds the variable name assigned via `(const|let|var) X = ` immediately before `before_call`
 /// (the text preceding an `await Xrm.WebApi.retrieve...` call), bounded to the current statement.
 fn js_lhs_var_before(before_call: &str) -> Option<String> {
-    let stmt_start = before_call.rfind(|c| c == '\n' || c == ';' || c == '{').map(|i| i + 1).unwrap_or(0);
+    let stmt_start = before_call
+        .rfind(|c| c == '\n' || c == ';' || c == '{')
+        .map(|i| i + 1)
+        .unwrap_or(0);
     let stmt = &before_call[stmt_start..];
     let eq_pos = stmt.rfind("= ")?;
     js_trailing_ident(stmt[..eq_pos].trim_end())
@@ -16664,7 +20840,9 @@ fn js_lhs_var_before(before_call: &str) -> Option<String> {
 
 /// Deduplicates and adds an entity reference (JS/TS scanner).
 fn js_add_entity_ref(entity: &str, source: &str, context_type: &str, refs: &mut Vec<Value>) {
-    if !refs.iter().any(|r| r["logicalName"].as_str() == Some(entity) && r["contextType"].as_str() == Some(context_type)) {
+    if !refs.iter().any(|r| {
+        r["logicalName"].as_str() == Some(entity) && r["contextType"].as_str() == Some(context_type)
+    }) {
         refs.push(serde_json::json!({
             "logicalName": entity,
             "sourceReason": source,
@@ -16704,7 +20882,9 @@ fn js_add_attr_ref(
         }
         attr_refs.push(v);
     } else {
-        if !ambiguous.contains(&attr.to_string()) { ambiguous.push(attr.to_string()); }
+        if !ambiguous.contains(&attr.to_string()) {
+            ambiguous.push(attr.to_string());
+        }
         attr_refs.push(serde_json::json!({
             "logicalName": attr,
             "sourceReason": source,
@@ -16737,14 +20917,28 @@ fn js_find_query_param<'a>(decoded: &'a str, name: &str) -> Option<&'a str> {
 
 /// Extracts attribute logical names used in `$filter eq/ne/.../contains/...` comparisons.
 fn js_extract_filter_attrs(filter: &str) -> Vec<String> {
-    const OPS: &[&str] = &["eq", "ne", "gt", "ge", "lt", "le", "contains", "startswith", "endswith"];
-    let tokens: Vec<&str> = filter.split(|c: char| c.is_whitespace() || c == '(' || c == ')')
-        .filter(|s| !s.is_empty()).collect();
+    const OPS: &[&str] = &[
+        "eq",
+        "ne",
+        "gt",
+        "ge",
+        "lt",
+        "le",
+        "contains",
+        "startswith",
+        "endswith",
+    ];
+    let tokens: Vec<&str> = filter
+        .split(|c: char| c.is_whitespace() || c == '(' || c == ')')
+        .filter(|s| !s.is_empty())
+        .collect();
     let mut out = Vec::new();
     for i in 1..tokens.len() {
         if OPS.contains(&tokens[i].to_lowercase().as_str()) {
             if let Some(name) = normalize_logical_name(tokens[i - 1]) {
-                if !out.contains(&name) { out.push(name); }
+                if !out.contains(&name) {
+                    out.push(name);
+                }
             }
         }
     }
@@ -16775,32 +20969,62 @@ fn js_push_query_attributes(
     ambiguous: &mut Vec<String>,
 ) {
     let stripped = raw_query.strip_prefix('?').unwrap_or(raw_query);
-    let decoded = urlencoding::decode(stripped).map(|c| c.into_owned()).unwrap_or_else(|_| stripped.to_string());
+    let decoded = urlencoding::decode(stripped)
+        .map(|c| c.into_owned())
+        .unwrap_or_else(|_| stripped.to_string());
     let entity_opt = entity.map(str::to_string);
 
     if let Some(select) = js_find_query_param(&decoded, "$select") {
         for field in select.split(',').map(str::trim).filter(|s| !s.is_empty()) {
             if let Some(f) = normalize_logical_name(field) {
-                js_add_attr_ref(&entity_opt, &f, &format!("{source_prefix} $select"), "$select", attr_refs, ambiguous, None);
+                js_add_attr_ref(
+                    &entity_opt,
+                    &f,
+                    &format!("{source_prefix} $select"),
+                    "$select",
+                    attr_refs,
+                    ambiguous,
+                    None,
+                );
             }
         }
     }
 
     if let Some(filter) = js_find_query_param(&decoded, "$filter") {
         for f in js_extract_filter_attrs(filter) {
-            js_add_attr_ref(&entity_opt, &f, &format!("{source_prefix} $filter"), "$filter", attr_refs, ambiguous, None);
+            js_add_attr_ref(
+                &entity_opt,
+                &f,
+                &format!("{source_prefix} $filter"),
+                "$filter",
+                attr_refs,
+                ambiguous,
+                None,
+            );
         }
     }
 
     if let Some((expand_entity, inner)) = js_extract_expand(&decoded) {
-        js_add_entity_ref(&expand_entity, &format!("{source_prefix} $expand"), "$expand", entity_refs);
+        js_add_entity_ref(
+            &expand_entity,
+            &format!("{source_prefix} $expand"),
+            "$expand",
+            entity_refs,
+        );
         if let Some(inner_select_pos) = inner.to_lowercase().find("$select=") {
             let after = &inner[inner_select_pos + "$select=".len()..];
             let value = after.split(';').next().unwrap_or(after);
             for field in value.split(',').map(str::trim).filter(|s| !s.is_empty()) {
                 if let Some(f) = normalize_logical_name(field) {
-                    js_add_attr_ref(&Some(expand_entity.clone()), &f, &format!("{source_prefix} $expand $select"), "$expand",
-                        attr_refs, ambiguous, entity);
+                    js_add_attr_ref(
+                        &Some(expand_entity.clone()),
+                        &f,
+                        &format!("{source_prefix} $expand $select"),
+                        "$expand",
+                        attr_refs,
+                        ambiguous,
+                        entity,
+                    );
                 }
             }
         }
@@ -16823,14 +21047,27 @@ fn scan_js_logical_names_for_mcp(content: &str, primary_entity_hint: Option<&str
 
     let primary_form_entity: Option<String> = primary_entity_hint.and_then(normalize_logical_name);
     if let Some(ref e) = primary_form_entity {
-        js_add_entity_ref(e, "from primary form entity inference", "primary_form_entity", &mut entity_refs);
+        js_add_entity_ref(
+            e,
+            "from primary form entity inference",
+            "primary_form_entity",
+            &mut entity_refs,
+        );
         notes.push(format!("Primary form entity: {e}."));
     }
 
     // ── Xrm.WebApi.retrieveRecord/retrieveMultipleRecords entity references ────────────────────
     for (keyword, context_type, source) in [
-        ("Xrm.WebApi.retrieveRecord(", "retrieveRecord", "from Xrm.WebApi.retrieveRecord"),
-        ("Xrm.WebApi.retrieveMultipleRecords(", "retrieveMultipleRecords", "from Xrm.WebApi.retrieveMultipleRecords"),
+        (
+            "Xrm.WebApi.retrieveRecord(",
+            "retrieveRecord",
+            "from Xrm.WebApi.retrieveRecord",
+        ),
+        (
+            "Xrm.WebApi.retrieveMultipleRecords(",
+            "retrieveMultipleRecords",
+            "from Xrm.WebApi.retrieveMultipleRecords",
+        ),
     ] {
         let mut search = content;
         while let Some(pos) = search.find(keyword) {
@@ -16845,12 +21082,17 @@ fn scan_js_logical_names_for_mcp(content: &str, primary_entity_hint: Option<&str
     }
 
     // ── Track `const X = await Xrm.WebApi.retrieve...(` result variables → entity ───────────────
-    for keyword in ["await Xrm.WebApi.retrieveRecord(", "await Xrm.WebApi.retrieveMultipleRecords("] {
+    for keyword in [
+        "await Xrm.WebApi.retrieveRecord(",
+        "await Xrm.WebApi.retrieveMultipleRecords(",
+    ] {
         let mut search = content;
         while let Some(pos) = search.find(keyword) {
             let before = &search[..pos];
             let after = &search[pos + keyword.len()..];
-            if let (Some(var), Some(entity_raw)) = (js_lhs_var_before(before), js_extract_leading_quoted(after)) {
+            if let (Some(var), Some(entity_raw)) =
+                (js_lhs_var_before(before), js_extract_leading_quoted(after))
+            {
                 if let Some(entity) = normalize_logical_name(&entity_raw) {
                     webapi_entity_by_var.insert(var, entity);
                 }
@@ -16872,9 +21114,12 @@ fn scan_js_logical_names_for_mcp(content: &str, primary_entity_hint: Option<&str
                             let after_second = rest[comma_pos + 1..].trim_start();
                             if let Some(query_raw) = js_extract_leading_quoted(after_second) {
                                 js_push_query_attributes(
-                                    &query_raw, Some(&entity_raw),
+                                    &query_raw,
+                                    Some(&entity_raw),
                                     &format!("from Xrm.WebApi.retrieveRecord {entity_raw}"),
-                                    &mut attr_refs, &mut entity_refs, &mut ambiguous_attrs,
+                                    &mut attr_refs,
+                                    &mut entity_refs,
+                                    &mut ambiguous_attrs,
                                 );
                             }
                         }
@@ -16894,9 +21139,12 @@ fn scan_js_logical_names_for_mcp(content: &str, primary_entity_hint: Option<&str
                     if let Some(rest) = rest.trim_start().strip_prefix(',') {
                         if let Some(query_raw) = js_extract_leading_quoted(rest.trim_start()) {
                             js_push_query_attributes(
-                                &query_raw, Some(&entity_raw),
+                                &query_raw,
+                                Some(&entity_raw),
                                 &format!("from Xrm.WebApi.retrieveMultipleRecords {entity_raw}"),
-                                &mut attr_refs, &mut entity_refs, &mut ambiguous_attrs,
+                                &mut attr_refs,
+                                &mut entity_refs,
+                                &mut ambiguous_attrs,
                             );
                         }
                     }
@@ -16914,9 +21162,13 @@ fn scan_js_logical_names_for_mcp(content: &str, primary_entity_hint: Option<&str
             if let Some(attr_raw) = js_extract_leading_quoted(after) {
                 if let Some(attr) = normalize_logical_name(&attr_raw) {
                     js_add_attr_ref(
-                        &primary_form_entity, &attr,
-                        "from formContext.getAttribute/getControl on primary form entity", "formContext",
-                        &mut attr_refs, &mut ambiguous_attrs, None,
+                        &primary_form_entity,
+                        &attr,
+                        "from formContext.getAttribute/getControl on primary form entity",
+                        "formContext",
+                        &mut attr_refs,
+                        &mut ambiguous_attrs,
+                        None,
                     );
                 }
             }
@@ -16948,12 +21200,18 @@ fn scan_js_logical_names_for_mcp(content: &str, primary_entity_hint: Option<&str
         while let Some(pos) = search.find("?.") {
             let before = &search[..pos];
             let after = &search[pos + 2..];
-            if let (Some(owner), Some(attr)) = (js_trailing_ident(before), js_leading_ident(after)) {
+            if let (Some(owner), Some(attr)) = (js_trailing_ident(before), js_leading_ident(after))
+            {
                 if let Some(entity) = webapi_entity_by_var.get(&owner).cloned() {
                     if let Some(a) = normalize_logical_name(&attr) {
                         js_add_attr_ref(
-                            &Some(entity), &a, &format!("from {owner}?.{attr} (WebApi result)"), "webapi_result",
-                            &mut attr_refs, &mut ambiguous_attrs, None,
+                            &Some(entity),
+                            &a,
+                            &format!("from {owner}?.{attr} (WebApi result)"),
+                            "webapi_result",
+                            &mut attr_refs,
+                            &mut ambiguous_attrs,
+                            None,
                         );
                     }
                 }
@@ -16964,17 +21222,29 @@ fn scan_js_logical_names_for_mcp(content: &str, primary_entity_hint: Option<&str
 
     if entity_refs.is_empty() {
         if let Some(ref e) = primary_form_entity {
-            js_add_entity_ref(e, "from workflow setup fallback", "fallback", &mut entity_refs);
-            notes.push("No explicit WebApi entity found; used fallback entity from workflow setup.".to_string());
+            js_add_entity_ref(
+                e,
+                "from workflow setup fallback",
+                "fallback",
+                &mut entity_refs,
+            );
+            notes.push(
+                "No explicit WebApi entity found; used fallback entity from workflow setup."
+                    .to_string(),
+            );
         }
     }
 
     let attrs_map = cs_build_attrs_map(&attr_refs);
-    let mut entities: Vec<String> = entity_refs.iter().filter_map(|r| r["logicalName"].as_str().map(str::to_string)).collect();
+    let mut entities: Vec<String> = entity_refs
+        .iter()
+        .filter_map(|r| r["logicalName"].as_str().map(str::to_string))
+        .collect();
     if let Some(obj) = attrs_map.as_object() {
         entities.extend(obj.keys().cloned());
     }
-    entities.sort(); entities.dedup();
+    entities.sort();
+    entities.dedup();
 
     serde_json::json!({
         "entities": entities,
@@ -17008,29 +21278,40 @@ fn cs_extract_bracket_lhs(
         // Identifier: resolve through const_map
         cs_resolve_const(const_map, raw_key).to_string()
     };
-    if !is_cs_logical_name(&attr) { return None; }
+    if !is_cs_logical_name(&attr) {
+        return None;
+    }
     let before = lhs[..bracket_start].trim_end_matches(".Attributes");
     let obj_var: &str = before
         .split(|c: char| !c.is_alphanumeric() && c != '_')
-        .filter(|s| !s.is_empty()).last().unwrap_or("");
-    let entity = entity_var_map.get(obj_var).cloned().or_else(|| primary_entity.clone());
+        .filter(|s| !s.is_empty())
+        .last()
+        .unwrap_or("");
+    let entity = entity_var_map
+        .get(obj_var)
+        .cloned()
+        .or_else(|| primary_entity.clone());
     Some((entity, attr))
 }
 
 /// Loads customers.json from the app data directory.
 fn task_mcp_load_customers(app: &tauri::AppHandle) -> Result<Vec<Value>, String> {
-    let dir  = app_data_dir(app)?;
+    let dir = app_data_dir(app)?;
     let path = dir.join("customers.json");
     match read_json(&path)? {
         Value::Array(arr) => Ok(arr),
-        _                 => Ok(Vec::new()),
+        _ => Ok(Vec::new()),
     }
 }
 
 /// Finds the customer whose `id` matches the given customer_id.
 fn task_mcp_find_customer<'a>(customers: &'a [Value], customer_id: &str) -> Option<&'a Value> {
-    if customer_id.is_empty() { return None; }
-    customers.iter().find(|c| c["id"].as_str().unwrap_or("") == customer_id)
+    if customer_id.is_empty() {
+        return None;
+    }
+    customers
+        .iter()
+        .find(|c| c["id"].as_str().unwrap_or("") == customer_id)
 }
 
 /// Builds a sanitized developer-defaults object from a customer.
@@ -17039,32 +21320,53 @@ fn task_mcp_find_customer<'a>(customers: &'a [Value], customer_id: &str) -> Opti
 fn task_mcp_customer_dev_defaults(customer: &Value, crm_base_dir: &str) -> Option<Value> {
     // Priority: repositoryRootOverride â†’ repositoryRoot â†’ folderName + crm_base_dir.
     // resolvedRepositoryPath is computed client-side and not persisted.
-    let repo_root: Option<String> = customer["repositoryRootOverride"].as_str()
+    let repo_root: Option<String> = customer["repositoryRootOverride"]
+        .as_str()
         .or_else(|| customer["repositoryRoot"].as_str())
         .filter(|s| !s.is_empty())
         .map(str::to_string)
         .or_else(|| {
             let folder = customer["folderName"].as_str()?.trim();
-            if folder.is_empty() || crm_base_dir.is_empty() { return None; }
+            if folder.is_empty() || crm_base_dir.is_empty() {
+                return None;
+            }
             Some(format!("{}/{}", crm_base_dir.trim_end_matches('/'), folder))
         });
     let repo_root = repo_root.as_deref();
-    let script_dir   = customer["scriptFolder"].as_str().filter(|s| !s.is_empty());
-    let plugin_dir   = customer["pluginFolder"].as_str().filter(|s| !s.is_empty());
-    let js_conv      = customer["jsConventionsSource"].as_str().filter(|s| !s.is_empty());
-    let plugin_conv  = customer["pluginConventionsSource"].as_str().filter(|s| !s.is_empty());
+    let script_dir = customer["scriptFolder"].as_str().filter(|s| !s.is_empty());
+    let plugin_dir = customer["pluginFolder"].as_str().filter(|s| !s.is_empty());
+    let js_conv = customer["jsConventionsSource"]
+        .as_str()
+        .filter(|s| !s.is_empty());
+    let plugin_conv = customer["pluginConventionsSource"]
+        .as_str()
+        .filter(|s| !s.is_empty());
 
-    if repo_root.is_none() && script_dir.is_none() && plugin_dir.is_none()
-        && js_conv.is_none() && plugin_conv.is_none() {
+    if repo_root.is_none()
+        && script_dir.is_none()
+        && plugin_dir.is_none()
+        && js_conv.is_none()
+        && plugin_conv.is_none()
+    {
         return None;
     }
 
     let mut obj = serde_json::json!({});
-    if let Some(v) = repo_root   { obj["repositoryRoot"]          = serde_json::json!(v); }
-    if let Some(v) = script_dir  { obj["scriptDirectory"]         = serde_json::json!(v); }
-    if let Some(v) = plugin_dir  { obj["pluginProjectPath"]       = serde_json::json!(v); }
-    if let Some(v) = js_conv     { obj["jsConventionsSource"]     = serde_json::json!(v); }
-    if let Some(v) = plugin_conv { obj["pluginConventionsSource"] = serde_json::json!(v); }
+    if let Some(v) = repo_root {
+        obj["repositoryRoot"] = serde_json::json!(v);
+    }
+    if let Some(v) = script_dir {
+        obj["scriptDirectory"] = serde_json::json!(v);
+    }
+    if let Some(v) = plugin_dir {
+        obj["pluginProjectPath"] = serde_json::json!(v);
+    }
+    if let Some(v) = js_conv {
+        obj["jsConventionsSource"] = serde_json::json!(v);
+    }
+    if let Some(v) = plugin_conv {
+        obj["pluginConventionsSource"] = serde_json::json!(v);
+    }
     Some(obj)
 }
 
@@ -17072,16 +21374,21 @@ fn task_mcp_customer_dev_defaults(customer: &Value, crm_base_dir: &str) -> Optio
 /// Uses customer dev defaults (scriptDirectory, repositoryRoot), task workflowSetup,
 /// and technical plan target to derive file name, function names, and paths.
 /// Returns None when the entity logical name cannot be determined.
-fn task_mcp_compute_script_naming(task: &Value, customer_dev_defaults: Option<&Value>) -> Option<Value> {
+fn task_mcp_compute_script_naming(
+    task: &Value,
+    customer_dev_defaults: Option<&Value>,
+) -> Option<Value> {
     let setup = &task["workflowSetup"];
     let plan_target = &task["crmDeveloperWorkflow"]["technicalPlan"]["target"];
 
-    let entity_name = setup["primaryEntityLogicalName"].as_str()
+    let entity_name = setup["primaryEntityLogicalName"]
+        .as_str()
         .or_else(|| plan_target["entityLogicalName"].as_str())
         .filter(|s| !s.is_empty())
         .map(str::to_string)?;
 
-    let event_field_name = setup["eventFieldName"].as_str()
+    let event_field_name = setup["eventFieldName"]
+        .as_str()
         .or_else(|| plan_target["eventFieldName"].as_str())
         .filter(|s| !s.is_empty())
         .map(str::to_string);
@@ -17109,40 +21416,61 @@ fn task_mcp_compute_script_naming(task: &Value, customer_dev_defaults: Option<&V
             }
         }
         // Fallback: last path component
-        abs.replace('\\', "/").split('/').filter(|s| !s.is_empty()).last().map(str::to_string)
+        abs.replace('\\', "/")
+            .split('/')
+            .filter(|s| !s.is_empty())
+            .last()
+            .map(str::to_string)
     });
 
-    let uses_backslash = scripts_folder_abs.as_deref().map(|s| s.contains('\\')).unwrap_or(false)
-        || repo_root.as_deref().map(|s| s.contains('\\')).unwrap_or(false);
+    let uses_backslash = scripts_folder_abs
+        .as_deref()
+        .map(|s| s.contains('\\'))
+        .unwrap_or(false)
+        || repo_root
+            .as_deref()
+            .map(|s| s.contains('\\'))
+            .unwrap_or(false);
     let sep = if uses_backslash { "\\" } else { "/" };
 
-    let naming_source = setup["namingSource"].as_str()
+    let naming_source = setup["namingSource"]
+        .as_str()
         .filter(|s| !s.is_empty())
         .unwrap_or("Scripts_Naming")
         .to_string();
 
-    let desired_script_file = setup["desiredScriptFile"].as_str()
+    let desired_script_file = setup["desiredScriptFile"]
+        .as_str()
         .filter(|s| !s.is_empty())
         .map(str::to_string)
         .unwrap_or_else(|| format!("{}_events.js", entity_name));
 
-    let script_path = scripts_folder_rel.as_deref()
+    let script_path = scripts_folder_rel
+        .as_deref()
         .map(|rel| format!("{}{}{}", rel, sep, desired_script_file));
 
-    let absolute_script_path = scripts_folder_abs.as_deref()
+    let absolute_script_path = scripts_folder_abs
+        .as_deref()
         .map(|abs| format!("{}{}{}", abs, sep, desired_script_file));
 
-    let on_load_fn = setup["onLoadFunctionName"].as_str()
+    let on_load_fn = setup["onLoadFunctionName"]
+        .as_str()
         .filter(|s| !s.is_empty())
         .map(str::to_string)
         .unwrap_or_else(|| format!("{}_OnLoad", entity_name));
 
-    let on_change_fn = setup["onChangeFunctionName"].as_str()
+    let on_change_fn = setup["onChangeFunctionName"]
+        .as_str()
         .filter(|s| !s.is_empty())
         .map(str::to_string)
-        .or_else(|| event_field_name.as_deref().map(|f| format!("{}_OnChange", f)));
+        .or_else(|| {
+            event_field_name
+                .as_deref()
+                .map(|f| format!("{}_OnChange", f))
+        });
 
-    let main_helper = setup["mainHelperSuggestion"].as_str()
+    let main_helper = setup["mainHelperSuggestion"]
+        .as_str()
         .filter(|s| !s.is_empty())
         .map(str::to_string);
 
@@ -17153,12 +21481,24 @@ fn task_mcp_compute_script_naming(task: &Value, customer_dev_defaults: Option<&V
         "onLoadFunctionName": on_load_fn,
         "helperNamingRule": "descriptive camelCase, no nvr_ prefix by default",
     });
-    if let Some(v) = scripts_folder_abs   { obj["scriptsFolderAbsolute"]  = serde_json::json!(v); }
-    if let Some(v) = scripts_folder_rel   { obj["scriptsFolderRelative"]  = serde_json::json!(v); }
-    if let Some(v) = script_path          { obj["scriptPath"]             = serde_json::json!(v); }
-    if let Some(v) = absolute_script_path { obj["absoluteScriptPath"]     = serde_json::json!(v); }
-    if let Some(v) = on_change_fn         { obj["onChangeFunctionName"]   = serde_json::json!(v); }
-    if let Some(v) = main_helper          { obj["mainHelperSuggestion"]   = serde_json::json!(v); }
+    if let Some(v) = scripts_folder_abs {
+        obj["scriptsFolderAbsolute"] = serde_json::json!(v);
+    }
+    if let Some(v) = scripts_folder_rel {
+        obj["scriptsFolderRelative"] = serde_json::json!(v);
+    }
+    if let Some(v) = script_path {
+        obj["scriptPath"] = serde_json::json!(v);
+    }
+    if let Some(v) = absolute_script_path {
+        obj["absoluteScriptPath"] = serde_json::json!(v);
+    }
+    if let Some(v) = on_change_fn {
+        obj["onChangeFunctionName"] = serde_json::json!(v);
+    }
+    if let Some(v) = main_helper {
+        obj["mainHelperSuggestion"] = serde_json::json!(v);
+    }
     Some(obj)
 }
 
@@ -17181,19 +21521,27 @@ fn mcp_resolve_artifact_path(
     task_index: usize,
 ) -> Result<(String, bool), String> {
     // 1. Explicit path
-    if let Some(p) = task["workflowSetup"]["artifactPath"].as_str().filter(|s| !s.trim().is_empty()) {
+    if let Some(p) = task["workflowSetup"]["artifactPath"]
+        .as_str()
+        .filter(|s| !s.trim().is_empty())
+    {
         return Ok((p.replace('\\', "/"), false));
     }
 
     // 1b. scriptPath fallback for script tasks (old data may only have scriptPath set).
-    if let Some(p) = task["workflowSetup"]["scriptPath"].as_str().filter(|s| !s.trim().is_empty()) {
+    if let Some(p) = task["workflowSetup"]["scriptPath"]
+        .as_str()
+        .filter(|s| !s.trim().is_empty())
+    {
         return Ok((p.replace('\\', "/"), false));
     }
 
     // 2. Inference
-    let project_name = task["workflowSetup"]["pluginProject"].as_str()
+    let project_name = task["workflowSetup"]["pluginProject"]
+        .as_str()
         .or_else(|| task["selectedPluginProject"].as_str())
-        .unwrap_or("").trim();
+        .unwrap_or("")
+        .trim();
     if project_name.is_empty() {
         return Err("No artifactPath and no pluginProject set on this task. Set workflowSetup.pluginProject or artifactPath.".into());
     }
@@ -17203,7 +21551,12 @@ fn mcp_resolve_artifact_path(
 
     // Option A: repositoryRoot/Plugins/ProjectName/ProjectName
     if let Some(repo) = task["workflowSetup"]["repositoryRoot"].as_str() {
-        candidates.push(format!("{}/Plugins/{}/{}", repo.replace('\\', "/").trim_end_matches('/'), project_name, project_name));
+        candidates.push(format!(
+            "{}/Plugins/{}/{}",
+            repo.replace('\\', "/").trim_end_matches('/'),
+            project_name,
+            project_name
+        ));
     }
 
     // Option B: customer.pluginFolder/ProjectName/ProjectName  or
@@ -17211,16 +21564,30 @@ fn mcp_resolve_artifact_path(
     let customer_id = task["customerId"].as_str().unwrap_or("");
     if !customer_id.is_empty() {
         if let Ok(customers) = task_mcp_load_customers(app) {
-            if let Some(cust) = customers.iter().find(|c| c["id"].as_str() == Some(customer_id)) {
+            if let Some(cust) = customers
+                .iter()
+                .find(|c| c["id"].as_str() == Some(customer_id))
+            {
                 if let Some(pf) = cust["pluginFolder"].as_str() {
-                    candidates.push(format!("{}/{}/{}", pf.replace('\\', "/").trim_end_matches('/'), project_name, project_name));
+                    candidates.push(format!(
+                        "{}/{}/{}",
+                        pf.replace('\\', "/").trim_end_matches('/'),
+                        project_name,
+                        project_name
+                    ));
                 }
                 if let Ok(settings) = load_settings(app.clone()) {
                     if let (Some(base), Some(folder)) = (
                         settings["crmBaseDirectory"].as_str(),
                         cust["folderName"].as_str(),
                     ) {
-                        candidates.push(format!("{}/{}/Plugins/{}/{}", base.replace('\\', "/").trim_end_matches('/'), folder, project_name, project_name));
+                        candidates.push(format!(
+                            "{}/{}/Plugins/{}/{}",
+                            base.replace('\\', "/").trim_end_matches('/'),
+                            folder,
+                            project_name,
+                            project_name
+                        ));
                     }
                 }
             }
@@ -17229,15 +21596,19 @@ fn mcp_resolve_artifact_path(
 
     for folder in &candidates {
         let p = std::path::Path::new(folder);
-        if !p.is_dir() { continue; }
+        if !p.is_dir() {
+            continue;
+        }
         let cs_files: Vec<String> = fs::read_dir(p)
             .map_err(|e| format!("Cannot list '{folder}': {e}"))?
             .flatten()
             .filter(|e| {
                 let path = e.path();
-                path.extension().map_or(false, |ext| ext.eq_ignore_ascii_case("cs"))
-                    && !path.file_name()
-                        .map_or(false, |n| n.to_string_lossy().to_lowercase().contains("assemblyinfo"))
+                path.extension()
+                    .map_or(false, |ext| ext.eq_ignore_ascii_case("cs"))
+                    && !path.file_name().map_or(false, |n| {
+                        n.to_string_lossy().to_lowercase().contains("assemblyinfo")
+                    })
             })
             .map(|e| e.path().to_string_lossy().replace('\\', "/"))
             .collect();
@@ -17246,7 +21617,8 @@ fn mcp_resolve_artifact_path(
             1 => {
                 let path = cs_files.into_iter().next().unwrap();
                 if persist_inferred {
-                    tasks[task_index]["workflowSetup"]["artifactPath"] = Value::String(path.clone());
+                    tasks[task_index]["workflowSetup"]["artifactPath"] =
+                        Value::String(path.clone());
                 }
                 return Ok((path, true));
             }
@@ -17280,7 +21652,7 @@ mod task_storage_tests {
     #[test]
     fn blocks_empty_overwrite_of_nonempty_file() {
         let dir = TempDir::new().unwrap();
-        let d   = dir.path().to_path_buf();
+        let d = dir.path().to_path_buf();
 
         save_tasks_impl(&d, &make_tasks(3), false).unwrap();
 
@@ -17302,7 +21674,7 @@ mod task_storage_tests {
     #[test]
     fn first_run_missing_file_allows_empty_write() {
         let dir = TempDir::new().unwrap();
-        let d   = dir.path().to_path_buf();
+        let d = dir.path().to_path_buf();
 
         // No tasks.json exists yet â†’ existing_count == 0 â†’ guard not triggered
         save_tasks_impl(&d, &Value::Array(vec![]), false).unwrap();
@@ -17315,7 +21687,7 @@ mod task_storage_tests {
     #[test]
     fn normal_nonempty_save_works() {
         let dir = TempDir::new().unwrap();
-        let d   = dir.path().to_path_buf();
+        let d = dir.path().to_path_buf();
 
         save_tasks_impl(&d, &make_tasks(5), false).unwrap();
 
@@ -17327,7 +21699,7 @@ mod task_storage_tests {
     #[test]
     fn explicit_reset_allows_empty_overwrite() {
         let dir = TempDir::new().unwrap();
-        let d   = dir.path().to_path_buf();
+        let d = dir.path().to_path_buf();
 
         save_tasks_impl(&d, &make_tasks(4), false).unwrap();
 
@@ -17341,11 +21713,11 @@ mod task_storage_tests {
     #[test]
     fn prune_keeps_at_most_five_backups() {
         let dir = TempDir::new().unwrap();
-        let d   = dir.path().to_path_buf();
+        let d = dir.path().to_path_buf();
 
         // Manually create 8 backup files with distinct sortable timestamps
         for i in 1u64..=8 {
-            let name    = format!("tasks.backup-{:010}.json", i * 1_000);
+            let name = format!("tasks.backup-{:010}.json", i * 1_000);
             let content = serde_json::to_string_pretty(&make_tasks(1)).unwrap();
             fs::write(d.join(&name), &content).unwrap();
         }
@@ -17359,10 +21731,16 @@ mod task_storage_tests {
         for bp in &kept {
             let fname = bp.file_name().unwrap().to_str().unwrap();
             let ts: u64 = fname
-                .strip_prefix("tasks.backup-").unwrap()
-                .strip_suffix(".json").unwrap()
-                .parse().unwrap();
-            assert!(ts >= 4_000, "expected only recent backups kept, got ts={ts}");
+                .strip_prefix("tasks.backup-")
+                .unwrap()
+                .strip_suffix(".json")
+                .unwrap()
+                .parse()
+                .unwrap();
+            assert!(
+                ts >= 4_000,
+                "expected only recent backups kept, got ts={ts}"
+            );
         }
     }
 
@@ -17371,7 +21749,7 @@ mod task_storage_tests {
     #[test]
     fn backup_is_created_before_overwrite() {
         let dir = TempDir::new().unwrap();
-        let d   = dir.path().to_path_buf();
+        let d = dir.path().to_path_buf();
 
         // Seed 3 tasks
         save_tasks_impl(&d, &make_tasks(3), false).unwrap();
@@ -17396,7 +21774,7 @@ mod task_storage_tests {
     #[test]
     fn check_storage_normal_nonempty() {
         let dir = TempDir::new().unwrap();
-        let d   = dir.path().to_path_buf();
+        let d = dir.path().to_path_buf();
 
         save_tasks_impl(&d, &make_tasks(7), false).unwrap();
         let status = check_task_storage_impl(&d).unwrap();
@@ -17411,7 +21789,7 @@ mod task_storage_tests {
     #[test]
     fn check_storage_detects_empty_file_with_nonempty_backup() {
         let dir = TempDir::new().unwrap();
-        let d   = dir.path().to_path_buf();
+        let d = dir.path().to_path_buf();
 
         // Write tasks, then explicitly clear to empty (which creates a backup)
         save_tasks_impl(&d, &make_tasks(4), false).unwrap();
@@ -17430,7 +21808,7 @@ mod task_storage_tests {
     #[test]
     fn check_storage_first_run_all_zero() {
         let dir = TempDir::new().unwrap();
-        let d   = dir.path().to_path_buf();
+        let d = dir.path().to_path_buf();
 
         let status = check_task_storage_impl(&d).unwrap();
 
@@ -17477,7 +21855,13 @@ mod tests {
             "hasMore": false
         });
 
-        let entry = build_entity_metadata_cache_entry(&payload, "list_columns", Some("all=true".to_string()), true, true);
+        let entry = build_entity_metadata_cache_entry(
+            &payload,
+            "list_columns",
+            Some("all=true".to_string()),
+            true,
+            true,
+        );
         assert_eq!(entry.column_count, 6);
         assert_eq!(entry.schema_completeness, "complete");
     }
@@ -17513,8 +21897,14 @@ mod tests {
             }
         "#;
         let scan = scan_js_logical_names_for_mcp(content, Some("nvr_servicecase"));
-        assert!(scan["entities"].as_array().unwrap().iter().any(|v| v == "nvr_servicecase"));
-        let attrs = scan["attributes"]["nvr_servicecase"].as_array().expect("attrs for nvr_servicecase");
+        assert!(scan["entities"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|v| v == "nvr_servicecase"));
+        let attrs = scan["attributes"]["nvr_servicecase"]
+            .as_array()
+            .expect("attrs for nvr_servicecase");
         let attr_names: Vec<&str> = attrs.iter().filter_map(|v| v.as_str()).collect();
         assert!(attr_names.contains(&"nvr_assetid"));
         assert!(attr_names.contains(&"nvr_iswarrantycase"));
@@ -17525,7 +21915,12 @@ mod tests {
     fn js_scanner_without_primary_entity_hint_marks_form_context_attributes_ambiguous() {
         let content = r#"formContext.getAttribute("nvr_assetid");"#;
         let scan = scan_js_logical_names_for_mcp(content, None);
-        let ambiguous: Vec<&str> = scan["ambiguousAttributes"].as_array().unwrap().iter().filter_map(|v| v.as_str()).collect();
+        let ambiguous: Vec<&str> = scan["ambiguousAttributes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect();
         assert!(ambiguous.contains(&"nvr_assetid"));
     }
 
@@ -17539,11 +21934,25 @@ mod tests {
             );
         "#;
         let scan = scan_js_logical_names_for_mcp(content, Some("nvr_servicecase"));
-        assert!(scan["entities"].as_array().unwrap().iter().any(|v| v == "nvr_customerasset"));
-        let attrs = scan["attributes"]["nvr_customerasset"].as_array().expect("attrs for nvr_customerasset");
+        assert!(scan["entities"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|v| v == "nvr_customerasset"));
+        let attrs = scan["attributes"]["nvr_customerasset"]
+            .as_array()
+            .expect("attrs for nvr_customerasset");
         let attr_names: Vec<&str> = attrs.iter().filter_map(|v| v.as_str()).collect();
-        for expected in ["nvr_customerid", "nvr_contactid", "nvr_isunderwarranty", "nvr_statuscustom"] {
-            assert!(attr_names.contains(&expected), "expected {expected} in {attr_names:?}");
+        for expected in [
+            "nvr_customerid",
+            "nvr_contactid",
+            "nvr_isunderwarranty",
+            "nvr_statuscustom",
+        ] {
+            assert!(
+                attr_names.contains(&expected),
+                "expected {expected} in {attr_names:?}"
+            );
         }
     }
 
@@ -17556,7 +21965,9 @@ mod tests {
             );
         "#;
         let scan = scan_js_logical_names_for_mcp(content, None);
-        let attrs = scan["attributes"]["nvr_customerasset"].as_array().expect("attrs for nvr_customerasset");
+        let attrs = scan["attributes"]["nvr_customerasset"]
+            .as_array()
+            .expect("attrs for nvr_customerasset");
         let attr_names: Vec<&str> = attrs.iter().filter_map(|v| v.as_str()).collect();
         assert!(attr_names.contains(&"nvr_statuscustom"));
     }
@@ -17568,7 +21979,9 @@ mod tests {
             var customerId = asset?.nvr_customerid;
         "#;
         let scan = scan_js_logical_names_for_mcp(content, None);
-        let attrs = scan["attributes"]["nvr_customerasset"].as_array().expect("attrs for nvr_customerasset");
+        let attrs = scan["attributes"]["nvr_customerasset"]
+            .as_array()
+            .expect("attrs for nvr_customerasset");
         let attr_names: Vec<&str> = attrs.iter().filter_map(|v| v.as_str()).collect();
         assert!(attr_names.contains(&"nvr_customerid"));
     }
@@ -17577,9 +21990,19 @@ mod tests {
     fn js_scanner_uses_primary_entity_hint_when_no_webapi_calls_found() {
         let content = "function noop() {}";
         let scan = scan_js_logical_names_for_mcp(content, Some("nvr_servicecase"));
-        assert_eq!(scan["entities"].as_array().unwrap(), &vec![Value::String("nvr_servicecase".to_string())]);
-        let notes: Vec<&str> = scan["notes"].as_array().unwrap().iter().filter_map(|v| v.as_str()).collect();
-        assert!(notes.iter().any(|n| n.contains("Primary form entity: nvr_servicecase")));
+        assert_eq!(
+            scan["entities"].as_array().unwrap(),
+            &vec![Value::String("nvr_servicecase".to_string())]
+        );
+        let notes: Vec<&str> = scan["notes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect();
+        assert!(notes
+            .iter()
+            .any(|n| n.contains("Primary form entity: nvr_servicecase")));
     }
 
     #[test]
@@ -17595,7 +22018,10 @@ mod tests {
         // empty arrays; ambiguity is tracked via ambiguousAttributes + entity-less attribute refs.
         let content = r#"formContext.getAttribute("nvr_assetid");"#;
         let scan = scan_js_logical_names_for_mcp(content, None);
-        assert!(scan["relationshipReferences"].as_array().unwrap().is_empty());
+        assert!(scan["relationshipReferences"]
+            .as_array()
+            .unwrap()
+            .is_empty());
         assert!(scan["ambiguousReferences"].as_array().unwrap().is_empty());
     }
 
@@ -17617,8 +22043,10 @@ mod tests {
     #[test]
     fn unable_to_verify_reasons_dedup_removes_exact_duplicates() {
         let mut reasons = vec![
-            "Column metadata for entity 'account' was incomplete; only 5 columns were returned.".to_string(),
-            "Column metadata for entity 'account' was incomplete; only 5 columns were returned.".to_string(),
+            "Column metadata for entity 'account' was incomplete; only 5 columns were returned."
+                .to_string(),
+            "Column metadata for entity 'account' was incomplete; only 5 columns were returned."
+                .to_string(),
             "Primary form entity: account.".to_string(),
         ];
         reasons.sort();
@@ -17635,22 +22063,30 @@ mod tests {
 
     #[test]
     fn non_blocking_note_classifies_primary_form_entity_as_non_blocking() {
-        assert!(is_non_blocking_registration_note("Primary form entity: nvr_labservicecase."));
+        assert!(is_non_blocking_registration_note(
+            "Primary form entity: nvr_labservicecase."
+        ));
     }
 
     #[test]
     fn non_blocking_note_classifies_primary_entity_override_as_non_blocking() {
-        assert!(is_non_blocking_registration_note("Primary entity override used for verification: account."));
+        assert!(is_non_blocking_registration_note(
+            "Primary entity override used for verification: account."
+        ));
     }
 
     #[test]
     fn non_blocking_note_classifies_no_explicit_webapi_entity_as_non_blocking() {
-        assert!(is_non_blocking_registration_note("No explicit WebApi entity found; used fallback entity from workflow setup."));
+        assert!(is_non_blocking_registration_note(
+            "No explicit WebApi entity found; used fallback entity from workflow setup."
+        ));
     }
 
     #[test]
     fn non_blocking_note_classifies_confirmed_plugin_entity_as_non_blocking() {
-        assert!(is_non_blocking_registration_note("Primary plugin entity: account (source: manual override)."));
+        assert!(is_non_blocking_registration_note(
+            "Primary plugin entity: account (source: manual override)."
+        ));
     }
 
     #[test]
@@ -17664,9 +22100,15 @@ mod tests {
 
     #[test]
     fn non_blocking_note_does_not_classify_real_metadata_gaps_as_non_blocking() {
-        assert!(!is_non_blocking_registration_note("Column metadata for entity 'account' was incomplete; only 5 columns were returned."));
-        assert!(!is_non_blocking_registration_note("Entity 'nvr_labservicecase' could not be inspected: connection refused"));
-        assert!(!is_non_blocking_registration_note("Some attributes could not be bound to a specific entity statically: nvr_foo."));
+        assert!(!is_non_blocking_registration_note(
+            "Column metadata for entity 'account' was incomplete; only 5 columns were returned."
+        ));
+        assert!(!is_non_blocking_registration_note(
+            "Entity 'nvr_labservicecase' could not be inspected: connection refused"
+        ));
+        assert!(!is_non_blocking_registration_note(
+            "Some attributes could not be bound to a specific entity statically: nvr_foo."
+        ));
     }
 
     #[test]
@@ -17708,8 +22150,14 @@ mod tests {
         // "warnings_unaccepted" mechanism as any other Dataverse Metadata Check warning, requiring
         // an explicit accept_dataverse_warnings call before task_mcp_compute_progression_gate
         // reports canProceed=true.
-        assert_eq!(task_mcp_normalize_dataverse_gate("warnings", false), "warnings_unaccepted");
-        assert_eq!(task_mcp_normalize_dataverse_gate("warnings", true), "passed");
+        assert_eq!(
+            task_mcp_normalize_dataverse_gate("warnings", false),
+            "warnings_unaccepted"
+        );
+        assert_eq!(
+            task_mcp_normalize_dataverse_gate("warnings", true),
+            "passed"
+        );
     }
 
     #[test]
@@ -17729,7 +22177,10 @@ mod tests {
     #[test]
     fn attribute_in_incomplete_schema_is_not_marked_confirmed() {
         let entry = EntityMetadataCacheEntry {
-            attributes: ["fullname", "ownerid"].iter().map(|s| s.to_string()).collect(),
+            attributes: ["fullname", "ownerid"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
             column_count: 2,
             schema_completeness: "incomplete".to_string(),
             ..Default::default()
@@ -17739,7 +22190,10 @@ mod tests {
         let found = entry.attributes.contains("fullname");
         let would_confirm = entry.schema_completeness == "complete";
         assert!(found, "attribute must be in the returned columns");
-        assert!(!would_confirm, "incomplete schema must not trigger the confirmed branch");
+        assert!(
+            !would_confirm,
+            "incomplete schema must not trigger the confirmed branch"
+        );
     }
 
     #[test]
@@ -17756,19 +22210,36 @@ mod tests {
         // list_columns has no paging params: supports_paging=false, limit params never sent
         let entry = build_entity_metadata_cache_entry(&payload, "list_columns", None, false, true);
         // All 5 real column names must be in the attributes set (extracted via fallback string scan)
-        assert!(entry.attributes.contains("nvr_erprelevant"), "nvr_erprelevant must be found");
-        assert!(entry.attributes.contains("nvr_sendtoerp"), "nvr_sendtoerp must be found");
-        assert!(entry.attributes.contains("parentaccountid"), "parentaccountid must be found");
-        assert!(entry.attributes.contains("fullname"), "fullname must be found");
-        assert!(entry.attributes.contains("telephone1"), "telephone1 must be found");
+        assert!(
+            entry.attributes.contains("nvr_erprelevant"),
+            "nvr_erprelevant must be found"
+        );
+        assert!(
+            entry.attributes.contains("nvr_sendtoerp"),
+            "nvr_sendtoerp must be found"
+        );
+        assert!(
+            entry.attributes.contains("parentaccountid"),
+            "parentaccountid must be found"
+        );
+        assert!(
+            entry.attributes.contains("fullname"),
+            "fullname must be found"
+        );
+        assert!(
+            entry.attributes.contains("telephone1"),
+            "telephone1 must be found"
+        );
         // column_count is at least 5 (may be more due to false positives from display name substrings)
         assert!(entry.column_count >= 5, "column_count must be at least 5");
         // The count:5 is inside the nested text string, which find_count_key does not parse.
         // False-positive tokens from display names ("ERP Relevant" â†’ "elevant", etc.) push
         // column_count above 5, so the <=5 incomplete heuristic does not fire.
         // Result: schema_completeness = "unknown" (conservative â€” we cannot prove it is complete or truncated).
-        assert_eq!(entry.schema_completeness, "unknown",
-            "list_columns text-wrapper format: count buried in string â†’ unknown, not incomplete");
+        assert_eq!(
+            entry.schema_completeness, "unknown",
+            "list_columns text-wrapper format: count buried in string â†’ unknown, not incomplete"
+        );
     }
 
     // â”€â”€ validate_working_directory â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
@@ -17822,7 +22293,10 @@ mod tests {
     fn customer_dev_defaults_folder_name_plus_crm_base_dir() {
         let customer = serde_json::json!({"id": "vsk", "folderName": "VSK-Test"});
         let result = task_mcp_customer_dev_defaults(&customer, "C:/Dev/repos").unwrap();
-        assert_eq!(result["repositoryRoot"].as_str(), Some("C:/Dev/repos/VSK-Test"));
+        assert_eq!(
+            result["repositoryRoot"].as_str(),
+            Some("C:/Dev/repos/VSK-Test")
+        );
     }
 
     #[test]
@@ -17841,10 +22315,13 @@ mod tests {
 
     #[test]
     fn customer_dev_defaults_folder_name_without_crm_base_dir_no_repo_root() {
-        let customer = serde_json::json!({"id": "vsk", "folderName": "VSK-Test", "scriptFolder": "/Scripts"});
+        let customer =
+            serde_json::json!({"id": "vsk", "folderName": "VSK-Test", "scriptFolder": "/Scripts"});
         let result = task_mcp_customer_dev_defaults(&customer, "").unwrap();
-        assert!(result.get("repositoryRoot").is_none() || result["repositoryRoot"].is_null(),
-            "repositoryRoot must be absent when crmBaseDir is empty");
+        assert!(
+            result.get("repositoryRoot").is_none() || result["repositoryRoot"].is_null(),
+            "repositoryRoot must be absent when crmBaseDir is empty"
+        );
         assert_eq!(result["scriptDirectory"].as_str(), Some("/Scripts"));
     }
 
@@ -17858,7 +22335,10 @@ mod tests {
     fn customer_dev_defaults_trailing_slash_stripped_from_base_dir() {
         let customer = serde_json::json!({"id": "vsk", "folderName": "VSK-Test"});
         let result = task_mcp_customer_dev_defaults(&customer, "C:/Dev/repos/").unwrap();
-        assert_eq!(result["repositoryRoot"].as_str(), Some("C:/Dev/repos/VSK-Test"));
+        assert_eq!(
+            result["repositoryRoot"].as_str(),
+            Some("C:/Dev/repos/VSK-Test")
+        );
     }
 
     #[test]
@@ -17867,21 +22347,26 @@ mod tests {
         // â†’ schema_completeness = "unknown" (conservative: we can't prove completeness from this format)
         let mut cols = Vec::new();
         for i in 0..186u32 {
-            cols.push(serde_json::json!({"n": format!("attr_{:03}", i), "d": "Display", "t": "String"}));
+            cols.push(
+                serde_json::json!({"n": format!("attr_{:03}", i), "d": "Display", "t": "String"}),
+            );
         }
         let text = serde_json::json!({
             "entity": "account",
             "count": 186,
             "columns": cols
-        }).to_string();
+        })
+        .to_string();
         let payload = serde_json::json!({
             "content": [{"type": "text", "text": text}]
         });
         let entry = build_entity_metadata_cache_entry(&payload, "list_columns", None, false, true);
         assert!(entry.column_count > 5, "186 columns â†’ count > 5");
         // totalCount is buried inside text string, find_count_key won't see it â†’ unknown not complete
-        assert_eq!(entry.schema_completeness, "unknown",
-            "186-column result stays unknown because count is nested in text string");
+        assert_eq!(
+            entry.schema_completeness, "unknown",
+            "186-column result stays unknown because count is nested in text string"
+        );
         // Attributes are still usable: verify a few are present
         assert!(entry.attributes.contains("attr_000"));
         assert!(entry.attributes.contains("attr_185"));
@@ -17892,9 +22377,7 @@ mod tests {
     #[test]
     fn read_only_tool_list_contains_continue_developer_workflow() {
         let tools = task_mcp_read_only_tool_definitions();
-        let names: Vec<&str> = tools.iter()
-            .filter_map(|t| t["name"].as_str())
-            .collect();
+        let names: Vec<&str> = tools.iter().filter_map(|t| t["name"].as_str()).collect();
         assert!(
             names.contains(&"continue_developer_workflow"),
             "read-only tool list must contain continue_developer_workflow; got: {names:?}"
@@ -17904,8 +22387,13 @@ mod tests {
     #[test]
     fn continue_developer_workflow_is_marked_read_only() {
         let tools = task_mcp_read_only_tool_definitions();
-        let tool = tools.iter().find(|t| t["name"].as_str() == Some("continue_developer_workflow"));
-        assert!(tool.is_some(), "continue_developer_workflow not found in read-only tools");
+        let tool = tools
+            .iter()
+            .find(|t| t["name"].as_str() == Some("continue_developer_workflow"));
+        assert!(
+            tool.is_some(),
+            "continue_developer_workflow not found in read-only tools"
+        );
         assert_eq!(
             tool.unwrap()["readOnly"].as_bool(),
             Some(true),
@@ -17925,8 +22413,14 @@ mod tests {
             "crmDeveloperWorkflow": { "detectedWorkKind": "script" },
         });
         let result = task_mcp_compute_continue_workflow_step(&task);
-        assert_eq!(result["nextAction"].as_str(), Some("run_implementation_verification"));
-        assert_eq!(result["recommendedTool"].as_str(), Some("run_implementation_verification"));
+        assert_eq!(
+            result["nextAction"].as_str(),
+            Some("run_implementation_verification")
+        );
+        assert_eq!(
+            result["recommendedTool"].as_str(),
+            Some("run_implementation_verification")
+        );
         assert_eq!(result["canProceed"].as_bool(), Some(true));
         assert_ne!(result["nextAction"].as_str(), Some("record_results"));
     }
@@ -18057,13 +22551,25 @@ mod tests {
             },
             "implementationVerification": { "dataverseCheck": { "status": "skipped" } },
         });
-        let packet = task_mcp_developer_work_packet(&task, None, Some("C:/repos/power-platform-ai-kit"));
+        let packet =
+            task_mcp_developer_work_packet(&task, None, Some("C:/repos/power-platform-ai-kit"));
         assert_eq!(packet["aiKit"]["available"].as_bool(), Some(true));
-        let rules = packet["aiKit"]["rulesFiles"].as_array().expect("rulesFiles must be array");
-        assert!(!rules.is_empty(), "rulesFiles must not be empty when kit path given");
+        let rules = packet["aiKit"]["rulesFiles"]
+            .as_array()
+            .expect("rulesFiles must be array");
+        assert!(
+            !rules.is_empty(),
+            "rulesFiles must not be empty when kit path given"
+        );
         let first = rules[0].as_str().unwrap_or("");
-        assert!(first.contains("crm-javascript-rules.md"), "script task must use javascript rules: {first}");
-        assert!(first.contains("power-platform-ai-kit"), "must include kit path: {first}");
+        assert!(
+            first.contains("crm-javascript-rules.md"),
+            "script task must use javascript rules: {first}"
+        );
+        assert!(
+            first.contains("power-platform-ai-kit"),
+            "must include kit path: {first}"
+        );
     }
 }
 // --- developer_work_packet v4 tests ----------------------------------------
@@ -18134,7 +22640,8 @@ mod developer_work_packet_tests {
         assert_eq!(
             packet["packetGeneratorVersion"].as_str(),
             Some("4"),
-            "packetGeneratorVersion must be '4'; got: {:?}", packet["packetGeneratorVersion"]
+            "packetGeneratorVersion must be '4'; got: {:?}",
+            packet["packetGeneratorVersion"]
         );
     }
 
@@ -18252,8 +22759,14 @@ mod developer_work_packet_tests {
             Some(false),
             "canWriteCode must be false when field mappings are required (unmappedSourceFields set) but none defined"
         );
-        assert_eq!(packet["implementation"]["requiresFieldMappings"].as_bool(), Some(true));
-        assert_eq!(packet["implementation"]["fieldMappingsCount"].as_u64(), Some(0));
+        assert_eq!(
+            packet["implementation"]["requiresFieldMappings"].as_bool(),
+            Some(true)
+        );
+        assert_eq!(
+            packet["implementation"]["fieldMappingsCount"].as_u64(),
+            Some(0)
+        );
     }
 
     // ── Final invariant: scaffold text in steps/risks blocks write ────────────
@@ -18328,7 +22841,9 @@ mod developer_work_packet_tests {
     fn work_packet_field_mappings_use_nvr_customerasset_not_nvr_asset() {
         let task = make_ready_script_task();
         let packet = task_mcp_developer_work_packet(&task, None, None);
-        let mappings = packet["implementation"]["fieldMappings"].as_array().unwrap();
+        let mappings = packet["implementation"]["fieldMappings"]
+            .as_array()
+            .unwrap();
         assert!(!mappings.is_empty(), "fieldMappings must not be empty");
         for m in mappings {
             let source = m["source"].as_str().unwrap_or("");
@@ -18354,10 +22869,14 @@ mod developer_work_packet_tests {
             "crmDeveloperWorkflow": { "technicalPlan": null }
         });
         let (required, mappings, _validation, _sources) = task_mcp_detect_field_mappings(&task);
-        assert!(required, "must detect field mapping work from source/target context + arrows");
+        assert!(
+            required,
+            "must detect field mapping work from source/target context + arrows"
+        );
         assert!(
             mappings.len() >= 2,
-            "must extract at least 2 arrow mappings; got: {:?}", mappings
+            "must extract at least 2 arrow mappings; got: {:?}",
+            mappings
         );
         let src0 = mappings[0]["source"].as_str().unwrap_or("");
         assert!(
@@ -18412,10 +22931,13 @@ mod developer_work_packet_tests {
             "crmVerificationReports": [{ "verdict": "pass" }],
         });
         let packet = task_mcp_developer_work_packet(&task, None, None);
-        let mappings = packet["implementation"]["fieldMappings"].as_array().unwrap();
+        let mappings = packet["implementation"]["fieldMappings"]
+            .as_array()
+            .unwrap();
         assert!(
             mappings.len() >= 2,
-            "should extract at least 2 arrow mappings from originalMessage; got: {:?}", mappings
+            "should extract at least 2 arrow mappings from originalMessage; got: {:?}",
+            mappings
         );
         assert_eq!(
             packet["implementation"]["fieldMappingsSource"].as_str(),
@@ -18458,21 +22980,48 @@ mod developer_work_packet_tests {
         let task = make_ready_script_task();
         let packet = task_mcp_developer_work_packet(&task, None, None);
         let impl_obj = &packet["implementation"];
-        assert!(!impl_obj["requiresFieldMappings"].is_null(), "requiresFieldMappings must be present");
-        assert!(!impl_obj["fieldMappingsCount"].is_null(), "fieldMappingsCount must be present");
-        assert!(!impl_obj["fieldMappingsSource"].is_null(), "fieldMappingsSource must be present");
-        assert!(!impl_obj["scaffoldSignalDetected"].is_null(), "scaffoldSignalDetected must be present");
-        assert!(!impl_obj["scaffoldSignalSources"].is_null(), "scaffoldSignalSources must be present");
-        assert!(!impl_obj["finalConsistencyGuardApplied"].is_null(), "finalConsistencyGuardApplied must be present");
-        assert!(!impl_obj["validationFields"].is_null(), "validationFields must be present");
+        assert!(
+            !impl_obj["requiresFieldMappings"].is_null(),
+            "requiresFieldMappings must be present"
+        );
+        assert!(
+            !impl_obj["fieldMappingsCount"].is_null(),
+            "fieldMappingsCount must be present"
+        );
+        assert!(
+            !impl_obj["fieldMappingsSource"].is_null(),
+            "fieldMappingsSource must be present"
+        );
+        assert!(
+            !impl_obj["scaffoldSignalDetected"].is_null(),
+            "scaffoldSignalDetected must be present"
+        );
+        assert!(
+            !impl_obj["scaffoldSignalSources"].is_null(),
+            "scaffoldSignalSources must be present"
+        );
+        assert!(
+            !impl_obj["finalConsistencyGuardApplied"].is_null(),
+            "finalConsistencyGuardApplied must be present"
+        );
+        assert!(
+            !impl_obj["validationFields"].is_null(),
+            "validationFields must be present"
+        );
     }
 
     // ── template matching sanity ──────────────────────────────────────────────
 
     #[test]
     fn template_match_finds_nvr_training_script_title() {
-        let tpl = task_mcp_match_template("Script: \u{50}\u{159}edvyplnění servisn\u{ed}ho po\u{17e}adavku", "");
-        assert!(tpl.is_some(), "task_mcp_match_template must match Czech NVR training script title");
+        let tpl = task_mcp_match_template(
+            "Script: \u{50}\u{159}edvyplnění servisn\u{ed}ho po\u{17e}adavku",
+            "",
+        );
+        assert!(
+            tpl.is_some(),
+            "task_mcp_match_template must match Czech NVR training script title"
+        );
         assert_eq!(
             tpl.as_ref().and_then(|t| t["sourceEntity"].as_str()),
             Some("nvr_customerasset"),
@@ -18486,7 +23035,9 @@ mod developer_work_packet_tests {
     fn work_packet_validation_fields_include_template_additional_source_fields() {
         let task = make_ready_script_task();
         let packet = task_mcp_developer_work_packet(&task, None, None);
-        let vf = packet["implementation"]["validationFields"].as_array().unwrap();
+        let vf = packet["implementation"]["validationFields"]
+            .as_array()
+            .unwrap();
         // Template nvr-training-sh-script-prefill has additionalSourceFields: ["nvr_statuscustom"]
         // with sourceEntity "nvr_customerasset".
         let vf_strs: Vec<&str> = vf.iter().filter_map(|v| v.as_str()).collect();
@@ -18552,17 +23103,39 @@ mod developer_work_packet_tests {
     fn work_packet_template_source_fields_populate_field_mappings() {
         let task = make_template_task_no_plan_mappings();
         let packet = task_mcp_developer_work_packet(&task, None, None);
-        let mappings = packet["implementation"]["fieldMappings"].as_array().unwrap();
+        let mappings = packet["implementation"]["fieldMappings"]
+            .as_array()
+            .unwrap();
         assert_eq!(
-            mappings.len(), 3,
-            "template sourceFields/targetFields must produce 3 fieldMappings; got: {:?}", mappings
+            mappings.len(),
+            3,
+            "template sourceFields/targetFields must produce 3 fieldMappings; got: {:?}",
+            mappings
         );
-        let sources: Vec<&str> = mappings.iter().filter_map(|m| m["source"].as_str()).collect();
-        let targets: Vec<&str> = mappings.iter().filter_map(|m| m["target"].as_str()).collect();
-        assert!(sources.iter().any(|s| s.contains("nvr_customerid")), "must include nvr_customerid mapping");
-        assert!(sources.iter().any(|s| s.contains("nvr_contactid")), "must include nvr_contactid mapping");
-        assert!(sources.iter().any(|s| s.contains("nvr_isunderwarranty")), "must include nvr_isunderwarranty mapping");
-        assert!(targets.iter().any(|t| t.contains("nvr_iswarrantycase")), "target must include nvr_iswarrantycase");
+        let sources: Vec<&str> = mappings
+            .iter()
+            .filter_map(|m| m["source"].as_str())
+            .collect();
+        let targets: Vec<&str> = mappings
+            .iter()
+            .filter_map(|m| m["target"].as_str())
+            .collect();
+        assert!(
+            sources.iter().any(|s| s.contains("nvr_customerid")),
+            "must include nvr_customerid mapping"
+        );
+        assert!(
+            sources.iter().any(|s| s.contains("nvr_contactid")),
+            "must include nvr_contactid mapping"
+        );
+        assert!(
+            sources.iter().any(|s| s.contains("nvr_isunderwarranty")),
+            "must include nvr_isunderwarranty mapping"
+        );
+        assert!(
+            targets.iter().any(|t| t.contains("nvr_iswarrantycase")),
+            "target must include nvr_iswarrantycase"
+        );
     }
 
     #[test]
@@ -18597,7 +23170,9 @@ mod developer_work_packet_tests {
     fn work_packet_template_mappings_source_entity_is_nvr_customerasset() {
         let task = make_template_task_no_plan_mappings();
         let packet = task_mcp_developer_work_packet(&task, None, None);
-        let mappings = packet["implementation"]["fieldMappings"].as_array().unwrap();
+        let mappings = packet["implementation"]["fieldMappings"]
+            .as_array()
+            .unwrap();
         for m in mappings {
             let source = m["source"].as_str().unwrap_or("");
             assert!(
@@ -18616,20 +23191,31 @@ mod developer_work_packet_tests {
         // additionalSourceFields (nvr_statuscustom) must appear in validationFields but NOT in fieldMappings
         let task = make_template_task_no_plan_mappings();
         let packet = task_mcp_developer_work_packet(&task, None, None);
-        let mappings = packet["implementation"]["fieldMappings"].as_array().unwrap();
-        let vf = packet["implementation"]["validationFields"].as_array().unwrap();
+        let mappings = packet["implementation"]["fieldMappings"]
+            .as_array()
+            .unwrap();
+        let vf = packet["implementation"]["validationFields"]
+            .as_array()
+            .unwrap();
         // Must not be a mapping target or source
         for m in mappings {
             let source = m["source"].as_str().unwrap_or("");
             let target = m["target"].as_str().unwrap_or("");
-            assert!(!source.contains("nvr_statuscustom"), "nvr_statuscustom must not appear in fieldMappings source; got: {source}");
-            assert!(!target.contains("nvr_statuscustom"), "nvr_statuscustom must not appear in fieldMappings target; got: {target}");
+            assert!(
+                !source.contains("nvr_statuscustom"),
+                "nvr_statuscustom must not appear in fieldMappings source; got: {source}"
+            );
+            assert!(
+                !target.contains("nvr_statuscustom"),
+                "nvr_statuscustom must not appear in fieldMappings target; got: {target}"
+            );
         }
         // Must be in validationFields
         let vf_strs: Vec<&str> = vf.iter().filter_map(|v| v.as_str()).collect();
         assert!(
             vf_strs.iter().any(|s| s.contains("nvr_statuscustom")),
-            "nvr_statuscustom must be in validationFields; got: {:?}", vf_strs
+            "nvr_statuscustom must be in validationFields; got: {:?}",
+            vf_strs
         );
     }
 
@@ -18688,7 +23274,8 @@ mod developer_work_packet_tests {
         let reasons = task_mcp_plan_approval_safety_check(&task, &packet);
         assert!(
             reasons.is_empty(),
-            "Expected no safety blocks for a valid template task awaiting approval, got: {:?}", reasons
+            "Expected no safety blocks for a valid template task awaiting approval, got: {:?}",
+            reasons
         );
     }
 
@@ -18766,13 +23353,20 @@ mod developer_work_packet_tests {
     fn lab_task_template_matches_only_with_explicit_logical_name_in_description() {
         // Title alone (no nvr_labservicecase anywhere) must not match the lab template.
         let title = "[TEST] Script: Povinný popis pro vysokou prioritu servisního případu";
-        assert!(task_mcp_match_template(title, "").is_none(),
-            "Lab template must not match from the title alone with no explicit logical name");
+        assert!(
+            task_mcp_match_template(title, "").is_none(),
+            "Lab template must not match from the title alone with no explicit logical name"
+        );
 
         // Explicit logical names in the description must match, regardless of title wording.
-        let matched = task_mcp_match_template("Some other title entirely", "nvr_labservicecase nvr_priority nvr_description");
-        assert_eq!(matched.and_then(|t| t["id"].as_str().map(str::to_string)),
-            Some("nvr-training-automation-lab-servicecase-priority-description".to_string()));
+        let matched = task_mcp_match_template(
+            "Some other title entirely",
+            "nvr_labservicecase nvr_priority nvr_description",
+        );
+        assert_eq!(
+            matched.and_then(|t| t["id"].as_str().map(str::to_string)),
+            Some("nvr-training-automation-lab-servicecase-priority-description".to_string())
+        );
     }
 
     #[test]
@@ -18780,13 +23374,27 @@ mod developer_work_packet_tests {
         let task = make_lab_ui_business_rule_task();
         let packet = task_mcp_developer_work_packet(&task, None, None);
         let impl_obj = &packet["implementation"];
-        assert_eq!(impl_obj["implementationPattern"].as_str(), Some("ui-business-rule"));
+        assert_eq!(
+            impl_obj["implementationPattern"].as_str(),
+            Some("ui-business-rule")
+        );
         assert_eq!(impl_obj["requiresFieldMappings"].as_bool(), Some(false));
-        assert_eq!(impl_obj["fieldMappings"].as_array().map(|a| a.len()), Some(0));
+        assert_eq!(
+            impl_obj["fieldMappings"].as_array().map(|a| a.len()),
+            Some(0)
+        );
         assert_eq!(impl_obj["scaffoldOnly"].as_bool(), Some(false));
-        assert_eq!(impl_obj["referencedFields"].as_array().cloned(),
-            Some(vec![serde_json::json!("nvr_priority"), serde_json::json!("nvr_description")]));
-        assert_eq!(impl_obj["affectedFields"].as_array().cloned(), Some(vec![serde_json::json!("nvr_description")]));
+        assert_eq!(
+            impl_obj["referencedFields"].as_array().cloned(),
+            Some(vec![
+                serde_json::json!("nvr_priority"),
+                serde_json::json!("nvr_description")
+            ])
+        );
+        assert_eq!(
+            impl_obj["affectedFields"].as_array().cloned(),
+            Some(vec![serde_json::json!("nvr_description")])
+        );
     }
 
     #[test]
@@ -18796,11 +23404,19 @@ mod developer_work_packet_tests {
         // never copied anywhere; only its required-level is toggled).
         let mut task = make_lab_ui_business_rule_task();
         task["crmDeveloperWorkflow"] = Value::Null;
-        let template = task_mcp_match_template(task["title"].as_str().unwrap(), &task_mcp_task_text_for_inference(&task));
+        let template = task_mcp_match_template(
+            task["title"].as_str().unwrap(),
+            &task_mcp_task_text_for_inference(&task),
+        );
         assert!(template.is_some(), "Precondition: lab template must match");
-        let plan = task_mcp_prepare_plan_draft(&task, template.as_ref()).expect("plan draft must be produced");
-        assert_eq!(plan["fieldMappings"].as_array().map(|a| a.len()), Some(0),
-            "Must not fabricate a field mapping for a ui-business-rule script; got: {:?}", plan["fieldMappings"]);
+        let plan = task_mcp_prepare_plan_draft(&task, template.as_ref())
+            .expect("plan draft must be produced");
+        assert_eq!(
+            plan["fieldMappings"].as_array().map(|a| a.len()),
+            Some(0),
+            "Must not fabricate a field mapping for a ui-business-rule script; got: {:?}",
+            plan["fieldMappings"]
+        );
     }
 
     #[test]
@@ -18808,7 +23424,11 @@ mod developer_work_packet_tests {
         let task = make_lab_ui_business_rule_task();
         let packet = task_mcp_developer_work_packet(&task, None, None);
         let reasons = task_mcp_plan_approval_safety_check(&task, &packet);
-        assert!(reasons.is_empty(), "Expected no safety blocks for the lab ui-business-rule task, got: {:?}", reasons);
+        assert!(
+            reasons.is_empty(),
+            "Expected no safety blocks for the lab ui-business-rule task, got: {:?}",
+            reasons
+        );
     }
 
     #[test]
@@ -18821,8 +23441,16 @@ mod developer_work_packet_tests {
         let packet = task_mcp_developer_work_packet(&task, None, None);
         assert_eq!(packet["canWriteCode"].as_bool(), Some(true),
             "canWriteCode must be true once the ui-business-rule plan is approved; decisionReason: {:?}", packet["decisionReason"]);
-        assert_eq!(packet["implementation"]["fieldMappings"].as_array().map(|a| a.len()), Some(0));
-        assert_eq!(packet["implementation"]["scaffoldOnly"].as_bool(), Some(false));
+        assert_eq!(
+            packet["implementation"]["fieldMappings"]
+                .as_array()
+                .map(|a| a.len()),
+            Some(0)
+        );
+        assert_eq!(
+            packet["implementation"]["scaffoldOnly"].as_bool(),
+            Some(false)
+        );
     }
 
     #[test]
@@ -18837,12 +23465,23 @@ mod developer_work_packet_tests {
         task["crmDeveloperWorkflow"]["technicalPlan"]["target"]["entityLogicalName"] = Value::Null;
         task["title"] = serde_json::json!("Generic follow-up task");
         task["originalMessage"] = serde_json::json!("Please double check the earlier change.");
-        assert!(task_mcp_match_template(task["title"].as_str().unwrap(), &task_mcp_task_text_for_inference(&task)).is_none(),
-            "Precondition: template must no longer match so targetEntity has no template fallback");
+        assert!(
+            task_mcp_match_template(
+                task["title"].as_str().unwrap(),
+                &task_mcp_task_text_for_inference(&task)
+            )
+            .is_none(),
+            "Precondition: template must no longer match so targetEntity has no template fallback"
+        );
         let packet = task_mcp_developer_work_packet(&task, None, None);
         let reasons = task_mcp_plan_approval_safety_check(&task, &packet);
-        assert!(reasons.iter().any(|r| r.contains("Target entity is not set")),
-            "Expected a target-entity reason, got: {:?}", reasons);
+        assert!(
+            reasons
+                .iter()
+                .any(|r| r.contains("Target entity is not set")),
+            "Expected a target-entity reason, got: {:?}",
+            reasons
+        );
     }
 
     #[test]
@@ -18852,24 +23491,46 @@ mod developer_work_packet_tests {
         let mut task = make_lab_ui_business_rule_task();
         task["title"] = serde_json::json!("Generic follow-up task");
         task["originalMessage"] = serde_json::json!("Please double check the earlier change.");
-        assert!(task_mcp_match_template(task["title"].as_str().unwrap(), &task_mcp_task_text_for_inference(&task)).is_none(),
-            "Precondition: template must no longer match after the text edit");
+        assert!(
+            task_mcp_match_template(
+                task["title"].as_str().unwrap(),
+                &task_mcp_task_text_for_inference(&task)
+            )
+            .is_none(),
+            "Precondition: template must no longer match after the text edit"
+        );
 
         let packet = task_mcp_developer_work_packet(&task, None, None);
         let impl_obj = &packet["implementation"];
-        assert_eq!(impl_obj["implementationPattern"].as_str(), Some("ui-business-rule"));
+        assert_eq!(
+            impl_obj["implementationPattern"].as_str(),
+            Some("ui-business-rule")
+        );
         assert_eq!(impl_obj["requiresFieldMappings"].as_bool(), Some(false));
-        assert_eq!(impl_obj["fieldMappings"].as_array().map(|a| a.len()), Some(0));
+        assert_eq!(
+            impl_obj["fieldMappings"].as_array().map(|a| a.len()),
+            Some(0)
+        );
         assert_eq!(impl_obj["scaffoldOnly"].as_bool(), Some(false));
-        assert_eq!(impl_obj["affectedFields"].as_array().cloned(), Some(vec![serde_json::json!("nvr_description")]));
+        assert_eq!(
+            impl_obj["affectedFields"].as_array().cloned(),
+            Some(vec![serde_json::json!("nvr_description")])
+        );
     }
 
     #[test]
-    fn field_mapping_prefill_template_still_requires_field_mappings_unaffected_by_ui_business_rule_fix() {
+    fn field_mapping_prefill_template_still_requires_field_mappings_unaffected_by_ui_business_rule_fix(
+    ) {
         let task = make_template_task_no_plan_mappings();
         let packet = task_mcp_developer_work_packet(&task, None, None);
-        assert_eq!(packet["implementation"]["implementationPattern"].as_str(), Some("field-mapping"));
-        assert_eq!(packet["implementation"]["requiresFieldMappings"].as_bool(), Some(true));
+        assert_eq!(
+            packet["implementation"]["implementationPattern"].as_str(),
+            Some("field-mapping")
+        );
+        assert_eq!(
+            packet["implementation"]["requiresFieldMappings"].as_bool(),
+            Some(true)
+        );
     }
 
     #[test]
@@ -18914,7 +23575,8 @@ Business logika:
             Some("nvr-training-automation-lab-servicecase-priority-description".to_string()),
             "Lab template must match the real task's exact Czech title/description"
         );
-        let inferred_entity = task_mcp_extract_explicit_nvr_entity(&task_mcp_task_text_for_inference(&task));
+        let inferred_entity =
+            task_mcp_extract_explicit_nvr_entity(&task_mcp_task_text_for_inference(&task));
         assert_eq!(inferred_entity, Some("nvr_labservicecase".to_string()),
             "Explicit nvr_labservicecase in the real description must win over the generic Czech title wording — must not become 'incident'");
     }
@@ -18931,7 +23593,11 @@ Business logika:
     fn workflow_transition_technical_plan_approved_moves_to_development_when_can_write_code() {
         let mut task = make_template_task_awaiting_approval();
         task["status"] = serde_json::json!("new");
-        task_mcp_apply_developer_workflow_transition(&mut task, "technical_plan_approved", &serde_json::json!({"canWriteCode": true}));
+        task_mcp_apply_developer_workflow_transition(
+            &mut task,
+            "technical_plan_approved",
+            &serde_json::json!({"canWriteCode": true}),
+        );
         assert_eq!(task["status"].as_str(), Some("in-progress"));
         assert!(task["waitingState"].is_null());
     }
@@ -18940,7 +23606,11 @@ Business logika:
     fn workflow_transition_technical_plan_approved_only_reaches_analyzed_when_cannot_write_code() {
         let mut task = make_template_task_awaiting_approval();
         task["status"] = serde_json::json!("new");
-        task_mcp_apply_developer_workflow_transition(&mut task, "technical_plan_approved", &serde_json::json!({"canWriteCode": false}));
+        task_mcp_apply_developer_workflow_transition(
+            &mut task,
+            "technical_plan_approved",
+            &serde_json::json!({"canWriteCode": false}),
+        );
         assert_eq!(task["status"].as_str(), Some("analyzed"));
     }
 
@@ -18948,7 +23618,11 @@ Business logika:
     fn workflow_transition_ai_implementation_completed_does_not_set_testing_waiting_state() {
         let mut task = make_template_task_no_plan_mappings();
         task["status"] = serde_json::json!("analyzed");
-        task_mcp_apply_developer_workflow_transition(&mut task, "ai_implementation_completed", &Value::Null);
+        task_mcp_apply_developer_workflow_transition(
+            &mut task,
+            "ai_implementation_completed",
+            &Value::Null,
+        );
         assert_eq!(task["status"].as_str(), Some("in-progress"));
         assert_ne!(task["waitingState"].as_str(), Some("consultant-testing"));
     }
@@ -18956,7 +23630,11 @@ Business logika:
     #[test]
     fn workflow_transition_manual_crm_verification_completed_moves_to_testing() {
         let mut task = make_template_task_no_plan_mappings(); // status: in-progress
-        task_mcp_apply_developer_workflow_transition(&mut task, "manual_crm_verification_completed", &Value::Null);
+        task_mcp_apply_developer_workflow_transition(
+            &mut task,
+            "manual_crm_verification_completed",
+            &Value::Null,
+        );
         assert_eq!(task["status"].as_str(), Some("in-progress"));
         assert_eq!(task["waitingState"].as_str(), Some("consultant-testing"));
     }
@@ -18965,13 +23643,18 @@ Business logika:
     fn workflow_overview_display_phase_is_development_after_ai_implementation_completed() {
         let mut task = make_template_task_no_plan_mappings();
         task["status"] = serde_json::json!("analyzed");
-        task_mcp_apply_developer_workflow_transition(&mut task, "ai_implementation_completed", &Value::Null);
+        task_mcp_apply_developer_workflow_transition(
+            &mut task,
+            "ai_implementation_completed",
+            &Value::Null,
+        );
         let overview = task_mcp_workflow_overview(&task);
         assert_eq!(overview["displayPhase"].as_str(), Some("development"));
     }
 
     #[test]
-    fn approve_technical_plan_if_safe_transition_does_not_leave_task_on_new_or_analyzed_when_can_write_code() {
+    fn approve_technical_plan_if_safe_transition_does_not_leave_task_on_new_or_analyzed_when_can_write_code(
+    ) {
         // Guard: get_developer_work_packet canWriteCode=true must never coexist with
         // get_task_workflow_overview showing NEW/Analyze.
         let mut task = make_template_task_awaiting_approval();
@@ -18982,9 +23665,17 @@ Business logika:
         });
         let packet = task_mcp_developer_work_packet(&task, None, None);
         let can_write = packet["canWriteCode"].as_bool().unwrap_or(false);
-        assert!(can_write, "test fixture must produce canWriteCode=true; packet: {:?}", packet["decisionReason"]);
+        assert!(
+            can_write,
+            "test fixture must produce canWriteCode=true; packet: {:?}",
+            packet["decisionReason"]
+        );
 
-        task_mcp_apply_developer_workflow_transition(&mut task, "technical_plan_approved", &serde_json::json!({"canWriteCode": can_write}));
+        task_mcp_apply_developer_workflow_transition(
+            &mut task,
+            "technical_plan_approved",
+            &serde_json::json!({"canWriteCode": can_write}),
+        );
 
         let overview = task_mcp_workflow_overview(&task);
         assert_ne!(overview["displayPhase"].as_str(), Some("new"));
@@ -19001,14 +23692,24 @@ Business logika:
         // No Dataverse verification recorded yet, and run_implementation_verification has not run
         // either — continue_developer_workflow must recommend running it before wait_for_user.
         task["crmVerificationReports"] = serde_json::json!([]);
-        task_mcp_apply_developer_workflow_transition(&mut task, "ai_implementation_completed", &Value::Null);
+        task_mcp_apply_developer_workflow_transition(
+            &mut task,
+            "ai_implementation_completed",
+            &Value::Null,
+        );
         task["localTestRecord"] = serde_json::json!({"status": "not-needed"});
 
         let continue_step = task_mcp_compute_continue_workflow_step(&task);
-        assert_eq!(continue_step["nextAction"].as_str(), Some("run_implementation_verification"));
+        assert_eq!(
+            continue_step["nextAction"].as_str(),
+            Some("run_implementation_verification")
+        );
 
         let next_step = task_mcp_next_recommended_step(&task);
-        assert_eq!(next_step["step"].as_str(), continue_step["nextAction"].as_str());
+        assert_eq!(
+            next_step["step"].as_str(),
+            continue_step["nextAction"].as_str()
+        );
         assert_eq!(
             next_step["reason"].as_str().unwrap_or(""),
             continue_step["instructionForAI"].as_str().unwrap_or(""),
@@ -19016,14 +23717,19 @@ Business logika:
     }
 
     #[test]
-    fn next_recommended_step_matches_continue_developer_workflow_when_verification_needs_manual_action() {
+    fn next_recommended_step_matches_continue_developer_workflow_when_verification_needs_manual_action(
+    ) {
         // Same consistency guard, once run_implementation_verification ran but Dataverse/AI
         // review/Local Test rows are still not-run in the modal — both must report the exact
         // modal-check message, not silently move on.
         let mut task = make_template_task_no_plan_mappings();
         task["status"] = serde_json::json!("analyzed");
         task["crmVerificationReports"] = serde_json::json!([]);
-        task_mcp_apply_developer_workflow_transition(&mut task, "ai_implementation_completed", &Value::Null);
+        task_mcp_apply_developer_workflow_transition(
+            &mut task,
+            "ai_implementation_completed",
+            &Value::Null,
+        );
         task["localTestRecord"] = serde_json::json!({"status": "not-needed"});
         task["implementationVerification"]["mcpVerification"] = serde_json::json!({
             "status": "needs_manual_action",
@@ -19040,10 +23746,17 @@ Business logika:
             Some("Run Dataverse Metadata Check and AI Kit/Settings Review in the Implementation Verification modal."),
         );
         // Blocked from reaching commit/push while verification rows are unresolved.
-        assert!(continue_step["forbiddenWrites"].as_array().unwrap().iter().any(|v| v == "commit_task_changes"));
+        assert!(continue_step["forbiddenWrites"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|v| v == "commit_task_changes"));
 
         let next_step = task_mcp_next_recommended_step(&task);
-        assert_eq!(next_step["step"].as_str(), continue_step["nextAction"].as_str());
+        assert_eq!(
+            next_step["step"].as_str(),
+            continue_step["nextAction"].as_str()
+        );
         assert_eq!(
             next_step["reason"].as_str().unwrap_or(""),
             continue_step["blockingUserAction"].as_str().unwrap_or(""),
@@ -19059,7 +23772,11 @@ Business logika:
         let mut task = make_template_task_no_plan_mappings();
         task["status"] = serde_json::json!("analyzed");
         task["crmVerificationReports"] = serde_json::json!([]);
-        task_mcp_apply_developer_workflow_transition(&mut task, "ai_implementation_completed", &Value::Null);
+        task_mcp_apply_developer_workflow_transition(
+            &mut task,
+            "ai_implementation_completed",
+            &Value::Null,
+        );
         task["localTestRecord"] = serde_json::json!({"status": "not-needed"});
         task["implementationVerification"]["mcpVerification"] = serde_json::json!({
             "status": "passed",
@@ -19070,12 +23787,21 @@ Business logika:
         });
 
         let continue_step = task_mcp_compute_continue_workflow_step(&task);
-        assert_eq!(continue_step["nextAction"].as_str(), Some("run_implementation_verification"));
+        assert_eq!(
+            continue_step["nextAction"].as_str(),
+            Some("run_implementation_verification")
+        );
         assert_eq!(continue_step["canProceed"].as_bool(), Some(true));
-        assert_eq!(continue_step["recommendedTool"].as_str(), Some("run_implementation_verification"));
+        assert_eq!(
+            continue_step["recommendedTool"].as_str(),
+            Some("run_implementation_verification")
+        );
 
         let next_step = task_mcp_next_recommended_step(&task);
-        assert_eq!(next_step["step"].as_str(), continue_step["nextAction"].as_str());
+        assert_eq!(
+            next_step["step"].as_str(),
+            continue_step["nextAction"].as_str()
+        );
         assert_eq!(
             next_step["reason"].as_str().unwrap_or(""),
             continue_step["instructionForAI"].as_str().unwrap_or(""),
@@ -19087,7 +23813,11 @@ Business logika:
         let mut task = make_template_task_no_plan_mappings();
         task["status"] = serde_json::json!("analyzed");
         task["crmVerificationReports"] = serde_json::json!([]);
-        task_mcp_apply_developer_workflow_transition(&mut task, "ai_implementation_completed", &Value::Null);
+        task_mcp_apply_developer_workflow_transition(
+            &mut task,
+            "ai_implementation_completed",
+            &Value::Null,
+        );
         task["localTestRecord"] = serde_json::json!({"status": "not-needed"});
         task["implementationVerification"]["mcpVerification"] = serde_json::json!({
             "status": "failed",
@@ -19122,7 +23852,10 @@ Business logika:
         task["workflowSetup"]["desiredScriptFile"] = serde_json::json!("nvr_servicecase_events.js");
         let files = vec!["Scripts/other.js", "Scripts/nvr_servicecase_events.js"];
         let resolved = task_mcp_resolve_implemented_script_artifact(&task, &files);
-        assert_eq!(resolved.as_deref(), Some("Scripts/nvr_servicecase_events.js"));
+        assert_eq!(
+            resolved.as_deref(),
+            Some("Scripts/nvr_servicecase_events.js")
+        );
     }
 
     #[test]
@@ -19139,7 +23872,10 @@ Business logika:
     fn resolve_implemented_script_artifact_ignores_non_script_files() {
         let task = make_template_task_no_plan_mappings();
         let files = vec!["README.md"];
-        assert_eq!(task_mcp_resolve_implemented_script_artifact(&task, &files), None);
+        assert_eq!(
+            task_mcp_resolve_implemented_script_artifact(&task, &files),
+            None
+        );
     }
 
     #[test]
@@ -19147,8 +23883,14 @@ Business logika:
         let mut task = make_template_task_no_plan_mappings();
         task["workflowSetup"]["repositoryRoot"] = serde_json::json!("C:\\Repos\\NVR");
         task_mcp_apply_implemented_script_artifact(&mut task, "Scripts/nvr_servicecase_events.js");
-        assert_eq!(task["workflowSetup"]["artifactPath"].as_str(), Some("Scripts/nvr_servicecase_events.js"));
-        assert_eq!(task["workflowSetup"]["desiredScriptFile"].as_str(), Some("nvr_servicecase_events.js"));
+        assert_eq!(
+            task["workflowSetup"]["artifactPath"].as_str(),
+            Some("Scripts/nvr_servicecase_events.js")
+        );
+        assert_eq!(
+            task["workflowSetup"]["desiredScriptFile"].as_str(),
+            Some("nvr_servicecase_events.js")
+        );
         assert_eq!(
             task["workflowSetup"]["absoluteScriptPath"].as_str(),
             Some("C:\\Repos\\NVR\\Scripts/nvr_servicecase_events.js"),
@@ -19163,13 +23905,16 @@ Business logika:
                 { "id": "retrieve-source-entity", "description": "retrieveRecord must target nvr_customerasset.", "type": "must-match" },
             ]
         });
-        let good = "Xrm.WebApi.retrieveRecord(\"nvr_customerasset\", id, \"?$select=nvr_customerid\")";
-        let (status, _findings, fixable) = task_mcp_run_static_business_rule_checks(Some(&template), good);
+        let good =
+            "Xrm.WebApi.retrieveRecord(\"nvr_customerasset\", id, \"?$select=nvr_customerid\")";
+        let (status, _findings, fixable) =
+            task_mcp_run_static_business_rule_checks(Some(&template), good);
         assert_eq!(status, "passed");
         assert!(fixable.is_empty());
 
         let bad = "var formContext = Xrm.Page;";
-        let (status2, _findings2, fixable2) = task_mcp_run_static_business_rule_checks(Some(&template), bad);
+        let (status2, _findings2, fixable2) =
+            task_mcp_run_static_business_rule_checks(Some(&template), bad);
         assert_eq!(status2, "failed");
         let ids: Vec<&str> = fixable2.iter().filter_map(|f| f["id"].as_str()).collect();
         assert!(ids.contains(&"no-xrm-page"));
@@ -19178,7 +23923,8 @@ Business logika:
 
     #[test]
     fn static_rule_checks_skip_when_template_has_no_rules() {
-        let (status, findings, fixable) = task_mcp_run_static_business_rule_checks(None, "anything");
+        let (status, findings, fixable) =
+            task_mcp_run_static_business_rule_checks(None, "anything");
         assert_eq!(status, "skipped");
         assert!(fixable.is_empty());
         assert_eq!(findings.len(), 1);
@@ -19194,7 +23940,10 @@ Business logika:
         task["crmVerificationReports"] = serde_json::json!([]);
         let (status, finding) = task_mcp_dataverse_metadata_check_passthrough(&task);
         assert_eq!(status, "needs_manual_action");
-        assert_eq!(finding, "Run Dataverse Metadata Check in the Implementation Verification modal.");
+        assert_eq!(
+            finding,
+            "Run Dataverse Metadata Check in the Implementation Verification modal."
+        );
     }
 
     #[test]
@@ -19210,13 +23959,17 @@ Business logika:
         let task = make_template_task_no_plan_mappings();
         let (status, finding) = task_mcp_ai_internal_code_review_passthrough(&task);
         assert_eq!(status, "needs_manual_action");
-        assert_eq!(finding, "Run AI Kit Review or Settings Reviewer in the Implementation Verification modal.");
+        assert_eq!(
+            finding,
+            "Run AI Kit Review or Settings Reviewer in the Implementation Verification modal."
+        );
     }
 
     #[test]
     fn ai_internal_code_review_passthrough_reports_existing_status() {
         let mut task = make_template_task_no_plan_mappings();
-        task["implementationVerification"]["aiCodeReview"] = serde_json::json!({"status": "skipped"});
+        task["implementationVerification"]["aiCodeReview"] =
+            serde_json::json!({"status": "skipped"});
         let (status, _finding) = task_mcp_ai_internal_code_review_passthrough(&task);
         assert_eq!(status, "skipped");
     }
@@ -19242,7 +23995,8 @@ Business logika:
     #[test]
     fn local_test_impl_passthrough_reports_existing_status() {
         let mut task = make_template_task_no_plan_mappings();
-        task["implementationVerification"]["localTest"] = serde_json::json!({"status": "not-needed"});
+        task["implementationVerification"]["localTest"] =
+            serde_json::json!({"status": "not-needed"});
         let (status, _finding) = task_mcp_local_test_impl_passthrough(&task);
         assert_eq!(status, "not-needed");
     }
@@ -19253,7 +24007,8 @@ Business logika:
         // completed started writing implementationVerification.localTest directly must still be
         // reported as not-needed, derived from the legacy localTestRecord + completed AI implementation.
         let mut task = make_template_task_no_plan_mappings();
-        task["crmDeveloperWorkflow"]["lastAiImplementation"] = serde_json::json!({"completedAt": "2026-01-01T00:00:00Z"});
+        task["crmDeveloperWorkflow"]["lastAiImplementation"] =
+            serde_json::json!({"completedAt": "2026-01-01T00:00:00Z"});
         task["localTestRecord"] = serde_json::json!({"status": "not-needed"});
         let (status, finding) = task_mcp_local_test_impl_passthrough(&task);
         assert_eq!(status, "not-needed");
@@ -19266,25 +24021,42 @@ Business logika:
         task_mcp_record_ai_managed_local_test_not_needed(&mut task, "2026-01-01T00:00:00Z");
         let local_test = &task["implementationVerification"]["localTest"];
         assert_eq!(local_test["status"].as_str(), Some("not-needed"));
-        assert_eq!(local_test["recordedAt"].as_str(), Some("2026-01-01T00:00:00Z"));
-        assert!(local_test["notes"].as_str().unwrap_or("").contains("Skipped for AI-managed workflow"));
+        assert_eq!(
+            local_test["recordedAt"].as_str(),
+            Some("2026-01-01T00:00:00Z")
+        );
+        assert!(local_test["notes"]
+            .as_str()
+            .unwrap_or("")
+            .contains("Skipped for AI-managed workflow"));
     }
 
     #[test]
     fn record_ai_managed_local_test_not_needed_preserves_explicit_passed() {
         let mut task = make_template_task_no_plan_mappings();
-        task["implementationVerification"]["localTest"] = serde_json::json!({"status": "passed", "recordedAt": "2025-01-01T00:00:00Z"});
+        task["implementationVerification"]["localTest"] =
+            serde_json::json!({"status": "passed", "recordedAt": "2025-01-01T00:00:00Z"});
         task_mcp_record_ai_managed_local_test_not_needed(&mut task, "2026-01-01T00:00:00Z");
-        assert_eq!(task["implementationVerification"]["localTest"]["status"].as_str(), Some("passed"));
-        assert_eq!(task["implementationVerification"]["localTest"]["recordedAt"].as_str(), Some("2025-01-01T00:00:00Z"));
+        assert_eq!(
+            task["implementationVerification"]["localTest"]["status"].as_str(),
+            Some("passed")
+        );
+        assert_eq!(
+            task["implementationVerification"]["localTest"]["recordedAt"].as_str(),
+            Some("2025-01-01T00:00:00Z")
+        );
     }
 
     #[test]
     fn record_ai_managed_local_test_not_needed_preserves_explicit_failed() {
         let mut task = make_template_task_no_plan_mappings();
-        task["implementationVerification"]["localTest"] = serde_json::json!({"status": "failed", "recordedAt": "2025-01-01T00:00:00Z"});
+        task["implementationVerification"]["localTest"] =
+            serde_json::json!({"status": "failed", "recordedAt": "2025-01-01T00:00:00Z"});
         task_mcp_record_ai_managed_local_test_not_needed(&mut task, "2026-01-01T00:00:00Z");
-        assert_eq!(task["implementationVerification"]["localTest"]["status"].as_str(), Some("failed"));
+        assert_eq!(
+            task["implementationVerification"]["localTest"]["status"].as_str(),
+            Some("failed")
+        );
     }
 
     // ── Automated Dataverse Metadata Check + AI Kit review (run_implementation_verification) ────
@@ -19311,8 +24083,13 @@ Business logika:
         let (status, _finding, fixable) = task_mcp_dataverse_check_from_report(&report);
         assert_eq!(status, "failed");
         assert_eq!(fixable.len(), 2);
-        let descriptions: Vec<&str> = fixable.iter().filter_map(|f| f["description"].as_str()).collect();
-        assert!(descriptions.iter().any(|d| d.contains("nvr_iswarrantycase") && d.contains("nvr_servicecase")));
+        let descriptions: Vec<&str> = fixable
+            .iter()
+            .filter_map(|f| f["description"].as_str())
+            .collect();
+        assert!(descriptions
+            .iter()
+            .any(|d| d.contains("nvr_iswarrantycase") && d.contains("nvr_servicecase")));
     }
 
     #[test]
@@ -19326,9 +24103,11 @@ Business logika:
 
     #[test]
     fn dataverse_check_from_report_maps_warnings_and_unknown_verdicts() {
-        let (status, ..) = task_mcp_dataverse_check_from_report(&serde_json::json!({"verdict": "warnings"}));
+        let (status, ..) =
+            task_mcp_dataverse_check_from_report(&serde_json::json!({"verdict": "warnings"}));
         assert_eq!(status, "warnings");
-        let (status, ..) = task_mcp_dataverse_check_from_report(&serde_json::json!({"verdict": "error"}));
+        let (status, ..) =
+            task_mcp_dataverse_check_from_report(&serde_json::json!({"verdict": "error"}));
         assert_eq!(status, "warnings");
     }
 
@@ -19351,7 +24130,10 @@ Business logika:
             serde_json::json!({"status": "needs_ai_kit_review"}),
         ];
         let (status, next_action) = task_mcp_rollup_verification_status(&checks, 0);
-        assert_eq!((status, next_action), ("pending_ai_kit_review", "run_ai_kit_review"));
+        assert_eq!(
+            (status, next_action),
+            ("pending_ai_kit_review", "run_ai_kit_review")
+        );
     }
 
     #[test]
@@ -19361,7 +24143,10 @@ Business logika:
             serde_json::json!({"status": "needs_configuration"}),
         ];
         let (status, next_action) = task_mcp_rollup_verification_status(&checks, 0);
-        assert_eq!((status, next_action), ("needs_configuration", "needs_configuration"));
+        assert_eq!(
+            (status, next_action),
+            ("needs_configuration", "needs_configuration")
+        );
     }
 
     #[test]
@@ -19372,7 +24157,10 @@ Business logika:
             serde_json::json!({"status": "needs_manual_action"}),
         ];
         let (status, next_action) = task_mcp_rollup_verification_status(&checks, 0);
-        assert_eq!((status, next_action), ("needs_manual_action", "wait_for_user"));
+        assert_eq!(
+            (status, next_action),
+            ("needs_manual_action", "wait_for_user")
+        );
     }
 
     #[test]
@@ -19405,17 +24193,32 @@ Business logika:
     #[test]
     fn apply_ai_kit_review_result_persists_to_canonical_field_and_ai_kit_review_gate() {
         let mut task = make_template_task_no_plan_mappings();
-        task_mcp_apply_ai_kit_review_result(&mut task, &full_ai_kit_review_args("passed"), "2026-07-01T00:00:00Z").unwrap();
-        assert_eq!(task["implementationVerification"]["aiCodeReview"]["status"].as_str(), Some("passed"));
-        assert_eq!(task["implementationVerification"]["aiCodeReview"]["reviewSource"].as_str(), Some("claude-ai-kit"));
+        task_mcp_apply_ai_kit_review_result(
+            &mut task,
+            &full_ai_kit_review_args("passed"),
+            "2026-07-01T00:00:00Z",
+        )
+        .unwrap();
+        assert_eq!(
+            task["implementationVerification"]["aiCodeReview"]["status"].as_str(),
+            Some("passed")
+        );
+        assert_eq!(
+            task["implementationVerification"]["aiCodeReview"]["reviewSource"].as_str(),
+            Some("claude-ai-kit")
+        );
         // Keeps continue_developer_workflow's separate pre-branch AI Kit gate from dead-ending.
-        assert_eq!(task["aiKitReview"]["completedAt"].as_str(), Some("2026-07-01T00:00:00Z"));
+        assert_eq!(
+            task["aiKitReview"]["completedAt"].as_str(),
+            Some("2026-07-01T00:00:00Z")
+        );
         assert_eq!(task["aiKitReview"]["status"].as_str(), Some("passed"));
 
         let (status, _finding) = task_mcp_ai_internal_code_review_passthrough(&task);
         assert_eq!(status, "passed");
 
-        let (gate_status, missing) = task_mcp_ai_kit_review_gate(&task["implementationVerification"]["aiCodeReview"]);
+        let (gate_status, missing) =
+            task_mcp_ai_kit_review_gate(&task["implementationVerification"]["aiCodeReview"]);
         assert_eq!(gate_status, "passed");
         assert!(missing.is_empty());
     }
@@ -19423,8 +24226,14 @@ Business logika:
     #[test]
     fn ai_kit_review_gate_treats_passed_without_details_as_incomplete() {
         let mut task = make_template_task_no_plan_mappings();
-        task_mcp_apply_ai_kit_review_result(&mut task, &serde_json::json!({"status": "passed"}), "2026-07-01T00:00:00Z").unwrap();
-        let (gate_status, missing) = task_mcp_ai_kit_review_gate(&task["implementationVerification"]["aiCodeReview"]);
+        task_mcp_apply_ai_kit_review_result(
+            &mut task,
+            &serde_json::json!({"status": "passed"}),
+            "2026-07-01T00:00:00Z",
+        )
+        .unwrap();
+        let (gate_status, missing) =
+            task_mcp_ai_kit_review_gate(&task["implementationVerification"]["aiCodeReview"]);
         assert_eq!(gate_status, "incomplete");
         assert!(!missing.is_empty());
     }
@@ -19435,14 +24244,16 @@ Business logika:
         args["fixableFindings"] = serde_json::json!([{"id": "early-return", "description": "Unrequested early return added."}]);
         let mut task = make_template_task_no_plan_mappings();
         task_mcp_apply_ai_kit_review_result(&mut task, &args, "2026-07-01T00:00:00Z").unwrap();
-        let (gate_status, _missing) = task_mcp_ai_kit_review_gate(&task["implementationVerification"]["aiCodeReview"]);
+        let (gate_status, _missing) =
+            task_mcp_ai_kit_review_gate(&task["implementationVerification"]["aiCodeReview"]);
         assert_eq!(gate_status, "failed");
     }
 
     #[test]
     fn ai_kit_review_gate_not_run_when_no_review_recorded() {
         let task = make_template_task_no_plan_mappings();
-        let (gate_status, _missing) = task_mcp_ai_kit_review_gate(&task["implementationVerification"]["aiCodeReview"]);
+        let (gate_status, _missing) =
+            task_mcp_ai_kit_review_gate(&task["implementationVerification"]["aiCodeReview"]);
         assert_eq!(gate_status, "not_run");
     }
 
@@ -19467,17 +24278,36 @@ Business logika:
         // record_ai_kit_review_result must never let an AI agent call itself "manually-verified"
         // or "skipped" in place of an honest automated verdict — those are manual UI overrides only.
         let mut task = make_template_task_no_plan_mappings();
-        assert!(task_mcp_apply_ai_kit_review_result(&mut task, &serde_json::json!({"status": "manually-verified"}), "2026-07-01T00:00:00Z").is_err());
-        assert!(task_mcp_apply_ai_kit_review_result(&mut task, &serde_json::json!({"status": "skipped"}), "2026-07-01T00:00:00Z").is_err());
+        assert!(task_mcp_apply_ai_kit_review_result(
+            &mut task,
+            &serde_json::json!({"status": "manually-verified"}),
+            "2026-07-01T00:00:00Z"
+        )
+        .is_err());
+        assert!(task_mcp_apply_ai_kit_review_result(
+            &mut task,
+            &serde_json::json!({"status": "skipped"}),
+            "2026-07-01T00:00:00Z"
+        )
+        .is_err());
         assert!(task["implementationVerification"]["aiCodeReview"].is_null());
     }
 
     #[test]
     fn dataverse_gate_warnings_blocks_until_accepted() {
-        assert_eq!(task_mcp_normalize_dataverse_gate("warnings", false), "warnings_unaccepted");
-        assert_eq!(task_mcp_normalize_dataverse_gate("warnings", true), "passed");
+        assert_eq!(
+            task_mcp_normalize_dataverse_gate("warnings", false),
+            "warnings_unaccepted"
+        );
+        assert_eq!(
+            task_mcp_normalize_dataverse_gate("warnings", true),
+            "passed"
+        );
         assert_eq!(task_mcp_normalize_dataverse_gate("failed", true), "failed");
-        assert_eq!(task_mcp_normalize_dataverse_gate("needs_configuration", true), "needs_configuration");
+        assert_eq!(
+            task_mcp_normalize_dataverse_gate("needs_configuration", true),
+            "needs_configuration"
+        );
         assert_eq!(task_mcp_normalize_dataverse_gate("passed", false), "passed");
         assert_eq!(task_mcp_normalize_dataverse_gate("", false), "not_run");
     }
@@ -19507,16 +24337,25 @@ Business logika:
         });
         let gate = task_mcp_compute_progression_gate(&task);
         assert_eq!(gate["canProceed"].as_bool(), Some(false));
-        assert_eq!(gate["dataverseGateStatus"].as_str(), Some("warnings_unaccepted"));
+        assert_eq!(
+            gate["dataverseGateStatus"].as_str(),
+            Some("warnings_unaccepted")
+        );
         assert_eq!(gate["requiresUserAction"].as_bool(), Some(true));
-        assert_eq!(gate["nextRecommendedAction"].as_str(), Some("review_dataverse_warnings"));
+        assert_eq!(
+            gate["nextRecommendedAction"].as_str(),
+            Some("review_dataverse_warnings")
+        );
 
         task["implementationVerification"]["dataverseCheck"]["warningsAccepted"] = serde_json::json!({
             "accepted": true, "acceptedAt": "2026-07-01T00:00:00Z", "acceptedBy": "user", "reason": "Known false positive.",
         });
         let gate_after_accept = task_mcp_compute_progression_gate(&task);
         assert_eq!(gate_after_accept["canProceed"].as_bool(), Some(true));
-        assert_eq!(gate_after_accept["dataverseGateStatus"].as_str(), Some("passed"));
+        assert_eq!(
+            gate_after_accept["dataverseGateStatus"].as_str(),
+            Some("passed")
+        );
     }
 
     #[test]
@@ -19528,7 +24367,10 @@ Business logika:
         let gate = task_mcp_compute_progression_gate(&task);
         assert_eq!(gate["canProceed"].as_bool(), Some(false));
         assert_eq!(gate["aiReviewGateStatus"].as_str(), Some("incomplete"));
-        assert_eq!(gate["nextRecommendedAction"].as_str(), Some("run_ai_kit_review"));
+        assert_eq!(
+            gate["nextRecommendedAction"].as_str(),
+            Some("run_ai_kit_review")
+        );
     }
 
     #[test]
@@ -19545,7 +24387,10 @@ Business logika:
         let gate = task_mcp_compute_progression_gate(&task);
         assert_eq!(gate["canProceed"].as_bool(), Some(true));
         assert_eq!(gate["blockingChecks"].as_array().unwrap().len(), 0);
-        assert_eq!(gate["nextRecommendedAction"].as_str(), Some("continue_workflow"));
+        assert_eq!(
+            gate["nextRecommendedAction"].as_str(),
+            Some("continue_workflow")
+        );
     }
 
     #[test]
@@ -19565,9 +24410,15 @@ Business logika:
         });
         let gate = task_mcp_compute_progression_gate(&task);
         assert_eq!(gate["canProceed"].as_bool(), Some(false));
-        assert_eq!(gate["dataverseGateStatus"].as_str(), Some("needs_configuration"));
+        assert_eq!(
+            gate["dataverseGateStatus"].as_str(),
+            Some("needs_configuration")
+        );
         assert_eq!(gate["requiresUserAction"].as_bool(), Some(true));
-        assert_eq!(gate["nextRecommendedAction"].as_str(), Some("needs_configuration"));
+        assert_eq!(
+            gate["nextRecommendedAction"].as_str(),
+            Some("needs_configuration")
+        );
     }
 
     #[test]
@@ -19577,7 +24428,10 @@ Business logika:
         });
         let gate = task_mcp_compute_progression_gate(&task);
         assert_eq!(gate["canProceed"].as_bool(), Some(false));
-        assert_eq!(gate["nextRecommendedAction"].as_str(), Some("run_ai_kit_review"));
+        assert_eq!(
+            gate["nextRecommendedAction"].as_str(),
+            Some("run_ai_kit_review")
+        );
     }
 
     #[test]
@@ -19707,7 +24561,9 @@ Business logika:
 
     #[test]
     fn task_has_resettable_workflow_state_true_for_fully_worked_task() {
-        assert!(task_mcp_task_has_resettable_workflow_state(&make_fully_worked_task_for_reset_tests()));
+        assert!(task_mcp_task_has_resettable_workflow_state(
+            &make_fully_worked_task_for_reset_tests()
+        ));
     }
 
     #[test]
@@ -19731,9 +24587,15 @@ Business logika:
         assert_eq!(task["status"].as_str(), Some("new"));
         assert!(task["waitingState"].is_null());
         assert!(task["attentionState"].is_null());
-        assert_eq!(task["suggestedActions"].as_array().map(|a| a.is_empty()), Some(true));
+        assert_eq!(
+            task["suggestedActions"].as_array().map(|a| a.is_empty()),
+            Some(true)
+        );
         for key in TASK_MCP_RESETTABLE_WORKFLOW_KEYS {
-            assert!(task[*key].is_null(), "expected {key} to be removed after reset");
+            assert!(
+                task[*key].is_null(),
+                "expected {key} to be removed after reset"
+            );
         }
         assert!(!task_mcp_task_has_resettable_workflow_state(&task));
 
@@ -19755,7 +24617,10 @@ Business logika:
         assert_eq!(task["budget"].as_f64(), Some(10.0));
         assert_eq!(task["budgetHours"].as_f64(), Some(8.0));
         assert_eq!(task["budgetNote"].as_str(), Some("Fixed-price scope."));
-        assert_eq!(task["ticketUrl"].as_str(), Some("https://helpdesk.example.com/tickets/1"));
+        assert_eq!(
+            task["ticketUrl"].as_str(),
+            Some("https://helpdesk.example.com/tickets/1")
+        );
         assert_eq!(task["notes"].as_str(), Some("Manual note the user wrote."));
         assert_eq!(task["mcpTestTask"].as_bool(), Some(true));
     }
@@ -19778,7 +24643,8 @@ Business logika:
     #[test]
     fn dataverse_environment_mismatch_detected_only_when_both_labels_set_and_differ() {
         let task = serde_json::json!({"customerId": "cust-1"});
-        let customers = vec![serde_json::json!({"id": "cust-1", "dataverseEnvironmentLabel": "Contoso PROD"})];
+        let customers =
+            vec![serde_json::json!({"id": "cust-1", "dataverseEnvironmentLabel": "Contoso PROD"})];
         let settings_mismatch = serde_json::json!({"primarchMcpEnvironmentLabel": "Contoso UAT"});
         assert_eq!(
             task_mcp_dataverse_environment_mismatch(&task, &customers, &settings_mismatch),
@@ -19786,34 +24652,56 @@ Business logika:
         );
 
         let settings_match = serde_json::json!({"primarchMcpEnvironmentLabel": "contoso prod"});
-        assert_eq!(task_mcp_dataverse_environment_mismatch(&task, &customers, &settings_match), None);
+        assert_eq!(
+            task_mcp_dataverse_environment_mismatch(&task, &customers, &settings_match),
+            None
+        );
 
         let settings_unset = serde_json::json!({});
-        assert_eq!(task_mcp_dataverse_environment_mismatch(&task, &customers, &settings_unset), None);
+        assert_eq!(
+            task_mcp_dataverse_environment_mismatch(&task, &customers, &settings_unset),
+            None
+        );
     }
 
     #[test]
-    fn continue_workflow_reports_run_ai_kit_review_not_wait_for_user_when_dataverse_resolved_but_ai_review_pending() {
+    fn continue_workflow_reports_run_ai_kit_review_not_wait_for_user_when_dataverse_resolved_but_ai_review_pending(
+    ) {
         let mut task = make_template_task_no_plan_mappings();
         task["status"] = serde_json::json!("analyzed");
         task["crmVerificationReports"] = serde_json::json!([{"verdict": "pass"}]);
-        task_mcp_apply_developer_workflow_transition(&mut task, "ai_implementation_completed", &Value::Null);
+        task_mcp_apply_developer_workflow_transition(
+            &mut task,
+            "ai_implementation_completed",
+            &Value::Null,
+        );
         task["localTestRecord"] = serde_json::json!({"status": "not-needed"});
         // No aiKitReview recorded — AI Kit review is the only remaining step.
 
         let continue_step = task_mcp_compute_continue_workflow_step(&task);
-        assert_eq!(continue_step["nextAction"].as_str(), Some("run_ai_kit_review"));
+        assert_eq!(
+            continue_step["nextAction"].as_str(),
+            Some("run_ai_kit_review")
+        );
         assert_eq!(continue_step["canProceed"].as_bool(), Some(true));
         assert_eq!(continue_step["requiresUserApproval"].as_bool(), Some(false));
-        assert_eq!(continue_step["recommendedTool"].as_str(), Some("record_ai_kit_review_result"));
+        assert_eq!(
+            continue_step["recommendedTool"].as_str(),
+            Some("record_ai_kit_review_result")
+        );
     }
 
     #[test]
-    fn continue_workflow_reports_run_ai_kit_review_when_mcp_verification_is_pending_ai_kit_review() {
+    fn continue_workflow_reports_run_ai_kit_review_when_mcp_verification_is_pending_ai_kit_review()
+    {
         let mut task = make_template_task_no_plan_mappings();
         task["status"] = serde_json::json!("analyzed");
         task["crmVerificationReports"] = serde_json::json!([]);
-        task_mcp_apply_developer_workflow_transition(&mut task, "ai_implementation_completed", &Value::Null);
+        task_mcp_apply_developer_workflow_transition(
+            &mut task,
+            "ai_implementation_completed",
+            &Value::Null,
+        );
         task["localTestRecord"] = serde_json::json!({"status": "not-needed"});
         task["implementationVerification"]["mcpVerification"] = serde_json::json!({
             "status": "pending_ai_kit_review",
@@ -19824,17 +24712,25 @@ Business logika:
         });
 
         let continue_step = task_mcp_compute_continue_workflow_step(&task);
-        assert_eq!(continue_step["nextAction"].as_str(), Some("run_ai_kit_review"));
+        assert_eq!(
+            continue_step["nextAction"].as_str(),
+            Some("run_ai_kit_review")
+        );
         assert_eq!(continue_step["canProceed"].as_bool(), Some(true));
         assert_eq!(continue_step["requiresUserApproval"].as_bool(), Some(false));
     }
 
     #[test]
-    fn continue_workflow_reports_needs_configuration_not_needs_manual_action_when_dataverse_not_configured() {
+    fn continue_workflow_reports_needs_configuration_not_needs_manual_action_when_dataverse_not_configured(
+    ) {
         let mut task = make_template_task_no_plan_mappings();
         task["status"] = serde_json::json!("analyzed");
         task["crmVerificationReports"] = serde_json::json!([]);
-        task_mcp_apply_developer_workflow_transition(&mut task, "ai_implementation_completed", &Value::Null);
+        task_mcp_apply_developer_workflow_transition(
+            &mut task,
+            "ai_implementation_completed",
+            &Value::Null,
+        );
         task["localTestRecord"] = serde_json::json!({"status": "not-needed"});
         task["implementationVerification"]["mcpVerification"] = serde_json::json!({
             "status": "needs_configuration",
@@ -19849,9 +24745,18 @@ Business logika:
         });
 
         let continue_step = task_mcp_compute_continue_workflow_step(&task);
-        assert_eq!(continue_step["nextAction"].as_str(), Some("needs_configuration"));
-        assert_ne!(continue_step["nextAction"].as_str(), Some("needs_manual_action"));
-        assert!(continue_step["blockingUserAction"].as_str().unwrap_or("").contains("CRM metadata assistant is not enabled"));
+        assert_eq!(
+            continue_step["nextAction"].as_str(),
+            Some("needs_configuration")
+        );
+        assert_ne!(
+            continue_step["nextAction"].as_str(),
+            Some("needs_manual_action")
+        );
+        assert!(continue_step["blockingUserAction"]
+            .as_str()
+            .unwrap_or("")
+            .contains("CRM metadata assistant is not enabled"));
         assert_eq!(continue_step["requiresUserApproval"].as_bool(), Some(true));
     }
 
@@ -19860,54 +24765,97 @@ Business logika:
     #[test]
     fn tool_definitions_include_record_ai_kit_review_result_and_capabilities_tool() {
         let definitions = task_mcp_tool_definitions();
-        let names: Vec<&str> = definitions.iter().filter_map(|t| t["name"].as_str()).collect();
-        assert!(names.contains(&"record_ai_kit_review_result"), "tools/list must include record_ai_kit_review_result: {names:?}");
-        assert!(names.contains(&"get_task_workbench_mcp_capabilities"), "tools/list must include get_task_workbench_mcp_capabilities: {names:?}");
+        let names: Vec<&str> = definitions
+            .iter()
+            .filter_map(|t| t["name"].as_str())
+            .collect();
+        assert!(
+            names.contains(&"record_ai_kit_review_result"),
+            "tools/list must include record_ai_kit_review_result: {names:?}"
+        );
+        assert!(
+            names.contains(&"get_task_workbench_mcp_capabilities"),
+            "tools/list must include get_task_workbench_mcp_capabilities: {names:?}"
+        );
         // Exact name match — no near-miss like recordAiKitReviewResult / record_ai_kit_review.
-        assert_eq!(names.iter().filter(|n| n.contains("ai_kit_review")).count(), 1);
+        assert_eq!(
+            names.iter().filter(|n| n.contains("ai_kit_review")).count(),
+            1
+        );
     }
 
     #[test]
     fn capabilities_reports_can_record_ai_kit_review_true_when_tool_is_exposed() {
-        let defined: std::collections::HashSet<String> = task_mcp_tool_definitions().iter()
+        let defined: std::collections::HashSet<String> = task_mcp_tool_definitions()
+            .iter()
             .filter_map(|t| t["name"].as_str().map(str::to_string))
             .collect();
         let capabilities = task_mcp_capabilities_from(&defined);
         assert_eq!(capabilities["bridgeMode"].as_str(), Some("live-rust"));
         assert_eq!(capabilities["canRecordAiKitReview"].as_bool(), Some(true));
-        assert_eq!(capabilities["canRunImplementationVerification"].as_bool(), Some(true));
-        assert_eq!(capabilities["canRunDeveloperWorkflow"].as_bool(), Some(true));
-        assert!(capabilities["missingRequiredTools"].as_array().unwrap().is_empty());
+        assert_eq!(
+            capabilities["canRunImplementationVerification"].as_bool(),
+            Some(true)
+        );
+        assert_eq!(
+            capabilities["canRunDeveloperWorkflow"].as_bool(),
+            Some(true)
+        );
+        assert!(capabilities["missingRequiredTools"]
+            .as_array()
+            .unwrap()
+            .is_empty());
         assert!(capabilities["recommendedAction"].is_null());
-        let required = capabilities["requiredDeveloperWorkflowTools"].as_array().unwrap();
+        let required = capabilities["requiredDeveloperWorkflowTools"]
+            .as_array()
+            .unwrap();
         assert!(required.iter().any(|v| v == "record_ai_kit_review_result"));
     }
 
     #[test]
     fn capabilities_reports_missing_record_ai_kit_review_result_when_absent_from_toolset() {
         // Simulates a stale/older running process whose tool list predates this tool.
-        let mut defined: std::collections::HashSet<String> = task_mcp_tool_definitions().iter()
+        let mut defined: std::collections::HashSet<String> = task_mcp_tool_definitions()
+            .iter()
             .filter_map(|t| t["name"].as_str().map(str::to_string))
             .collect();
         defined.remove("record_ai_kit_review_result");
 
         let capabilities = task_mcp_capabilities_from(&defined);
-        let missing: Vec<&str> = capabilities["missingRequiredTools"].as_array().unwrap()
-            .iter().filter_map(|v| v.as_str()).collect();
+        let missing: Vec<&str> = capabilities["missingRequiredTools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect();
         assert_eq!(missing, vec!["record_ai_kit_review_result"]);
         assert_eq!(capabilities["canRecordAiKitReview"].as_bool(), Some(false));
-        assert_eq!(capabilities["canRunDeveloperWorkflow"].as_bool(), Some(false));
+        assert_eq!(
+            capabilities["canRunDeveloperWorkflow"].as_bool(),
+            Some(false)
+        );
         // run_implementation_verification itself is unaffected — only the AI Kit review path is.
-        assert_eq!(capabilities["canRunImplementationVerification"].as_bool(), Some(true));
-        assert!(capabilities["recommendedAction"].as_str().unwrap().contains("record_ai_kit_review_result"));
+        assert_eq!(
+            capabilities["canRunImplementationVerification"].as_bool(),
+            Some(true)
+        );
+        assert!(capabilities["recommendedAction"]
+            .as_str()
+            .unwrap()
+            .contains("record_ai_kit_review_result"));
     }
 
     #[test]
     fn tooling_availability_guard_passes_through_when_record_ai_kit_review_result_is_available() {
         let (status, next_action, missing) = task_mcp_apply_tooling_availability_guard(
-            "pending_ai_kit_review", "run_ai_kit_review", &[],
+            "pending_ai_kit_review",
+            "run_ai_kit_review",
+            &[],
         );
-        assert_eq!((status, next_action), ("pending_ai_kit_review", "run_ai_kit_review"));
+        assert_eq!(
+            (status, next_action),
+            ("pending_ai_kit_review", "run_ai_kit_review")
+        );
         assert!(missing.is_empty());
     }
 
@@ -19917,7 +24865,9 @@ Business logika:
         // nextAction=run_ai_kit_review when record_ai_kit_review_result is unavailable — the agent
         // would be told to call a tool that does not exist in its current environment.
         let (status, next_action, missing) = task_mcp_apply_tooling_availability_guard(
-            "pending_ai_kit_review", "run_ai_kit_review", &["record_ai_kit_review_result".to_string()],
+            "pending_ai_kit_review",
+            "run_ai_kit_review",
+            &["record_ai_kit_review_result".to_string()],
         );
         assert_eq!(status, "tooling_error");
         assert_eq!(next_action, "reload_mcp_or_start_app");
@@ -19929,7 +24879,9 @@ Business logika:
         // Only the run_ai_kit_review path is guarded here — an unrelated missing tool (e.g. one
         // never even reached this run) must not spuriously flip an unrelated nextAction.
         let (status, next_action, missing) = task_mcp_apply_tooling_availability_guard(
-            "passed", "continue_workflow", &["record_ai_kit_review_result".to_string()],
+            "passed",
+            "continue_workflow",
+            &["record_ai_kit_review_result".to_string()],
         );
         assert_eq!((status, next_action), ("passed", "continue_workflow"));
         assert!(missing.is_empty());
@@ -19948,10 +24900,22 @@ Business logika:
         });
         let summary = task_mcp_build_modal_verification_summary(&task);
         assert_eq!(summary["buildCheck"]["status"].as_str(), Some("passed"));
-        assert_eq!(summary["buildCheck"]["label"].as_str(), Some("Script File Readiness"));
-        assert_eq!(summary["dataverseCheck"]["status"].as_str(), Some("needs_manual_action"));
-        assert_eq!(summary["aiCodeReview"]["status"].as_str(), Some("needs_manual_action"));
-        assert_eq!(summary["localTest"]["status"].as_str(), Some("needs_manual_action"));
+        assert_eq!(
+            summary["buildCheck"]["label"].as_str(),
+            Some("Script File Readiness")
+        );
+        assert_eq!(
+            summary["dataverseCheck"]["status"].as_str(),
+            Some("needs_manual_action")
+        );
+        assert_eq!(
+            summary["aiCodeReview"]["status"].as_str(),
+            Some("needs_manual_action")
+        );
+        assert_eq!(
+            summary["localTest"]["status"].as_str(),
+            Some("needs_manual_action")
+        );
 
         let rows = task_mcp_unresolved_modal_rows(&summary);
         assert_eq!(rows, vec!["dataverseCheck", "aiCodeReview", "localTest"]);
@@ -19971,7 +24935,8 @@ Business logika:
     fn compose_manual_verification_step_mentions_only_unresolved_rows() {
         let mut task = make_template_task_no_plan_mappings();
         task["crmVerificationReports"] = serde_json::json!([{"verdict": "pass"}]);
-        task["implementationVerification"]["aiCodeReview"] = serde_json::json!({"status": "skipped"});
+        task["implementationVerification"]["aiCodeReview"] =
+            serde_json::json!({"status": "skipped"});
         // Local Test remains unresolved (legacy display row), but it is not part of Implementation
         // Verification's manual-action message — Dataverse/AI Kit review are the only rows that
         // can appear here, and both are resolved in this fixture.
@@ -19987,11 +24952,16 @@ Business logika:
     fn compose_manual_verification_step_reports_all_resolved() {
         let mut task = make_template_task_no_plan_mappings();
         task["crmVerificationReports"] = serde_json::json!([{"verdict": "pass"}]);
-        task["implementationVerification"]["aiCodeReview"] = serde_json::json!({"status": "passed"});
-        task["implementationVerification"]["localTest"] = serde_json::json!({"status": "not-needed"});
+        task["implementationVerification"]["aiCodeReview"] =
+            serde_json::json!({"status": "passed"});
+        task["implementationVerification"]["localTest"] =
+            serde_json::json!({"status": "not-needed"});
         let summary = task_mcp_build_modal_verification_summary(&task);
         assert!(task_mcp_unresolved_modal_rows(&summary).is_empty());
-        assert_eq!(task_mcp_compose_manual_verification_step(&summary), "All Implementation Verification checks are resolved.");
+        assert_eq!(
+            task_mcp_compose_manual_verification_step(&summary),
+            "All Implementation Verification checks are resolved."
+        );
     }
 
     #[test]
@@ -20000,17 +24970,25 @@ Business logika:
         task["crmVerificationReports"] = serde_json::json!([]);
         let overview = task_mcp_workflow_overview(&task);
         assert!(overview["implementationVerification"].is_object());
-        assert_eq!(overview["implementationVerification"]["dataverseCheck"]["status"].as_str(), Some("needs_manual_action"));
+        assert_eq!(
+            overview["implementationVerification"]["dataverseCheck"]["status"].as_str(),
+            Some("needs_manual_action")
+        );
     }
 
     #[test]
     fn workflow_overview_includes_unresolved_required_rows_matching_the_live_example() {
         let mut task = make_template_task_no_plan_mappings();
         task["crmVerificationReports"] = serde_json::json!([]);
-        task["implementationVerification"]["buildCheck"] = serde_json::json!({ "status": "passed" });
+        task["implementationVerification"]["buildCheck"] =
+            serde_json::json!({ "status": "passed" });
         let overview = task_mcp_workflow_overview(&task);
-        let rows: Vec<&str> = overview["unresolvedRequiredRows"].as_array().unwrap()
-            .iter().filter_map(|v| v.as_str()).collect();
+        let rows: Vec<&str> = overview["unresolvedRequiredRows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect();
         assert_eq!(rows, vec!["dataverseCheck", "aiCodeReview", "localTest"]);
 
         // Must match exactly what run_implementation_verification / get_implementation_verification_summary
@@ -20037,7 +25015,11 @@ Business logika:
             local_test["message"].as_str(),
             Some("Record Local Test in the Implementation Verification modal after manual/browser CRM testing (or mark it not-needed there)."),
         );
-        assert!(!local_test["message"].as_str().unwrap_or("").to_lowercase().contains("localtestrecord"));
+        assert!(!local_test["message"]
+            .as_str()
+            .unwrap_or("")
+            .to_lowercase()
+            .contains("localtestrecord"));
         assert!(!local_test.as_object().unwrap().contains_key("note"));
     }
 
@@ -20048,29 +25030,40 @@ Business logika:
         // needs_manual_action, and must not appear in unresolvedRequiredRows.
         let mut task = make_template_task_no_plan_mappings();
         task["crmVerificationReports"] = serde_json::json!([]);
-        task["crmDeveloperWorkflow"]["lastAiImplementation"] = serde_json::json!({"completedAt": "2026-01-01T00:00:00Z"});
+        task["crmDeveloperWorkflow"]["lastAiImplementation"] =
+            serde_json::json!({"completedAt": "2026-01-01T00:00:00Z"});
         task["localTestRecord"] = serde_json::json!({"status": "not-needed"});
         let overview = task_mcp_workflow_overview(&task);
         let local_test = &overview["implementationVerification"]["localTest"];
         assert_eq!(local_test["status"].as_str(), Some("not-needed"));
-        let rows: Vec<&str> = overview["unresolvedRequiredRows"].as_array().unwrap()
-            .iter().filter_map(|v| v.as_str()).collect();
+        let rows: Vec<&str> = overview["unresolvedRequiredRows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect();
         assert!(!rows.contains(&"localTest"));
     }
 
     #[test]
-    fn workflow_overview_ai_managed_task_with_all_checks_resolved_never_waits_for_user_on_local_test() {
+    fn workflow_overview_ai_managed_task_with_all_checks_resolved_never_waits_for_user_on_local_test(
+    ) {
         // run_implementation_verification / continue_developer_workflow must not return
         // wait_for_user solely because of Local Test once Dataverse + AI review are resolved and
         // the task is AI-managed with the legacy not-needed record.
         let mut task = make_template_task_no_plan_mappings();
         task["crmVerificationReports"] = serde_json::json!([{"verdict": "pass"}]);
-        task["implementationVerification"]["aiCodeReview"] = serde_json::json!({"status": "passed"});
-        task["crmDeveloperWorkflow"]["lastAiImplementation"] = serde_json::json!({"completedAt": "2026-01-01T00:00:00Z"});
+        task["implementationVerification"]["aiCodeReview"] =
+            serde_json::json!({"status": "passed"});
+        task["crmDeveloperWorkflow"]["lastAiImplementation"] =
+            serde_json::json!({"completedAt": "2026-01-01T00:00:00Z"});
         task["localTestRecord"] = serde_json::json!({"status": "not-needed"});
         let summary = task_mcp_build_modal_verification_summary(&task);
         assert!(task_mcp_unresolved_modal_rows(&summary).is_empty());
-        assert_eq!(task_mcp_compose_manual_verification_step(&summary), "All Implementation Verification checks are resolved.");
+        assert_eq!(
+            task_mcp_compose_manual_verification_step(&summary),
+            "All Implementation Verification checks are resolved."
+        );
     }
 
     #[test]
@@ -20078,8 +25071,14 @@ Business logika:
         let mut task = make_template_task_no_plan_mappings();
         task["localTestRecord"] = serde_json::json!({"status": "not-needed"});
         let overview = task_mcp_workflow_overview(&task);
-        assert_eq!(overview["legacyLocalTestRecord"]["status"].as_str(), Some("not-needed"));
-        assert_eq!(overview["legacyLocalTestRecord"]["ignoredForImplementationVerification"].as_bool(), Some(true));
+        assert_eq!(
+            overview["legacyLocalTestRecord"]["status"].as_str(),
+            Some("not-needed")
+        );
+        assert_eq!(
+            overview["legacyLocalTestRecord"]["ignoredForImplementationVerification"].as_bool(),
+            Some(true)
+        );
     }
 
     #[test]
@@ -20089,8 +25088,11 @@ Business logika:
         let packet = task_mcp_developer_work_packet(&task, None, None);
         let reasons = task_mcp_plan_approval_safety_check(&task, &packet);
         assert!(
-            reasons.iter().any(|r| r.contains("required but not defined")),
-            "Should block when requiresFieldMappings=true but fieldMappings=[]; got: {:?}", reasons
+            reasons
+                .iter()
+                .any(|r| r.contains("required but not defined")),
+            "Should block when requiresFieldMappings=true but fieldMappings=[]; got: {:?}",
+            reasons
         );
     }
 
@@ -20102,7 +25104,8 @@ Business logika:
         let reasons = task_mcp_plan_approval_safety_check(&task, &packet);
         assert!(
             reasons.iter().any(|r| r.contains("scaffoldOnly=true")),
-            "Should block when packet.scaffoldOnly=true; got: {:?}", reasons
+            "Should block when packet.scaffoldOnly=true; got: {:?}",
+            reasons
         );
     }
 
@@ -20115,8 +25118,11 @@ Business logika:
         let packet = task_mcp_developer_work_packet(&task, None, None);
         let reasons = task_mcp_plan_approval_safety_check(&task, &packet);
         assert!(
-            reasons.iter().any(|r| r.contains("TODO") || r.contains("scaffold") || r.contains("placeholder")),
-            "Should block when plan steps contain TODO text; got: {:?}", reasons
+            reasons
+                .iter()
+                .any(|r| r.contains("TODO") || r.contains("scaffold") || r.contains("placeholder")),
+            "Should block when plan steps contain TODO text; got: {:?}",
+            reasons
         );
     }
 
@@ -20130,7 +25136,8 @@ Business logika:
         let reasons = task_mcp_plan_approval_safety_check(&task, &packet);
         assert!(
             reasons.iter().any(|r| r.contains("fieldMappingsSource")),
-            "Should block when fieldMappingsSource is not trusted; got: {:?}", reasons
+            "Should block when fieldMappingsSource is not trusted; got: {:?}",
+            reasons
         );
     }
 
@@ -20144,7 +25151,8 @@ Business logika:
         let reasons = task_mcp_plan_approval_safety_check(&task, &packet);
         assert!(
             reasons.iter().any(|r| r.contains("external actions")),
-            "Should block when plan has externalActionPreview; got: {:?}", reasons
+            "Should block when plan has externalActionPreview; got: {:?}",
+            reasons
         );
     }
 
@@ -20153,8 +25161,12 @@ Business logika:
         // task_mcp_append_audit_note writes to task["notes"] as a string.
         // Verify the action text appears in notes after append.
         let mut task = make_template_task_awaiting_approval();
-        task_mcp_append_audit_note(&mut task, "approve_technical_plan_if_safe [AI safe auto-approval]");
-        let notes = task["notes"].as_str()
+        task_mcp_append_audit_note(
+            &mut task,
+            "approve_technical_plan_if_safe [AI safe auto-approval]",
+        );
+        let notes = task["notes"]
+            .as_str()
             .expect("task.notes must be a string after task_mcp_append_audit_note");
         assert!(
             notes.contains("approve_technical_plan_if_safe"),
@@ -20165,7 +25177,9 @@ Business logika:
     #[test]
     fn local_write_tool_definitions_includes_approve_technical_plan_if_safe() {
         let defs = task_mcp_local_write_tool_definitions();
-        let found = defs.iter().any(|d| d["name"].as_str() == Some("approve_technical_plan_if_safe"));
+        let found = defs
+            .iter()
+            .any(|d| d["name"].as_str() == Some("approve_technical_plan_if_safe"));
         assert!(found, "approve_technical_plan_if_safe must be in task_mcp_local_write_tool_definitions (tools/list write set)");
     }
 
@@ -20190,15 +25204,26 @@ Business logika:
         let task = make_approved_task_with_stale_nvr_asset_risk();
         let packet = task_mcp_developer_work_packet(&task, None, None);
 
-        assert_eq!(packet["canWriteCode"].as_bool(), Some(true),
-            "canWriteCode must remain true; got: {:?}", packet["decisionReason"]);
+        assert_eq!(
+            packet["canWriteCode"].as_bool(),
+            Some(true),
+            "canWriteCode must remain true; got: {:?}",
+            packet["decisionReason"]
+        );
 
         let risks: Vec<&str> = packet["implementation"]["risks"]
-            .as_array().into_iter().flatten().filter_map(|v| v.as_str()).collect();
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|v| v.as_str())
+            .collect();
 
         assert!(
-            !risks.iter().any(|s| s.contains("nvr_asset") && !s.contains("nvr_customerasset")),
-            "Packet risks must not contain hallucinated entity nvr_asset; got: {:?}", risks
+            !risks
+                .iter()
+                .any(|s| s.contains("nvr_asset") && !s.contains("nvr_customerasset")),
+            "Packet risks must not contain hallucinated entity nvr_asset; got: {:?}",
+            risks
         );
     }
 
@@ -20207,8 +25232,12 @@ Business logika:
         // Filtering stale risks must not affect canWriteCode.
         let task = make_approved_task_with_stale_nvr_asset_risk();
         let packet = task_mcp_developer_work_packet(&task, None, None);
-        assert_eq!(packet["canWriteCode"].as_bool(), Some(true),
-            "canWriteCode must stay true after stale-risk filter; got: {:?}", packet["decisionReason"]);
+        assert_eq!(
+            packet["canWriteCode"].as_bool(),
+            Some(true),
+            "canWriteCode must stay true after stale-risk filter; got: {:?}",
+            packet["decisionReason"]
+        );
     }
 
     #[test]
@@ -20217,10 +25246,15 @@ Business logika:
         let task = make_approved_task_with_stale_nvr_asset_risk();
         let packet = task_mcp_developer_work_packet(&task, None, None);
         let risks: Vec<&str> = packet["implementation"]["risks"]
-            .as_array().into_iter().flatten().filter_map(|v| v.as_str()).collect();
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|v| v.as_str())
+            .collect();
         assert!(
             risks.iter().any(|s| s.contains("Dataverse")),
-            "Standard Dataverse risk must be preserved; got: {:?}", risks
+            "Standard Dataverse risk must be preserved; got: {:?}",
+            risks
         );
     }
 
@@ -20230,8 +25264,10 @@ Business logika:
         let task = make_approved_task_with_stale_nvr_asset_risk();
         let packet = task_mcp_developer_work_packet(&task, None, None);
         let allowed = task_mcp_build_allowed_logical_names(&packet);
-        assert!(allowed.contains("nvr_assetid"),
-            "nvr_assetid (event field name) must be in allowed set");
+        assert!(
+            allowed.contains("nvr_assetid"),
+            "nvr_assetid (event field name) must be in allowed set"
+        );
         assert!(!allowed.contains("nvr_asset"),
             "nvr_asset must NOT be in allowed set — it is inferred from the field name, not from mappings");
     }
@@ -20245,10 +25281,15 @@ Business logika:
         ]);
         let packet = task_mcp_developer_work_packet(&task, None, None);
         let risks: Vec<&str> = packet["implementation"]["risks"]
-            .as_array().into_iter().flatten().filter_map(|v| v.as_str()).collect();
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|v| v.as_str())
+            .collect();
         assert!(
             risks.iter().any(|s| s.contains("nvr_customerasset")),
-            "Risk mentioning the allowed entity nvr_customerasset must be preserved; got: {:?}", risks
+            "Risk mentioning the allowed entity nvr_customerasset must be preserved; got: {:?}",
+            risks
         );
     }
 
@@ -20256,10 +25297,14 @@ Business logika:
 
     fn make_template_task_with_stale_scaffold_steps() -> Value {
         let mut task = make_template_task_awaiting_approval();
-        task["crmDeveloperWorkflow"]["technicalPlan"]["implementationSteps"] =
-            serde_json::json!(["TODO: implement the field copy logic", "TODO: fill in field mappings"]);
-        task["crmDeveloperWorkflow"]["technicalPlan"]["risks"] =
-            serde_json::json!(["field mappings are not defined", "script contains TODO comments"]);
+        task["crmDeveloperWorkflow"]["technicalPlan"]["implementationSteps"] = serde_json::json!([
+            "TODO: implement the field copy logic",
+            "TODO: fill in field mappings"
+        ]);
+        task["crmDeveloperWorkflow"]["technicalPlan"]["risks"] = serde_json::json!([
+            "field mappings are not defined",
+            "script contains TODO comments"
+        ]);
         task
     }
 
@@ -20269,9 +25314,17 @@ Business logika:
         let task = make_template_task_with_stale_scaffold_steps();
         let packet = task_mcp_developer_work_packet(&task, None, None);
         let reasons = task_mcp_plan_approval_safety_check(&task, &packet);
-        assert_eq!(reasons.len(), 1, "Precondition: exactly one blocker (scaffold text); got: {:?}", reasons);
-        assert!(reasons[0].contains("TODO/scaffold/placeholder"),
-            "Precondition: blocker must be scaffold text; got: {}", reasons[0]);
+        assert_eq!(
+            reasons.len(),
+            1,
+            "Precondition: exactly one blocker (scaffold text); got: {:?}",
+            reasons
+        );
+        assert!(
+            reasons[0].contains("TODO/scaffold/placeholder"),
+            "Precondition: blocker must be scaffold text; got: {}",
+            reasons[0]
+        );
         assert!(task_mcp_can_safely_refresh_plan(&packet),
             "Should be able to safely refresh when only scaffold blocker and trusted template mappings");
     }
@@ -20305,10 +25358,15 @@ Business logika:
             }
         });
         let packet = task_mcp_developer_work_packet(&task, None, None);
-        let fm_count = packet["implementation"]["fieldMappings"].as_array().map(|a| a.len()).unwrap_or(0);
+        let fm_count = packet["implementation"]["fieldMappings"]
+            .as_array()
+            .map(|a| a.len())
+            .unwrap_or(0);
         assert_eq!(fm_count, 0, "Precondition: empty field mappings");
-        assert!(!task_mcp_can_safely_refresh_plan(&packet),
-            "Must NOT refresh when field mappings are empty");
+        assert!(
+            !task_mcp_can_safely_refresh_plan(&packet),
+            "Must NOT refresh when field mappings are empty"
+        );
     }
 
     #[test]
@@ -20316,10 +25374,15 @@ Business logika:
         // Non-template task with unmapped source fields: scaffoldOnly=true → cannot refresh.
         let task = make_non_template_task_with_unmapped_fields();
         let packet = task_mcp_developer_work_packet(&task, None, None);
-        assert_eq!(packet["implementation"]["scaffoldOnly"].as_bool(), Some(true),
-            "Precondition: scaffoldOnly=true");
-        assert!(!task_mcp_can_safely_refresh_plan(&packet),
-            "Must NOT refresh when scaffoldOnly=true");
+        assert_eq!(
+            packet["implementation"]["scaffoldOnly"].as_bool(),
+            Some(true),
+            "Precondition: scaffoldOnly=true"
+        );
+        assert!(
+            !task_mcp_can_safely_refresh_plan(&packet),
+            "Must NOT refresh when scaffoldOnly=true"
+        );
     }
 
     #[test]
@@ -20335,10 +25398,15 @@ Business logika:
         // Two reasons: external actions + scaffold text → is_only_scaffold_blocker=false
         assert!(
             reasons.len() >= 2 || reasons.iter().any(|r| r.contains("external actions")),
-            "Must block with external actions reason; got: {:?}", reasons
+            "Must block with external actions reason; got: {:?}",
+            reasons
         );
-        let is_only_scaffold = reasons.len() == 1 && reasons[0].contains("TODO/scaffold/placeholder");
-        assert!(!is_only_scaffold, "Should not be only-scaffold when external actions also present");
+        let is_only_scaffold =
+            reasons.len() == 1 && reasons[0].contains("TODO/scaffold/placeholder");
+        assert!(
+            !is_only_scaffold,
+            "Should not be only-scaffold when external actions also present"
+        );
     }
 
     #[test]
@@ -20348,12 +25416,27 @@ Business logika:
         let packet = task_mcp_developer_work_packet(&task, None, None);
         let steps = task_mcp_generate_concrete_steps_from_packet(&packet);
         let step_texts: Vec<&str> = steps.iter().filter_map(|v| v.as_str()).collect();
-        assert!(step_texts.iter().any(|s| s.contains("Copy") && s.contains("nvr_customerid")),
-            "Must include Copy step for nvr_customerid; got: {:?}", step_texts);
-        assert!(step_texts.iter().any(|s| s.contains("Copy") && s.contains("nvr_contactid")),
-            "Must include Copy step for nvr_contactid; got: {:?}", step_texts);
-        assert!(step_texts.iter().any(|s| s.contains("Copy") && s.contains("nvr_isunderwarranty")),
-            "Must include Copy step for nvr_isunderwarranty; got: {:?}", step_texts);
+        assert!(
+            step_texts
+                .iter()
+                .any(|s| s.contains("Copy") && s.contains("nvr_customerid")),
+            "Must include Copy step for nvr_customerid; got: {:?}",
+            step_texts
+        );
+        assert!(
+            step_texts
+                .iter()
+                .any(|s| s.contains("Copy") && s.contains("nvr_contactid")),
+            "Must include Copy step for nvr_contactid; got: {:?}",
+            step_texts
+        );
+        assert!(
+            step_texts
+                .iter()
+                .any(|s| s.contains("Copy") && s.contains("nvr_isunderwarranty")),
+            "Must include Copy step for nvr_isunderwarranty; got: {:?}",
+            step_texts
+        );
     }
 
     #[test]
@@ -20362,12 +25445,27 @@ Business logika:
         let packet = task_mcp_developer_work_packet(&task, None, None);
         let steps = task_mcp_generate_concrete_steps_from_packet(&packet);
         let step_texts: Vec<&str> = steps.iter().filter_map(|v| v.as_str()).collect();
-        assert!(step_texts.iter().any(|s| s.contains("nvr_servicecase_events.js")),
-            "Must mention the artifact path; got: {:?}", step_texts);
-        assert!(step_texts.iter().any(|s| s.contains("nvr_servicecase_OnLoad")),
-            "Must mention onLoad handler; got: {:?}", step_texts);
-        assert!(step_texts.iter().any(|s| s.contains("nvr_assetid_OnChange")),
-            "Must mention onChange handler; got: {:?}", step_texts);
+        assert!(
+            step_texts
+                .iter()
+                .any(|s| s.contains("nvr_servicecase_events.js")),
+            "Must mention the artifact path; got: {:?}",
+            step_texts
+        );
+        assert!(
+            step_texts
+                .iter()
+                .any(|s| s.contains("nvr_servicecase_OnLoad")),
+            "Must mention onLoad handler; got: {:?}",
+            step_texts
+        );
+        assert!(
+            step_texts
+                .iter()
+                .any(|s| s.contains("nvr_assetid_OnChange")),
+            "Must mention onChange handler; got: {:?}",
+            step_texts
+        );
     }
 
     #[test]
@@ -20390,10 +25488,18 @@ Business logika:
         let packet = task_mcp_developer_work_packet(&task, None, None);
         let steps = task_mcp_generate_concrete_steps_from_packet(&packet);
         let step_texts: Vec<&str> = steps.iter().filter_map(|v| v.as_str()).collect();
-        assert!(step_texts.iter().any(|s| s.contains("auto-save")),
-            "Must include no-auto-save guardrail; got: {:?}", step_texts);
-        assert!(step_texts.iter().any(|s| s.contains("upload") || s.contains("web resource")),
-            "Must include no-upload guardrail; got: {:?}", step_texts);
+        assert!(
+            step_texts.iter().any(|s| s.contains("auto-save")),
+            "Must include no-auto-save guardrail; got: {:?}",
+            step_texts
+        );
+        assert!(
+            step_texts
+                .iter()
+                .any(|s| s.contains("upload") || s.contains("web resource")),
+            "Must include no-upload guardrail; got: {:?}",
+            step_texts
+        );
     }
 
     #[test]
@@ -20409,30 +25515,49 @@ Business logika:
         let risks_text: Vec<&str> = new_risks.iter().filter_map(|v| v.as_str()).collect();
 
         // Scaffold risks removed
-        assert!(!risks_text.iter().any(|s| task_mcp_matches_scaffold_text(s)),
-            "No scaffold/TODO risks should remain; got: {:?}", risks_text);
+        assert!(
+            !risks_text.iter().any(|s| task_mcp_matches_scaffold_text(s)),
+            "No scaffold/TODO risks should remain; got: {:?}",
+            risks_text
+        );
         // Real risk preserved
-        assert!(risks_text.iter().any(|s| s.contains("Manual testing")),
-            "Real risks must be preserved; got: {:?}", risks_text);
+        assert!(
+            risks_text.iter().any(|s| s.contains("Manual testing")),
+            "Real risks must be preserved; got: {:?}",
+            risks_text
+        );
         // Standard risks added
-        assert!(risks_text.iter().any(|s| s.contains("Dataverse")),
-            "Must add Dataverse metadata risk; got: {:?}", risks_text);
-        assert!(risks_text.iter().any(|s| s.contains("Web resource") || s.contains("web resource")),
-            "Must add web resource risk; got: {:?}", risks_text);
+        assert!(
+            risks_text.iter().any(|s| s.contains("Dataverse")),
+            "Must add Dataverse metadata risk; got: {:?}",
+            risks_text
+        );
+        assert!(
+            risks_text
+                .iter()
+                .any(|s| s.contains("Web resource") || s.contains("web resource")),
+            "Must add web resource risk; got: {:?}",
+            risks_text
+        );
     }
 
     #[test]
     fn generate_clean_risks_does_not_duplicate_standard_risks() {
-        let existing_risks = vec![
-            serde_json::json!("Dataverse metadata must be verified in-app for JS/TS."),
-        ];
+        let existing_risks = vec![serde_json::json!(
+            "Dataverse metadata must be verified in-app for JS/TS."
+        )];
         let task = make_template_task_with_stale_scaffold_steps();
         let packet = task_mcp_developer_work_packet(&task, None, None);
         let new_risks = task_mcp_generate_clean_risks_from_packet(&existing_risks, &packet);
-        let dataverse_count = new_risks.iter()
+        let dataverse_count = new_risks
+            .iter()
             .filter(|v| v.as_str().map(|s| s.contains("Dataverse")).unwrap_or(false))
             .count();
-        assert_eq!(dataverse_count, 1, "Standard risk must not be duplicated; got: {:?}", new_risks);
+        assert_eq!(
+            dataverse_count, 1,
+            "Standard risk must not be duplicated; got: {:?}",
+            new_risks
+        );
     }
 
     #[test]
@@ -20443,15 +25568,21 @@ Business logika:
 
         // Verify preconditions
         let reasons = task_mcp_plan_approval_safety_check(&task, &packet);
-        assert!(task_mcp_can_safely_refresh_plan(&packet), "Precondition: can refresh");
+        assert!(
+            task_mcp_can_safely_refresh_plan(&packet),
+            "Precondition: can refresh"
+        );
         assert_eq!(reasons.len(), 1, "Precondition: only scaffold blocker");
 
         // Apply the refresh
         let existing_risks: Vec<Value> = task["crmDeveloperWorkflow"]["technicalPlan"]["risks"]
-            .as_array().cloned().unwrap_or_default();
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
         let new_steps = task_mcp_generate_concrete_steps_from_packet(&packet);
         let new_risks = task_mcp_generate_clean_risks_from_packet(&existing_risks, &packet);
-        task["crmDeveloperWorkflow"]["technicalPlan"]["implementationSteps"] = serde_json::json!(new_steps);
+        task["crmDeveloperWorkflow"]["technicalPlan"]["implementationSteps"] =
+            serde_json::json!(new_steps);
         task["crmDeveloperWorkflow"]["technicalPlan"]["risks"] = serde_json::json!(new_risks);
 
         // Apply approval
@@ -20462,7 +25593,8 @@ Business logika:
 
         let refreshed_packet = task_mcp_developer_work_packet(&task, None, None);
         assert_eq!(
-            refreshed_packet["canWriteCode"].as_bool(), Some(true),
+            refreshed_packet["canWriteCode"].as_bool(),
+            Some(true),
             "canWriteCode must be true after plan refresh and approval; reason: {:?}",
             refreshed_packet["decisionReason"]
         );
@@ -20483,20 +25615,50 @@ Business logika:
 
     #[test]
     fn looks_like_crm_name_accepts_typical_crm_names() {
-        assert!(task_mcp_looks_like_crm_name("nvr_asset"),         "nvr_asset should be CRM-like");
-        assert!(task_mcp_looks_like_crm_name("nvr_customerasset"), "nvr_customerasset should be CRM-like");
-        assert!(task_mcp_looks_like_crm_name("nvr_servicecase"),   "nvr_servicecase should be CRM-like");
-        assert!(task_mcp_looks_like_crm_name("msdyn_something"),   "msdyn_ prefix (5 chars) should be accepted");
+        assert!(
+            task_mcp_looks_like_crm_name("nvr_asset"),
+            "nvr_asset should be CRM-like"
+        );
+        assert!(
+            task_mcp_looks_like_crm_name("nvr_customerasset"),
+            "nvr_customerasset should be CRM-like"
+        );
+        assert!(
+            task_mcp_looks_like_crm_name("nvr_servicecase"),
+            "nvr_servicecase should be CRM-like"
+        );
+        assert!(
+            task_mcp_looks_like_crm_name("msdyn_something"),
+            "msdyn_ prefix (5 chars) should be accepted"
+        );
     }
 
     #[test]
     fn looks_like_crm_name_rejects_short_prefix_and_common_words() {
-        assert!(!task_mcp_looks_like_crm_name("is_valid"),  "is_ (2 chars) must be rejected – too short prefix");
-        assert!(!task_mcp_looks_like_crm_name("on_change"), "on_ (2 chars) must be rejected – too short prefix");
-        assert!(!task_mcp_looks_like_crm_name("no_data"),   "no_ (2 chars) must be rejected – too short prefix");
-        assert!(!task_mcp_looks_like_crm_name("logick"),    "no underscore – not a CRM name");
-        assert!(!task_mcp_looks_like_crm_name("nvr"),       "no underscore – not a CRM name");
-        assert!(!task_mcp_looks_like_crm_name("nvr_id"),    "suffix 'id' is only 2 chars – too short");
+        assert!(
+            !task_mcp_looks_like_crm_name("is_valid"),
+            "is_ (2 chars) must be rejected – too short prefix"
+        );
+        assert!(
+            !task_mcp_looks_like_crm_name("on_change"),
+            "on_ (2 chars) must be rejected – too short prefix"
+        );
+        assert!(
+            !task_mcp_looks_like_crm_name("no_data"),
+            "no_ (2 chars) must be rejected – too short prefix"
+        );
+        assert!(
+            !task_mcp_looks_like_crm_name("logick"),
+            "no underscore – not a CRM name"
+        );
+        assert!(
+            !task_mcp_looks_like_crm_name("nvr"),
+            "no underscore – not a CRM name"
+        );
+        assert!(
+            !task_mcp_looks_like_crm_name("nvr_id"),
+            "suffix 'id' is only 2 chars – too short"
+        );
     }
 
     #[test]
@@ -20504,10 +25666,22 @@ Business logika:
         let task = make_template_task_with_stale_scaffold_steps();
         let packet = task_mcp_developer_work_packet(&task, None, None);
         let allowed = task_mcp_build_allowed_logical_names(&packet);
-        assert!(allowed.contains("nvr_servicecase"),   "target entity must be in allowed set");
-        assert!(allowed.contains("nvr_customerasset"), "source entity from mappings must be in allowed set");
-        assert!(allowed.contains("nvr_customerid"),    "field name from mappings must be in allowed set");
-        assert!(allowed.contains("nvr_assetid"),       "event field name must be in allowed set");
+        assert!(
+            allowed.contains("nvr_servicecase"),
+            "target entity must be in allowed set"
+        );
+        assert!(
+            allowed.contains("nvr_customerasset"),
+            "source entity from mappings must be in allowed set"
+        );
+        assert!(
+            allowed.contains("nvr_customerid"),
+            "field name from mappings must be in allowed set"
+        );
+        assert!(
+            allowed.contains("nvr_assetid"),
+            "event field name must be in allowed set"
+        );
         assert!(!allowed.contains("nvr_asset"),
             "nvr_asset must NOT be in allowed set – it is a hallucinated entity name, not present in the packet");
     }
@@ -20516,7 +25690,9 @@ Business logika:
     fn generate_clean_risks_removes_risk_mentioning_stale_nvr_asset_entity() {
         let existing_risks = vec![
             serde_json::json!("TODO: verify fields"),
-            serde_json::json!("Logický název entity zařízení (nvr_asset) musí být ověřen v prostředí."),
+            serde_json::json!(
+                "Logický název entity zařízení (nvr_asset) musí být ověřen v prostředí."
+            ),
             serde_json::json!("Manual testing should be performed after deployment."),
         ];
         let task = make_template_task_with_stale_scaffold_steps();
@@ -20526,21 +25702,25 @@ Business logika:
 
         // The stale risk mentioning the hallucinated nvr_asset entity must be removed.
         assert!(
-            !risks_text.iter().any(|s| s.contains("nvr_asset") && !s.contains("nvr_customerasset")),
-            "Stale risk with hallucinated entity nvr_asset must be removed; got: {:?}", risks_text
+            !risks_text
+                .iter()
+                .any(|s| s.contains("nvr_asset") && !s.contains("nvr_customerasset")),
+            "Stale risk with hallucinated entity nvr_asset must be removed; got: {:?}",
+            risks_text
         );
         // A generic real risk that mentions no CRM entity names must be preserved.
         assert!(
             risks_text.iter().any(|s| s.contains("Manual testing")),
-            "Generic real risk must be preserved; got: {:?}", risks_text
+            "Generic real risk must be preserved; got: {:?}",
+            risks_text
         );
     }
 
     #[test]
     fn generate_clean_risks_preserves_risk_mentioning_allowed_entity_nvr_customerasset() {
-        let existing_risks = vec![
-            serde_json::json!("Logické názvy entity nvr_customerasset a polí podléhají ověření."),
-        ];
+        let existing_risks = vec![serde_json::json!(
+            "Logické názvy entity nvr_customerasset a polí podléhají ověření."
+        )];
         let task = make_template_task_with_stale_scaffold_steps();
         let packet = task_mcp_developer_work_packet(&task, None, None);
         let new_risks = task_mcp_generate_clean_risks_from_packet(&existing_risks, &packet);
@@ -20548,7 +25728,8 @@ Business logika:
 
         assert!(
             risks_text.iter().any(|s| s.contains("nvr_customerasset")),
-            "Risk mentioning the allowed entity nvr_customerasset must be preserved; got: {:?}", risks_text
+            "Risk mentioning the allowed entity nvr_customerasset must be preserved; got: {:?}",
+            risks_text
         );
     }
 }
@@ -20563,7 +25744,11 @@ mod git_workflow_tests {
     use tempfile::TempDir;
 
     fn run(repo: &str, args: &[&str]) -> std::process::Output {
-        std::process::Command::new("git").arg("-C").arg(repo).args(args).output()
+        std::process::Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(args)
+            .output()
             .unwrap_or_else(|e| panic!("failed to run git {args:?}: {e}"))
     }
 
@@ -20571,8 +25756,12 @@ mod git_workflow_tests {
         let dir = TempDir::new().expect("tempdir");
         let root = dir.path().to_string_lossy().to_string();
         assert!(run(&root, &["init", "-b", "main"]).status.success());
-        assert!(run(&root, &["config", "user.email", "test@example.com"]).status.success());
-        assert!(run(&root, &["config", "user.name", "Test"]).status.success());
+        assert!(run(&root, &["config", "user.email", "test@example.com"])
+            .status
+            .success());
+        assert!(run(&root, &["config", "user.name", "Test"])
+            .status
+            .success());
         std::fs::write(dir.path().join("README.md"), "hello\n").unwrap();
         assert!(run(&root, &["add", "README.md"]).status.success());
         assert!(run(&root, &["commit", "-m", "initial"]).status.success());
@@ -20592,7 +25781,10 @@ mod git_workflow_tests {
         assert_eq!(preview["branchCreated"].as_bool(), Some(false));
         assert_eq!(preview["checkoutPerformed"].as_bool(), Some(false));
         let branches_after = run(&root, &["branch", "--list"]);
-        assert_eq!(branches_before.stdout, branches_after.stdout, "no branch should have been created");
+        assert_eq!(
+            branches_before.stdout, branches_after.stdout,
+            "no branch should have been created"
+        );
         assert_eq!(current_branch(&root), "main");
     }
 
@@ -20602,18 +25794,28 @@ mod git_workflow_tests {
         let root = dir.path().to_string_lossy().to_string();
         let task = serde_json::json!({ "title": "Add warranty flag", "devopsTaskUrl": "" });
         let preview = git_commit_preview_impl(&root, Some(&task)).expect("preview");
-        assert_eq!(preview["proposedBranchName"].as_str(), Some("feature/add-warranty-flag"));
+        assert_eq!(
+            preview["proposedBranchName"].as_str(),
+            Some("feature/add-warranty-flag")
+        );
         assert_eq!(preview["branchExists"].as_bool(), Some(false));
-        assert_eq!(preview["nextAction"].as_str(), Some("ask_user_to_approve_branch_creation"));
+        assert_eq!(
+            preview["nextAction"].as_str(),
+            Some("ask_user_to_approve_branch_creation")
+        );
     }
 
     #[test]
     fn create_or_checkout_task_branch_creates_a_missing_branch() {
         let dir = init_repo();
         let root = dir.path().to_string_lossy().to_string();
-        let result = checkout_or_create_task_branch_impl(&root, "feature/123-add-thing").expect("create");
+        let result =
+            checkout_or_create_task_branch_impl(&root, "feature/123-add-thing").expect("create");
         assert_eq!(result["previousBranch"].as_str(), Some("main"));
-        assert_eq!(result["currentBranch"].as_str(), Some("feature/123-add-thing"));
+        assert_eq!(
+            result["currentBranch"].as_str(),
+            Some("feature/123-add-thing")
+        );
         assert_eq!(result["branchCreated"].as_bool(), Some(true));
         assert_eq!(result["branchCheckedOut"].as_bool(), Some(true));
         assert_eq!(current_branch(&root), "feature/123-add-thing");
@@ -20626,7 +25828,8 @@ mod git_workflow_tests {
         assert!(run(&root, &["branch", "feature/existing"]).status.success());
         assert_eq!(current_branch(&root), "main");
 
-        let result = checkout_or_create_task_branch_impl(&root, "feature/existing").expect("checkout");
+        let result =
+            checkout_or_create_task_branch_impl(&root, "feature/existing").expect("checkout");
         assert_eq!(result["branchCreated"].as_bool(), Some(false));
         assert_eq!(result["branchCheckedOut"].as_bool(), Some(true));
         assert_eq!(current_branch(&root), "feature/existing");
@@ -20644,8 +25847,18 @@ mod git_workflow_tests {
     fn create_or_checkout_task_branch_rejects_unsafe_names() {
         let dir = init_repo();
         let root = dir.path().to_string_lossy().to_string();
-        for bad in ["feature/../etc", "-bad", "has space", "trailing.", "refs/heads/x", "weird~name"] {
-            assert!(checkout_or_create_task_branch_impl(&root, bad).is_err(), "expected '{bad}' to be rejected");
+        for bad in [
+            "feature/../etc",
+            "-bad",
+            "has space",
+            "trailing.",
+            "refs/heads/x",
+            "weird~name",
+        ] {
+            assert!(
+                checkout_or_create_task_branch_impl(&root, bad).is_err(),
+                "expected '{bad}' to be rejected"
+            );
         }
     }
 
@@ -20656,15 +25869,25 @@ mod git_workflow_tests {
         // Create a branch where README.md has different committed content.
         assert!(checkout_or_create_task_branch_impl(&root, "feature/other").is_ok());
         std::fs::write(dir.path().join("README.md"), "branch content\n").unwrap();
-        assert!(run(&root, &["commit", "-am", "branch change"]).status.success());
+        assert!(run(&root, &["commit", "-am", "branch change"])
+            .status
+            .success());
         assert!(run(&root, &["checkout", "main"]).status.success());
 
         // Dirty, conflicting change on main that checkout to feature/other would overwrite.
-        std::fs::write(dir.path().join("README.md"), "conflicting uncommitted change\n").unwrap();
+        std::fs::write(
+            dir.path().join("README.md"),
+            "conflicting uncommitted change\n",
+        )
+        .unwrap();
 
         let result = checkout_or_create_task_branch_impl(&root, "feature/other");
         assert!(result.is_err(), "checkout must be refused, not forced");
-        assert_eq!(current_branch(&root), "main", "must not have switched branches");
+        assert_eq!(
+            current_branch(&root),
+            "main",
+            "must not have switched branches"
+        );
         assert_eq!(
             std::fs::read_to_string(dir.path().join("README.md")).unwrap(),
             "conflicting uncommitted change\n",
@@ -20684,7 +25907,10 @@ mod git_workflow_tests {
             String::from_utf8_lossy(&log_before.stdout).lines().count(),
             String::from_utf8_lossy(&log_after.stdout).lines().count(),
         );
-        assert!(run(&root, &["remote"]).stdout.is_empty(), "no remote should exist (nothing could have been pushed)");
+        assert!(
+            run(&root, &["remote"]).stdout.is_empty(),
+            "no remote should exist (nothing could have been pushed)"
+        );
     }
 
     #[test]
@@ -20745,7 +25971,9 @@ mod git_workflow_tests {
         checkout_or_create_task_branch_impl(&root, "feature/ok").expect("create");
         std::fs::write(dir.path().join(".gitignore"), "secret.txt\n").unwrap();
         assert!(run(&root, &["add", ".gitignore"]).status.success());
-        assert!(run(&root, &["commit", "-m", "add gitignore"]).status.success());
+        assert!(run(&root, &["commit", "-m", "add gitignore"])
+            .status
+            .success());
         std::fs::write(dir.path().join("secret.txt"), "shh\n").unwrap();
 
         let blocked = git_commit_impl(&root, &["secret.txt".to_string()], "msg", &[], &[], true);
@@ -20753,7 +25981,12 @@ mod git_workflow_tests {
         assert!(blocked.unwrap_err().contains("ignored by .gitignore"));
 
         let forced = git_commit_impl(
-            &root, &["secret.txt".to_string()], "msg", &["secret.txt".to_string()], &[], true,
+            &root,
+            &["secret.txt".to_string()],
+            "msg",
+            &["secret.txt".to_string()],
+            &[],
+            true,
         );
         assert!(forced.is_ok(), "{:?}", forced);
     }
@@ -20776,7 +26009,8 @@ mod git_workflow_tests {
             "forceAddFiles": ["b.txt"],
             "confirmUnrelatedFiles": true,
         });
-        let (message, files, force_add_files, confirm_unrelated) = task_mcp_parse_commit_args(&args);
+        let (message, files, force_add_files, confirm_unrelated) =
+            task_mcp_parse_commit_args(&args);
         assert_eq!(message, "msg");
         assert_eq!(files, vec!["a.txt".to_string(), "b.txt".to_string()]);
         assert_eq!(force_add_files, vec!["b.txt".to_string()]);
@@ -20794,7 +26028,8 @@ mod git_workflow_tests {
     }
 
     #[test]
-    fn commit_dispatcher_boundary_confirm_unrelated_files_from_json_args_allows_previously_rejected_file() {
+    fn commit_dispatcher_boundary_confirm_unrelated_files_from_json_args_allows_previously_rejected_file(
+    ) {
         let dir = init_repo();
         let root = dir.path().to_string_lossy().to_string();
         checkout_or_create_task_branch_impl(&root, "feature/ok").expect("create");
@@ -20806,8 +26041,16 @@ mod git_workflow_tests {
         let args_no_confirm = serde_json::json!({
             "taskId": "t1", "message": "msg", "files": ["a.txt", "b.txt"],
         });
-        let (message, files, force_add_files, confirm_unrelated) = task_mcp_parse_commit_args(&args_no_confirm);
-        let blocked = git_commit_impl(&root, &files, &message, &force_add_files, &related, confirm_unrelated);
+        let (message, files, force_add_files, confirm_unrelated) =
+            task_mcp_parse_commit_args(&args_no_confirm);
+        let blocked = git_commit_impl(
+            &root,
+            &files,
+            &message,
+            &force_add_files,
+            &related,
+            confirm_unrelated,
+        );
         assert!(blocked.is_err());
         assert!(blocked.unwrap_err().contains("b.txt"));
 
@@ -20816,19 +26059,34 @@ mod git_workflow_tests {
         let args_confirmed = serde_json::json!({
             "taskId": "t1", "message": "msg", "files": ["a.txt", "b.txt"], "confirmUnrelatedFiles": true,
         });
-        let (message, files, force_add_files, confirm_unrelated) = task_mcp_parse_commit_args(&args_confirmed);
-        let allowed = git_commit_impl(&root, &files, &message, &force_add_files, &related, confirm_unrelated);
+        let (message, files, force_add_files, confirm_unrelated) =
+            task_mcp_parse_commit_args(&args_confirmed);
+        let allowed = git_commit_impl(
+            &root,
+            &files,
+            &message,
+            &force_add_files,
+            &related,
+            confirm_unrelated,
+        );
         assert!(allowed.is_ok(), "{:?}", allowed);
     }
 
     #[test]
-    fn commit_dispatcher_boundary_force_add_files_from_json_args_only_allows_specifically_approved_paths() {
+    fn commit_dispatcher_boundary_force_add_files_from_json_args_only_allows_specifically_approved_paths(
+    ) {
         let dir = init_repo();
         let root = dir.path().to_string_lossy().to_string();
         checkout_or_create_task_branch_impl(&root, "feature/ok").expect("create");
-        std::fs::write(dir.path().join(".gitignore"), "ignored1.txt\nignored2.txt\n").unwrap();
+        std::fs::write(
+            dir.path().join(".gitignore"),
+            "ignored1.txt\nignored2.txt\n",
+        )
+        .unwrap();
         assert!(run(&root, &["add", ".gitignore"]).status.success());
-        assert!(run(&root, &["commit", "-m", "add gitignore"]).status.success());
+        assert!(run(&root, &["commit", "-m", "add gitignore"])
+            .status
+            .success());
         std::fs::write(dir.path().join("ignored1.txt"), "shh1\n").unwrap();
         std::fs::write(dir.path().join("ignored2.txt"), "shh2\n").unwrap();
 
@@ -20839,8 +26097,16 @@ mod git_workflow_tests {
             "files": ["ignored1.txt", "ignored2.txt"],
             "forceAddFiles": ["ignored1.txt"],
         });
-        let (message, files, force_add_files, confirm_unrelated) = task_mcp_parse_commit_args(&args_partial);
-        let blocked = git_commit_impl(&root, &files, &message, &force_add_files, &[], confirm_unrelated);
+        let (message, files, force_add_files, confirm_unrelated) =
+            task_mcp_parse_commit_args(&args_partial);
+        let blocked = git_commit_impl(
+            &root,
+            &files,
+            &message,
+            &force_add_files,
+            &[],
+            confirm_unrelated,
+        );
         assert!(blocked.is_err());
         assert!(blocked.unwrap_err().contains("ignored2.txt"));
 
@@ -20850,8 +26116,16 @@ mod git_workflow_tests {
             "files": ["ignored1.txt", "ignored2.txt"],
             "forceAddFiles": ["ignored1.txt", "ignored2.txt"],
         });
-        let (message, files, force_add_files, confirm_unrelated) = task_mcp_parse_commit_args(&args_full);
-        let allowed = git_commit_impl(&root, &files, &message, &force_add_files, &[], confirm_unrelated);
+        let (message, files, force_add_files, confirm_unrelated) =
+            task_mcp_parse_commit_args(&args_full);
+        let allowed = git_commit_impl(
+            &root,
+            &files,
+            &message,
+            &force_add_files,
+            &[],
+            confirm_unrelated,
+        );
         assert!(allowed.is_ok(), "{:?}", allowed);
     }
 
@@ -20861,7 +26135,9 @@ mod git_workflow_tests {
         let root = dir.path().to_string_lossy().to_string();
         std::fs::write(dir.path().join(".gitignore"), "generated/\n").unwrap();
         assert!(run(&root, &["add", ".gitignore"]).status.success());
-        assert!(run(&root, &["commit", "-m", "add gitignore"]).status.success());
+        assert!(run(&root, &["commit", "-m", "add gitignore"])
+            .status
+            .success());
         std::fs::create_dir_all(dir.path().join("generated")).unwrap();
         std::fs::write(dir.path().join("generated/output.js"), "// generated\n").unwrap();
 
@@ -20870,8 +26146,12 @@ mod git_workflow_tests {
             "crmDeveloperWorkflow": { "lastAiImplementation": { "filesChanged": ["generated/output.js"] } },
         });
         let preview = git_commit_preview_impl(&root, Some(&task)).expect("preview");
-        let ignored: Vec<&str> = preview["gitIgnoredTaskFiles"].as_array().unwrap()
-            .iter().filter_map(|v| v.as_str()).collect();
+        let ignored: Vec<&str> = preview["gitIgnoredTaskFiles"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect();
         assert_eq!(ignored, vec!["generated/output.js"]);
     }
 
@@ -20908,10 +26188,20 @@ mod git_workflow_tests {
         });
         let step = task_mcp_compute_continue_workflow_step(&task);
         assert_eq!(step["nextAction"].as_str(), Some("prepare_commit"));
-        let forbidden: Vec<&str> = step["forbiddenWrites"].as_array().unwrap().iter().filter_map(|v| v.as_str()).collect();
+        let forbidden: Vec<&str> = step["forbiddenWrites"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect();
         assert!(forbidden.contains(&"push_task_branch"));
         assert!(forbidden.contains(&"commit_and_push_task_changes"));
-        let allowed: Vec<&str> = step["allowedWrites"].as_array().unwrap().iter().filter_map(|v| v.as_str()).collect();
+        let allowed: Vec<&str> = step["allowedWrites"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect();
         assert!(!allowed.contains(&"push_task_branch"));
     }
 
@@ -20937,8 +26227,16 @@ mod git_workflow_tests {
         });
         let step = task_mcp_compute_continue_workflow_step(&task);
         assert_eq!(step["nextAction"].as_str(), Some("propose_branch"));
-        assert_eq!(step["recommendedTool"].as_str(), Some("create_or_checkout_task_branch"));
-        let forbidden: Vec<&str> = step["forbiddenWrites"].as_array().unwrap().iter().filter_map(|v| v.as_str()).collect();
+        assert_eq!(
+            step["recommendedTool"].as_str(),
+            Some("create_or_checkout_task_branch")
+        );
+        let forbidden: Vec<&str> = step["forbiddenWrites"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect();
         assert!(forbidden.contains(&"commit_task_changes"));
     }
 
@@ -20971,7 +26269,10 @@ mod git_workflow_tests {
         let task = serde_json::json!({});
         let gate = task_mcp_compute_deployment_testing_gate(&task);
         assert_eq!(gate["canProceedToCommit"].as_bool(), Some(false));
-        assert_eq!(gate["nextRecommendedAction"].as_str(), Some("wait_for_manual_deployment"));
+        assert_eq!(
+            gate["nextRecommendedAction"].as_str(),
+            Some("wait_for_manual_deployment")
+        );
     }
 
     #[test]
@@ -20983,7 +26284,10 @@ mod git_workflow_tests {
         });
         let gate = task_mcp_compute_deployment_testing_gate(&task);
         assert_eq!(gate["canProceedToCommit"].as_bool(), Some(false));
-        assert_eq!(gate["nextRecommendedAction"].as_str(), Some("wait_for_manual_deployment"));
+        assert_eq!(
+            gate["nextRecommendedAction"].as_str(),
+            Some("wait_for_manual_deployment")
+        );
     }
 
     #[test]
@@ -20993,7 +26297,10 @@ mod git_workflow_tests {
         });
         let gate = task_mcp_compute_deployment_testing_gate(&task);
         assert_eq!(gate["canProceedToCommit"].as_bool(), Some(false));
-        assert_eq!(gate["nextRecommendedAction"].as_str(), Some("wait_for_manual_deployment"));
+        assert_eq!(
+            gate["nextRecommendedAction"].as_str(),
+            Some("wait_for_manual_deployment")
+        );
     }
 
     #[test]
@@ -21006,7 +26313,10 @@ mod git_workflow_tests {
         });
         let gate = task_mcp_compute_deployment_testing_gate(&task);
         assert_eq!(gate["canProceedToCommit"].as_bool(), Some(false));
-        assert_eq!(gate["nextRecommendedAction"].as_str(), Some("fix_code_or_redeploy"));
+        assert_eq!(
+            gate["nextRecommendedAction"].as_str(),
+            Some("fix_code_or_redeploy")
+        );
     }
 
     #[test]
@@ -21019,7 +26329,10 @@ mod git_workflow_tests {
         });
         let gate = task_mcp_compute_deployment_testing_gate(&task);
         assert_eq!(gate["canProceedToCommit"].as_bool(), Some(true));
-        assert_eq!(gate["nextRecommendedAction"].as_str(), Some("prepare_commit"));
+        assert_eq!(
+            gate["nextRecommendedAction"].as_str(),
+            Some("prepare_commit")
+        );
     }
 
     #[test]
@@ -21033,7 +26346,11 @@ mod git_workflow_tests {
     fn validate_not_needed_requires_notes_rejects_not_needed_without_a_meaningful_reason() {
         assert!(task_mcp_validate_not_needed_requires_notes("not-needed", "").is_err());
         assert!(task_mcp_validate_not_needed_requires_notes("not-needed", "   ").is_err());
-        assert!(task_mcp_validate_not_needed_requires_notes("not-needed", "No deployment required for this repo-only change.").is_ok());
+        assert!(task_mcp_validate_not_needed_requires_notes(
+            "not-needed",
+            "No deployment required for this repo-only change."
+        )
+        .is_ok());
     }
 
     #[test]
@@ -21056,7 +26373,10 @@ mod git_workflow_tests {
         assert_eq!(gate["commitVerified"].as_bool(), Some(true));
         assert_eq!(gate["pushVerified"].as_bool(), Some(true));
         assert_eq!(gate["canEnterCodeReview"].as_bool(), Some(false));
-        assert_eq!(gate["nextRecommendedAction"].as_str(), Some("prepare_pull_request"));
+        assert_eq!(
+            gate["nextRecommendedAction"].as_str(),
+            Some("prepare_pull_request")
+        );
     }
 
     #[test]
@@ -21072,16 +26392,27 @@ mod git_workflow_tests {
         });
         let gate = task_mcp_compute_code_review_readiness_gate(&task);
         assert_eq!(gate["canEnterCodeReview"].as_bool(), Some(true));
-        assert_eq!(gate["nextRecommendedAction"].as_str(), Some("wait_for_colleague_code_review"));
+        assert_eq!(
+            gate["nextRecommendedAction"].as_str(),
+            Some("wait_for_colleague_code_review")
+        );
     }
 
     #[test]
     fn continue_workflow_recommends_wait_for_manual_deployment_once_verification_passes() {
         let task = verified_dev_task(serde_json::json!({}));
         let step = task_mcp_compute_continue_workflow_step(&task);
-        assert_eq!(step["nextAction"].as_str(), Some("wait_for_manual_deployment"));
+        assert_eq!(
+            step["nextAction"].as_str(),
+            Some("wait_for_manual_deployment")
+        );
         assert_eq!(step["requiresUserApproval"].as_bool(), Some(true));
-        let forbidden: Vec<&str> = step["forbiddenWrites"].as_array().unwrap().iter().filter_map(|v| v.as_str()).collect();
+        let forbidden: Vec<&str> = step["forbiddenWrites"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect();
         assert!(forbidden.contains(&"commit_task_changes"));
     }
 
@@ -21091,7 +26422,10 @@ mod git_workflow_tests {
             "deploymentTesting": { "deployment": { "status": "deployed", "notes": "Deployed to dev." } },
         }));
         let step = task_mcp_compute_continue_workflow_step(&task);
-        assert_eq!(step["nextAction"].as_str(), Some("wait_for_deployment_test"));
+        assert_eq!(
+            step["nextAction"].as_str(),
+            Some("wait_for_deployment_test")
+        );
     }
 
     #[test]
@@ -21133,7 +26467,10 @@ mod git_workflow_tests {
         }));
         let step = task_mcp_compute_continue_workflow_step(&task);
         assert_eq!(step["nextAction"].as_str(), Some("prepare_pull_request"));
-        assert_eq!(step["recommendedTool"].as_str(), Some("prepare_pull_request_for_task"));
+        assert_eq!(
+            step["recommendedTool"].as_str(),
+            Some("prepare_pull_request_for_task")
+        );
     }
 
     #[test]
@@ -21153,8 +26490,15 @@ mod git_workflow_tests {
             },
         }));
         let step = task_mcp_compute_continue_workflow_step(&task);
-        assert_eq!(step["nextAction"].as_str(), Some("wait_for_colleague_code_review"));
-        assert!(step["instructionForAI"].as_str().unwrap().to_lowercase().contains("independent"));
+        assert_eq!(
+            step["nextAction"].as_str(),
+            Some("wait_for_colleague_code_review")
+        );
+        assert!(step["instructionForAI"]
+            .as_str()
+            .unwrap()
+            .to_lowercase()
+            .contains("independent"));
     }
 
     // -----------------------------------------------------------------------
@@ -21163,45 +26507,79 @@ mod git_workflow_tests {
 
     #[test]
     fn should_transition_to_deployment_testing_true_for_all_three_deployment_testing_actions() {
-        for action in ["wait_for_manual_deployment", "wait_for_deployment_test", "fix_code_or_redeploy"] {
+        for action in [
+            "wait_for_manual_deployment",
+            "wait_for_deployment_test",
+            "fix_code_or_redeploy",
+        ] {
             let task = serde_json::json!({});
-            assert!(task_mcp_should_transition_to_deployment_testing(&task, action), "expected true for {action}");
+            assert!(
+                task_mcp_should_transition_to_deployment_testing(&task, action),
+                "expected true for {action}"
+            );
         }
     }
 
     #[test]
     fn should_transition_to_deployment_testing_false_for_other_actions() {
-        for action in ["run_ai_kit_review", "propose_branch", "prepare_commit", "commit_and_push", "prepare_pull_request", "wait_for_colleague_code_review", "needs_configuration"] {
+        for action in [
+            "run_ai_kit_review",
+            "propose_branch",
+            "prepare_commit",
+            "commit_and_push",
+            "prepare_pull_request",
+            "wait_for_colleague_code_review",
+            "needs_configuration",
+        ] {
             let task = serde_json::json!({});
-            assert!(!task_mcp_should_transition_to_deployment_testing(&task, action), "expected false for {action}");
+            assert!(
+                !task_mcp_should_transition_to_deployment_testing(&task, action),
+                "expected false for {action}"
+            );
         }
     }
 
     #[test]
     fn should_transition_to_deployment_testing_false_once_already_transitioned() {
         let task = serde_json::json!({ "waitingState": "consultant-testing" });
-        assert!(!task_mcp_should_transition_to_deployment_testing(&task, "wait_for_manual_deployment"));
+        assert!(!task_mcp_should_transition_to_deployment_testing(
+            &task,
+            "wait_for_manual_deployment"
+        ));
     }
 
     #[test]
     fn apply_deployment_testing_transition_sets_waiting_state_and_clears_attention_state() {
         let mut task = serde_json::json!({ "id": "t1", "status": "in-progress", "attentionState": "pr-comments", "notes": "" });
-        let applied = task_mcp_apply_deployment_testing_transition(&mut task, "wait_for_manual_deployment");
+        let applied =
+            task_mcp_apply_deployment_testing_transition(&mut task, "wait_for_manual_deployment");
         assert!(applied);
         assert_eq!(task["waitingState"].as_str(), Some("consultant-testing"));
         assert_eq!(task["status"].as_str(), Some("in-progress")); // status itself is untouched
         assert!(task["attentionState"].is_null());
-        assert!(task["notes"].as_str().unwrap().contains("transitioned to Deployment & Testing"));
+        assert!(task["notes"]
+            .as_str()
+            .unwrap()
+            .contains("transitioned to Deployment & Testing"));
     }
 
     #[test]
     fn apply_deployment_testing_transition_is_idempotent() {
         let mut task = serde_json::json!({ "id": "t1", "status": "in-progress", "notes": "" });
-        assert!(task_mcp_apply_deployment_testing_transition(&mut task, "wait_for_manual_deployment"));
+        assert!(task_mcp_apply_deployment_testing_transition(
+            &mut task,
+            "wait_for_manual_deployment"
+        ));
         // Second call: already transitioned, must be a no-op (does not re-append a note).
-        let applied_again = task_mcp_apply_deployment_testing_transition(&mut task, "wait_for_manual_deployment");
+        let applied_again =
+            task_mcp_apply_deployment_testing_transition(&mut task, "wait_for_manual_deployment");
         assert!(!applied_again);
-        let transition_notes = task["notes"].as_str().unwrap().split('\n').filter(|l| l.contains("transitioned to Deployment & Testing")).count();
+        let transition_notes = task["notes"]
+            .as_str()
+            .unwrap()
+            .split('\n')
+            .filter(|l| l.contains("transitioned to Deployment & Testing"))
+            .count();
         assert_eq!(transition_notes, 1);
     }
 
@@ -21218,17 +26596,23 @@ mod git_workflow_tests {
     }
 
     #[test]
-    fn regression_full_sequence_transitions_from_development_to_deployment_testing_without_resetting_verification() {
+    fn regression_full_sequence_transitions_from_development_to_deployment_testing_without_resetting_verification(
+    ) {
         // Simulates the tool arm's logic end-to-end at the pure-function level (no AppHandle
         // needed): compute the step, then decide/apply the transition from it — exactly what
         // src-tauri's "continue_developer_workflow" tool arm and mcp/task-workbench-mcp.mjs's
         // case both do. Also covers the legacy-task backward-compatibility requirement: no
         // deploymentTesting field yet, status/waitingState still plain Development.
-        let mut task = verified_dev_task(serde_json::json!({ "status": "in-progress", "waitingState": Value::Null, "notes": "" }));
+        let mut task = verified_dev_task(
+            serde_json::json!({ "status": "in-progress", "waitingState": Value::Null, "notes": "" }),
+        );
         assert!(task["deploymentTesting"].is_null());
 
         let step = task_mcp_compute_continue_workflow_step(&task);
-        assert_eq!(step["nextAction"].as_str(), Some("wait_for_manual_deployment"));
+        assert_eq!(
+            step["nextAction"].as_str(),
+            Some("wait_for_manual_deployment")
+        );
         let next_action = step["nextAction"].as_str().unwrap().to_string();
         let transitioned = task_mcp_apply_deployment_testing_transition(&mut task, &next_action);
 
@@ -21236,13 +26620,25 @@ mod git_workflow_tests {
         assert_eq!(task["waitingState"].as_str(), Some("consultant-testing"));
         assert_eq!(task["status"].as_str(), Some("in-progress"));
         // Passed verification results are untouched — no reset performed.
-        assert_eq!(task["implementationVerification"]["dataverseCheck"]["status"].as_str(), Some("skipped"));
-        assert_eq!(task["implementationVerification"]["aiCodeReview"]["status"].as_str(), Some("passed"));
+        assert_eq!(
+            task["implementationVerification"]["dataverseCheck"]["status"].as_str(),
+            Some("skipped")
+        );
+        assert_eq!(
+            task["implementationVerification"]["aiCodeReview"]["status"].as_str(),
+            Some("passed")
+        );
 
         // A second call while still waiting on manual deployment must not re-transition or loop.
         let step2 = task_mcp_compute_continue_workflow_step(&task);
-        assert_eq!(step2["nextAction"].as_str(), Some("wait_for_manual_deployment"));
-        let transitioned2 = task_mcp_apply_deployment_testing_transition(&mut task, step2["nextAction"].as_str().unwrap());
+        assert_eq!(
+            step2["nextAction"].as_str(),
+            Some("wait_for_manual_deployment")
+        );
+        let transitioned2 = task_mcp_apply_deployment_testing_transition(
+            &mut task,
+            step2["nextAction"].as_str().unwrap(),
+        );
         assert!(!transitioned2);
     }
 
@@ -21298,6 +26694,15 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             load_tasks,
             save_tasks,
+            initialize_work_item_storage,
+            list_work_items,
+            get_work_item,
+            list_work_item_changes,
+            create_work_item,
+            update_work_item,
+            transition_work_item,
+            append_work_item_note,
+            get_planning_today,
             clear_all_tasks,
             check_task_storage,
             restore_tasks_from_latest_backup,
@@ -21356,20 +26761,19 @@ pub fn run() {
             get_git_diff,
             run_ai_change_review,
             run_ai_kit_implementation,
-                get_task_mcp_bridge_status,
-                test_primarch_mcp_connection,
-                list_primarch_mcp_tools,
-                generate_crm_skeleton,
-                scan_cs_file_for_crm,
-                verify_against_crm,
-                get_git_commit_preview,
-                commit_task_changes,
-                push_task_branch,
-                commit_and_push_task_changes,
-                create_git_branch,
-                create_or_checkout_task_branch_command,
+            get_task_mcp_bridge_status,
+            test_primarch_mcp_connection,
+            list_primarch_mcp_tools,
+            generate_crm_skeleton,
+            scan_cs_file_for_crm,
+            verify_against_crm,
+            get_git_commit_preview,
+            commit_task_changes,
+            push_task_branch,
+            commit_and_push_task_changes,
+            create_git_branch,
+            create_or_checkout_task_branch_command,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }
-

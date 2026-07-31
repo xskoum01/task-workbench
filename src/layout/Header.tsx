@@ -1,18 +1,22 @@
 import type { NavPage } from '../types';
 
 const PAGE_LABELS: Record<NavPage, string> = {
+  overview:  'Overview',
   inbox:     'Inbox',
-  tasks:     'Tasks',
-  'week-log':'Week Log',
-  customers: 'Customers',
+  work:      'Work',
+  obligations: 'Obligations',
+  areas:     'Areas',
+  activity:  'Activity',
   settings:  'Settings',
 };
 
 const PAGE_SUBTITLES: Record<NavPage, string> = {
+  overview:  'What needs attention across your work and obligations',
   inbox:     'Incoming work items pending classification',
-  tasks:     'All tracked work items',
-  'week-log':'Daily notes and completed tasks by week',
-  customers: 'Client repository and project mappings',
+  work:      'Tasks, deadlines, ownership, and current status',
+  obligations: 'Ongoing responsibilities and explicit commitments',
+  areas:     'Responsibility, customer, and project context',
+  activity:  'Record history and weekly completion log',
   settings:  'Application configuration',
 };
 

@@ -14,7 +14,24 @@ export type TaskWaitingState =
 export type TaskAttentionState =
   | 'pr-comments';
 
-export type TaskSource = 'email' | 'teams' | 'manual';
+export type TaskSource = 'email' | 'teams' | 'manual' | 'mcp' | 'devops';
+
+export type TaskObligationKind = 'task' | 'commitment' | 'follow-up' | 'responsibility';
+export type TaskActorType = 'user' | 'system' | 'integration';
+export interface TaskHistoryChange {
+  field: string;
+  from?: string | number | boolean | null;
+  to?: string | number | boolean | null;
+}
+export interface TaskHistoryEntry {
+  id: string;
+  at: string;
+  actorType: TaskActorType;
+  actorName?: string;
+  action: string;
+  summary: string;
+  changes?: TaskHistoryChange[];
+}
 
 export type TaskType =
   | 'bug-fix'
@@ -498,11 +515,24 @@ export interface Task {
   receivedAt: string; // ISO date string
   suggestedActions: SuggestedAction[];
 
+  // --- Canonical work-record fields (optional for legacy records) ---
+  description?: string;
+  obligationKind?: TaskObligationKind;
+  responsibleParty?: string;
+  accountableTo?: string;
+  createdAt?: string;
+  updatedAt?: string;
+  revision?: number;
+  archivedAt?: string;
+  history?: TaskHistoryEntry[];
+
   // --- Planning fields (all optional for backwards compatibility) ---
   /** ISO date string for the task's deadline. */
   dueAt?: string;
   /** Rough effort estimate in hours. */
   estimatedEffort?: number;
+  /** True only after a person explicitly confirms/enters the estimate. */
+  estimatedEffortConfirmed?: boolean;
   /** Budget: number of hours estimated for this task (explicit, user-editable). */
   budget?: number;
   /** The bucket the user explicitly chose; overrides the suggestion when set. */
@@ -1562,7 +1592,7 @@ export interface CrmVerificationReport {
   rawExtractedReferences?: CrmRawExtractedReferences;
 }
 
-export type NavPage = 'inbox' | 'tasks' | 'week-log' | 'customers' | 'settings';
+export type NavPage = 'overview' | 'inbox' | 'work' | 'obligations' | 'areas' | 'activity' | 'settings';
 
 // --- Git commit preview types -----------------------------------------------
 

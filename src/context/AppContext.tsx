@@ -1,12 +1,14 @@
-import { createContext, useContext, useEffect, useState, useRef, useCallback } from 'react';
+import { createContext, useContext, useEffect, useState, useRef, useCallback, useMemo } from 'react';
 import { listen } from '@tauri-apps/api/event';
-import type { Task, Customer, AppSettings, CreateRepoResult, CreateRepoOptions, TaskType, ClassificationState, PlanningBucket, AdoEmailContext, TaskStorageStatus } from '../types';
+import type { Task, Customer, AppSettings, TaskType, ClassificationState, PlanningBucket, AdoEmailContext, TaskStorageStatus } from '../types';
 import * as api from '../lib/tauriCommands';
 import { defaultSettings } from '../data/mockData';
 import { OTHER_CUSTOMER, OTHER_CUSTOMER_ID } from '../data/mockData';
 import { prefilter } from '../lib/prefilter';
 import { matchCustomer } from '../lib/customerMatch';
 import { normalizeText, normalizeTitle } from '../lib/textNormalize';
+import { createTaskRecord, normalizeTaskRecord, updateTaskRecord } from '../lib/taskRecord';
+import { taskToWorkItem, type WorkItem } from '../domain/workItem';
 
 // --- Context value shape ---------------------------------------------------
 
@@ -33,7 +35,7 @@ export interface ImportMessageInput {
   preResolvedCustomerId?: string;
   /**
    * Structured Azure DevOps context extracted by the ADO parser.
-   * Stored on the task for display in TaskDetail.
+   * Stored on the task for display in the canonical task record.
    */
   adoContext?: AdoEmailContext;
   /**
@@ -57,7 +59,7 @@ export interface ImportMessageInput {
    */
   captureMode?: 'explicit';
   /**
-   * CID-resolved HTML body from Microsoft Graph — used only for display in TaskDetail.
+   * CID-resolved HTML body from Microsoft Graph — used only for task context display.
    * Never fed into AI, prefilter, ADO parsing, or text normalization.
    */
   emailBodyHtml?: string;
@@ -75,6 +77,8 @@ export interface ImportResult {
 
 interface AppContextValue {
   tasks: Task[];
+  /** Canonical read model used by new product surfaces during the persistence migration. */
+  workItems: WorkItem[];
   customers: Customer[];
   settings: AppSettings;
   /** Subfolder names from the configured CRM base directory — used as customer candidates. */
@@ -92,6 +96,7 @@ interface AppContextValue {
   // Task operations
   createTask: (draft: Omit<Task, 'id' | 'receivedAt' | 'suggestedActions'>) => Promise<void>;
   updateTask: (id: string, updates: Partial<Task>) => Promise<void>;
+  /** Reversibly archives a task. Kept under the legacy name for component compatibility. */
   deleteTask: (id: string) => Promise<void>;
   /** Re-fetches tasks from storage. Useful after external writes (e.g. MCP tools). */
   reloadTasks: () => Promise<void>;
@@ -112,9 +117,8 @@ interface AppContextValue {
    */
   resolveOrCreateCustomerByFolder: (folderName: string) => Promise<string>;
 
-  // Repository operations
+  // Linked context operations
   rescanRepositories: () => Promise<void>;
-  createRepositoryFromTemplate: (customer: Customer, options?: CreateRepoOptions) => Promise<CreateRepoResult>;
 
   // Settings operations
   updateSettings: (updates: Partial<AppSettings>) => Promise<void>;
@@ -314,7 +318,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
           }
         }
 
-        setTasks(loadedTasks);
+        setTasks(loadedTasks.map(normalizeTaskRecord));
         // Always ensure the Other sentinel customer is present.
         const withOther = finalCustomers.some((c) => c.id === OTHER_CUSTOMER_ID)
           ? finalCustomers
@@ -348,7 +352,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     // Listen for MCP bridge writes and reload tasks to keep UI in sync
     const unlisten = listen('tasks-changed-externally', () => {
       api.loadTasks().then((updated) => {
-        setTasks(updated);
+        setTasks(updated.map(normalizeTaskRecord));
       }).catch(() => {});
     });
 
@@ -371,19 +375,23 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
       console.warn(`[saveTasks] blocked: initial load failed (${label})`);
       return Promise.resolve();
     }
-    return api.saveTasks(tasks).catch((e) => {
+    return api.saveTasks(tasks).catch(async (e) => {
       console.warn(`[saveTasks] ${label} failed:`, e);
+      // SQLite rejects stale revisions instead of accepting a last-writer-wins overwrite.
+      // Reconcile the optimistic UI with the authoritative store after any failed mutation.
+      try {
+        const authoritative = await api.loadTasks();
+        setTasks(authoritative.map(normalizeTaskRecord));
+      } catch (reloadError) {
+        console.warn(`[saveTasks] ${label} reconciliation failed:`, reloadError);
+      }
     });
   }, []);
 
   const createTask = useCallback(
     async (draft: Omit<Task, 'id' | 'receivedAt' | 'suggestedActions'>) => {
-      const newTask: Task = {
-        ...draft,
-        id:               generateId(),
-        receivedAt:       new Date().toISOString(),
-        suggestedActions: [],
-      };
+      const now = new Date().toISOString();
+      const newTask = createTaskRecord(draft, generateId(), now);
       let captured: Task[] = [];
       setTasks((prev) => {
         const next = [...prev, newTask];
@@ -401,14 +409,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
       setTasks((prev) => {
         const next = prev.map((t) => {
           if (t.id !== id) return t;
-          const merged = { ...t, ...updates };
-          // Track completion timestamp automatically.
-          if (updates.status === 'done' && t.status !== 'done') {
-            merged.completedAt = new Date().toISOString();
-          } else if (updates.status && updates.status !== 'done' && t.status === 'done') {
-            merged.completedAt = undefined;
-          }
-          return merged;
+          return updateTaskRecord(t, updates, new Date().toISOString());
         });
         captured = next;
         return next;
@@ -422,11 +423,14 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     async (id: string) => {
       let captured: Task[] = [];
       setTasks((prev) => {
-        const next = prev.filter((t) => t.id !== id);
+        const now = new Date().toISOString();
+        const next = prev.map((task) =>
+          task.id === id ? updateTaskRecord(task, { archivedAt: now }, now) : task,
+        );
         captured = next;
         return next;
       });
-      await persistTasksIfSafe(captured, 'deleteTask');
+      await persistTasksIfSafe(captured, 'archiveTask');
     },
     [persistTasksIfSafe],
   );
@@ -474,7 +478,9 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
             if (input.source === 'email' && input.emailBodyHtml && !existing.emailBodyHtml) {
               console.log(`[import-html] force-create duplicate: backfilling emailBodyHtml length=${input.emailBodyHtml.length}`);
               const patched = tasksRef.current.map((t) =>
-                t.id === existing.id ? { ...t, emailBodyHtml: input.emailBodyHtml } : t
+                t.id === existing.id
+                  ? updateTaskRecord(t, { emailBodyHtml: input.emailBodyHtml }, new Date().toISOString(), 'integration', 'Inbox import')
+                  : t
               );
               tasksRef.current = patched;
               setTasks(patched);
@@ -491,7 +497,13 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
             if (Object.keys(htmlPatch).length > 0) console.log(`[import-html] force-create upgrade: adding emailBodyHtml length=${input.emailBodyHtml?.length}`);
             const upgraded = tasksRef.current.map((t) =>
               t.id === existing.id
-                ? { ...t, ...htmlPatch, classificationState: 'created' as const, confidence: Math.max(t.confidence, 80) }
+                ? updateTaskRecord(
+                    t,
+                    { ...htmlPatch, classificationState: 'created' as const, confidence: Math.max(t.confidence, 80) },
+                    new Date().toISOString(),
+                    'integration',
+                    'Inbox import',
+                  )
                 : t,
             );
             tasksRef.current = upgraded;
@@ -507,6 +519,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
           ? customers.find((c) => c.id === input.preResolvedCustomerId) ?? null
           : matchCustomer(customers.filter((c) => c.id !== OTHER_CUSTOMER_ID), { senderEmail: input.senderEmail, senderName: input.senderName, title: cleanTitle, content: cleanContent });
         const forcedId   = generateId();
+        const forcedAt   = new Date().toISOString();
         const forcedTask: Task = {
           id:                      forcedId,
           title:                   cleanTitle,
@@ -523,7 +536,19 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
           sourceUrl:               input.sourceUrl,
           senderName:              input.senderName,
           senderEmail:             input.senderEmail,
-          importedAt:              new Date().toISOString(),
+          importedAt:              forcedAt,
+          createdAt:               forcedAt,
+          updatedAt:               forcedAt,
+          revision:                1,
+          obligationKind:          'task',
+          history:                 [{
+            id: `event-${forcedAt}-${forcedId}`,
+            at: forcedAt,
+            actorType: 'integration',
+            actorName: input.source === 'email' ? 'Outlook import' : 'Teams import',
+            action: 'imported',
+            summary: `Task created from ${input.source} context`,
+          }],
           classificationLabel:     detectClassificationLabel(cleanTitle, cleanContent, input.senderEmail),
           classificationState:     'created',
           adoContext:              input.adoContext,
@@ -585,7 +610,9 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
 
           if (Object.keys(backfill).length > 0) {
             const upgraded = tasksRef.current.map((t) =>
-              t.id === existing.id ? { ...t, ...backfill } : t
+              t.id === existing.id
+                ? updateTaskRecord(t, backfill, new Date().toISOString(), 'integration', 'Inbox import')
+                : t
             );
             tasksRef.current = upgraded;
             setTasks(upgraded);
@@ -618,6 +645,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
       if (!filterResult.pass) {
         console.log(`[import] prefilter rejected "${input.title}": ${filterResult.reason}`);
         const rejectedId   = generateId();
+        const rejectedAt   = new Date().toISOString();
         const rejectedTask: Task = {
           id:                  rejectedId,
           title:               cleanTitle,
@@ -634,7 +662,19 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
           sourceUrl:           input.sourceUrl,
           senderName:          input.senderName,
           senderEmail:         input.senderEmail,
-          importedAt:          new Date().toISOString(),
+          importedAt:          rejectedAt,
+          createdAt:           rejectedAt,
+          updatedAt:           rejectedAt,
+          revision:            1,
+          obligationKind:      'task',
+          history:             [{
+            id: `event-${rejectedAt}-${rejectedId}`,
+            at: rejectedAt,
+            actorType: 'integration',
+            actorName: input.source === 'email' ? 'Outlook import' : 'Teams import',
+            action: 'imported',
+            summary: `Context imported from ${input.source} and classified as non-actionable`,
+          }],
           classificationLabel: classificationLabel ?? filterResult.reason,
           classificationState: 'rejected',
           // Keep heuristic planning even for rejected items (avoids data loss if user re-promotes)
@@ -645,6 +685,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
         };
         // Read from ref so a concurrent import's pending task is not lost
         const next = [...tasksRef.current, rejectedTask];
+        tasksRef.current = next;
         setTasks(next);
         persistTasksIfSafe(next, 'import:prefilter-rejected');
         return { outcome: 'rejected', reason: filterResult.reason, taskId: rejectedId };
@@ -670,6 +711,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
       // 'pending' is an internal transient state — InboxPage filters it out, so
       // the item is intentionally invisible until classification completes.
       const pendingId   = generateId();
+      const importedAt  = new Date().toISOString();
       const pendingTask: Task = {
         id:                  pendingId,
         title:               cleanTitle,
@@ -680,13 +722,25 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
         confidence:          0,
         originalMessage:     cleanContent,
         receivedAt:          input.receivedAt,
+        createdAt:           importedAt,
+        updatedAt:           importedAt,
+        revision:            1,
+        obligationKind:      'task',
+        history:             [{
+          id: `event-${importedAt}-${pendingId}`,
+          at: importedAt,
+          actorType: 'integration',
+          actorName: input.source === 'email' ? 'Outlook import' : 'Teams import',
+          action: 'imported',
+          summary: `Task context imported from ${input.source}`,
+        }],
         suggestedActions:    [],
         externalMessageId:   dedupeKey,
         sourceThreadId:      input.sourceThreadId,
         sourceUrl:           input.sourceUrl,
         senderName:          input.senderName,
         senderEmail:         input.senderEmail,
-        importedAt:          new Date().toISOString(),
+        importedAt,
         classificationLabel,
         classificationState: 'pending',
         adoContext:          input.adoContext,
@@ -746,18 +800,24 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
         // Preserve any heuristic planning values set in the pending task.
         const afterError = tasksRef.current.map((t) =>
           t.id === pendingId
-            ? {
-                ...t,
-                confidence:          fallbackConfidence,
-                classificationState: fallbackState,
-                analysisResult: {
-                  summary:          fallbackSummary,
-                  suggestedActions: [],
-                  confidence:       fallbackConfidence,
+            ? updateTaskRecord(
+                t,
+                {
+                  confidence: fallbackConfidence,
+                  classificationState: fallbackState,
+                  analysisResult: {
+                    summary: fallbackSummary,
+                    suggestedActions: [],
+                    confidence: fallbackConfidence,
+                  },
                 },
-              }
+                new Date().toISOString(),
+                'integration',
+                'Inbox classification',
+              )
             : t,
         );
+        tasksRef.current = afterError;
         setTasks(afterError);
         persistTasksIfSafe(afterError, 'import:after-ai-error');
         return {
@@ -788,9 +848,16 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
         console.log(`[import] skip "${input.title}": ${skipReason}`);
         const withRejected = tasksRef.current.map((t) =>
           t.id === pendingId
-            ? { ...t, classificationState: 'rejected' as const, confidence }
+            ? updateTaskRecord(
+                t,
+                { classificationState: 'rejected' as const, confidence },
+                new Date().toISOString(),
+                'integration',
+                'Inbox classification',
+              )
             : t,
         );
+        tasksRef.current = withRejected;
         setTasks(withRejected);
         persistTasksIfSafe(withRejected, 'import:ai-rejected');
         return { outcome: 'rejected', reason: skipReason, taskId: pendingId };
@@ -854,6 +921,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
         confidence,
         dueAt:                  dueAt ?? undefined,
         estimatedEffort:        estimatedEffort ?? undefined,
+        estimatedEffortConfirmed: estimatedEffort !== undefined ? false : undefined,
         analysisResult:         {
           summary,
           summaryCz:        summaryCz   ?? undefined,
@@ -879,9 +947,16 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
         );
         const withCreated = tasksRef.current.map((t) =>
           t.id === pendingId
-            ? { ...t, ...aiFields, classificationState: 'created' as const }
+            ? updateTaskRecord(
+                t,
+                { ...aiFields, classificationState: 'created' as const },
+                new Date().toISOString(),
+                'integration',
+                'Inbox classification',
+              )
             : t,
         );
+        tasksRef.current = withCreated;
         setTasks(withCreated);
         persistTasksIfSafe(withCreated, 'import:created');
         // Non-blocking: generate a reply draft for explicit captures.
@@ -890,7 +965,12 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
             { id: pendingId, title: resolvedTitle ?? pendingTask.title, taskType: resolvedTaskType, status: 'new', originalMessage: pendingTask.originalMessage } as Task,
             finalCustomer,
           ).then((replyDraft) => {
-            const withReply = tasksRef.current.map((t) => t.id === pendingId ? { ...t, generatedReply: replyDraft } : t);
+            const withReply = tasksRef.current.map((t) =>
+              t.id === pendingId
+                ? updateTaskRecord(t, { generatedReply: replyDraft }, new Date().toISOString(), 'integration', 'Reply drafting')
+                : t
+            );
+            tasksRef.current = withReply;
             setTasks(withReply);
             persistTasksIfSafe(withReply, 'import:reply-draft');
             console.log('[import] reply draft generated for', pendingId);
@@ -905,9 +985,16 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
       );
       const withAnalyzed = tasksRef.current.map((t) =>
         t.id === pendingId
-          ? { ...t, ...aiFields, classificationState: 'analyzed' as const }
+          ? updateTaskRecord(
+              t,
+              { ...aiFields, classificationState: 'analyzed' as const },
+              new Date().toISOString(),
+              'integration',
+              'Inbox classification',
+            )
           : t,
       );
+      tasksRef.current = withAnalyzed;
       setTasks(withAnalyzed);
       persistTasksIfSafe(withAnalyzed, 'import:analyzed');
       // Non-blocking: generate a reply draft for explicit captures.
@@ -916,7 +1003,12 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
           { id: pendingId, title: resolvedTitle ?? pendingTask.title, taskType: resolvedTaskType, status: 'new', originalMessage: pendingTask.originalMessage } as Task,
           finalCustomer,
         ).then((replyDraft) => {
-          const withReply = tasksRef.current.map((t) => t.id === pendingId ? { ...t, generatedReply: replyDraft } : t);
+          const withReply = tasksRef.current.map((t) =>
+            t.id === pendingId
+              ? updateTaskRecord(t, { generatedReply: replyDraft }, new Date().toISOString(), 'integration', 'Reply drafting')
+              : t
+          );
+          tasksRef.current = withReply;
           setTasks(withReply);
           persistTasksIfSafe(withReply, 'import:reply-draft-analyzed');
           console.log('[import] reply draft generated for', pendingId);
@@ -1063,53 +1155,6 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     [customers, settings.crmBaseDirectory],
   );
 
-  // --- Repository creation from template ---
-
-  const createRepositoryFromTemplate = useCallback(
-    async (customer: Customer, options?: CreateRepoOptions): Promise<CreateRepoResult> => {
-      const templatePath = settings.repositoryTemplatePath;
-      const templateType = settings.repositoryTemplateType ?? 'none';
-      const baseDir      = settings.crmBaseDirectory ?? '';
-
-      if (!templatePath || templateType === 'none') {
-        throw new Error('No repository template configured. Set one in Settings → Repository Workspace.');
-      }
-      if (!baseDir) {
-        throw new Error('CRM base directory is not configured. Set it in Settings → Repository Workspace.');
-      }
-      const folderName = customer.folderName || customer.repositoryName;
-      if (!folderName) {
-        throw new Error('Customer has no folder name configured.');
-      }
-
-      const targetPath = `${baseDir}/${folderName}`;
-
-      await api.createRepositoryFromTemplate(templatePath, targetPath);
-
-      let gitInit: CreateRepoResult['gitInit'] = 'skipped';
-      let gitMessage: string | undefined;
-      let initialCommitCreated = false;
-
-      const doGit    = options?.initializeGit    ?? (settings.initializeGitOnCreate ?? true);
-      const branch   = options?.gitBranch?.trim()  || settings.defaultGitBranch?.trim() || 'main';
-      const doCommit = options?.createInitialCommit ?? (settings.createInitialCommit ?? false);
-
-      if (doGit) {
-        const result = await api.initializeGitRepository(targetPath, branch, doCommit);
-        gitInit              = result.status;
-        gitMessage           = result.message || undefined;
-        initialCommitCreated = result.initialCommitCreated;
-      }
-
-      const rescanned = await api.rescanRepositories(customers, baseDir);
-      setCustomers(rescanned);
-      await api.saveCustomers(rescanned);
-
-      return { targetPath, gitInit, gitMessage, initialCommitCreated };
-    },
-    [customers, settings],
-  );
-
   // --- Convenience ---
 
   const getCustomerById = useCallback(
@@ -1121,6 +1166,12 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     },
     [customers],
   );
+  const workItems = useMemo(
+    () => tasks
+      .filter((task) => !task.classificationState || task.classificationState === 'created')
+      .map(taskToWorkItem),
+    [tasks],
+  );
 
   // --- Render ---
 
@@ -1128,6 +1179,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     <AppContext.Provider
       value={{
         tasks,
+        workItems,
         customers,
         settings,
         crmFolders,
@@ -1140,7 +1192,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
         deleteTask,
         reloadTasks: async () => {
           const updated = await api.loadTasks();
-          setTasks(updated);
+          setTasks(updated.map(normalizeTaskRecord));
           // A successful reload resolves the load-failed state.
           if (taskLoadFailedRef.current) {
             taskLoadFailedRef.current = false;
@@ -1153,7 +1205,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
         restoreTasksFromLatestBackup: async () => {
           await api.restoreTasksFromLatestBackup();
           const updated = await api.loadTasks();
-          setTasks(updated);
+          setTasks(updated.map(normalizeTaskRecord));
           api.checkTaskStorage().then(setTaskStorageStatus).catch(() => undefined);
         },
         importMessage,
@@ -1162,7 +1214,6 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
         deleteCustomer,
         resolveOrCreateCustomerByFolder,
         rescanRepositories,
-        createRepositoryFromTemplate,
         updateSettings,
         updateWeeklyNote,
         getCustomerById,

@@ -1,160 +1,69 @@
-# task-workbench MCP Bridge
+# Task Workbench MCP 2.x
 
-task-workbench uses a Primarch-style local MCP bridge architecture:
-
-- task-workbench app starts a localhost bridge (`127.0.0.1:38473`)
-- `mcp/task-workbench-mcp.mjs` talks to that bridge
-- reads/writes go through task-workbench app logic (not direct file writes from MCP script)
-
-The MCP script also supports an explicit debug fallback (`--fallback-readonly` with
-`--data-dir`) when the app is not running. Most fallback tools are read-only; the
-`prepare_developer_task` fallback may update only local `tasks.json` setup state.
+Task Workbench MCP exposes authoritative task, obligation, context, deadline,
+status, revision, and history data. It never executes the represented work and
+does not orchestrate AI agents.
 
 ## Start
 
-Run the task-workbench app first, then:
+The desktop app must be running because it owns the authoritative SQLite store
+and the authenticated localhost bridge.
 
-```bash
-node mcp/task-workbench-mcp.mjs
+```json
+{
+  "mcpServers": {
+    "task-workbench": {
+      "command": "node",
+      "args": ["C:/path/to/task-workbench/mcp/task-workbench-mcp.mjs"]
+    }
+  }
+}
 ```
 
-Optional bridge URL override:
+The Node process loads the bridge session token from Windows Credential Manager
+target `com.vskoumal.task-workbench/bridge-token`. The desktop app creates or
+migrates that target on startup and exposes only safe credential status metadata
+through `/mcp/status`.
 
-```bash
-node mcp/task-workbench-mcp.mjs --bridge-url http://127.0.0.1:38473
+Legacy plaintext sources are read only as migration fallbacks when the vault
+entry is missing: the previous application-data `mcp-bridge-token` file and
+`TASK_WORKBENCH_BRIDGE_TOKEN`. They are not deleted automatically, are no longer
+created by the bridge, and are not returned by status responses.
+
+## Supported tools
+
+| Tool | Mutation | Purpose |
+|---|---:|---|
+| `list_work_items` | No | List canonical tasks and obligations |
+| `get_work_item` | No | Read one record by stable ID |
+| `list_work_item_changes` | No | Read ordered changes after a cursor |
+| `create_work_item` | Yes | Create a canonical record |
+| `update_work_item` | Yes | Replace record data with revision checking |
+| `transition_work_item` | Yes | Apply a validated lifecycle transition |
+| `append_work_item_note` | Yes | Append contextual information |
+| `get_planning_today` | No | Read the live Now and Today planning model |
+
+Every mutation other than create requires `expectedRevision`. A stale revision
+returns `revision_conflict` and the current revision.
+
+The lifecycle states are:
+
+```text
+planned, ready, in_progress, waiting, blocked, review, completed, cancelled
 ```
 
-Optional fallback debug mode (no Primarch):
+Transitions to `blocked` or `cancelled` require a reason. Completed and cancelled
+records can only be reopened into `planned`.
 
-```bash
-node mcp/task-workbench-mcp.mjs --fallback-readonly --data-dir "/path/to/task-workbench-data"
-```
+## Machine-readable contracts
 
-## Tool groups
+- JSON Schema: [`work-item.schema.json`](./work-item.schema.json)
+- Local REST OpenAPI: [`openapi.yaml`](./openapi.yaml)
+- Legacy boundary: [`legacy-boundary.md`](./legacy-boundary.md)
 
-### Read-only
+## Explicit exclusions
 
-These tools never write to Dataverse, GitHub, Azure DevOps, or the local filesystem
-(except `run_dataverse_check_for_task` and `run_implementation_verification`, which persist a
-report/check result to local task state only).
-
-| Tool | Purpose |
-|------|---------|
-| `list_tasks` | List sanitized tasks with optional status/mode filter |
-| `get_task` | Get one sanitized task by ID (no raw email HTML) |
-| `get_task_summary` | Compact task summary by ID |
-| `get_task_full_context` | Phase, mode, setup, estimate, checklist, notes, PR state, next step |
-| `get_task_workflow_overview` | Display phase, waiting state, checklist rows, recommended next step |
-| `get_task_original_message` | Sanitized original email/Teams/DevOps message body |
-| `get_task_developer_setup` | Mode, work kind, work action, repo root, plugin/script target |
-| `get_crm_workflow_state` | Full sanitized CRM Developer Workflow state |
-| `get_current_crm_workflow_step` | Current step + approval gate summary |
-| `get_technical_plan` | Persisted local technical implementation plan |
-| `get_pr_review_state` | PR proposal, tracking, review, analysis, fix proposal |
-| `get_next_recommended_step` | Conservative next recommended workflow step |
-| `prepare_commit_for_task` | Read-only Git diff preview: branch, files, commit message suggestion |
-| `get_power_platform_ai_kit_status` | AI Kit configuration and required file presence check |
-| `run_dataverse_check_for_task` | Trigger read-only Primarch metadata check; persists report locally |
-| `get_dataverse_verification_report` | Return the stored Dataverse verification report (no new check) |
-| `get_external_action_proposal` | Return externalActionPreview, approval gate, execution tracking |
-| `get_implementation_verification_state` | Build check, Dataverse check override, AI code review, local test, consultant testing |
-| `get_implementation_readiness` | isImplementationReady, blockers, warnings, recommendedNextStep for plugin/script tasks |
-| `get_developer_work_packet` | AI-facing work packet: canWriteCode, why, target path, implementation instructions, conventions, verification, review/test/commit guidance |
-| `continue_developer_workflow` | Next required post-implementation step: record results, Dataverse verification, AI Kit review, or branch creation. Call after every file write. |
-| `get_task_templates` | Built-in setup templates and matched template for a task title |
-| `run_implementation_verification` | Orchestrates Script File Readiness, Local Static/Business-Rule Verification, and (when configured) automated Dataverse Metadata Check for script/ribbon tasks; reports whether AI Kit review still needs the calling agent to run it via `record_ai_kit_review_result` |
-| `get_implementation_verification_summary` | Same modal-truth Implementation Verification summary as `run_implementation_verification`, from currently persisted state only (does not re-run any check) |
-| `get_task_workbench_mcp_capabilities` | Health/capability check for the current MCP session: bridge mode (live-rust/js-fallback/offline), which developer-workflow tools are actually available, missing required tools, recommended action. Call this after a "tool not found"/"bridge is not running" error, or before relying on automated Dataverse/AI Kit verification |
-
-AI clients should use `get_developer_work_packet` as the default first read for
-developer work. It hides Task Workbench internal workflow state and returns a
-single decision: whether code may be written and what to do next.
-
-### Local-write
-
-These tools update only local task-workbench state. No external system is called.
-
-**Task lifecycle**
-
-| Tool | Purpose |
-|------|---------|
-| `create_task` | Create a new task with full field validation |
-| `append_task_note` | Append a note to task.notes |
-| `update_task_summary` | Update compact summary and optional next-step text |
-| `save_task_analysis` | Save AI analysis: summary, requirements, assumptions, questions, risks |
-| `set_task_status` | Set status (enum validated). Prefer `set_task_phase` for workflow consistency |
-| `set_task_attention_state` | Set or clear attentionState (enum validated) |
-| `set_task_waiting_state` | Set or clear waitingState (enum validated) |
-| `set_task_phase` | Set phase: new / analyzed / development / testing / review / done. `phase="new"` on a task that already carries workflow state (analysis, developer setup, technical plan/approvals, implementation verification, AI reviews, test/checklist results, next-step state, or local Git workflow tracking) performs a **complete reset** of that state back to a fresh NEW task — not just a status change. Requires `confirmReset: true` unless the task is already clean (idempotent no-op). Never touches repository files, Git, Dataverse, or any external system. Preserves identity, original assignment, notes, and import/tracking metadata. |
-| `set_task_estimate` | Set effort estimate in hours |
-| `set_task_next_step` | Set AI-recommended next action and reason |
-| `update_task_checklist_item` | Set status of a workflow checklist item |
-
-**Developer workflow setup**
-
-| Tool | Purpose |
-|------|---------|
-| `set_task_mode` | Set mode: developer or general |
-| `set_task_work_classification` | Set work kind (`plugin`, `script`, `ribbon`, `repo-only`, `bugfix`, `review`, `general`, `unknown`) and work action |
-| `set_task_developer_target` | Set repo root, plugin project, script path, customer |
-| `prepare_developer_task` | Apply safe template/default setup, derive target, draft a technical plan, and stop at approval gate/blocker |
-| `confirm_task_setup` | Record setup confirmation; advance new → analyzed |
-
-**CRM workflow**
-
-| Tool | Purpose |
-|------|---------|
-| `save_technical_plan` | Save plan: summary, steps, entities, test plan, risks, pluginTarget, scriptTarget |
-| `mark_technical_plan_ready_for_approval` | Mark plan ready for in-app user review |
-| `record_external_action_completed` | Record that the developer manually completed an external action (plugin registration, web resource upload, etc.) |
-| `record_ai_kit_review_result` | Record the result of an AI Kit / Client-API code review performed by the calling AI agent itself (`reviewSource: "claude-ai-kit"`). Persists to `implementationVerification.aiCodeReview` and `task.aiKitReview`. Calls no external LLM/API. |
-| `record_local_test` | Record local test result |
-| `record_consultant_testing` | Record consultant testing status |
-| `mark_testing_confirmed_prepare_commit` | Mark consultant testing confirmed; set next step to prepare commit |
-
-**PR workflow**
-
-| Tool | Purpose |
-|------|---------|
-| `record_manual_pr` | Record a PR created manually outside task-workbench |
-| `save_pr_review_analysis` | Save PR review analysis: summary, action items, warnings |
-| `save_pr_fix_proposal` | Save PR fix proposal: summary and proposed changes |
-
-### Git-write (3 tools)
-
-These tools modify the local Git repository. No PR is created. No GitHub/Azure DevOps API is called.
-
-| Tool | Safety constraints |
-|------|-------------------|
-| `prepare_commit_for_task` | Read-only preview — does not stage, commit, or push |
-| `commit_task_changes` | Stages files and creates a commit. Rejects noise files. Unrelated files require `confirmUnrelatedFiles`; `.gitignore`d files require `forceAddFiles`. Does NOT push. |
-| `push_task_branch` | Pushes current branch. Push to main/master blocked. No force push. |
-| `commit_and_push_task_changes` | Commit + push in one step. Same guards, including `confirmUnrelatedFiles`/`forceAddFiles`. Optional phase advance. |
-
-### Guarded / test-only (2 tools)
-
-| Tool | Guard |
-|------|-------|
-| `create_test_task` | Creates a task flagged with `mcpTestTask=true` for smoke testing |
-| `delete_test_task` | Deletes only tasks where `mcpTestTask=true`. Cannot delete real tasks. |
-
-## Safety rules
-
-- Bridge binds to `127.0.0.1` only (localhost, not network-accessible)
-- No Dataverse write tools
-- No GitHub / Azure DevOps write tools
-- No plugin registration, web resource upload, or customization publish tools
-- No repo file write tools (only Git stage/commit/push with strict guards)
-- `prepare_developer_task` writes only local task setup/plan metadata; it never writes code, registers plugins, uploads web resources, or calls external systems
-- No raw secrets, env vars, bridge tokens, or raw email HTML in tool responses
-- Write tools validate task IDs and enum values before modifying state
-- Write tools sanitize free-text fields (length limits, HTML stripping)
-- `record_external_action_completed` records completion locally — it does not call any external system
-- Git push to main/master is blocked; no force push
-- `delete_test_task` is scoped to `mcpTestTask=true` tasks only
-- `set_task_phase(phase="new")` cannot silently discard a task's workflow state — a populated task requires explicit `confirmReset: true`, and the rejection message describes exactly what would be cleared
-
-## Tool count summary (v0.6.0)
-
-- Tool counts are published dynamically by `tools/list`.
-- High-level setup should prefer `prepare_developer_task`; low-level setup tools remain available for manual or corrective updates.
+The server does not expose Git, file generation, deployment, testing, coding,
+prompt-policy, agent-management, task-execution, commit, push, or pull-request
+tools. The pre-2.0 source is retained under `mcp/legacy/` as a disabled migration
+archive only.

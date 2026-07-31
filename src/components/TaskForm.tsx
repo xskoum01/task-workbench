@@ -1,10 +1,7 @@
 import { useState } from 'react';
-import type { Task, TaskSource, TaskType } from '../types';
+import type { Task, TaskObligationKind, TaskSource, TaskStatus, TaskType } from '../types';
 import { useApp } from '../context/AppContext';
 import Modal from './Modal';
-import ResetWorkflowConfirmModal from './ResetWorkflowConfirmModal';
-import { type TaskPhase, PHASE_OPTIONS, getTaskPhase, applyTaskPhase } from '../lib/taskPhase';
-import { taskHasResettableWorkflowState, resetTaskWorkflowToNew } from '../lib/taskWorkflowReset';
 
 interface TaskFormProps {
   onClose: () => void;
@@ -14,13 +11,18 @@ interface TaskFormProps {
 
 interface FormState {
   title: string;
+  description: string;
   customerId: string;
   taskType: TaskType;
+  obligationKind: TaskObligationKind;
+  responsibleParty: string;
+  accountableTo: string;
   source: TaskSource;
-  /** Uses the shared TaskPhase vocabulary; converted via applyTaskPhase() before saving. */
-  status: TaskPhase;
+  status: TaskStatus;
   confidence: string; // string while editing, converted on submit
   originalMessage: string;
+  dueAt: string;
+  estimatedEffort: string;
   // Tracking
   ticketUrl: string;
   devopsTaskUrl: string;
@@ -33,7 +35,7 @@ const TASK_TYPE_OPTIONS: { value: TaskType; label: string }[] = [
   { value: 'feature',   label: 'Feature'    },
   { value: 'review',    label: 'Review'     },
   { value: 'question',  label: 'Question'   },
-  { value: 'deployment',label: 'Deployment' },
+  { value: 'deployment',label: 'Delivery'   },
   { value: 'other',     label: 'Other'      },
 ];
 
@@ -43,16 +45,30 @@ const SOURCE_OPTIONS: { value: TaskSource; label: string }[] = [
   { value: 'teams',  label: 'Teams'   },
 ];
 
+const STATUS_OPTIONS: Array<{ value: TaskStatus; label: string }> = [
+  { value: 'new', label: 'Planned' },
+  { value: 'analyzed', label: 'Ready' },
+  { value: 'in-progress', label: 'In progress' },
+  { value: 'ready-for-review', label: 'Review' },
+  { value: 'blocked', label: 'Blocked' },
+  { value: 'done', label: 'Completed' },
+];
 
 function blankForm(customers: { id: string }[], defaultConfidence: number): FormState {
   return {
     title:           '',
+    description:     '',
     customerId:      customers[0]?.id ?? '',
     taskType:        'other',
+    obligationKind:  'task',
+    responsibleParty:'',
+    accountableTo:   '',
     source:          'manual',
     status:          'new',
     confidence:      String(defaultConfidence),
     originalMessage: '',
+    dueAt:           '',
+    estimatedEffort: '',
     ticketUrl:       '',
     devopsTaskUrl:   '',
     budgetHours:     '',
@@ -63,12 +79,18 @@ function blankForm(customers: { id: string }[], defaultConfidence: number): Form
 function taskToForm(task: Task): FormState {
   return {
     title:           task.title,
+    description:     task.description ?? '',
     customerId:      task.customerId,
     taskType:        task.taskType,
+    obligationKind:  task.obligationKind ?? 'task',
+    responsibleParty:task.responsibleParty ?? '',
+    accountableTo:   task.accountableTo ?? '',
     source:          task.source,
-    status:          getTaskPhase(task),
+    status:          task.status,
     confidence:      String(task.confidence),
     originalMessage: task.originalMessage,
+    dueAt:           task.dueAt ? task.dueAt.slice(0, 10) : '',
+    estimatedEffort: task.estimatedEffort !== undefined ? String(task.estimatedEffort) : '',
     ticketUrl:       task.ticketUrl ?? '',
     devopsTaskUrl:   task.devopsTaskUrl ?? '',
     budgetHours:     task.budgetHours !== undefined ? String(task.budgetHours) : '',
@@ -85,7 +107,6 @@ export default function TaskForm({ onClose, initialTask }: TaskFormProps) {
   );
   const [saving, setSaving]               = useState(false);
   const [validationError, setValidationError] = useState('');
-  const [showResetConfirm, setShowResetConfirm] = useState(false);
 
   function set<K extends keyof FormState>(key: K, value: FormState[K]) {
     setForm((prev) => ({ ...prev, [key]: value }));
@@ -95,8 +116,17 @@ export default function TaskForm({ onClose, initialTask }: TaskFormProps) {
   async function performSave() {
     const confidence  = Math.min(100, Math.max(0, parseInt(form.confidence, 10) || 0));
     const budgetHours = form.budgetHours !== '' ? parseFloat(form.budgetHours) : undefined;
+    const estimatedEffort = form.estimatedEffort !== '' ? parseFloat(form.estimatedEffort) : undefined;
+    const dueAt = form.dueAt ? new Date(`${form.dueAt}T23:59:59`).toISOString() : undefined;
 
     const trackingFields = {
+      description:    form.description.trim() || undefined,
+      obligationKind: form.obligationKind,
+      responsibleParty: form.responsibleParty.trim() || undefined,
+      accountableTo:  form.accountableTo.trim() || undefined,
+      dueAt,
+      estimatedEffort: estimatedEffort !== undefined && !isNaN(estimatedEffort) ? estimatedEffort : undefined,
+      estimatedEffortConfirmed: estimatedEffort !== undefined && !isNaN(estimatedEffort),
       ticketUrl:      form.ticketUrl.trim()    || undefined,
       devopsTaskUrl:  form.devopsTaskUrl.trim() || undefined,
       budgetHours:    budgetHours !== undefined && !isNaN(budgetHours) ? budgetHours : undefined,
@@ -106,17 +136,12 @@ export default function TaskForm({ onClose, initialTask }: TaskFormProps) {
     setSaving(true);
     try {
       if (initialTask) {
-        // Selecting NEW on an existing task must fully reset its workflow state, not just
-        // status — see src/lib/taskWorkflowReset.ts.
-        const phasePatch = form.status === 'new'
-          ? resetTaskWorkflowToNew(initialTask)
-          : applyTaskPhase(form.status);
         await updateTask(initialTask.id, {
           title:           form.title.trim(),
           customerId:      form.customerId,
           taskType:        form.taskType,
           source:          form.source,
-          ...phasePatch,
+          status:           form.status,
           confidence,
           originalMessage: form.originalMessage.trim(),
           ...trackingFields,
@@ -127,7 +152,7 @@ export default function TaskForm({ onClose, initialTask }: TaskFormProps) {
           customerId:      form.customerId,
           taskType:        form.taskType,
           source:          form.source,
-          ...applyTaskPhase(form.status),
+          status:           form.status,
           confidence,
           originalMessage: form.originalMessage.trim(),
           ...trackingFields,
@@ -149,15 +174,6 @@ export default function TaskForm({ onClose, initialTask }: TaskFormProps) {
       return;
     }
 
-    if (initialTask && form.status === 'new' && taskHasResettableWorkflowState(initialTask)) {
-      setShowResetConfirm(true);
-      return;
-    }
-    await performSave();
-  }
-
-  async function handleConfirmReset() {
-    setShowResetConfirm(false);
     await performSave();
   }
 
@@ -165,14 +181,13 @@ export default function TaskForm({ onClose, initialTask }: TaskFormProps) {
     <>
       <button className="btn btn-ghost" onClick={onClose} disabled={saving}>Cancel</button>
       <button className="btn btn-primary" onClick={handleSubmit} disabled={saving}>
-        {saving ? (isEditing ? 'Saving…' : 'Creating…') : (isEditing ? 'Save Task' : 'Create Task')}
+        {saving ? (isEditing ? 'Saving…' : 'Creating…') : (isEditing ? 'Save record' : 'Create record')}
       </button>
     </>
   );
 
   return (
-    <>
-    <Modal title={isEditing ? 'Edit Task' : 'New Task'} onClose={onClose} footer={footer} size="lg">
+    <Modal title={isEditing ? 'Edit work item' : 'New work item'} onClose={onClose} footer={footer} size="lg">
       {/* Title */}
       <div className="form-group">
         <label className="form-label form-label-required">Title</label>
@@ -218,6 +233,56 @@ export default function TaskForm({ onClose, initialTask }: TaskFormProps) {
         </div>
       </div>
 
+      <div className="form-group">
+        <label className="form-label">Description / expected outcome</label>
+        <textarea
+          className="form-textarea"
+          placeholder="What must be true for this obligation to be complete?"
+          value={form.description}
+          onChange={(e) => set('description', e.target.value)}
+          style={{ minHeight: 84 }}
+        />
+      </div>
+
+      <div className="form-section-divider" />
+      <div className="form-section-title">Responsibility</div>
+
+      <div className="form-row-3">
+        <div className="form-group">
+          <label className="form-label">Obligation kind</label>
+          <select
+            className="form-select"
+            value={form.obligationKind}
+            onChange={(e) => set('obligationKind', e.target.value as TaskObligationKind)}
+          >
+            <option value="task">Task</option>
+            <option value="responsibility">Responsibility</option>
+            <option value="commitment">Commitment</option>
+            <option value="follow-up">Follow-up</option>
+          </select>
+        </div>
+        <div className="form-group">
+          <label className="form-label">Responsible party</label>
+          <input
+            className="form-input"
+            type="text"
+            placeholder="Person, team, or system"
+            value={form.responsibleParty}
+            onChange={(e) => set('responsibleParty', e.target.value)}
+          />
+        </div>
+        <div className="form-group">
+          <label className="form-label">Accountable to</label>
+          <input
+            className="form-input"
+            type="text"
+            placeholder="Stakeholder or customer"
+            value={form.accountableTo}
+            onChange={(e) => set('accountableTo', e.target.value)}
+          />
+        </div>
+      </div>
+
       {/* Source + Status + Confidence */}
       <div className="form-row-3">
         <div className="form-group">
@@ -234,13 +299,13 @@ export default function TaskForm({ onClose, initialTask }: TaskFormProps) {
         </div>
 
         <div className="form-group">
-          <label className="form-label">Phase</label>
+          <label className="form-label">Status</label>
           <select
             className="form-select"
             value={form.status}
-            onChange={(e) => set('status', e.target.value as TaskPhase)}
+            onChange={(e) => set('status', e.target.value as TaskStatus)}
           >
-            {PHASE_OPTIONS.map((o) => (
+            {STATUS_OPTIONS.map((o) => (
               <option key={o.value} value={o.value}>{o.label}</option>
             ))}
           </select>
@@ -255,6 +320,30 @@ export default function TaskForm({ onClose, initialTask }: TaskFormProps) {
             max={100}
             value={form.confidence}
             onChange={(e) => set('confidence', e.target.value)}
+          />
+        </div>
+      </div>
+
+      <div className="form-row">
+        <div className="form-group">
+          <label className="form-label">Deadline</label>
+          <input
+            className="form-input"
+            type="date"
+            value={form.dueAt}
+            onChange={(e) => set('dueAt', e.target.value)}
+          />
+        </div>
+        <div className="form-group">
+          <label className="form-label">Estimated effort (hours)</label>
+          <input
+            className="form-input"
+            type="number"
+            min={0}
+            step={0.25}
+            placeholder="e.g. 2.5"
+            value={form.estimatedEffort}
+            onChange={(e) => set('estimatedEffort', e.target.value)}
           />
         </div>
       </div>
@@ -332,13 +421,5 @@ export default function TaskForm({ onClose, initialTask }: TaskFormProps) {
         </div>
       )}
     </Modal>
-    {showResetConfirm && (
-      <ResetWorkflowConfirmModal
-        onConfirm={handleConfirmReset}
-        onCancel={() => setShowResetConfirm(false)}
-        busy={saving}
-      />
-    )}
-    </>
   );
 }
