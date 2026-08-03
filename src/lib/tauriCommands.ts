@@ -70,6 +70,21 @@ export interface WorkItemChangesResult {
   nextCursor: number | null;
 }
 
+export interface TaskRecordDetailResult {
+  apiVersion: string;
+  canonical: WorkItem;
+  legacyTask: Task | Record<string, unknown>;
+  derived: {
+    workflowType: 'developer' | 'general';
+    recordStatus: string;
+    recordStatusLabel: string;
+    recordStatusOptions: Array<{ value: string; label: string }>;
+    planningBucket: string | null;
+    notesText: string;
+    externalLinks: unknown[];
+  };
+}
+
 export function initializeWorkItemStorage(): Promise<WorkItemMigrationReport> {
   return invoke<WorkItemMigrationReport>('initialize_work_item_storage');
 }
@@ -80,6 +95,10 @@ export function listWorkItems(includeArchived = false, limit = 200): Promise<Wor
 
 export function getWorkItem(id: string): Promise<WorkItem | null> {
   return invoke<WorkItem | null>('get_work_item', { id });
+}
+
+export function getTaskRecord(id: string): Promise<TaskRecordDetailResult> {
+  return invoke<TaskRecordDetailResult>('get_task_record', { id });
 }
 
 export function createWorkItem(item: WorkItem, idempotencyKey?: string): Promise<WorkItem> {

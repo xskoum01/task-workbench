@@ -7405,6 +7405,141 @@ fn canonical_detail(item: &WorkItem) -> Value {
     detail
 }
 
+fn task_record_phase_from_legacy(legacy_task: &Value, canonical: &WorkItem) -> &'static str {
+    if legacy_task["attentionState"].as_str() == Some("pr-comments") {
+        return "pr-comments";
+    }
+    match legacy_task["waitingState"].as_str() {
+        Some("pricing-approval") => return "waiting-estimate-approval",
+        Some("consultant-testing") => return "waiting-consultant-testing",
+        Some("code-review") => return "waiting-review",
+        Some(_) => return "waiting-review",
+        None => {}
+    }
+    match legacy_task["status"].as_str() {
+        Some("new") => "new",
+        Some("analyzed") => "analyzed",
+        Some("in-progress") => "development",
+        Some("ready-for-review") => "waiting-review",
+        Some("done") => "done",
+        Some("blocked") => "blocked",
+        _ => match canonical.status {
+            WorkItemStatus::Planned => "new",
+            WorkItemStatus::Ready => "analyzed",
+            WorkItemStatus::InProgress => "development",
+            WorkItemStatus::Waiting | WorkItemStatus::Review => "waiting-review",
+            WorkItemStatus::Completed | WorkItemStatus::Cancelled => "done",
+            WorkItemStatus::Blocked => "blocked",
+        },
+    }
+}
+
+fn task_record_phase_label(phase: &str, workflow_type: &str) -> &'static str {
+    if workflow_type == "general" {
+        return match phase {
+            "new" => "New",
+            "done" => "Done",
+            "waiting-review" => "Waiting for colleague",
+            _ => "Analyzed",
+        };
+    }
+    match phase {
+        "new" => "New",
+        "analyzed" => "Need estimate",
+        "waiting-estimate-approval" => "Waiting for estimate approval",
+        "development" => "Development",
+        "waiting-consultant-testing" => "Testing",
+        "waiting-review" => "Waiting for code review",
+        "done" => "Done",
+        "blocked" => "Blocked",
+        "pr-comments" => "PR comments",
+        _ => "New",
+    }
+}
+
+fn task_record_phase_options(workflow_type: &str) -> Value {
+    let options: &[(&str, &str)] = if workflow_type == "general" {
+        &[
+            ("new", "New"),
+            ("analyzed", "Analyzed"),
+            ("waiting-review", "Waiting for colleague"),
+            ("done", "Done"),
+        ]
+    } else {
+        &[
+            ("new", "New"),
+            ("analyzed", "Need estimate"),
+            ("waiting-estimate-approval", "Waiting for estimate approval"),
+            ("development", "Development"),
+            ("waiting-consultant-testing", "Testing"),
+            ("waiting-review", "Waiting for code review"),
+            ("done", "Done"),
+        ]
+    };
+    Value::Array(options.iter().map(|(value, label)| serde_json::json!({"value": value, "label": label})).collect())
+}
+
+fn task_record_workflow_type(legacy_task: &Value) -> &'static str {
+    match legacy_task["taskMode"].as_str() {
+        Some("developer") => "developer",
+        Some("general") => "general",
+        _ => {
+            let has_dev_context = legacy_task.get("workflowSetup").is_some()
+                || legacy_task.get("crmDeveloperWorkflow").is_some()
+                || legacy_task.get("devopsTaskUrl").and_then(Value::as_str).is_some_and(|v| !v.trim().is_empty())
+                || legacy_task.get("adoContext").is_some();
+            if has_dev_context { "developer" } else { "general" }
+        }
+    }
+}
+
+fn task_record_notes_text(canonical: &WorkItem, legacy_task: &Value) -> String {
+    if let Some(notes) = legacy_task["notes"].as_str().filter(|value| !value.trim().is_empty()) {
+        return notes.to_string();
+    }
+    canonical
+        .context
+        .iter()
+        .filter(|entry| entry.entry_type == "note")
+        .filter_map(|entry| entry.text.as_deref())
+        .filter(|text| !text.trim().is_empty())
+        .collect::<Vec<_>>()
+        .join("\n\n")
+}
+
+fn task_record_detail(canonical: &WorkItem, legacy_task: Value) -> Value {
+    let workflow_type = task_record_workflow_type(&legacy_task);
+    let phase = task_record_phase_from_legacy(&legacy_task, canonical);
+    let canonical_detail_value = canonical_detail(canonical);
+    let external_links = canonical_detail_value
+        .get("externalReferences")
+        .cloned()
+        .unwrap_or_else(|| Value::Array(vec![]));
+    let planning_bucket = canonical
+        .planning_bucket
+        .clone()
+        .map(Value::String)
+        .or_else(|| canonical.metadata.get("planningBucket").cloned())
+        .unwrap_or(Value::Null);
+    let notes_text = task_record_notes_text(canonical, &legacy_task);
+    let record_status_label = task_record_phase_label(phase, workflow_type);
+    let record_status_options = task_record_phase_options(workflow_type);
+    serde_json::json!({
+        "apiVersion": "1",
+        "canonical": canonical_detail_value,
+        "legacyTask": legacy_task,
+        "derived": {
+            "workflowType": workflow_type,
+            "recordStatus": phase,
+            "recordStatusLabel": record_status_label,
+            "recordStatusOptions": record_status_options,
+            "planningBucket": planning_bucket,
+            "notesText": notes_text,
+            "externalLinks": external_links,
+        }
+    })
+}
+
 #[tauri::command]
 fn initialize_work_item_storage(app: tauri::AppHandle) -> Result<Value, String> {
     let repo = canonical_repo(&app)?;
@@ -7428,6 +7563,16 @@ fn get_work_item(app: tauri::AppHandle, id: String) -> Result<Value, String> {
     let repo = canonical_repo(&app)?;
     let service = WorkItemApplicationService { repository: &repo };
     Ok(canonical_detail(&service.get(&id).map_err(canonical_error)?))
+}
+
+#[tauri::command]
+fn get_task_record(app: tauri::AppHandle, id: String) -> Result<Value, String> {
+    let repo = canonical_repo(&app)?;
+    let service = WorkItemApplicationService { repository: &repo };
+    let canonical = service.get(&id).map_err(canonical_error)?;
+    let legacy_snapshot = repo.get_legacy_snapshot(&id).map_err(canonical_error)?;
+    let legacy_task = crate::storage::sqlite::legacy_compatible_value(&canonical, legacy_snapshot);
+    Ok(task_record_detail(&canonical, legacy_task))
 }
 
 #[tauri::command]
@@ -7645,6 +7790,121 @@ mod planning_today_contract_tests {
         );
         assert_eq!(result["sections"]["now"].as_array().unwrap().len(), 1);
         assert_eq!(result["sections"]["now"][0]["planningBucket"], Value::Null);
+    }
+}
+
+#[cfg(test)]
+mod task_record_contract_tests {
+    use super::*;
+    use crate::domain::work_item::{
+        ActorType, ExternalReference, WorkItemContextEntry, WorkItemKind, WorkItemPriority,
+        WorkItemStatus, WORK_ITEM_SCHEMA_VERSION,
+    };
+    use std::collections::HashMap;
+
+    fn item(id: &str) -> WorkItem {
+        WorkItem {
+            schema_version: WORK_ITEM_SCHEMA_VERSION,
+            id: id.to_string(),
+            kind: WorkItemKind::Task,
+            obligation_mode: None,
+            title: format!("Title {id}"),
+            description: Some("Expected result".to_string()),
+            expected_outcome: Some("Expected result".to_string()),
+            status: WorkItemStatus::Waiting,
+            priority: WorkItemPriority::Normal,
+            owner: None,
+            accountable_to: None,
+            area_id: Some("customer-1".to_string()),
+            parent_id: None,
+            start_at: None,
+            due_at: None,
+            completed_at: None,
+            next_review_at: None,
+            blocker_reason: None,
+            source: "manual".to_string(),
+            source_url: Some("https://example.test/source".to_string()),
+            planning_bucket: Some("waiting".to_string()),
+            estimate_minutes: Some(90),
+            external_references: vec![ExternalReference {
+                reference_type: "reference".to_string(),
+                label: "Reference".to_string(),
+                id: None,
+                url: "https://example.test/ref".to_string(),
+            }],
+            tags: vec![],
+            context: vec![WorkItemContextEntry {
+                id: "note-1".to_string(),
+                entry_type: "note".to_string(),
+                text: Some("Canonical note".to_string()),
+                url: None,
+                created_at: "2026-08-01T08:00:00Z".to_string(),
+                actor_type: ActorType::User,
+                actor_name: None,
+            }],
+            created_at: "2026-08-01T08:00:00Z".to_string(),
+            updated_at: "2026-08-01T08:00:00Z".to_string(),
+            revision: 1,
+            archived_at: None,
+            history: vec![],
+            metadata: HashMap::new(),
+        }
+    }
+
+    #[test]
+    fn full_task_record_contains_canonical_legacy_and_derived_fields() {
+        let canonical = item("task-1");
+        let legacy_task = serde_json::json!({
+            "id": "task-1",
+            "title": "Title task-1",
+            "taskMode": "developer",
+            "status": "ready-for-review",
+            "waitingState": "code-review",
+            "notes": "UI note",
+            "workflowSetup": {"devTargetKind": "script"},
+            "analysisResult": {"summary": "Analyzed"},
+            "adoContext": {"type": "work-item"},
+            "emailBodyHtml": "<p>raw html</p>"
+        });
+
+        let detail = task_record_detail(&canonical, legacy_task);
+
+        assert_eq!(detail["apiVersion"], "1");
+        assert_eq!(detail["canonical"]["id"], "task-1");
+        assert_eq!(detail["legacyTask"]["workflowSetup"]["devTargetKind"], "script");
+        assert_eq!(detail["legacyTask"]["emailBodyHtml"], "<p>raw html</p>");
+        assert_eq!(detail["derived"]["workflowType"], "developer");
+        assert_eq!(detail["derived"]["recordStatus"], "waiting-review");
+        assert_eq!(detail["derived"]["recordStatusLabel"], "Waiting for code review");
+        assert_eq!(detail["derived"]["planningBucket"], "waiting");
+        assert_eq!(detail["derived"]["notesText"], "UI note");
+        assert!(detail["derived"]["externalLinks"].as_array().unwrap().len() >= 2);
+        assert_eq!(
+            detail["derived"]["recordStatusOptions"][0],
+            serde_json::json!({"value":"new","label":"New"})
+        );
+    }
+
+    #[test]
+    fn general_task_record_gets_general_status_options() {
+        let canonical = item("task-2");
+        let detail = task_record_detail(
+            &canonical,
+            serde_json::json!({"id":"task-2","title":"Title task-2","taskMode":"general","status":"analyzed"}),
+        );
+        assert_eq!(detail["derived"]["workflowType"], "general");
+        assert_eq!(detail["derived"]["recordStatus"], "analyzed");
+        assert_eq!(detail["derived"]["recordStatusLabel"], "Analyzed");
+        assert_eq!(detail["derived"]["recordStatusOptions"].as_array().unwrap().len(), 4);
+    }
+
+    #[test]
+    fn canonical_mcp_toolset_includes_full_record_read_tool() {
+        let names: Vec<String> = canonical_mcp_tool_definitions()
+            .iter()
+            .filter_map(|tool| tool["name"].as_str().map(str::to_string))
+            .collect();
+        assert!(names.contains(&"get_task_record".to_string()));
     }
 }
 
@@ -8052,7 +8312,7 @@ fn task_mcp_bridge_state() -> &'static Mutex<Value> {
             "host": TASK_MCP_BRIDGE_HOST,
             "port": TASK_MCP_BRIDGE_PORT,
             "canonicalTools": canonical_mcp_tool_definitions(),
-            "readOnlyTools": canonical_mcp_tool_definitions().into_iter().filter(|tool| matches!(tool["name"].as_str(), Some("list_work_items"|"get_work_item"|"list_work_item_changes"|"get_planning_today"))).collect::<Vec<_>>(),
+            "readOnlyTools": canonical_mcp_tool_definitions().into_iter().filter(|tool| matches!(tool["name"].as_str(), Some("list_work_items"|"get_work_item"|"get_task_record"|"list_work_item_changes"|"get_planning_today"))).collect::<Vec<_>>(),
             "localWriteTools": canonical_mcp_tool_definitions().into_iter().filter(|tool| matches!(tool["name"].as_str(), Some("create_work_item"|"update_work_item"|"transition_work_item"|"append_work_item_note"))).collect::<Vec<_>>(),
             "readOnlyMode": false,
             "localWriteMode": true,
@@ -8079,7 +8339,7 @@ fn task_mcp_current_bridge_state() -> Value {
                 "host": TASK_MCP_BRIDGE_HOST,
                 "port": TASK_MCP_BRIDGE_PORT,
                 "canonicalTools": canonical_mcp_tool_definitions(),
-                "readOnlyTools": canonical_mcp_tool_definitions().into_iter().filter(|tool| matches!(tool["name"].as_str(), Some("list_work_items"|"get_work_item"|"list_work_item_changes"|"get_planning_today"))).collect::<Vec<_>>(),
+                "readOnlyTools": canonical_mcp_tool_definitions().into_iter().filter(|tool| matches!(tool["name"].as_str(), Some("list_work_items"|"get_work_item"|"get_task_record"|"list_work_item_changes"|"get_planning_today"))).collect::<Vec<_>>(),
                 "localWriteTools": canonical_mcp_tool_definitions().into_iter().filter(|tool| matches!(tool["name"].as_str(), Some("create_work_item"|"update_work_item"|"transition_work_item"|"append_work_item_note"))).collect::<Vec<_>>(),
                 "readOnlyMode": false,
                 "localWriteMode": true,
@@ -8353,6 +8613,7 @@ fn canonical_mcp_tool_definitions() -> Vec<Value> {
     vec![
         serde_json::json!({"name":"list_work_items","description":"List canonical task and obligation summaries. Read-only; never executes work.","inputSchema":{"type":"object","additionalProperties":false,"properties":{"includeArchived":{"type":"boolean"},"limit":{"type":"integer","minimum":1,"maximum":500},"cursor":{"type":"string"},"status":{"type":"string"},"kind":{"type":"string"},"owner":{"type":"string"},"area":{"type":"string"},"source":{"type":"string"},"planningBucket":{"type":"string"},"dueBefore":{"type":"string"},"dueAfter":{"type":"string"},"updatedAfter":{"type":"string"}}},"outputSchema":{"type":"object","required":["apiVersion","generatedAt","snapshotRevision","items","nextCursor"],"properties":{"apiVersion":{"const":"1"},"generatedAt":{"type":"string"},"snapshotRevision":{"type":"integer"},"items":{"type":"array","items":mcp_work_item_summary_schema()},"nextCursor":{"type":["string","null"]}}}}),
         serde_json::json!({"name":"get_work_item","description":"Get one canonical work-item detail by stable id.","inputSchema":{"type":"object","required":["id"],"additionalProperties":false,"properties":{"id":{"type":"string","minLength":1}}}}),
+        serde_json::json!({"name":"get_task_record","description":"Get one full Task Workbench task record for trusted local integrations. Includes canonical work item, UI-compatible legacy task JSON, and derived workflow/status/link fields.","inputSchema":{"type":"object","required":["id"],"additionalProperties":false,"properties":{"id":{"type":"string","minLength":1}}}}),
         serde_json::json!({"name":"list_work_item_changes","description":"Read ordered changes after a revision cursor.","inputSchema":{"type":"object","additionalProperties":false,"properties":{"after":{"type":"integer","minimum":0},"limit":{"type":"integer","minimum":1,"maximum":500}}}}),
         serde_json::json!({"name":"create_work_item","description":"Create a canonical task or obligation record only.","inputSchema":{"type":"object","required":["item"],"additionalProperties":false,"properties":{"item":{"type":"object"},"idempotencyKey":{"type":"string"}}}}),
         serde_json::json!({"name":"update_work_item","description":"Update canonical work-item data with expected revision.","inputSchema":{"type":"object","required":["id","item","expectedRevision"],"additionalProperties":false,"properties":{"id":{"type":"string"},"item":{"type":"object"},"expectedRevision":{"type":"integer","minimum":1},"actorName":{"type":"string"}}}}),
@@ -8366,6 +8627,7 @@ fn task_mcp_execute_canonical_tool(app: &tauri::AppHandle, name: &str, args: &Va
     match name {
         "list_work_items" => list_work_items(app.clone(), args["includeArchived"].as_bool(), args["limit"].as_u64().map(|v| v as usize), args["status"].as_str().map(str::to_string), args["kind"].as_str().map(str::to_string), args["owner"].as_str().map(str::to_string), args["area"].as_str().map(str::to_string), args["source"].as_str().map(str::to_string), args["planningBucket"].as_str().map(str::to_string), args["dueBefore"].as_str().map(str::to_string), args["dueAfter"].as_str().map(str::to_string), args["updatedAfter"].as_str().map(str::to_string), args["cursor"].as_str().map(str::to_string)),
         "get_work_item" => get_work_item(app.clone(), args["id"].as_str().unwrap_or_default().to_string()),
+        "get_task_record" => get_task_record(app.clone(), args["id"].as_str().unwrap_or_default().to_string()),
         "list_work_item_changes" => list_work_item_changes(app.clone(), args["after"].as_i64(), args["limit"].as_u64().map(|v| v as usize)),
         "create_work_item" => { let item: WorkItem = serde_json::from_value(args["item"].clone()).map_err(|e| e.to_string())?; create_work_item(app.clone(), item, args["idempotencyKey"].as_str().map(str::to_string)) },
         "update_work_item" => { let item: WorkItem = serde_json::from_value(args["item"].clone()).map_err(|e| e.to_string())?; update_work_item(app.clone(), args["id"].as_str().unwrap_or_default().to_string(), item, args["expectedRevision"].as_i64().unwrap_or(0), args["actorName"].as_str().map(str::to_string)) },
@@ -16870,7 +17132,7 @@ fn handle_canonical_http(app: &tauri::AppHandle, method: &str, raw_path: &str, b
         if let Err(error) = canonical_storage_ready(app) {
             return Some((503, canonical_http_envelope(false, serde_json::json!({"code":"work_item_storage_unavailable","message":error}), &correlation_id)));
         }
-        return Some((200, canonical_http_envelope(true, serde_json::json!({"capabilities":["work-items.list","work-items.detail","work-items.changes","work-items.create","work-items.update","work-items.transition","work-items.notes","planning.today","mcp.canonical-v1"]}), &correlation_id)));
+        return Some((200, canonical_http_envelope(true, serde_json::json!({"capabilities":["work-items.list","work-items.detail","work-items.changes","work-items.create","work-items.update","work-items.transition","work-items.notes","task-records.detail","planning.today","mcp.canonical-v1"]}), &correlation_id)));
     }
     let json: Value = serde_json::from_str(body).unwrap_or_else(|_| serde_json::json!({}));
     eprintln!("[task-mcp-bridge] canonical route selected correlationId={} endpoint={}", correlation_id, path);
@@ -16880,6 +17142,9 @@ fn handle_canonical_http(app: &tauri::AppHandle, method: &str, raw_path: &str, b
         list_work_item_changes(app.clone(), query.get("afterRevision").or_else(|| query.get("after")).and_then(|v| v.parse().ok()), query.get("limit").and_then(|v| v.parse().ok()))
     } else if method == "GET" && path == "/api/v1/planning/today" {
         get_planning_today(app.clone(), query.get("timezone").cloned())
+    } else if let Some(id) = path.strip_prefix("/api/v1/task-records/") {
+        if method == "GET" && !id.contains('/') { get_task_record(app.clone(), id.to_string()) }
+        else { Err("Endpoint not found.".to_string()) }
     } else if method == "POST" && path == "/api/v1/work-items" {
         serde_json::from_value::<WorkItem>(json.get("item").cloned().unwrap_or(json.clone())).map_err(|e| e.to_string()).and_then(|item| create_work_item(app.clone(), item, json["idempotencyKey"].as_str().map(str::to_string)))
     } else if let Some(id) = path.strip_prefix("/api/v1/work-items/") {
@@ -26883,6 +27148,7 @@ pub fn run() {
             initialize_work_item_storage,
             list_work_items,
             get_work_item,
+            get_task_record,
             list_work_item_changes,
             create_work_item,
             update_work_item,

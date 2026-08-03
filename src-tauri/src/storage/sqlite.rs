@@ -476,6 +476,25 @@ impl SqliteWorkItemRepository {
             .map_err(|error| ApplicationError::storage(error.to_string()))
     }
 
+    pub fn get_legacy_snapshot(&self, id: &str) -> Result<Option<Value>, ApplicationError> {
+        self.initialize()?;
+        let connection = self.connect()?;
+        let raw = connection
+            .query_row(
+                "SELECT legacy_json FROM work_items WHERE id = ?1",
+                [id],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()
+            .map_err(|error| ApplicationError::storage(error.to_string()))?
+            .flatten();
+        raw.map(|value| {
+            serde_json::from_str(&value)
+                .map_err(|error| ApplicationError::storage(error.to_string()))
+        })
+        .transpose()
+    }
+
     pub fn clear_all(&self) -> Result<(), ApplicationError> {
         self.initialize()?;
         let mut connection = self.connect()?;
@@ -960,7 +979,7 @@ fn legacy_status(item: &WorkItem) -> (&'static str, Option<&'static str>) {
     }
 }
 
-fn legacy_compatible_value(item: &WorkItem, legacy: Option<Value>) -> Value {
+pub(crate) fn legacy_compatible_value(item: &WorkItem, legacy: Option<Value>) -> Value {
     let mut object = legacy
         .and_then(|value| value.as_object().cloned())
         .unwrap_or_else(Map::new);

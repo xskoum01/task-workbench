@@ -11,6 +11,7 @@ describe('Task Workbench MCP 2.x boundary', () => {
       'append_work_item_note',
       'create_work_item',
       'get_planning_today',
+      'get_task_record',
       'get_work_item',
       'list_work_item_changes',
       'list_work_items',

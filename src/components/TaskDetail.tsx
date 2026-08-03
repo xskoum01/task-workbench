@@ -368,8 +368,8 @@ function PlanningSection({ task }: PlanningSectionProps) {
     <div className="detail-section detail-planning-section">
       <span className="detail-section-label">Planning</span>
 
-      {/* Due date + effort row */}
-      {(task.dueAt || task.estimatedEffort !== undefined) && (
+      {/* Due date + effort / budget row */}
+      {(task.dueAt || task.estimatedEffort !== undefined || task.budgetHours !== undefined) && (
         <div className="detail-planning-meta">
           {task.dueAt && (
             <div className={`detail-planning-meta-item${taskOverdue ? ' detail-planning-meta-item--overdue' : ''}`}>
@@ -386,6 +386,13 @@ function PlanningSection({ task }: PlanningSectionProps) {
               <Icon name="effort" size={12} className="detail-planning-meta-icon" />
               <span className="detail-planning-meta-label">Effort</span>
               <span className="detail-planning-meta-value">{formatEffort(task.estimatedEffort)}</span>
+            </div>
+          )}
+          {task.budgetHours !== undefined && (
+            <div className="detail-planning-meta-item">
+              <Icon name="effort" size={12} className="detail-planning-meta-icon" />
+              <span className="detail-planning-meta-label">Budget</span>
+              <span className="detail-planning-meta-value">{formatEffort(task.budgetHours)}</span>
             </div>
           )}
         </div>

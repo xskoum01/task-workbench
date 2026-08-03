@@ -36,6 +36,7 @@ created by the bridge, and are not returned by status responses.
 |---|---:|---|
 | `list_work_items` | No | List canonical tasks and obligations |
 | `get_work_item` | No | Read one record by stable ID |
+| `get_task_record` | No | Read the full trusted-local Task Workbench record for integrations |
 | `list_work_item_changes` | No | Read ordered changes after a cursor |
 | `create_work_item` | Yes | Create a canonical record |
 | `update_work_item` | Yes | Replace record data with revision checking |
@@ -60,6 +61,11 @@ records can only be reopened into `planned`.
 - JSON Schema: [`work-item.schema.json`](./work-item.schema.json)
 - Local REST OpenAPI: [`openapi.yaml`](./openapi.yaml)
 - Legacy boundary: [`legacy-boundary.md`](./legacy-boundary.md)
+
+`get_task_record` and `GET /api/v1/task-records/{id}` intentionally expose a
+more complete local record than the provider-neutral `WorkItem`: canonical data,
+the UI-compatible task JSON, and derived workflow/status/link fields for trusted
+local clients such as Jarvis.
 
 ## Explicit exclusions
 

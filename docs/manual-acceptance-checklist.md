@@ -68,6 +68,7 @@ Restart the app once more and confirm all changes remain.
 3. Confirm its tool list contains exactly:
    - `list_work_items`
    - `get_work_item`
+   - `get_task_record`
    - `list_work_item_changes`
    - `create_work_item`
    - `update_work_item`
@@ -80,6 +81,9 @@ Restart the app once more and confirm all changes remain.
 6. Call `get_planning_today` and confirm that `sections.now` and
    `sections.today` contain only records explicitly assigned to those planning
    buckets; records without a planning bucket must not be inferred into them.
+7. Call `get_task_record` for a representative work item and confirm the result
+   contains `canonical`, `legacyTask`, and `derived` with notes, status label,
+   workflow type, planning bucket, and external links.
 
 ## Completion
 

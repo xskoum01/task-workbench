@@ -27,6 +27,10 @@ function phaseForMode(phase: TaskPhase, mode: TaskMode): TaskPhase {
   return 'analyzed';
 }
 
+function formatHours(hours: number): string {
+  return Number.isInteger(hours) ? `${hours}h` : `${hours.toFixed(2).replace(/0+$/, '').replace(/\.$/, '')}h`;
+}
+
 export default function TaskRecordPanel({ task, onOpenDetail }: TaskRecordPanelProps) {
   const { updateTask } = useApp();
   const [notes, setNotes] = useState(task.notes ?? '');
@@ -147,6 +151,16 @@ export default function TaskRecordPanel({ task, onOpenDetail }: TaskRecordPanelP
             {task.estimatedEffort !== undefined && (
               <div style={{ marginTop: 4, fontSize: 12, color: 'var(--text-muted)' }}>
                 Estimated effort: {task.estimatedEffort}h
+              </div>
+            )}
+            {task.budgetHours !== undefined && (
+              <div style={{ marginTop: 4, fontSize: 12, color: 'var(--text-muted)' }}>
+                Budget: {formatHours(task.budgetHours)}
+              </div>
+            )}
+            {task.budgetNote && (
+              <div style={{ marginTop: 4, fontSize: 12, color: 'var(--text-muted)' }}>
+                Budget note: {task.budgetNote}
               </div>
             )}
           </div>

@@ -14,6 +14,10 @@ interface TaskRecordDetailProps {
   onClose: () => void;
 }
 
+function formatHours(hours: number): string {
+  return Number.isInteger(hours) ? `${hours}h` : `${hours.toFixed(2).replace(/0+$/, '').replace(/\.$/, '')}h`;
+}
+
 export default function TaskRecordDetail({ task, onClose }: TaskRecordDetailProps) {
   const { getCustomerById, updateTask } = useApp();
   const [showEditForm, setShowEditForm] = useState(false);
@@ -97,6 +101,29 @@ export default function TaskRecordDetail({ task, onClose }: TaskRecordDetailProp
             </div>
           </div>
         </div>
+
+        {(task.estimatedEffort !== undefined || task.budgetHours !== undefined || task.budgetNote) && (
+          <div className="form-row-3">
+            {task.estimatedEffort !== undefined && (
+              <div className="detail-section">
+                <span className="detail-section-label">Estimated effort</span>
+                <div style={{ color: 'var(--text-secondary)', fontSize: 13 }}>{formatHours(task.estimatedEffort)}</div>
+              </div>
+            )}
+            {task.budgetHours !== undefined && (
+              <div className="detail-section">
+                <span className="detail-section-label">Budget</span>
+                <div style={{ color: 'var(--text-secondary)', fontSize: 13 }}>{formatHours(task.budgetHours)}</div>
+              </div>
+            )}
+            {task.budgetNote && (
+              <div className="detail-section">
+                <span className="detail-section-label">Budget note</span>
+                <div style={{ color: 'var(--text-secondary)', fontSize: 13 }}>{task.budgetNote}</div>
+              </div>
+            )}
+          </div>
+        )}
 
         <div className="detail-section">
           <span className="detail-section-label">Related context</span>

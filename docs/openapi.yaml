@@ -107,6 +107,26 @@ paths:
       responses:
         "200": { description: Updated work item }
         "409": { $ref: "#/components/responses/Error" }
+  /task-records/{id}:
+    parameters:
+      - $ref: "#/components/parameters/WorkItemId"
+    get:
+      operationId: getTaskRecord
+      description: >
+        Full trusted-local Task Workbench record for application integrations
+        such as Jarvis. Includes the canonical provider-neutral work item, the
+        UI-compatible task JSON, and derived workflow/status/link fields. This
+        endpoint is intentionally more complete than `/work-items/{id}` and is
+        available only to clients with the local bridge token.
+      responses:
+        "200":
+          description: Full Task Workbench task record
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TaskRecordDetailEnvelope"
+        "401": { $ref: "#/components/responses/Error" }
+        "404": { $ref: "#/components/responses/Error" }
   /work-items/{id}/transitions:
     parameters:
       - $ref: "#/components/parameters/WorkItemId"
@@ -293,6 +313,45 @@ components:
         - type: object
           properties:
             result: { $ref: "#/components/schemas/WorkItemListResult" }
+    TaskRecordDetail:
+      type: object
+      required: [apiVersion, canonical, legacyTask, derived]
+      properties:
+        apiVersion: { const: "1" }
+        canonical:
+          description: Full canonical WorkItem detail; see work-item.schema.json.
+          $ref: ./work-item.schema.json
+        legacyTask:
+          type: object
+          additionalProperties: true
+          description: Current UI-compatible task JSON, including legacy/UI-only fields when present.
+        derived:
+          type: object
+          required: [workflowType, recordStatus, recordStatusLabel, recordStatusOptions, planningBucket, notesText, externalLinks]
+          properties:
+            workflowType: { enum: [developer, general] }
+            recordStatus: { type: string }
+            recordStatusLabel: { type: string }
+            recordStatusOptions:
+              type: array
+              items:
+                type: object
+                required: [value, label]
+                properties:
+                  value: { type: string }
+                  label: { type: string }
+            planningBucket:
+              type: [string, "null"]
+            notesText: { type: string }
+            externalLinks:
+              type: array
+              items: { type: object, additionalProperties: true }
+    TaskRecordDetailEnvelope:
+      allOf:
+        - $ref: "#/components/schemas/CanonicalEnvelope"
+        - type: object
+          properties:
+            result: { $ref: "#/components/schemas/TaskRecordDetail" }
     PlanningSections:
       type: object
       required: [now, today]

@@ -96,6 +96,17 @@ const TOOL_DEFINITIONS = [
     },
   },
   {
+    name: 'get_task_record',
+    description:
+      'Get one full Task Workbench task record for trusted local integrations. Includes canonical work item, UI-compatible task JSON, and derived workflow/status/link fields.',
+    inputSchema: {
+      type: 'object',
+      properties: { id: { type: 'string', minLength: 1 } },
+      required: ['id'],
+      additionalProperties: false,
+    },
+  },
+  {
     name: 'list_work_item_changes',
     description: 'Read the ordered work-item change feed after a numeric cursor.',
     inputSchema: {
