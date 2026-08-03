@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react';
-import type { Task, TaskStatus } from '../types';
+import type { Task } from '../types';
 import { useApp } from '../context/AppContext';
 import Modal from './Modal';
 import TaskForm from './TaskForm';
@@ -7,20 +7,12 @@ import { SourceBadge, TaskStateBadges, TypeBadge } from './StatusBadge';
 import { formatRelativeDate, isOverdue } from '../lib/dates';
 import { openExternalUrl } from '../lib/tauriCommands';
 import { expectedOutcomeCzech } from '../lib/taskPresentation';
+import { type TaskPhase, PHASE_OPTIONS, applyTaskPhase, getTaskPhase } from '../lib/taskPhase';
 
 interface TaskRecordDetailProps {
   task: Task;
   onClose: () => void;
 }
-
-const STATUS_OPTIONS: Array<{ value: TaskStatus; label: string }> = [
-  { value: 'new', label: 'New' },
-  { value: 'analyzed', label: 'Clarified' },
-  { value: 'in-progress', label: 'In progress' },
-  { value: 'ready-for-review', label: 'Awaiting review' },
-  { value: 'blocked', label: 'Blocked' },
-  { value: 'done', label: 'Done' },
-];
 
 export default function TaskRecordDetail({ task, onClose }: TaskRecordDetailProps) {
   const { getCustomerById, updateTask } = useApp();
@@ -65,10 +57,10 @@ export default function TaskRecordDetail({ task, onClose }: TaskRecordDetailProp
             <span className="detail-section-label">Status</span>
             <select
               className="form-select"
-              value={task.status}
-              onChange={(event) => void updateTask(task.id, { status: event.target.value as TaskStatus })}
+              value={getTaskPhase(task)}
+              onChange={(event) => void updateTask(task.id, applyTaskPhase(event.target.value as TaskPhase))}
             >
-              {STATUS_OPTIONS.map((option) => (
+              {PHASE_OPTIONS.map((option) => (
                 <option key={option.value} value={option.value}>{option.label}</option>
               ))}
             </select>

@@ -4184,6 +4184,10 @@ body {
   min-height: 240px;
 }
 
+.tip-columns--record {
+  grid-template-columns: 1fr 1fr;
+}
+
 @media (max-width: 860px) {
   .tip-columns {
     grid-template-columns: 1fr;

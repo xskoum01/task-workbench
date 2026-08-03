@@ -158,15 +158,22 @@ export function computePlanning(task: Task): PlanningResult {
 
 /**
  * Returns the effective bucket for a task.
- * Respects `planningBucket` (user choice) when set, otherwise falls back to
- * `suggestedPlanningBucket`, then computes on the fly.
+ *
+ * Canonical planning membership (Now / Today, in particular) is decided by
+ * the explicitly stored `planningBucket` alone — never inferred from due
+ * date, status, or "today". This mirrors exactly what the backend's
+ * `get_planning_today` / `WorkItemApplicationService::list` does (an exact
+ * match on the stored bucket), so this view and the REST/MCP planning
+ * surfaces can never disagree about which tasks are Now/Today. A task with
+ * no explicit bucket falls into `queue` — "not yet planned" — rather than
+ * being silently promoted into Today by a heuristic the backend can't see.
+ * `computePlanning()` remains available to *suggest* a bucket for the
+ * quick-action buttons; it no longer decides membership on its own.
  */
 export function effectiveBucket(task: Task): PlanningBucket {
-  if (task.waitingState) return 'waiting';
-  if (task.attentionState === 'pr-comments') return 'now';
   if (task.planningBucket) return task.planningBucket;
-  if (task.suggestedPlanningBucket) return task.suggestedPlanningBucket;
-  return computePlanning(task).suggestedPlanningBucket;
+  if (task.waitingState) return 'waiting';
+  return 'queue';
 }
 
 /**

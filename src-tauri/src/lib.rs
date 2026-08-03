@@ -7480,13 +7480,172 @@ fn append_work_item_note(app: tauri::AppHandle, id: String, text: String, expect
     Ok(canonical_detail(&updated))
 }
 
+/// Pure JSON-shape builder for the canonical Planning Today read model.
+/// Kept free of `tauri::AppHandle` so the exact response contract (this is
+/// the one and only place `result.sections.now`/`result.sections.today` is
+/// assembled) can be unit-tested without a running app. `get_planning_today`
+/// below is the single fetch-then-format entry point used by the Tauri
+/// command, the REST route, and the MCP tool dispatch alike — none of the
+/// three surfaces has its own copy of this logic.
+fn build_planning_today_result(
+    now_items: &[WorkItem],
+    today_items: &[WorkItem],
+    timezone: Option<String>,
+    generated_at: String,
+) -> Value {
+    let source_revision = now_items
+        .iter()
+        .chain(today_items.iter())
+        .map(|i| i.revision)
+        .max()
+        .unwrap_or(0);
+    serde_json::json!({
+        "apiVersion": "1",
+        "generatedAt": generated_at,
+        "sourceRevision": source_revision,
+        "timezone": timezone.unwrap_or_else(|| "UTC".to_string()),
+        "sections": {
+            "now": now_items.iter().map(canonical_summary).collect::<Vec<_>>(),
+            "today": today_items.iter().map(canonical_summary).collect::<Vec<_>>(),
+        }
+    })
+}
+
+/// Canonical Planning Today read model. `planning_bucket` is matched
+/// exactly against the stored/explicit value ("now" / "today") — buckets
+/// are never inferred from `dueAt`, `status`, or the current date. This is
+/// a deliberate product decision (see docs/manual-acceptance-checklist.md
+/// and src/lib/planning.ts's `effectiveBucket`, which mirrors the same
+/// explicit-only rule so the UI and this endpoint can never disagree about
+/// Now/Today membership).
 #[tauri::command]
 fn get_planning_today(app: tauri::AppHandle, timezone: Option<String>) -> Result<Value, String> {
     let repo = canonical_repo(&app)?;
     let service = WorkItemApplicationService { repository: &repo };
-    let items = service.list(&WorkItemListQuery { include_archived: false, limit: 500, planning_bucket: Some("now".to_string()), ..Default::default() }).map_err(canonical_error)?;
-    let today = service.list(&WorkItemListQuery { include_archived: false, limit: 500, planning_bucket: Some("today".to_string()), ..Default::default() }).map_err(canonical_error)?;
-    Ok(serde_json::json!({"apiVersion":"1", "generatedAt":chrono_now_iso(), "sourceRevision": items.iter().chain(today.iter()).map(|i| i.revision).max().unwrap_or(0), "timezone": timezone.unwrap_or_else(|| "UTC".to_string()), "sections":{"now":items.iter().map(canonical_summary).collect::<Vec<_>>(), "today":today.iter().map(canonical_summary).collect::<Vec<_>>()}}))
+    let now_items = service.list(&WorkItemListQuery { include_archived: false, limit: 500, planning_bucket: Some("now".to_string()), ..Default::default() }).map_err(canonical_error)?;
+    let today_items = service.list(&WorkItemListQuery { include_archived: false, limit: 500, planning_bucket: Some("today".to_string()), ..Default::default() }).map_err(canonical_error)?;
+    Ok(build_planning_today_result(&now_items, &today_items, timezone, chrono_now_iso()))
+}
+
+#[cfg(test)]
+mod planning_today_contract_tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    fn item(id: &str, bucket: Option<&str>) -> WorkItem {
+        WorkItem {
+            schema_version: crate::domain::work_item::WORK_ITEM_SCHEMA_VERSION,
+            id: id.to_string(),
+            kind: crate::domain::work_item::WorkItemKind::Task,
+            obligation_mode: None,
+            title: format!("Title {id}"),
+            description: None,
+            expected_outcome: None,
+            status: crate::domain::work_item::WorkItemStatus::Planned,
+            priority: crate::domain::work_item::WorkItemPriority::Normal,
+            owner: None,
+            accountable_to: None,
+            area_id: None,
+            parent_id: None,
+            start_at: None,
+            due_at: None,
+            completed_at: None,
+            next_review_at: None,
+            blocker_reason: None,
+            source: "manual".to_string(),
+            source_url: None,
+            planning_bucket: bucket.map(str::to_string),
+            estimate_minutes: None,
+            external_references: vec![],
+            tags: vec![],
+            context: vec![],
+            created_at: "2026-08-01T08:00:00Z".to_string(),
+            updated_at: "2026-08-01T08:00:00Z".to_string(),
+            revision: 1,
+            archived_at: None,
+            history: vec![],
+            metadata: HashMap::new(),
+        }
+    }
+
+    /// Pins the exact live-reported scenario: NOW=2, TODAY=1, and confirms
+    /// the nesting requested by the Jarvis contract review —
+    /// `result.sections.now` / `result.sections.today` — end to end through
+    /// the same envelope function the HTTP bridge uses.
+    #[test]
+    fn planning_today_reproduces_now_2_today_1_with_the_documented_shape() {
+        let now_items = vec![
+            item("1", Some("now")),
+            item("2", Some("now")),
+        ];
+        let today_items = vec![item("3", Some("today"))];
+
+        let result = build_planning_today_result(
+            &now_items,
+            &today_items,
+            None,
+            "2026-08-02T16:46:20Z".to_string(),
+        );
+        assert_eq!(result["sections"]["now"].as_array().unwrap().len(), 2);
+        assert_eq!(result["sections"]["today"].as_array().unwrap().len(), 1);
+        assert_eq!(result["timezone"], "UTC");
+        assert_eq!(result["apiVersion"], "1");
+
+        let envelope = canonical_http_envelope(true, result, "req-test-1");
+        assert_eq!(envelope["ok"], true);
+        assert_eq!(
+            envelope["result"]["sections"]["now"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
+        assert_eq!(
+            envelope["result"]["sections"]["today"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn summary_items_use_the_documented_camel_case_field_set() {
+        let now_items = vec![item("1", Some("now"))];
+        let result = build_planning_today_result(&now_items, &[], None, "2026-08-02T00:00:00Z".to_string());
+        let summary = &result["sections"]["now"][0];
+        for field in [
+            "id", "kind", "title", "status", "priority", "planningBucket",
+            "owner", "area", "dueAt", "estimateMinutes", "source", "updatedAt",
+            "revision", "archived",
+        ] {
+            assert!(
+                summary.get(field).is_some(),
+                "WorkItemSummary is missing expected field `{field}`"
+            );
+        }
+    }
+
+    /// build_planning_today_result is a pure formatter: it renders exactly
+    /// the items it is handed and does no bucket filtering of its own — the
+    /// "never inferred, exact match only" guarantee lives entirely in
+    /// WorkItemApplicationService::list's `planning_bucket` filter (see
+    /// application::tests::planning_bucket_filter_matches_only_the_explicit_value_never_inferred).
+    /// This test just documents that separation of concerns: if a caller
+    /// upstream ever passes an unfiltered item in by mistake, the formatter
+    /// will faithfully report it rather than silently double-filtering.
+    #[test]
+    fn formatter_trusts_the_caller_and_does_not_re_filter() {
+        let passed_in_without_a_bucket = vec![item("no-bucket", None)];
+        let result = build_planning_today_result(
+            &passed_in_without_a_bucket,
+            &[],
+            None,
+            "2026-08-02T00:00:00Z".to_string(),
+        );
+        assert_eq!(result["sections"]["now"].as_array().unwrap().len(), 1);
+        assert_eq!(result["sections"]["now"][0]["planningBucket"], Value::Null);
+    }
 }
 
 // --- Teams message link detection and resolution --------------------------
@@ -8163,16 +8322,43 @@ fn task_mcp_tool_definitions() -> Vec<Value> {
     tools
 }
 
+/// The list-item projection shared by list_work_items and get_planning_today
+/// (canonical_summary above). Kept in one place so both tools' outputSchema
+/// stays identical to the other and to docs/openapi.yaml's WorkItemSummary /
+/// mcp/task-workbench-mcp.mjs's WORK_ITEM_SUMMARY_SCHEMA.
+fn mcp_work_item_summary_schema() -> Value {
+    serde_json::json!({
+        "type": "object",
+        "required": ["id","kind","title","status","priority","source","updatedAt","revision","archived"],
+        "properties": {
+            "id": {"type": "string"},
+            "kind": {"enum": ["task", "obligation"]},
+            "title": {"type": "string"},
+            "status": {"enum": ["planned","ready","in_progress","waiting","blocked","review","completed","cancelled"]},
+            "priority": {"enum": ["low","normal","high","critical"]},
+            "planningBucket": {"type": ["string","null"], "description": "Explicitly stored bucket; null when unset. Never inferred."},
+            "owner": {"type": ["object","null"], "properties": {"id": {"type": ["string","null"]}, "displayName": {"type": "string"}}},
+            "area": {"type": ["object","null"], "properties": {"id": {"type": "string"}, "name": {"type": "string"}}},
+            "dueAt": {"type": ["string","null"]},
+            "estimateMinutes": {"type": ["integer","null"]},
+            "source": {"type": "string"},
+            "updatedAt": {"type": "string"},
+            "revision": {"type": "integer", "minimum": 1},
+            "archived": {"type": "boolean"}
+        }
+    })
+}
+
 fn canonical_mcp_tool_definitions() -> Vec<Value> {
     vec![
-        serde_json::json!({"name":"list_work_items","description":"List canonical task and obligation summaries. Read-only; never executes work.","inputSchema":{"type":"object","additionalProperties":false,"properties":{"includeArchived":{"type":"boolean"},"limit":{"type":"integer","minimum":1,"maximum":500},"cursor":{"type":"string"},"status":{"type":"string"},"kind":{"type":"string"},"owner":{"type":"string"},"area":{"type":"string"},"source":{"type":"string"},"planningBucket":{"type":"string"},"dueBefore":{"type":"string"},"dueAfter":{"type":"string"},"updatedAfter":{"type":"string"}}}}),
+        serde_json::json!({"name":"list_work_items","description":"List canonical task and obligation summaries. Read-only; never executes work.","inputSchema":{"type":"object","additionalProperties":false,"properties":{"includeArchived":{"type":"boolean"},"limit":{"type":"integer","minimum":1,"maximum":500},"cursor":{"type":"string"},"status":{"type":"string"},"kind":{"type":"string"},"owner":{"type":"string"},"area":{"type":"string"},"source":{"type":"string"},"planningBucket":{"type":"string"},"dueBefore":{"type":"string"},"dueAfter":{"type":"string"},"updatedAfter":{"type":"string"}}},"outputSchema":{"type":"object","required":["apiVersion","generatedAt","snapshotRevision","items","nextCursor"],"properties":{"apiVersion":{"const":"1"},"generatedAt":{"type":"string"},"snapshotRevision":{"type":"integer"},"items":{"type":"array","items":mcp_work_item_summary_schema()},"nextCursor":{"type":["string","null"]}}}}),
         serde_json::json!({"name":"get_work_item","description":"Get one canonical work-item detail by stable id.","inputSchema":{"type":"object","required":["id"],"additionalProperties":false,"properties":{"id":{"type":"string","minLength":1}}}}),
         serde_json::json!({"name":"list_work_item_changes","description":"Read ordered changes after a revision cursor.","inputSchema":{"type":"object","additionalProperties":false,"properties":{"after":{"type":"integer","minimum":0},"limit":{"type":"integer","minimum":1,"maximum":500}}}}),
         serde_json::json!({"name":"create_work_item","description":"Create a canonical task or obligation record only.","inputSchema":{"type":"object","required":["item"],"additionalProperties":false,"properties":{"item":{"type":"object"},"idempotencyKey":{"type":"string"}}}}),
         serde_json::json!({"name":"update_work_item","description":"Update canonical work-item data with expected revision.","inputSchema":{"type":"object","required":["id","item","expectedRevision"],"additionalProperties":false,"properties":{"id":{"type":"string"},"item":{"type":"object"},"expectedRevision":{"type":"integer","minimum":1},"actorName":{"type":"string"}}}}),
         serde_json::json!({"name":"transition_work_item","description":"Apply a validated lifecycle transition.","inputSchema":{"type":"object","required":["id","status","expectedRevision"],"additionalProperties":false,"properties":{"id":{"type":"string"},"status":{"type":"string"},"reason":{"type":"string"},"expectedRevision":{"type":"integer","minimum":1},"actorName":{"type":"string"}}}}),
         serde_json::json!({"name":"append_work_item_note","description":"Append contextual information to a work item.","inputSchema":{"type":"object","required":["id","text","expectedRevision"],"additionalProperties":false,"properties":{"id":{"type":"string"},"text":{"type":"string","minLength":1},"expectedRevision":{"type":"integer","minimum":1},"actorName":{"type":"string"}}}}),
-        serde_json::json!({"name":"get_planning_today","description":"Return the live deterministic Now and Today planning sections.","inputSchema":{"type":"object","additionalProperties":false,"properties":{"timezone":{"type":"string"}}}}),
+        serde_json::json!({"name":"get_planning_today","description":"Return the live deterministic Now and Today planning sections. Membership is an exact match against each item's stored planningBucket — never inferred from dueAt/status/date. timezone is echoed back only.","inputSchema":{"type":"object","additionalProperties":false,"properties":{"timezone":{"type":"string"}}},"outputSchema":{"type":"object","required":["apiVersion","generatedAt","sourceRevision","timezone","sections"],"properties":{"apiVersion":{"const":"1"},"generatedAt":{"type":"string"},"sourceRevision":{"type":"integer"},"timezone":{"type":"string"},"sections":{"type":"object","required":["now","today"],"properties":{"now":{"type":"array","items":mcp_work_item_summary_schema()},"today":{"type":"array","items":mcp_work_item_summary_schema()}}}}}}),
     ]
 }
 

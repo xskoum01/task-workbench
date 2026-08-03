@@ -56,8 +56,18 @@ impl SqliteWorkItemRepository {
         connection
             .busy_timeout(std::time::Duration::from_secs(5))
             .map_err(|error| ApplicationError::storage(error.to_string()))?;
+        // NOTE: intentionally NOT WAL. WAL readers rely on a memory-mapped
+        // shared index file (`-shm`) to decide which frames are visible;
+        // on this desktop (single-writer, low-throughput) workload that
+        // extra IPC/mmap surface bought no real concurrency benefit and was
+        // the prime suspect behind a reproduced-in-production incident
+        // where SqliteWorkItemRepository::list() observed zero rows in a
+        // long-lived process while get(id) and a brand-new connection to
+        // the same file both saw the data correctly. The rollback journal
+        // (default) uses plain file locking with no shared-memory reader
+        // path, which removes that entire failure class.
         connection
-            .execute_batch("PRAGMA foreign_keys = ON; PRAGMA journal_mode = WAL;")
+            .execute_batch("PRAGMA foreign_keys = ON; PRAGMA journal_mode = DELETE;")
             .map_err(|error| ApplicationError::storage(error.to_string()))?;
         Ok(connection)
     }
@@ -249,23 +259,61 @@ impl SqliteWorkItemRepository {
         limit: usize,
     ) -> Result<Vec<WorkItem>, ApplicationError> {
         self.initialize()?;
-        let connection = self.connect()?;
-        let sql = if include_archived {
-            "SELECT payload_json FROM work_items ORDER BY updated_at DESC, id ASC LIMIT ?1"
+        let mut connection = self.connect()?;
+        let clamped_limit = limit.clamp(1, 500) as i64;
+        let (list_sql, count_sql) = if include_archived {
+            (
+                "SELECT id, payload_json FROM work_items ORDER BY updated_at DESC, id ASC LIMIT ?1",
+                "SELECT COUNT(*) FROM work_items",
+            )
         } else {
-            "SELECT payload_json FROM work_items WHERE archived_at IS NULL ORDER BY updated_at DESC, id ASC LIMIT ?1"
+            (
+                "SELECT id, payload_json FROM work_items WHERE archived_at IS NULL ORDER BY updated_at DESC, id ASC LIMIT ?1",
+                "SELECT COUNT(*) FROM work_items WHERE archived_at IS NULL",
+            )
         };
-        let mut statement = connection
-            .prepare(sql)
+
+        // Both queries run inside one read transaction so they observe the
+        // exact same snapshot — list() and get() must never disagree about
+        // how many rows exist. If they do, surface a loud storage error
+        // instead of quietly handing back a short or empty page (see the
+        // note on connect() for the incident this guards against).
+        let transaction = connection
+            .transaction()
+            .map_err(|error| ApplicationError::storage(error.to_string()))?;
+        let true_count: i64 = transaction
+            .query_row(count_sql, [], |row| row.get(0))
+            .map_err(|error| ApplicationError::storage(error.to_string()))?;
+
+        let mut statement = transaction
+            .prepare(list_sql)
             .map_err(|error| ApplicationError::storage(error.to_string()))?;
         let rows = statement
-            .query_map([limit.clamp(1, 500) as i64], |row| row.get::<_, String>(0))
+            .query_map([clamped_limit], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
             .map_err(|error| ApplicationError::storage(error.to_string()))?;
-        rows.map(|row| {
-            let raw = row.map_err(|error| ApplicationError::storage(error.to_string()))?;
-            serde_json::from_str(&raw).map_err(|error| ApplicationError::storage(error.to_string()))
-        })
-        .collect()
+
+        let mut items = Vec::new();
+        for row in rows {
+            let (id, raw) = row.map_err(|error| ApplicationError::storage(error.to_string()))?;
+            let item: WorkItem = serde_json::from_str(&raw).map_err(|error| {
+                ApplicationError::storage(format!(
+                    "work_items row {id} failed to deserialize as WorkItem: {error}"
+                ))
+            })?;
+            items.push(item);
+        }
+
+        let expected = (true_count as usize).min(clamped_limit as usize);
+        if items.len() < expected {
+            return Err(ApplicationError::storage(format!(
+                "SqliteWorkItemRepository::list integrity check failed: COUNT(*) reports {true_count} matching rows but the list query only returned {}.",
+                items.len()
+            )));
+        }
+
+        Ok(items)
     }
 
     pub fn count(&self) -> Result<usize, ApplicationError> {
@@ -1512,5 +1560,117 @@ mod tests {
         assert_eq!(second_page.len(), 1);
         assert!(second_page[0].sequence > first_page[0].sequence);
         assert_eq!(second_page[0].revision, 5);
+    }
+
+    // ── Regression coverage for the list()-returns-empty incident ──────────
+    // A production instance observed SqliteWorkItemRepository::list()
+    // returning zero rows for a database that get(id) and a fresh external
+    // connection both confirmed held 27 rows. The suspect mechanism was
+    // WAL's memory-mapped shared reader index; connect() now uses the
+    // plain rollback journal instead. These tests pin the behavior list()
+    // and get() must always agree on, and make any future silent
+    // under-return a hard test failure rather than a quiet empty result.
+
+    #[test]
+    fn list_returns_every_row_of_a_twenty_seven_item_fixture() {
+        let directory = tempdir().unwrap();
+        let repository = SqliteWorkItemRepository::at(directory.path().join(DATABASE_FILE));
+        for n in 0..27 {
+            let item = project_legacy_task(&legacy_task(&format!("task-{n:02}"))).unwrap();
+            repository.create(&item).unwrap();
+        }
+        assert_eq!(repository.list(false, 500).unwrap().len(), 27);
+        assert_eq!(repository.list(true, 500).unwrap().len(), 27);
+    }
+
+    #[test]
+    fn get_and_list_never_disagree_about_which_rows_exist() {
+        let directory = tempdir().unwrap();
+        let repository = SqliteWorkItemRepository::at(directory.path().join(DATABASE_FILE));
+        let ids: Vec<String> = (0..10).map(|n| format!("task-{n:02}")).collect();
+        for id in &ids {
+            let item = project_legacy_task(&legacy_task(id)).unwrap();
+            repository.create(&item).unwrap();
+        }
+
+        let listed = repository.list(false, 500).unwrap();
+        assert_eq!(listed.len(), ids.len());
+        let listed_ids: std::collections::HashSet<_> =
+            listed.iter().map(|item| item.id.clone()).collect();
+
+        for id in &ids {
+            assert!(
+                repository.get(id).unwrap().is_some(),
+                "get({id}) must find a row that list() also returned"
+            );
+            assert!(
+                listed_ids.contains(id),
+                "list() must include every row get() can find ({id})"
+            );
+        }
+    }
+
+    #[test]
+    fn corrupt_payload_json_fails_list_loudly_instead_of_being_dropped() {
+        let directory = tempdir().unwrap();
+        let database_path = directory.path().join(DATABASE_FILE);
+        let repository = SqliteWorkItemRepository::at(database_path.clone());
+        let good = project_legacy_task(&legacy_task("task-good")).unwrap();
+        repository.create(&good).unwrap();
+        let other_good = project_legacy_task(&legacy_task("task-good-2")).unwrap();
+        repository.create(&other_good).unwrap();
+
+        // Simulate on-disk corruption directly, bypassing the repository API.
+        let connection = Connection::open(&database_path).unwrap();
+        connection
+            .execute(
+                "UPDATE work_items SET payload_json = ? WHERE id = ?",
+                params!["{ not valid json", "task-good"],
+            )
+            .unwrap();
+
+        let error = repository
+            .list(true, 50)
+            .expect_err("a corrupt row must fail the whole list(), not silently shrink it");
+        assert!(
+            error.message.contains("task-good"),
+            "error should name the offending row: {}",
+            error.message
+        );
+
+        // The other, uncorrupted row must still be reachable individually —
+        // proving the corruption is isolated and not a whole-database issue.
+        assert!(repository.get("task-good-2").unwrap().is_some());
+    }
+
+    #[test]
+    fn archived_filter_is_explicit_in_both_directions() {
+        let directory = tempdir().unwrap();
+        let repository = SqliteWorkItemRepository::at(directory.path().join(DATABASE_FILE));
+        let active = project_legacy_task(&legacy_task("task-active")).unwrap();
+        repository.create(&active).unwrap();
+        let mut to_archive = project_legacy_task(&legacy_task("task-archived")).unwrap();
+        repository.create(&to_archive).unwrap();
+        to_archive.archived_at = Some("2026-08-01T00:00:00Z".to_string());
+        to_archive.updated_at = "2026-08-01T00:00:00Z".to_string();
+        repository
+            .update(
+                "task-archived",
+                &to_archive,
+                &MutationContext {
+                    expected_revision: 4,
+                    actor_type: ActorType::User,
+                    actor_name: None,
+                },
+            )
+            .unwrap();
+
+        let active_only = repository.list(false, 50).unwrap();
+        assert_eq!(active_only.len(), 1);
+        assert_eq!(active_only[0].id, "task-active");
+
+        let with_archived = repository.list(true, 50).unwrap();
+        assert_eq!(with_archived.len(), 2);
+        assert!(with_archived.iter().any(|item| item.id == "task-archived"));
     }
 }

@@ -1,17 +1,10 @@
-import type { Task, TaskStatus } from '../types';
+import { useEffect, useState } from 'react';
+import type { Task } from '../types';
 import { useApp } from '../context/AppContext';
 import { formatRelativeDate, isOverdue } from '../lib/dates';
 import { openExternalUrl } from '../lib/tauriCommands';
 import { expectedOutcomeCzech } from '../lib/taskPresentation';
-
-const STATUS_OPTIONS: Array<{ value: TaskStatus; label: string }> = [
-  { value: 'new', label: 'New' },
-  { value: 'analyzed', label: 'Clarified' },
-  { value: 'in-progress', label: 'In progress' },
-  { value: 'ready-for-review', label: 'Awaiting review' },
-  { value: 'blocked', label: 'Blocked' },
-  { value: 'done', label: 'Done' },
-];
+import { type TaskPhase, PHASE_OPTIONS, applyTaskPhase, getTaskPhase } from '../lib/taskPhase';
 
 interface TaskRecordPanelProps {
   task: Task;
@@ -20,13 +13,21 @@ interface TaskRecordPanelProps {
 
 export default function TaskRecordPanel({ task, onOpenDetail }: TaskRecordPanelProps) {
   const { updateTask } = useApp();
+  const [notes, setNotes] = useState(task.notes ?? '');
   const overdue = task.dueAt ? isOverdue(task.dueAt, task.status) : false;
   const devopsUrl = task.devopsTaskUrl ?? task.adoContext?.workItemUrl ?? task.adoContext?.prUrl;
+
+  useEffect(() => setNotes(task.notes ?? ''), [task.id, task.notes]);
+
   const openEdge = (event: React.MouseEvent<HTMLAnchorElement>, url: string) => {
     event.preventDefault();
     event.stopPropagation();
     void openExternalUrl(url);
   };
+
+  async function saveNotes() {
+    if (notes !== (task.notes ?? '')) await updateTask(task.id, { notes });
+  }
 
   return (
     <div
@@ -34,15 +35,15 @@ export default function TaskRecordPanel({ task, onOpenDetail }: TaskRecordPanelP
       onClick={(event) => event.stopPropagation()}
       onKeyDown={(event) => event.stopPropagation()}
     >
-      <div className="tip-grid">
-        <div className="tip-column">
-          <div className="tip-section">
-            <div className="tip-section-label">Očekávaný výsledek</div>
-            <div className="tip-summary">
-              {expectedOutcomeCzech(task)}
-            </div>
-          </div>
+      <div className="tip-section">
+        <div className="tip-section-label">Očekávaný výsledek</div>
+        <div className="tip-summary">
+          {expectedOutcomeCzech(task)}
+        </div>
+      </div>
 
+      <div className="tip-columns tip-columns--record">
+        <div className="tip-col-main">
           <div className="tip-section">
             <div className="tip-section-label">Responsibility</div>
             <div className="detail-repo-block">
@@ -90,17 +91,15 @@ export default function TaskRecordPanel({ task, onOpenDetail }: TaskRecordPanelP
               )}
             </div>
           </div>
-        </div>
 
-        <div className="tip-column">
           <div className="tip-section">
             <div className="tip-section-label">Record status</div>
             <select
               className="form-select"
-              value={task.status}
-              onChange={(event) => void updateTask(task.id, { status: event.target.value as TaskStatus })}
+              value={getTaskPhase(task)}
+              onChange={(event) => void updateTask(task.id, applyTaskPhase(event.target.value as TaskPhase))}
             >
-              {STATUS_OPTIONS.map((option) => (
+              {PHASE_OPTIONS.map((option) => (
                 <option key={option.value} value={option.value}>{option.label}</option>
               ))}
             </select>
@@ -129,6 +128,19 @@ export default function TaskRecordPanel({ task, onOpenDetail }: TaskRecordPanelP
             <button className="btn btn-secondary" style={{ marginTop: 8 }} onClick={onOpenDetail}>
               Open full record
             </button>
+          </div>
+        </div>
+
+        <div className="tip-col-side">
+          <div className="tip-section tip-section--notes">
+            <div className="tip-section-label">Notes</div>
+            <textarea
+              className="tip-notes"
+              value={notes}
+              placeholder="Add decisions, context, or reminders…"
+              onChange={(event) => setNotes(event.target.value)}
+              onBlur={() => void saveNotes()}
+            />
           </div>
         </div>
       </div>

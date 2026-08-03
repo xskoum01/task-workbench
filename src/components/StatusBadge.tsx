@@ -3,11 +3,11 @@ import type { Task, TaskStatus, TaskSource, TaskType, ClassificationState, TaskA
 // --- Status badge ----------------------------------------------------------
 
 export const STATUS_LABELS: Record<TaskStatus, string> = {
-  'new':              'Planned',
-  'analyzed':         'Ready',
-  'in-progress':      'In Progress',
-  'ready-for-review': 'Review',
-  'done':             'Completed',
+  'new':              'New',
+  'analyzed':         'Need estimate',
+  'in-progress':      'Development',
+  'ready-for-review': 'Waiting for code review',
+  'done':             'Done',
   'blocked':          'Blocked',
 };
 
@@ -27,10 +27,8 @@ export function StatusBadge({ status }: StatusBadgeProps) {
 
 export const WAITING_LABELS: Record<TaskWaitingState, string> = {
   'pricing-approval':    'Waiting for estimate approval',
-  'code-review':         'Waiting for colleague review',
-  // Persisted value stays 'consultant-testing' (see TaskWaitingState) — only the display label
-  // changed to reflect the renamed Deployment & Testing phase (see src/lib/deploymentTestingGate.ts).
-  'consultant-testing':  'Waiting for validation',
+  'code-review':         'Waiting for code review',
+  'consultant-testing':  'Testing',
 };
 
 export const ATTENTION_LABELS: Record<TaskAttentionState, string> = {

@@ -25,6 +25,40 @@ const WORK_ITEM_STATUS = [
   'cancelled',
 ];
 
+// The list-item projection shared by list_work_items and get_planning_today
+// (canonical_summary in lib.rs) — kept in one place so both tool
+// outputSchemas below stay identical to each other and to
+// docs/openapi.yaml's WorkItemSummary schema.
+const WORK_ITEM_SUMMARY_SCHEMA = {
+  type: 'object',
+  required: ['id', 'kind', 'title', 'status', 'priority', 'source', 'updatedAt', 'revision', 'archived'],
+  properties: {
+    id: { type: 'string' },
+    kind: { enum: ['task', 'obligation'] },
+    title: { type: 'string' },
+    status: { type: 'string', enum: WORK_ITEM_STATUS },
+    priority: { enum: ['low', 'normal', 'high', 'critical'] },
+    planningBucket: {
+      type: ['string', 'null'],
+      description: 'Explicitly stored bucket; null when unset. Never inferred from dueAt/status.',
+    },
+    owner: {
+      type: ['object', 'null'],
+      properties: { id: { type: ['string', 'null'] }, displayName: { type: 'string' } },
+    },
+    area: {
+      type: ['object', 'null'],
+      properties: { id: { type: 'string' }, name: { type: 'string' } },
+    },
+    dueAt: { type: ['string', 'null'] },
+    estimateMinutes: { type: ['integer', 'null'] },
+    source: { type: 'string' },
+    updatedAt: { type: 'string' },
+    revision: { type: 'integer', minimum: 1 },
+    archived: { type: 'boolean' },
+  },
+};
+
 const TOOL_DEFINITIONS = [
   {
     name: 'list_work_items',
@@ -38,6 +72,17 @@ const TOOL_DEFINITIONS = [
         cursor: { type: 'string' },
       },
       additionalProperties: false,
+    },
+    outputSchema: {
+      type: 'object',
+      required: ['apiVersion', 'generatedAt', 'snapshotRevision', 'items', 'nextCursor'],
+      properties: {
+        apiVersion: { const: '1' },
+        generatedAt: { type: 'string' },
+        snapshotRevision: { type: 'integer' },
+        items: { type: 'array', items: WORK_ITEM_SUMMARY_SCHEMA },
+        nextCursor: { type: ['string', 'null'] },
+      },
     },
   },
   {
@@ -121,11 +166,33 @@ const TOOL_DEFINITIONS = [
   },
   {
     name: 'get_planning_today',
-    description: 'Return the live deterministic Now and Today planning sections.',
+    description:
+      'Return the live deterministic Now and Today planning sections. Membership is an exact match ' +
+      'against each work item\'s explicitly stored planningBucket — never inferred from dueAt, status, ' +
+      'or the current date. `timezone` is echoed back on the response only; it does not change which ' +
+      'items are returned.',
     inputSchema: {
       type: 'object',
       properties: { timezone: { type: 'string' } },
       additionalProperties: false,
+    },
+    outputSchema: {
+      type: 'object',
+      required: ['apiVersion', 'generatedAt', 'sourceRevision', 'timezone', 'sections'],
+      properties: {
+        apiVersion: { const: '1' },
+        generatedAt: { type: 'string' },
+        sourceRevision: { type: 'integer' },
+        timezone: { type: 'string' },
+        sections: {
+          type: 'object',
+          required: ['now', 'today'],
+          properties: {
+            now: { type: 'array', items: WORK_ITEM_SUMMARY_SCHEMA },
+            today: { type: 'array', items: WORK_ITEM_SUMMARY_SCHEMA },
+          },
+        },
+      },
     },
   },
 ];

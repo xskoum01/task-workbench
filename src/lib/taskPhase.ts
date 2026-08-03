@@ -19,18 +19,13 @@ export type TaskPhase =
   | 'done';
 
 export const PHASE_OPTIONS: { value: TaskPhase; label: string }[] = [
-  { value: 'new',                        label: 'New'                            },
-  { value: 'waiting-estimate-approval',  label: 'Waiting for estimate approval'  },
-  { value: 'analyzed',                   label: 'Analyzed'                       },
-  { value: 'development',                label: 'Development'                    },
-  // 'waiting-consultant-testing' TaskPhase value / 'consultant-testing' waitingState are
-  // unchanged (see taskPhase value below) — only the label reflects the renamed
-  // Deployment & Testing phase (src/lib/deploymentTestingGate.ts).
-  { value: 'waiting-consultant-testing', label: 'Waiting for deployment & testing' },
-  { value: 'waiting-review',             label: 'Waiting for colleague review'   },
-  { value: 'pr-comments',                label: 'PR comments'                    },
-  { value: 'blocked',                    label: 'Blocked'                        },
-  { value: 'done',                       label: 'Done'                           },
+  { value: 'new',                        label: 'New'                           },
+  { value: 'analyzed',                   label: 'Need estimate'                 },
+  { value: 'waiting-estimate-approval',  label: 'Waiting for estimate approval' },
+  { value: 'development',                label: 'Development'                   },
+  { value: 'waiting-consultant-testing', label: 'Testing'                       },
+  { value: 'waiting-review',             label: 'Waiting for code review'       },
+  { value: 'done',                       label: 'Done'                          },
 ];
 
 /**
@@ -62,17 +57,17 @@ type PhasePatch = Pick<Task, 'status'> &
 export function applyTaskPhase(phase: TaskPhase): PhasePatch {
   switch (phase) {
     case 'new':
-      return { status: 'new', waitingState: null, attentionState: null };
+      return { status: 'new', waitingState: null, attentionState: null, planningBucket: 'today', isPlanningLocked: false };
     case 'waiting-estimate-approval':
-      return { status: 'new', waitingState: 'pricing-approval' as TaskWaitingState, attentionState: null };
+      return { status: 'new', waitingState: 'pricing-approval' as TaskWaitingState, attentionState: null, planningBucket: 'waiting', isPlanningLocked: false };
     case 'analyzed':
-      return { status: 'analyzed', waitingState: null, attentionState: null };
+      return { status: 'analyzed', waitingState: null, attentionState: null, planningBucket: 'now', isPlanningLocked: false };
     case 'development':
-      return { status: 'in-progress', waitingState: null, attentionState: null };
+      return { status: 'in-progress', waitingState: null, attentionState: null, planningBucket: 'now', isPlanningLocked: false };
     case 'waiting-consultant-testing':
-      return { status: 'in-progress', waitingState: 'consultant-testing' as TaskWaitingState, attentionState: null };
+      return { status: 'in-progress', waitingState: 'consultant-testing' as TaskWaitingState, attentionState: null, planningBucket: 'today', isPlanningLocked: false };
     case 'waiting-review':
-      return { status: 'ready-for-review', waitingState: 'code-review' as TaskWaitingState, attentionState: null };
+      return { status: 'ready-for-review', waitingState: 'code-review' as TaskWaitingState, attentionState: null, planningBucket: 'waiting', isPlanningLocked: false };
     case 'pr-comments':
       return { status: 'in-progress', waitingState: null, attentionState: 'pr-comments', planningBucket: 'now', isPlanningLocked: false };
     case 'blocked':

@@ -65,7 +65,12 @@ paths:
           name: updatedAfter
           schema: { type: string, format: date-time }
       responses:
-        "200": { description: Canonical work-item page }
+        "200":
+          description: Canonical work-item page
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/WorkItemListEnvelope"
     post:
       operationId: createWorkItem
       requestBody:
@@ -158,12 +163,29 @@ paths:
   /planning/today:
     get:
       operationId: getPlanningToday
+      description: >
+        Live Now/Today planning read model. Membership in `now`/`today` is
+        an exact match against each work item's explicitly stored
+        `planningBucket` — it is never inferred from `dueAt`, `status`, or
+        the current date/timezone. The `timezone` parameter is echoed back
+        on the response only; it does not affect which items are returned.
+        The UI's Planning view (src/lib/planning.ts `effectiveBucket`)
+        applies this same exact-match rule against the same stored field,
+        so this endpoint and the UI can never disagree about Now/Today
+        membership.
       parameters:
         - in: query
           name: timezone
           schema: { type: string, default: UTC }
       responses:
-        "200": { description: Live Now and Today planning read model }
+        "200":
+          description: Live Now and Today planning read model
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PlanningTodayEnvelope"
+        "401": { $ref: "#/components/responses/Error" }
+        "503": { $ref: "#/components/responses/Error" }
 components:
   securitySchemes:
     bridgeToken:
@@ -194,3 +216,107 @@ components:
                   code: { type: string }
                   message: { type: string }
                   currentRevision: { type: integer }
+  schemas:
+    # Canonical success envelope every /api/v1/* route wraps its payload in.
+    # `result` carries the endpoint-specific body (see PlanningTodayResult /
+    # WorkItemListResult below) — it is one level below the top-level `ok`/
+    # `apiVersion`/`correlationId` fields, not merged into them.
+    CanonicalEnvelope:
+      type: object
+      required: [ok, apiVersion, correlationId, result]
+      properties:
+        ok: { const: true }
+        apiVersion: { const: "1" }
+        correlationId: { type: string }
+        result: {}
+    WorkItemSummary:
+      type: object
+      description: >
+        The projected list-item shape used by /work-items and
+        /planning/today (built by canonical_summary in lib.rs). This is
+        intentionally a smaller projection than the full WorkItem detail
+        returned by GET /work-items/{id} — see work-item.schema.json for
+        that shape.
+      required:
+        - id
+        - kind
+        - title
+        - status
+        - priority
+        - source
+        - updatedAt
+        - revision
+        - archived
+      properties:
+        id: { type: string }
+        kind: { enum: [task, obligation] }
+        title: { type: string }
+        status:
+          enum: [planned, ready, in_progress, waiting, blocked, review, completed, cancelled]
+        priority: { enum: [low, normal, high, critical] }
+        planningBucket:
+          type: [string, "null"]
+          description: Explicitly stored bucket assignment; null when never set. Never inferred.
+        owner:
+          type: [object, "null"]
+          properties:
+            id: { type: [string, "null"] }
+            displayName: { type: string }
+        area:
+          type: [object, "null"]
+          description: >
+            `name` currently duplicates `id` — it is not a resolved
+            human-readable area name yet.
+          properties:
+            id: { type: string }
+            name: { type: string }
+        dueAt: { type: [string, "null"], format: date-time }
+        estimateMinutes: { type: [integer, "null"] }
+        source: { type: string }
+        updatedAt: { type: string, format: date-time }
+        revision: { type: integer, minimum: 1 }
+        archived: { type: boolean }
+    WorkItemListResult:
+      type: object
+      required: [apiVersion, generatedAt, snapshotRevision, items, nextCursor]
+      properties:
+        apiVersion: { const: "1" }
+        generatedAt: { type: string, format: date-time }
+        snapshotRevision: { type: integer }
+        items:
+          type: array
+          items: { $ref: "#/components/schemas/WorkItemSummary" }
+        nextCursor: { type: [string, "null"] }
+    WorkItemListEnvelope:
+      allOf:
+        - $ref: "#/components/schemas/CanonicalEnvelope"
+        - type: object
+          properties:
+            result: { $ref: "#/components/schemas/WorkItemListResult" }
+    PlanningSections:
+      type: object
+      required: [now, today]
+      properties:
+        now:
+          type: array
+          items: { $ref: "#/components/schemas/WorkItemSummary" }
+        today:
+          type: array
+          items: { $ref: "#/components/schemas/WorkItemSummary" }
+    PlanningTodayResult:
+      type: object
+      required: [apiVersion, generatedAt, sourceRevision, timezone, sections]
+      properties:
+        apiVersion: { const: "1" }
+        generatedAt: { type: string, format: date-time }
+        sourceRevision: { type: integer }
+        timezone:
+          type: string
+          description: Echoed back from the request; does not affect bucket membership.
+        sections: { $ref: "#/components/schemas/PlanningSections" }
+    PlanningTodayEnvelope:
+      allOf:
+        - $ref: "#/components/schemas/CanonicalEnvelope"
+        - type: object
+          properties:
+            result: { $ref: "#/components/schemas/PlanningTodayResult" }
