@@ -5,10 +5,26 @@ import { formatRelativeDate, isOverdue } from '../lib/dates';
 import { openExternalUrl } from '../lib/tauriCommands';
 import { expectedOutcomeCzech } from '../lib/taskPresentation';
 import { type TaskPhase, PHASE_OPTIONS, applyTaskPhase, getTaskPhase } from '../lib/taskPhase';
+import { inferTaskMode, type TaskMode } from '../lib/taskMode';
+import TaskModeSwitch from './TaskModeSwitch';
 
 interface TaskRecordPanelProps {
   task: Task;
   onOpenDetail: () => void;
+}
+
+const GENERAL_PHASE_OPTIONS: { value: TaskPhase; label: string }[] = [
+  { value: 'new',            label: 'New' },
+  { value: 'analyzed',       label: 'Analyzed' },
+  { value: 'waiting-review', label: 'Waiting for colleague' },
+  { value: 'done',           label: 'Done' },
+];
+
+function phaseForMode(phase: TaskPhase, mode: TaskMode): TaskPhase {
+  if (mode === 'developer') return phase;
+  if (phase === 'new' || phase === 'done' || phase === 'analyzed' || phase === 'waiting-review') return phase;
+  if (phase.startsWith('waiting-')) return 'waiting-review';
+  return 'analyzed';
 }
 
 export default function TaskRecordPanel({ task, onOpenDetail }: TaskRecordPanelProps) {
@@ -16,6 +32,9 @@ export default function TaskRecordPanel({ task, onOpenDetail }: TaskRecordPanelP
   const [notes, setNotes] = useState(task.notes ?? '');
   const overdue = task.dueAt ? isOverdue(task.dueAt, task.status) : false;
   const devopsUrl = task.devopsTaskUrl ?? task.adoContext?.workItemUrl ?? task.adoContext?.prUrl;
+  const { mode: taskMode } = inferTaskMode(task);
+  const phaseOptions = taskMode === 'developer' ? PHASE_OPTIONS : GENERAL_PHASE_OPTIONS;
+  const taskPhase = phaseForMode(getTaskPhase(task), taskMode);
 
   useEffect(() => setNotes(task.notes ?? ''), [task.id, task.notes]);
 
@@ -27,6 +46,14 @@ export default function TaskRecordPanel({ task, onOpenDetail }: TaskRecordPanelP
 
   async function saveNotes() {
     if (notes !== (task.notes ?? '')) await updateTask(task.id, { notes });
+  }
+
+  async function setMode(mode: TaskMode) {
+    const nextPhase = phaseForMode(getTaskPhase(task), mode);
+    await updateTask(task.id, {
+      taskMode: mode,
+      ...(mode === 'general' ? applyTaskPhase(nextPhase) : {}),
+    });
   }
 
   return (
@@ -93,13 +120,18 @@ export default function TaskRecordPanel({ task, onOpenDetail }: TaskRecordPanelP
           </div>
 
           <div className="tip-section">
+            <div className="tip-section-label">Workflow type</div>
+            <TaskModeSwitch task={task} onSetMode={setMode} />
+          </div>
+
+          <div className="tip-section">
             <div className="tip-section-label">Record status</div>
             <select
               className="form-select"
-              value={getTaskPhase(task)}
+              value={taskPhase}
               onChange={(event) => void updateTask(task.id, applyTaskPhase(event.target.value as TaskPhase))}
             >
-              {PHASE_OPTIONS.map((option) => (
+              {phaseOptions.map((option) => (
                 <option key={option.value} value={option.value}>{option.label}</option>
               ))}
             </select>
