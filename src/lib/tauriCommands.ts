@@ -85,6 +85,32 @@ export interface TaskRecordDetailResult {
   };
 }
 
+export type WorkItemPatch = Partial<Pick<
+  WorkItem,
+  | 'title'
+  | 'description'
+  | 'expectedOutcome'
+  | 'priority'
+  | 'owner'
+  | 'accountableTo'
+  | 'areaId'
+  | 'parentId'
+  | 'startAt'
+  | 'dueAt'
+  | 'nextReviewAt'
+  | 'blockerReason'
+  | 'source'
+  | 'sourceUrl'
+  | 'planningBucket'
+  | 'estimateMinutes'
+  | 'externalReferences'
+  | 'tags'
+  | 'metadata'
+>> & {
+  budgetHours?: number | null;
+  budgetNote?: string | null;
+};
+
 export function initializeWorkItemStorage(): Promise<WorkItemMigrationReport> {
   return invoke<WorkItemMigrationReport>('initialize_work_item_storage');
 }
@@ -117,6 +143,20 @@ export function updateWorkItem(
     item,
     expectedRevision,
     actorType,
+    actorName,
+  });
+}
+
+export function patchWorkItem(
+  id: string,
+  patch: WorkItemPatch,
+  expectedRevision: number,
+  actorName?: string,
+): Promise<WorkItem> {
+  return invoke<WorkItem>('patch_work_item', {
+    id,
+    patch,
+    expectedRevision,
     actorName,
   });
 }

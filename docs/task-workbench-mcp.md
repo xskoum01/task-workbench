@@ -40,6 +40,7 @@ created by the bridge, and are not returned by status responses.
 | `list_work_item_changes` | No | Read ordered changes after a cursor |
 | `create_work_item` | Yes | Create a canonical record |
 | `update_work_item` | Yes | Replace record data with revision checking |
+| `patch_work_item` | Yes | Patch whitelisted record fields with revision checking |
 | `transition_work_item` | Yes | Apply a validated lifecycle transition |
 | `append_work_item_note` | Yes | Append contextual information |
 | `get_planning_today` | No | Read the live Now and Today planning model |
@@ -66,6 +67,11 @@ records can only be reopened into `planned`.
 more complete local record than the provider-neutral `WorkItem`: canonical data,
 the UI-compatible task JSON, and derived workflow/status/link fields for trusted
 local clients such as Jarvis.
+
+For trusted local writes, integrations should prefer the narrowest operation:
+`append_work_item_note` for notes, `transition_work_item` for lifecycle changes,
+`patch_work_item` / `POST /api/v1/work-items/{id}/patch` for small field edits,
+and `update_work_item` only when replacing the complete canonical record.
 
 ## Explicit exclusions
 

@@ -1,7 +1,9 @@
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use rand::Rng;
 use crate::application::{MutationContext, WorkItemApplicationService, WorkItemListQuery, WorkItemRepository};
-use crate::domain::work_item::{ActorType, WorkItem, WorkItemStatus};
+use crate::domain::work_item::{
+    ActorType, ExternalReference, PartyReference, WorkItem, WorkItemPriority, WorkItemStatus,
+};
 use crate::storage::sqlite::SqliteWorkItemRepository;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
@@ -7575,6 +7577,173 @@ fn get_task_record(app: tauri::AppHandle, id: String) -> Result<Value, String> {
     Ok(task_record_detail(&canonical, legacy_task))
 }
 
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
+struct WorkItemPatch {
+    title: Option<String>,
+    description: Option<Option<String>>,
+    expected_outcome: Option<Option<String>>,
+    priority: Option<WorkItemPriority>,
+    owner: Option<Option<PartyReference>>,
+    accountable_to: Option<Option<PartyReference>>,
+    area_id: Option<Option<String>>,
+    parent_id: Option<Option<String>>,
+    start_at: Option<Option<String>>,
+    due_at: Option<Option<String>>,
+    next_review_at: Option<Option<String>>,
+    blocker_reason: Option<Option<String>>,
+    source: Option<String>,
+    source_url: Option<Option<String>>,
+    planning_bucket: Option<Option<String>>,
+    estimate_minutes: Option<Option<i64>>,
+    external_references: Option<Vec<ExternalReference>>,
+    tags: Option<Vec<String>>,
+    metadata: Option<HashMap<String, Value>>,
+    budget_hours: Option<Option<f64>>,
+    budget_note: Option<Option<String>>,
+}
+
+fn normalize_optional_string(value: Option<String>) -> Option<String> {
+    value.and_then(|text| {
+        let trimmed = text.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_string())
+        }
+    })
+}
+
+fn apply_work_item_patch(item: &mut WorkItem, patch: WorkItemPatch) -> Result<(), crate::application::ApplicationError> {
+    if let Some(title) = patch.title {
+        let title = title.trim();
+        if title.is_empty() {
+            return Err(crate::application::ApplicationError::validation(
+                "Patch title must not be empty.",
+            ));
+        }
+        item.title = title.to_string();
+    }
+    if let Some(value) = patch.description {
+        item.description = normalize_optional_string(value);
+    }
+    if let Some(value) = patch.expected_outcome {
+        item.expected_outcome = normalize_optional_string(value);
+    }
+    if let Some(value) = patch.priority {
+        item.priority = value;
+    }
+    if let Some(value) = patch.owner {
+        item.owner = value;
+    }
+    if let Some(value) = patch.accountable_to {
+        item.accountable_to = value;
+    }
+    if let Some(value) = patch.area_id {
+        item.area_id = normalize_optional_string(value);
+    }
+    if let Some(value) = patch.parent_id {
+        item.parent_id = normalize_optional_string(value);
+    }
+    if let Some(value) = patch.start_at {
+        item.start_at = normalize_optional_string(value);
+    }
+    if let Some(value) = patch.due_at {
+        item.due_at = normalize_optional_string(value);
+    }
+    if let Some(value) = patch.next_review_at {
+        item.next_review_at = normalize_optional_string(value);
+    }
+    if let Some(value) = patch.blocker_reason {
+        item.blocker_reason = normalize_optional_string(value);
+    }
+    if let Some(source) = patch.source {
+        let source = source.trim();
+        if source.is_empty() {
+            return Err(crate::application::ApplicationError::validation(
+                "Patch source must not be empty.",
+            ));
+        }
+        item.source = source.to_string();
+    }
+    if let Some(value) = patch.source_url {
+        item.source_url = normalize_optional_string(value);
+    }
+    if let Some(value) = patch.planning_bucket {
+        item.planning_bucket = normalize_optional_string(value.clone());
+        match item.planning_bucket.as_deref() {
+            Some(bucket) => {
+                item.metadata
+                    .insert("planningBucket".to_string(), Value::String(bucket.to_string()));
+            }
+            None => {
+                item.metadata.remove("planningBucket");
+            }
+        }
+    }
+    if let Some(value) = patch.estimate_minutes {
+        if let Some(minutes) = value {
+            if minutes <= 0 || minutes > 60_000 {
+                return Err(crate::application::ApplicationError::validation(
+                    "estimateMinutes must be positive and at most 60000.",
+                ));
+            }
+            item.estimate_minutes = Some(minutes);
+            item.metadata
+                .insert("estimateMinutes".to_string(), Value::from(minutes));
+        } else {
+            item.estimate_minutes = None;
+            item.metadata.remove("estimateMinutes");
+        }
+    }
+    if let Some(value) = patch.external_references {
+        item.external_references = value;
+    }
+    if let Some(value) = patch.tags {
+        item.tags = value
+            .into_iter()
+            .filter_map(|tag| normalize_optional_string(Some(tag)))
+            .collect();
+    }
+    if let Some(metadata) = patch.metadata {
+        for (key, value) in metadata {
+            if value.is_null() {
+                item.metadata.remove(&key);
+            } else {
+                item.metadata.insert(key, value);
+            }
+        }
+    }
+    if let Some(value) = patch.budget_hours {
+        if let Some(hours) = value {
+            if !hours.is_finite() || hours <= 0.0 || hours > 1000.0 {
+                return Err(crate::application::ApplicationError::validation(
+                    "budgetHours must be positive and at most 1000.",
+                ));
+            }
+            item.metadata
+                .insert("budgetHours".to_string(), serde_json::json!(hours));
+        } else {
+            item.metadata.remove("budgetHours");
+        }
+    }
+    if let Some(value) = patch.budget_note {
+        match normalize_optional_string(value) {
+            Some(note) => {
+                item.metadata
+                    .insert("budgetNote".to_string(), Value::String(note));
+            }
+            None => {
+                item.metadata.remove("budgetNote");
+            }
+        }
+    }
+    item.updated_at = chrono_now_iso();
+    item.validate()
+        .map_err(crate::application::ApplicationError::validation)
+}
+
 #[tauri::command]
 fn list_work_item_changes(app: tauri::AppHandle, after: Option<i64>, limit: Option<usize>) -> Result<Value, String> {
     let repo = canonical_repo(&app)?;
@@ -7604,6 +7773,37 @@ fn create_work_item(app: tauri::AppHandle, item: WorkItem, idempotency_key: Opti
 fn update_work_item(app: tauri::AppHandle, id: String, item: WorkItem, expected_revision: i64, actor_name: Option<String>) -> Result<Value, String> {
     let repo = canonical_repo(&app)?;
     let updated = repo.update(&id, &item, &MutationContext { expected_revision, actor_type: ActorType::User, actor_name }).map_err(canonical_error)?;
+    Ok(canonical_detail(&updated))
+}
+
+#[tauri::command]
+fn patch_work_item(
+    app: tauri::AppHandle,
+    id: String,
+    patch: Value,
+    expected_revision: i64,
+    actor_name: Option<String>,
+) -> Result<Value, String> {
+    let repo = canonical_repo(&app)?;
+    let service = WorkItemApplicationService { repository: &repo };
+    let mut item = service.get(&id).map_err(canonical_error)?;
+    let patch: WorkItemPatch = serde_json::from_value(patch).map_err(|error| {
+        canonical_error(crate::application::ApplicationError::validation(format!(
+            "Invalid work item patch: {error}"
+        )))
+    })?;
+    apply_work_item_patch(&mut item, patch).map_err(canonical_error)?;
+    let updated = repo
+        .update(
+            &id,
+            &item,
+            &MutationContext {
+                expected_revision,
+                actor_type: ActorType::Integration,
+                actor_name,
+            },
+        )
+        .map_err(canonical_error)?;
     Ok(canonical_detail(&updated))
 }
 
@@ -7905,6 +8105,53 @@ mod task_record_contract_tests {
             .filter_map(|tool| tool["name"].as_str().map(str::to_string))
             .collect();
         assert!(names.contains(&"get_task_record".to_string()));
+    }
+
+    #[test]
+    fn work_item_patch_updates_whitelisted_fields_and_budget_metadata() {
+        let mut canonical = item("task-3");
+        let patch: WorkItemPatch = serde_json::from_value(serde_json::json!({
+            "title": "Updated title",
+            "planningBucket": "now",
+            "estimateMinutes": 120,
+            "budgetHours": 8,
+            "budgetNote": "Fixed delivery scope.",
+            "tags": ["crm", "urgent", ""]
+        }))
+        .unwrap();
+
+        apply_work_item_patch(&mut canonical, patch).unwrap();
+
+        assert_eq!(canonical.title, "Updated title");
+        assert_eq!(canonical.planning_bucket.as_deref(), Some("now"));
+        assert_eq!(canonical.estimate_minutes, Some(120));
+        assert_eq!(canonical.metadata["planningBucket"], "now");
+        assert_eq!(canonical.metadata["estimateMinutes"], 120);
+        assert_eq!(canonical.metadata["budgetHours"], 8.0);
+        assert_eq!(canonical.metadata["budgetNote"], "Fixed delivery scope.");
+        assert_eq!(canonical.tags, vec!["crm".to_string(), "urgent".to_string()]);
+    }
+
+    #[test]
+    fn work_item_patch_rejects_empty_title() {
+        let mut canonical = item("task-4");
+        let patch: WorkItemPatch = serde_json::from_value(serde_json::json!({
+            "title": "   "
+        }))
+        .unwrap();
+
+        let error = apply_work_item_patch(&mut canonical, patch).unwrap_err();
+
+        assert_eq!(error.code, "validation_error");
+    }
+
+    #[test]
+    fn work_item_patch_rejects_unknown_fields() {
+        let result = serde_json::from_value::<WorkItemPatch>(serde_json::json!({
+            "rawLegacyJson": {"should": "not be writable"}
+        }));
+
+        assert!(result.is_err());
     }
 }
 
@@ -8313,7 +8560,7 @@ fn task_mcp_bridge_state() -> &'static Mutex<Value> {
             "port": TASK_MCP_BRIDGE_PORT,
             "canonicalTools": canonical_mcp_tool_definitions(),
             "readOnlyTools": canonical_mcp_tool_definitions().into_iter().filter(|tool| matches!(tool["name"].as_str(), Some("list_work_items"|"get_work_item"|"get_task_record"|"list_work_item_changes"|"get_planning_today"))).collect::<Vec<_>>(),
-            "localWriteTools": canonical_mcp_tool_definitions().into_iter().filter(|tool| matches!(tool["name"].as_str(), Some("create_work_item"|"update_work_item"|"transition_work_item"|"append_work_item_note"))).collect::<Vec<_>>(),
+            "localWriteTools": canonical_mcp_tool_definitions().into_iter().filter(|tool| matches!(tool["name"].as_str(), Some("create_work_item"|"update_work_item"|"patch_work_item"|"transition_work_item"|"append_work_item_note"))).collect::<Vec<_>>(),
             "readOnlyMode": false,
             "localWriteMode": true,
             "lastError": Value::Null,
@@ -8340,7 +8587,7 @@ fn task_mcp_current_bridge_state() -> Value {
                 "port": TASK_MCP_BRIDGE_PORT,
                 "canonicalTools": canonical_mcp_tool_definitions(),
                 "readOnlyTools": canonical_mcp_tool_definitions().into_iter().filter(|tool| matches!(tool["name"].as_str(), Some("list_work_items"|"get_work_item"|"get_task_record"|"list_work_item_changes"|"get_planning_today"))).collect::<Vec<_>>(),
-                "localWriteTools": canonical_mcp_tool_definitions().into_iter().filter(|tool| matches!(tool["name"].as_str(), Some("create_work_item"|"update_work_item"|"transition_work_item"|"append_work_item_note"))).collect::<Vec<_>>(),
+                "localWriteTools": canonical_mcp_tool_definitions().into_iter().filter(|tool| matches!(tool["name"].as_str(), Some("create_work_item"|"update_work_item"|"patch_work_item"|"transition_work_item"|"append_work_item_note"))).collect::<Vec<_>>(),
                 "readOnlyMode": false,
                 "localWriteMode": true,
                 "lastError": "Bridge state lock poisoned.",
@@ -8617,6 +8864,7 @@ fn canonical_mcp_tool_definitions() -> Vec<Value> {
         serde_json::json!({"name":"list_work_item_changes","description":"Read ordered changes after a revision cursor.","inputSchema":{"type":"object","additionalProperties":false,"properties":{"after":{"type":"integer","minimum":0},"limit":{"type":"integer","minimum":1,"maximum":500}}}}),
         serde_json::json!({"name":"create_work_item","description":"Create a canonical task or obligation record only.","inputSchema":{"type":"object","required":["item"],"additionalProperties":false,"properties":{"item":{"type":"object"},"idempotencyKey":{"type":"string"}}}}),
         serde_json::json!({"name":"update_work_item","description":"Update canonical work-item data with expected revision.","inputSchema":{"type":"object","required":["id","item","expectedRevision"],"additionalProperties":false,"properties":{"id":{"type":"string"},"item":{"type":"object"},"expectedRevision":{"type":"integer","minimum":1},"actorName":{"type":"string"}}}}),
+        serde_json::json!({"name":"patch_work_item","description":"Patch whitelisted canonical work-item fields with expected revision. Use for small trusted-local edits without sending the whole record.","inputSchema":{"type":"object","required":["id","patch","expectedRevision"],"additionalProperties":false,"properties":{"id":{"type":"string"},"patch":{"type":"object"},"expectedRevision":{"type":"integer","minimum":1},"actorName":{"type":"string"}}}}),
         serde_json::json!({"name":"transition_work_item","description":"Apply a validated lifecycle transition.","inputSchema":{"type":"object","required":["id","status","expectedRevision"],"additionalProperties":false,"properties":{"id":{"type":"string"},"status":{"type":"string"},"reason":{"type":"string"},"expectedRevision":{"type":"integer","minimum":1},"actorName":{"type":"string"}}}}),
         serde_json::json!({"name":"append_work_item_note","description":"Append contextual information to a work item.","inputSchema":{"type":"object","required":["id","text","expectedRevision"],"additionalProperties":false,"properties":{"id":{"type":"string"},"text":{"type":"string","minLength":1},"expectedRevision":{"type":"integer","minimum":1},"actorName":{"type":"string"}}}}),
         serde_json::json!({"name":"get_planning_today","description":"Return the live deterministic Now and Today planning sections. Membership is an exact match against each item's stored planningBucket — never inferred from dueAt/status/date. timezone is echoed back only.","inputSchema":{"type":"object","additionalProperties":false,"properties":{"timezone":{"type":"string"}}},"outputSchema":{"type":"object","required":["apiVersion","generatedAt","sourceRevision","timezone","sections"],"properties":{"apiVersion":{"const":"1"},"generatedAt":{"type":"string"},"sourceRevision":{"type":"integer"},"timezone":{"type":"string"},"sections":{"type":"object","required":["now","today"],"properties":{"now":{"type":"array","items":mcp_work_item_summary_schema()},"today":{"type":"array","items":mcp_work_item_summary_schema()}}}}}}),
@@ -8631,6 +8879,7 @@ fn task_mcp_execute_canonical_tool(app: &tauri::AppHandle, name: &str, args: &Va
         "list_work_item_changes" => list_work_item_changes(app.clone(), args["after"].as_i64(), args["limit"].as_u64().map(|v| v as usize)),
         "create_work_item" => { let item: WorkItem = serde_json::from_value(args["item"].clone()).map_err(|e| e.to_string())?; create_work_item(app.clone(), item, args["idempotencyKey"].as_str().map(str::to_string)) },
         "update_work_item" => { let item: WorkItem = serde_json::from_value(args["item"].clone()).map_err(|e| e.to_string())?; update_work_item(app.clone(), args["id"].as_str().unwrap_or_default().to_string(), item, args["expectedRevision"].as_i64().unwrap_or(0), args["actorName"].as_str().map(str::to_string)) },
+        "patch_work_item" => patch_work_item(app.clone(), args["id"].as_str().unwrap_or_default().to_string(), args["patch"].clone(), args["expectedRevision"].as_i64().unwrap_or(0), args["actorName"].as_str().map(str::to_string)),
         "transition_work_item" => transition_work_item(app.clone(), args["id"].as_str().unwrap_or_default().to_string(), args["status"].as_str().unwrap_or_default().to_string(), args["reason"].as_str().map(str::to_string), args["expectedRevision"].as_i64().unwrap_or(0), args["actorName"].as_str().map(str::to_string)),
         "append_work_item_note" => append_work_item_note(app.clone(), args["id"].as_str().unwrap_or_default().to_string(), args["text"].as_str().unwrap_or_default().to_string(), args["expectedRevision"].as_i64().unwrap_or(0), args["actorName"].as_str().map(str::to_string)),
         "get_planning_today" => get_planning_today(app.clone(), args["timezone"].as_str().map(str::to_string)),
@@ -17132,7 +17381,7 @@ fn handle_canonical_http(app: &tauri::AppHandle, method: &str, raw_path: &str, b
         if let Err(error) = canonical_storage_ready(app) {
             return Some((503, canonical_http_envelope(false, serde_json::json!({"code":"work_item_storage_unavailable","message":error}), &correlation_id)));
         }
-        return Some((200, canonical_http_envelope(true, serde_json::json!({"capabilities":["work-items.list","work-items.detail","work-items.changes","work-items.create","work-items.update","work-items.transition","work-items.notes","task-records.detail","planning.today","mcp.canonical-v1"]}), &correlation_id)));
+        return Some((200, canonical_http_envelope(true, serde_json::json!({"capabilities":["work-items.list","work-items.detail","work-items.changes","work-items.create","work-items.update","work-items.patch","work-items.transition","work-items.notes","task-records.detail","planning.today","mcp.canonical-v1"]}), &correlation_id)));
     }
     let json: Value = serde_json::from_str(body).unwrap_or_else(|_| serde_json::json!({}));
     eprintln!("[task-mcp-bridge] canonical route selected correlationId={} endpoint={}", correlation_id, path);
@@ -17150,6 +17399,7 @@ fn handle_canonical_http(app: &tauri::AppHandle, method: &str, raw_path: &str, b
     } else if let Some(id) = path.strip_prefix("/api/v1/work-items/") {
         if method == "GET" && !id.contains('/') { get_work_item(app.clone(), id.to_string()) }
         else if method == "PATCH" && !id.contains('/') { serde_json::from_value::<WorkItem>(json["item"].clone()).map_err(|e| e.to_string()).and_then(|item| update_work_item(app.clone(), id.to_string(), item, json["expectedRevision"].as_i64().unwrap_or(0), json["actorName"].as_str().map(str::to_string))) }
+        else if method == "POST" && id.ends_with("/patch") { let work_id = id.trim_end_matches("/patch"); patch_work_item(app.clone(), work_id.to_string(), json["patch"].clone(), json["expectedRevision"].as_i64().unwrap_or(0), json["actorName"].as_str().map(str::to_string)) }
         else if method == "POST" && id.ends_with("/transitions") { let work_id = id.trim_end_matches("/transitions"); transition_work_item(app.clone(), work_id.to_string(), json["status"].as_str().unwrap_or_default().to_string(), json["reason"].as_str().map(str::to_string), json["expectedRevision"].as_i64().unwrap_or(0), json["actorName"].as_str().map(str::to_string)) }
         else if method == "POST" && id.ends_with("/notes") { let work_id = id.trim_end_matches("/notes"); append_work_item_note(app.clone(), work_id.to_string(), json["text"].as_str().unwrap_or_default().to_string(), json["expectedRevision"].as_i64().unwrap_or(0), json["actorName"].as_str().map(str::to_string)) }
         else { Err("Endpoint not found.".to_string()) }
@@ -27152,6 +27402,7 @@ pub fn run() {
             list_work_item_changes,
             create_work_item,
             update_work_item,
+            patch_work_item,
             transition_work_item,
             append_work_item_note,
             get_planning_today,

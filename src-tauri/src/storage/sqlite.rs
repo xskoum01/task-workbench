@@ -656,15 +656,16 @@ impl WorkItemRepository for SqliteWorkItemRepository {
         let transaction = connection
             .transaction()
             .map_err(|error| ApplicationError::storage(error.to_string()))?;
-        let current_revision: Option<i64> = transaction
+        let current_record: Option<(i64, Option<String>)> = transaction
             .query_row(
-                "SELECT revision FROM work_items WHERE id = ?1",
+                "SELECT revision, legacy_json FROM work_items WHERE id = ?1",
                 [id],
-                |row| row.get(0),
+                |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .optional()
             .map_err(|error| ApplicationError::storage(error.to_string()))?;
-        let current_revision = current_revision.ok_or_else(|| ApplicationError::not_found(id))?;
+        let (current_revision, current_legacy_json) =
+            current_record.ok_or_else(|| ApplicationError::not_found(id))?;
         if current_revision != mutation.expected_revision {
             return Err(ApplicationError::revision_conflict(
                 mutation.expected_revision,
@@ -677,13 +678,22 @@ impl WorkItemRepository for SqliteWorkItemRepository {
         updated.revision = current_revision + 1;
         let payload = serde_json::to_string(&updated)
             .map_err(|error| ApplicationError::storage(error.to_string()))?;
+        let legacy_snapshot = current_legacy_json
+            .map(|raw| {
+                serde_json::from_str::<Value>(&raw)
+                    .map_err(|error| ApplicationError::storage(error.to_string()))
+            })
+            .transpose()?;
+        let legacy_payload =
+            serde_json::to_string(&legacy_compatible_value(&updated, legacy_snapshot))
+                .map_err(|error| ApplicationError::storage(error.to_string()))?;
         transaction
             .execute(
                 r#"UPDATE work_items SET
                     schema_version = ?2, kind = ?3, status = ?4, priority = ?5,
                     owner_name = ?6, accountable_to_name = ?7, area_id = ?8,
                     due_at = ?9, updated_at = ?10, revision = ?11,
-                    archived_at = ?12, payload_json = ?13
+                    archived_at = ?12, payload_json = ?13, legacy_json = ?14
                    WHERE id = ?1"#,
                 params![
                     id,
@@ -705,6 +715,7 @@ impl WorkItemRepository for SqliteWorkItemRepository {
                     updated.revision,
                     updated.archived_at,
                     payload,
+                    legacy_payload,
                 ],
             )
             .map_err(|error| ApplicationError::storage(error.to_string()))?;
@@ -1082,13 +1093,21 @@ pub(crate) fn legacy_compatible_value(item: &WorkItem, legacy: Option<Value>) ->
     for (key, value) in [
         ("ticketUrl", item.metadata.get("ticketUrl")),
         ("devopsTaskUrl", item.metadata.get("devopsTaskUrl")),
+        ("budgetHours", item.metadata.get("budgetHours")),
+        ("budgetNote", item.metadata.get("budgetNote")),
     ] {
-        if let Some(value) =
-            value.filter(|value| value.as_str().is_some_and(|text| !text.trim().is_empty()))
-        {
-            object.insert(key.to_string(), value.clone());
-        } else {
-            object.remove(key);
+        match value {
+            Some(value)
+                if value
+                    .as_str()
+                    .is_some_and(|text| !text.trim().is_empty())
+                    || value.is_number() =>
+            {
+                object.insert(key.to_string(), value.clone());
+            }
+            _ => {
+                object.remove(key);
+            }
         }
     }
     if let Some(waiting_state) = waiting_state {

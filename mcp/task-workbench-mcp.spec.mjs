@@ -15,6 +15,7 @@ describe('Task Workbench MCP 2.x boundary', () => {
       'get_work_item',
       'list_work_item_changes',
       'list_work_items',
+      'patch_work_item',
       'transition_work_item',
       'update_work_item',
     ]);
@@ -30,6 +31,7 @@ describe('Task Workbench MCP 2.x boundary', () => {
   it('publishes revision requirements on every mutation after create', () => {
     for (const name of [
       'update_work_item',
+      'patch_work_item',
       'transition_work_item',
       'append_work_item_note',
     ]) {

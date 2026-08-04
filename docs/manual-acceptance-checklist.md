@@ -72,6 +72,7 @@ Restart the app once more and confirm all changes remain.
    - `list_work_item_changes`
    - `create_work_item`
    - `update_work_item`
+   - `patch_work_item`
    - `transition_work_item`
    - `append_work_item_note`
    - `get_planning_today`
@@ -84,6 +85,10 @@ Restart the app once more and confirm all changes remain.
 7. Call `get_task_record` for a representative work item and confirm the result
    contains `canonical`, `legacyTask`, and `derived` with notes, status label,
    workflow type, planning bucket, and external links.
+8. Call `patch_work_item` on a sandbox work item with `expectedRevision` and a
+   small patch such as `{ "planningBucket": "now", "budgetHours": 2 }`; confirm
+   the response revision increments and the full task record reflects the new
+   canonical and UI-compatible values.
 
 ## Completion
 

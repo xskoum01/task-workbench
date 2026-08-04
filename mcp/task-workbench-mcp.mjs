@@ -145,6 +145,22 @@ const TOOL_DEFINITIONS = [
     },
   },
   {
+    name: 'patch_work_item',
+    description:
+      'Patch whitelisted Task Workbench work-item fields with optimistic revision control.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        id: { type: 'string', minLength: 1 },
+        patch: { type: 'object' },
+        expectedRevision: { type: 'integer', minimum: 1 },
+        actorName: { type: 'string' },
+      },
+      required: ['id', 'patch', 'expectedRevision'],
+      additionalProperties: false,
+    },
+  },
+  {
     name: 'transition_work_item',
     description: 'Apply one validated lifecycle transition to a task or obligation.',
     inputSchema: {

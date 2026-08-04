@@ -92,6 +92,7 @@ paths:
         "404": { $ref: "#/components/responses/Error" }
     patch:
       operationId: updateWorkItem
+      description: Replace the complete canonical WorkItem with optimistic revision control.
       requestBody:
         required: true
         content:
@@ -106,6 +107,32 @@ paths:
                 actorName: { type: string }
       responses:
         "200": { description: Updated work item }
+        "409": { $ref: "#/components/responses/Error" }
+  /work-items/{id}/patch:
+    parameters:
+      - $ref: "#/components/parameters/WorkItemId"
+    post:
+      operationId: patchWorkItem
+      description: >
+        Patch whitelisted canonical WorkItem fields with optimistic revision
+        control. This is the preferred small-edit endpoint for trusted local
+        integrations such as Jarvis because callers do not need to send the
+        whole WorkItem record.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [patch, expectedRevision]
+              properties:
+                patch: { $ref: "#/components/schemas/WorkItemPatch" }
+                expectedRevision: { type: integer, minimum: 1 }
+                actorName: { type: string }
+      responses:
+        "200": { description: Patched work item }
+        "400": { $ref: "#/components/responses/Error" }
+        "404": { $ref: "#/components/responses/Error" }
         "409": { $ref: "#/components/responses/Error" }
   /task-records/{id}:
     parameters:
@@ -346,6 +373,39 @@ components:
             externalLinks:
               type: array
               items: { type: object, additionalProperties: true }
+    WorkItemPatch:
+      type: object
+      additionalProperties: false
+      description: Whitelisted partial update for a canonical WorkItem.
+      properties:
+        title: { type: string, minLength: 1 }
+        description: { type: [string, "null"] }
+        expectedOutcome: { type: [string, "null"] }
+        priority: { enum: [low, normal, high, critical] }
+        owner: { oneOf: [{ $ref: ./work-item.schema.json#/properties/owner }, { type: "null" }] }
+        accountableTo: { oneOf: [{ $ref: ./work-item.schema.json#/properties/accountableTo }, { type: "null" }] }
+        areaId: { type: [string, "null"] }
+        parentId: { type: [string, "null"] }
+        startAt: { type: [string, "null"] }
+        dueAt: { type: [string, "null"] }
+        nextReviewAt: { type: [string, "null"] }
+        blockerReason: { type: [string, "null"] }
+        source: { type: string, minLength: 1 }
+        sourceUrl: { type: [string, "null"] }
+        planningBucket: { type: [string, "null"] }
+        estimateMinutes: { type: [integer, "null"], minimum: 1, maximum: 60000 }
+        externalReferences:
+          type: array
+          items: { $ref: ./work-item.schema.json#/properties/externalReferences/items }
+        tags:
+          type: array
+          items: { type: string }
+        metadata:
+          type: object
+          additionalProperties: true
+          description: Shallow metadata merge; null values remove individual keys.
+        budgetHours: { type: [number, "null"], minimum: 0, maximum: 1000 }
+        budgetNote: { type: [string, "null"] }
     TaskRecordDetailEnvelope:
       allOf:
         - $ref: "#/components/schemas/CanonicalEnvelope"
