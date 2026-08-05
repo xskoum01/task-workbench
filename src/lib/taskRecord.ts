@@ -89,6 +89,34 @@ export function createTaskRecord(
   return task;
 }
 
+/** History `action` value for a short, manually-entered status update — distinct from the free-text `notes` field and from auto-generated field-diff entries. */
+export const STATUS_NOTE_ACTION = 'status-note';
+
+/**
+ * Returns a new history array with a status-update entry appended.
+ * Callers pass the result as `history` in an `updateTask(id, { history })`
+ * call — `history` updates are excluded from updateTaskRecord's field-diff
+ * tracking, so this is the only entry that gets added for the change.
+ */
+export function buildStatusNoteHistory(
+  task: Task,
+  text: string,
+  at: string,
+  actorName?: string,
+): TaskHistoryEntry[] {
+  const entry = createHistoryEntry(STATUS_NOTE_ACTION, text.trim(), at, 'user', undefined, actorName);
+  return [...(task.history ?? []), entry].slice(-MAX_HISTORY_ENTRIES);
+}
+
+export function getStatusNotes(task: Task): TaskHistoryEntry[] {
+  return (task.history ?? []).filter((entry) => entry.action === STATUS_NOTE_ACTION);
+}
+
+export function getLatestStatusNote(task: Task): TaskHistoryEntry | undefined {
+  const notes = getStatusNotes(task);
+  return notes[notes.length - 1];
+}
+
 export function updateTaskRecord(
   current: Task,
   updates: Partial<Task>,

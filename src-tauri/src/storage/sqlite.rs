@@ -14,6 +14,20 @@ use std::path::{Path, PathBuf};
 const DATABASE_FILE: &str = "task-workbench.sqlite3";
 const JSON_IMPORT_MARKER: &str = "json_tasks_import_v1";
 
+/// Metadata keys that `project_legacy_task` derives fresh from the incoming
+/// legacy JSON on every save. Kept in sync with that function's metadata
+/// block and with the `_canonicalWorkItem` merge in the same function.
+const LEGACY_MANAGED_METADATA_KEYS: [&str; 8] = [
+    "legacyObligationKind",
+    "ticketUrl",
+    "devopsTaskUrl",
+    "planningBucket",
+    "estimateMinutes",
+    "budgetHours",
+    "budgetNote",
+    "legacyWaitingState",
+];
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MigrationReport {
@@ -978,12 +992,28 @@ fn non_empty(value: Option<&Value>) -> Option<String> {
         .map(ToOwned::to_owned)
 }
 
-fn legacy_status(item: &WorkItem) -> (&'static str, Option<&'static str>) {
+/// `WorkItemStatus::Waiting` collapses every legacy waiting sub-state (code
+/// review, pricing/estimate approval, consultant testing, ...) into one
+/// canonical enum value. The specific sub-state the legacy UI needs is kept
+/// separately in `metadata["legacyWaitingState"]` (see `project_legacy_task`);
+/// without reading it back here, every waiting task would render as
+/// "code-review" after any SQLite round-trip, regardless of which sub-state
+/// it actually was.
+fn legacy_status(item: &WorkItem) -> (&'static str, Option<String>) {
     match item.status {
         WorkItemStatus::Planned => ("new", None),
         WorkItemStatus::Ready => ("analyzed", None),
         WorkItemStatus::InProgress => ("in-progress", None),
-        WorkItemStatus::Waiting => ("in-progress", Some("code-review")),
+        WorkItemStatus::Waiting => (
+            "in-progress",
+            Some(
+                item.metadata
+                    .get("legacyWaitingState")
+                    .and_then(Value::as_str)
+                    .unwrap_or("code-review")
+                    .to_string(),
+            ),
+        ),
         WorkItemStatus::Blocked => ("blocked", None),
         WorkItemStatus::Review => ("ready-for-review", None),
         WorkItemStatus::Completed | WorkItemStatus::Cancelled => ("done", None),
@@ -1111,10 +1141,7 @@ pub(crate) fn legacy_compatible_value(item: &WorkItem, legacy: Option<Value>) ->
         }
     }
     if let Some(waiting_state) = waiting_state {
-        object.insert(
-            "waitingState".to_string(),
-            Value::String(waiting_state.to_string()),
-        );
+        object.insert("waitingState".to_string(), Value::String(waiting_state));
     } else {
         object.insert("waitingState".to_string(), Value::Null);
     }
@@ -1228,6 +1255,15 @@ fn project_legacy_task(legacy: &Value) -> Result<WorkItem, ApplicationError> {
             Value::from((hours * 60.0).round() as i64),
         );
     }
+    if let Some(hours) = object.get("budgetHours").and_then(Value::as_f64) {
+        metadata.insert("budgetHours".to_string(), Value::from(hours));
+    }
+    if let Some(note) = non_empty(object.get("budgetNote")) {
+        metadata.insert("budgetNote".to_string(), Value::String(note));
+    }
+    if let Some(state) = non_empty(object.get("waitingState")) {
+        metadata.insert("legacyWaitingState".to_string(), Value::String(state));
+    }
 
     let projected = WorkItem {
         schema_version: WORK_ITEM_SCHEMA_VERSION,
@@ -1293,11 +1329,27 @@ fn project_legacy_task(legacy: &Value) -> Result<WorkItem, ApplicationError> {
                 })
                 .collect();
             preserved_context.extend(projected.context.clone());
+            // Start from the previously stored canonical metadata — this is what
+            // keeps canonical-only keys set outside the legacy UI (e.g. via
+            // patch_work_item) alive across a legacy-path save. Then sync just the
+            // keys this save derives from the legacy JSON to whatever `projected`
+            // says now (present -> overwrite, absent -> remove), instead of
+            // blanket-copying `base.metadata` over `projected.metadata`: doing
+            // that reverted every edit to these fields (budget, waiting sub-state,
+            // ticket/DevOps links, planning bucket, estimate) back to its
+            // pre-edit value on every save after the first, because `base` here
+            // is only ever the snapshot from the *last load*, not this edit.
             let mut preserved_metadata = base.metadata;
-            preserved_metadata.insert(
-                "legacyObligationKind".to_string(),
-                Value::String(obligation_kind.clone()),
-            );
+            for key in LEGACY_MANAGED_METADATA_KEYS {
+                match projected.metadata.get(key) {
+                    Some(value) => {
+                        preserved_metadata.insert(key.to_string(), value.clone());
+                    }
+                    None => {
+                        preserved_metadata.remove(key);
+                    }
+                }
+            }
             WorkItem {
                 expected_outcome: base.expected_outcome,
                 parent_id: base.parent_id,
@@ -1307,8 +1359,15 @@ fn project_legacy_task(legacy: &Value) -> Result<WorkItem, ApplicationError> {
                 tags: base.tags,
                 context: preserved_context,
                 metadata: preserved_metadata,
-                planning_bucket: base.planning_bucket.or(projected.planning_bucket.clone()),
-                estimate_minutes: base.estimate_minutes.or(projected.estimate_minutes),
+                // Fresh value from *this* save wins, same reasoning as metadata
+                // above: `base.planning_bucket`/`base.estimate_minutes` is only
+                // ever the snapshot from the last load, so preferring it here
+                // silently reverted a bucket move or an estimate edit on every
+                // save after the first. Falls back to `base` only when this
+                // save's legacy JSON has no opinion at all (e.g. set solely via
+                // patch_work_item, with no legacy-UI field to carry it).
+                planning_bucket: projected.planning_bucket.clone().or(base.planning_bucket),
+                estimate_minutes: projected.estimate_minutes.or(base.estimate_minutes),
                 external_references: if base.external_references.is_empty() {
                     projected.external_references.clone()
                 } else {
@@ -1462,6 +1521,141 @@ mod tests {
             .context
             .iter()
             .any(|entry| entry.id == "decision-1"));
+    }
+
+    // Regression coverage for a reported bug: budget entered through the
+    // legacy UI (TaskForm) survived only in memory for the running session —
+    // it was silently dropped on the very first save because
+    // `project_legacy_task` never extracted budgetHours/budgetNote into
+    // canonical metadata, so a reload (e.g. app restart) showed it as gone.
+    #[test]
+    fn budget_set_through_the_legacy_form_survives_a_reload_and_a_later_unrelated_save() {
+        let directory = tempdir().unwrap();
+        let tasks_path = directory.path().join("tasks.json");
+        fs::write(
+            &tasks_path,
+            serde_json::to_vec(&vec![legacy_task("task-1")]).unwrap(),
+        )
+        .unwrap();
+        let repository = SqliteWorkItemRepository::at(directory.path().join(DATABASE_FILE));
+        repository.migrate_json_tasks(&tasks_path).unwrap();
+
+        // Simulates the user filling in budget fields in TaskForm and saving.
+        let mut ui_records = repository.list_legacy_compatible().unwrap();
+        ui_records[0]["budgetHours"] = Value::from(6.5);
+        ui_records[0]["budgetNote"] = Value::String("Fixed-price scope.".to_string());
+        ui_records[0]["revision"] = Value::from(5);
+        ui_records[0]["updatedAt"] = Value::String("2026-07-29T10:00:00Z".to_string());
+        repository.sync_legacy_snapshot(&ui_records).unwrap();
+
+        // Simulates an app restart: fresh read from SQLite.
+        let after_restart = repository.list_legacy_compatible().unwrap();
+        assert_eq!(after_restart[0]["budgetHours"], Value::from(6.5));
+        assert_eq!(after_restart[0]["budgetNote"], "Fixed-price scope.");
+
+        // Simulates a later, unrelated save (e.g. editing notes) made from
+        // that reloaded state — must not wipe the previously saved budget.
+        let mut second_edit = after_restart;
+        second_edit[0]["notes"] = Value::String("Some follow-up note.".to_string());
+        second_edit[0]["revision"] = Value::from(6);
+        second_edit[0]["updatedAt"] = Value::String("2026-07-29T11:00:00Z".to_string());
+        repository.sync_legacy_snapshot(&second_edit).unwrap();
+
+        let final_state = repository.list_legacy_compatible().unwrap();
+        assert_eq!(final_state[0]["budgetHours"], Value::from(6.5));
+        assert_eq!(final_state[0]["budgetNote"], "Fixed-price scope.");
+    }
+
+    // Regression coverage for a reported bug: setting a task to a waiting
+    // sub-state other than code review (e.g. "waiting for pricing
+    // confirmation") flipped to "waiting for code review" after an app
+    // restart, because the canonical WorkItemStatus enum only has one
+    // `Waiting` value and the reverse mapping hard-coded "code-review".
+    #[test]
+    fn waiting_sub_state_other_than_code_review_survives_a_reload() {
+        let directory = tempdir().unwrap();
+        let tasks_path = directory.path().join("tasks.json");
+        fs::write(
+            &tasks_path,
+            serde_json::to_vec(&vec![legacy_task("task-1")]).unwrap(),
+        )
+        .unwrap();
+        let repository = SqliteWorkItemRepository::at(directory.path().join(DATABASE_FILE));
+        repository.migrate_json_tasks(&tasks_path).unwrap();
+
+        let mut ui_records = repository.list_legacy_compatible().unwrap();
+        ui_records[0]["waitingState"] = Value::String("pricing-approval".to_string());
+        ui_records[0]["revision"] = Value::from(5);
+        ui_records[0]["updatedAt"] = Value::String("2026-07-29T10:00:00Z".to_string());
+        repository.sync_legacy_snapshot(&ui_records).unwrap();
+
+        let after_restart = repository.list_legacy_compatible().unwrap();
+        assert_eq!(after_restart[0]["waitingState"], "pricing-approval");
+
+        // Clearing the wait must clear the stored sub-state too, so it can't
+        // resurface if the task later waits on something else.
+        let mut cleared = after_restart;
+        cleared[0]["waitingState"] = Value::Null;
+        cleared[0]["status"] = Value::String("in-progress".to_string());
+        cleared[0]["revision"] = Value::from(6);
+        cleared[0]["updatedAt"] = Value::String("2026-07-29T11:00:00Z".to_string());
+        repository.sync_legacy_snapshot(&cleared).unwrap();
+        let canonical = repository.get("task-1").unwrap().unwrap();
+        assert!(!canonical.metadata.contains_key("legacyWaitingState"));
+
+        let mut waiting_again = repository.list_legacy_compatible().unwrap();
+        waiting_again[0]["waitingState"] = Value::String("consultant-testing".to_string());
+        waiting_again[0]["revision"] = Value::from(7);
+        waiting_again[0]["updatedAt"] = Value::String("2026-07-29T12:00:00Z".to_string());
+        repository.sync_legacy_snapshot(&waiting_again).unwrap();
+        let final_state = repository.list_legacy_compatible().unwrap();
+        assert_eq!(final_state[0]["waitingState"], "consultant-testing");
+    }
+
+    // Regression coverage for the same stale-`_canonicalWorkItem`-wins pattern
+    // as the budget/waiting-state bugs, but on the canonical WorkItem struct
+    // fields consumed by MCP/REST/get_task_record (list_work_items,
+    // get_work_item, task_record_detail's "derived.planningBucket") rather
+    // than by the desktop UI, which reads its own legacy planningBucket key
+    // untouched. A second planning-bucket move or estimate edit — made from a
+    // freshly reloaded state, exactly like a real session after restart —
+    // must land in the canonical row, not silently revert to the value from
+    // before the edit.
+    #[test]
+    fn planning_bucket_and_estimate_moved_on_an_existing_task_are_not_reverted_by_the_next_save() {
+        let directory = tempdir().unwrap();
+        let tasks_path = directory.path().join("tasks.json");
+        fs::write(
+            &tasks_path,
+            serde_json::to_vec(&vec![legacy_task("task-1")]).unwrap(),
+        )
+        .unwrap();
+        let repository = SqliteWorkItemRepository::at(directory.path().join(DATABASE_FILE));
+        repository.migrate_json_tasks(&tasks_path).unwrap();
+
+        let mut ui_records = repository.list_legacy_compatible().unwrap();
+        ui_records[0]["planningBucket"] = Value::String("today".to_string());
+        ui_records[0]["estimatedEffort"] = Value::from(3.0);
+        ui_records[0]["revision"] = Value::from(5);
+        ui_records[0]["updatedAt"] = Value::String("2026-07-29T10:00:00Z".to_string());
+        repository.sync_legacy_snapshot(&ui_records).unwrap();
+
+        let canonical = repository.get("task-1").unwrap().unwrap();
+        assert_eq!(canonical.planning_bucket, Some("today".to_string()));
+        assert_eq!(canonical.estimate_minutes, Some(180));
+
+        // A later save from a freshly reloaded state moves the bucket again
+        // and revises the estimate — this must not fall back to "today"/180.
+        let mut moved = repository.list_legacy_compatible().unwrap();
+        moved[0]["planningBucket"] = Value::String("now".to_string());
+        moved[0]["estimatedEffort"] = Value::from(5.0);
+        moved[0]["revision"] = Value::from(6);
+        moved[0]["updatedAt"] = Value::String("2026-07-29T11:00:00Z".to_string());
+        repository.sync_legacy_snapshot(&moved).unwrap();
+
+        let final_canonical = repository.get("task-1").unwrap().unwrap();
+        assert_eq!(final_canonical.planning_bucket, Some("now".to_string()));
+        assert_eq!(final_canonical.estimate_minutes, Some(300));
     }
 
     #[test]

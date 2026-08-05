@@ -7,6 +7,7 @@ import { expectedOutcomeCzech } from '../lib/taskPresentation';
 import { type TaskPhase, PHASE_OPTIONS, applyTaskPhase, getTaskPhase } from '../lib/taskPhase';
 import { inferTaskMode, type TaskMode } from '../lib/taskMode';
 import TaskModeSwitch from './TaskModeSwitch';
+import { buildStatusNoteHistory, getStatusNotes } from '../lib/taskRecord';
 
 interface TaskRecordPanelProps {
   task: Task;
@@ -34,13 +35,16 @@ function formatHours(hours: number): string {
 export default function TaskRecordPanel({ task, onOpenDetail }: TaskRecordPanelProps) {
   const { updateTask } = useApp();
   const [notes, setNotes] = useState(task.notes ?? '');
+  const [statusNoteInput, setStatusNoteInput] = useState('');
   const overdue = task.dueAt ? isOverdue(task.dueAt, task.status) : false;
   const devopsUrl = task.devopsTaskUrl ?? task.adoContext?.workItemUrl ?? task.adoContext?.prUrl;
   const { mode: taskMode } = inferTaskMode(task);
   const phaseOptions = taskMode === 'developer' ? PHASE_OPTIONS : GENERAL_PHASE_OPTIONS;
   const taskPhase = phaseForMode(getTaskPhase(task), taskMode);
+  const recentStatusNotes = getStatusNotes(task).slice(-3).reverse();
 
   useEffect(() => setNotes(task.notes ?? ''), [task.id, task.notes]);
+  useEffect(() => setStatusNoteInput(''), [task.id]);
 
   const openEdge = (event: React.MouseEvent<HTMLAnchorElement>, url: string) => {
     event.preventDefault();
@@ -50,6 +54,13 @@ export default function TaskRecordPanel({ task, onOpenDetail }: TaskRecordPanelP
 
   async function saveNotes() {
     if (notes !== (task.notes ?? '')) await updateTask(task.id, { notes });
+  }
+
+  async function addStatusNote() {
+    const text = statusNoteInput.trim();
+    if (!text) return;
+    setStatusNoteInput('');
+    await updateTask(task.id, { history: buildStatusNoteHistory(task, text, new Date().toISOString()) });
   }
 
   async function setMode(mode: TaskMode) {
@@ -187,6 +198,44 @@ export default function TaskRecordPanel({ task, onOpenDetail }: TaskRecordPanelP
               onChange={(event) => setNotes(event.target.value)}
               onBlur={() => void saveNotes()}
             />
+          </div>
+
+          <div className="tip-section">
+            <div className="tip-section-label">Status update</div>
+            <div style={{ display: 'flex', gap: 6 }}>
+              <input
+                type="text"
+                className="form-input"
+                style={{ flex: 1 }}
+                value={statusNoteInput}
+                placeholder="e.g. Implemented, waiting for JKV…"
+                onChange={(event) => setStatusNoteInput(event.target.value)}
+                onKeyDown={(event) => {
+                  if (event.key === 'Enter') {
+                    event.preventDefault();
+                    void addStatusNote();
+                  }
+                }}
+              />
+              <button
+                className="btn btn-secondary"
+                disabled={!statusNoteInput.trim()}
+                onClick={() => void addStatusNote()}
+              >
+                Add
+              </button>
+            </div>
+            {recentStatusNotes.length > 0 && (
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 4, marginTop: 8 }}>
+                {recentStatusNotes.map((entry) => (
+                  <div key={entry.id} style={{ fontSize: 11, color: 'var(--text-muted)' }}>
+                    <span style={{ color: 'var(--text-secondary)' }}>{entry.summary}</span>
+                    {' · '}
+                    {new Date(entry.at).toLocaleString()}
+                  </div>
+                ))}
+              </div>
+            )}
           </div>
         </div>
       </div>

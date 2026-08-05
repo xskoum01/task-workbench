@@ -18,6 +18,7 @@ import {
   groupByBucket,
 } from '../lib/planning';
 import { isOverdue, formatRelativeDate } from '../lib/dates';
+import { getLatestStatusNote } from '../lib/taskRecord';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -189,6 +190,7 @@ interface PlanningTaskRowProps {
 function PlanningTaskRow({ task, selected, onSelect }: PlanningTaskRowProps) {
   const { getCustomerById, updateTask } = useApp();
   const customer = getCustomerById(task.customerId);
+  const latestStatusNote = getLatestStatusNote(task);
 
   // Use stored planning data, or compute on the fly as fallback
   const planning = task.priorityScore !== undefined
@@ -235,6 +237,11 @@ function PlanningTaskRow({ task, selected, onSelect }: PlanningTaskRowProps) {
           <span className="planning-task-customer">
             {customer?.name ?? task.customerId}
           </span>
+          {latestStatusNote && (
+            <span className="planning-task-status-note" title={new Date(latestStatusNote.at).toLocaleString()}>
+              {latestStatusNote.summary}
+            </span>
+          )}
 
           {task.dueAt && (
             <>

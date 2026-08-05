@@ -8,6 +8,7 @@ import { formatRelativeDate, isOverdue } from '../lib/dates';
 import { openExternalUrl } from '../lib/tauriCommands';
 import { expectedOutcomeCzech } from '../lib/taskPresentation';
 import { type TaskPhase, PHASE_OPTIONS, applyTaskPhase, getTaskPhase } from '../lib/taskPhase';
+import { buildStatusNoteHistory } from '../lib/taskRecord';
 
 interface TaskRecordDetailProps {
   task: Task;
@@ -22,6 +23,7 @@ export default function TaskRecordDetail({ task, onClose }: TaskRecordDetailProp
   const { getCustomerById, updateTask } = useApp();
   const [showEditForm, setShowEditForm] = useState(false);
   const [notes, setNotes] = useState(task.notes ?? '');
+  const [statusNoteInput, setStatusNoteInput] = useState('');
   const customer = getCustomerById(task.customerId);
   const overdue = task.dueAt ? isOverdue(task.dueAt, task.status) : false;
   const devopsUrl = task.devopsTaskUrl ?? task.adoContext?.workItemUrl ?? task.adoContext?.prUrl;
@@ -31,9 +33,17 @@ export default function TaskRecordDetail({ task, onClose }: TaskRecordDetailProp
   };
 
   useEffect(() => setNotes(task.notes ?? ''), [task.id, task.notes]);
+  useEffect(() => setStatusNoteInput(''), [task.id]);
 
   async function saveNotes() {
     if (notes !== (task.notes ?? '')) await updateTask(task.id, { notes });
+  }
+
+  async function addStatusNote() {
+    const text = statusNoteInput.trim();
+    if (!text) return;
+    setStatusNoteInput('');
+    await updateTask(task.id, { history: buildStatusNoteHistory(task, text, new Date().toISOString()) });
   }
 
   const footer = (
@@ -156,6 +166,33 @@ export default function TaskRecordDetail({ task, onClose }: TaskRecordDetailProp
             onChange={(event) => setNotes(event.target.value)}
             onBlur={() => void saveNotes()}
           />
+        </div>
+
+        <div className="detail-section">
+          <span className="detail-section-label">Status update</span>
+          <div style={{ display: 'flex', gap: 8 }}>
+            <input
+              type="text"
+              className="form-input"
+              style={{ flex: 1 }}
+              value={statusNoteInput}
+              placeholder="e.g. Implemented, waiting for JKV…"
+              onChange={(event) => setStatusNoteInput(event.target.value)}
+              onKeyDown={(event) => {
+                if (event.key === 'Enter') {
+                  event.preventDefault();
+                  void addStatusNote();
+                }
+              }}
+            />
+            <button
+              className="btn btn-secondary"
+              disabled={!statusNoteInput.trim()}
+              onClick={() => void addStatusNote()}
+            >
+              Add
+            </button>
+          </div>
         </div>
 
         <div className="detail-section">

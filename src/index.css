@@ -787,6 +787,16 @@ body {
   font-weight: 500;
 }
 
+.task-list-item-status-note {
+  font-size: var(--font-size-xs);
+  color: var(--text-muted);
+  font-style: italic;
+  max-width: 240px;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
 .task-list-item-label {
   font-size: var(--font-size-xs);
   color: var(--text-muted);
@@ -2884,6 +2894,16 @@ body {
   font-size: var(--font-size-xs);
   color: var(--text-secondary);
   font-weight: 500;
+}
+
+.planning-task-status-note {
+  font-size: var(--font-size-xs);
+  color: var(--text-muted);
+  font-style: italic;
+  max-width: 240px;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
 }
 
 .planning-task-due {

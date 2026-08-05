@@ -1,6 +1,13 @@
 import { describe, expect, it } from 'vitest';
 import type { Task } from '../types';
-import { createTaskRecord, normalizeTaskRecord, updateTaskRecord } from './taskRecord';
+import {
+  buildStatusNoteHistory,
+  createTaskRecord,
+  getLatestStatusNote,
+  getStatusNotes,
+  normalizeTaskRecord,
+  updateTaskRecord,
+} from './taskRecord';
 
 const baseDraft: Omit<Task, 'id' | 'receivedAt' | 'suggestedActions'> = {
   title: 'Confirm renewal',
@@ -63,6 +70,34 @@ describe('taskRecord', () => {
     const restored = updateTaskRecord(archived, { archivedAt: undefined }, '2026-07-29T13:00:00.000Z');
     expect(restored.archivedAt).toBeUndefined();
     expect(restored.history?.[restored.history.length - 1]?.action).toBe('restored');
+  });
+
+  it('appends a status note as its own history entry, verbatim, without a field-diff entry', () => {
+    const task = createTaskRecord(baseDraft, 'task-1', '2026-07-29T10:00:00.000Z');
+    const withNote = { ...task, history: buildStatusNoteHistory(task, 'Implementováno, čekám na JKV', '2026-08-05T09:00:00.000Z') };
+    expect(withNote.history).toHaveLength(2);
+    const entry = withNote.history[1];
+    expect(entry.action).toBe('status-note');
+    expect(entry.summary).toBe('Implementováno, čekám na JKV');
+    expect(entry.at).toBe('2026-08-05T09:00:00.000Z');
+  });
+
+  it('trims whitespace and keeps status notes in chronological order for lookup', () => {
+    const task = createTaskRecord(baseDraft, 'task-1', '2026-07-29T10:00:00.000Z');
+    let running = task;
+    running = { ...running, history: buildStatusNoteHistory(running, '  first update  ', '2026-08-05T09:00:00.000Z') };
+    running = { ...running, history: buildStatusNoteHistory(running, 'second update', '2026-08-05T10:00:00.000Z') };
+
+    const notes = getStatusNotes(running);
+    expect(notes.map((n) => n.summary)).toEqual(['first update', 'second update']);
+    expect(getLatestStatusNote(running)?.summary).toBe('second update');
+  });
+
+  it('ignores non-status-note history entries when looking up status notes', () => {
+    const task = createTaskRecord(baseDraft, 'task-1', '2026-07-29T10:00:00.000Z');
+    const updated = updateTaskRecord(task, { status: 'done' }, '2026-07-29T11:00:00.000Z');
+    expect(getStatusNotes(updated)).toEqual([]);
+    expect(getLatestStatusNote(updated)).toBeUndefined();
   });
 
   it('does not present an unconfirmed AI effort guess as a real estimate', () => {

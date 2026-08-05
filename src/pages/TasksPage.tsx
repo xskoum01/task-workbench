@@ -9,6 +9,7 @@ import TaskForm from '../components/TaskForm';
 import PlanningView, { type PlanningFilter } from '../components/PlanningView';
 import { isOverdue, formatRelativeDate } from '../lib/dates';
 import { effectiveBucket } from '../lib/planning';
+import { getLatestStatusNote } from '../lib/taskRecord';
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -343,6 +344,7 @@ export default function TasksPage() {
               {filtered.map((task) => {
                 const customer = getCustomerById(task.customerId);
                 const isConfirmingDelete = confirmDeleteId === task.id;
+                const latestStatusNote = getLatestStatusNote(task);
                 return (
                   <div
                     key={task.id}
@@ -363,6 +365,11 @@ export default function TasksPage() {
                         <span className="task-list-item-customer">
                           {customer?.name ?? task.customerId}
                         </span>
+                        {latestStatusNote && (
+                          <span className="task-list-item-status-note" title={new Date(latestStatusNote.at).toLocaleString()}>
+                            {latestStatusNote.summary}
+                          </span>
+                        )}
                         {task.responsibleParty && (
                           <>
                             <span className="task-meta-sep">Â·</span>
