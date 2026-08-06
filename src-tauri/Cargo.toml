@@ -38,10 +38,12 @@ urlencoding = "2"
 # OS credential store (Windows Credential Manager / macOS Keychain / Linux
 # Secret Service) for the OpenAI/Anthropic API keys and the Microsoft OAuth
 # token cache — these must not sit in plaintext JSON on disk.
-keyring = "3"
-
-[target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security_Credentials"] }
+# Platform backends are opt-in features, not defaults — omitting them compiles
+# a silent no-op backend that accepts writes without ever persisting them.
+# This app is Windows-only (see the NSIS-only bundle config and the `cmd`
+# shell-outs elsewhere) so only the Windows Credential Manager backend is
+# enabled; add apple-native / sync-secret-service if macOS/Linux ever ship.
+keyring = { version = "3", features = ["windows-native"] }
 
 [dev-dependencies]
 tempfile = "3"

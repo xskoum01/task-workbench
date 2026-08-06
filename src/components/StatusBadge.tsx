@@ -51,11 +51,21 @@ export function AttentionBadge({ state }: { state: TaskAttentionState }) {
   );
 }
 
+/**
+ * "ready-for-review" status and "code-review" waiting state read as the
+ * identical label ("Waiting for code review") — showing both badges would
+ * repeat the same text twice. Suppress the waiting badge whenever its label
+ * exactly matches the status badge's, whatever combination produced it.
+ */
+export function shouldShowWaitingBadge(task: Pick<Task, 'status' | 'waitingState'>): boolean {
+  return !!task.waitingState && WAITING_LABELS[task.waitingState] !== STATUS_LABELS[task.status];
+}
+
 export function TaskStateBadges({ task }: { task: Task }) {
   return (
     <>
       <StatusBadge status={task.status} />
-      {task.waitingState && <WaitingBadge state={task.waitingState} />}
+      {shouldShowWaitingBadge(task) && <WaitingBadge state={task.waitingState!} />}
       {task.attentionState && <AttentionBadge state={task.attentionState} />}
     </>
   );
