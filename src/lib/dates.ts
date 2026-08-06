@@ -110,3 +110,14 @@ function daysBetween(from: string, to: string): number {
 function shortDate(d: Date): string {
   return d.toLocaleDateString(undefined, { day: 'numeric', month: 'short' });
 }
+
+/**
+ * Formats a past ISO timestamp as a compact "dnes" / "5.8." label — the same
+ * day.month. shorthand used in hand-written task notes, for a status-note
+ * timestamp shown alongside its text (e.g. in a list-row badge).
+ */
+export function formatShortPastDate(iso: string): string {
+  if (toLocalDateStr(iso) === localTodayStr()) return 'dnes';
+  const d = new Date(iso);
+  return `${d.getDate()}.${d.getMonth() + 1}.`;
+}

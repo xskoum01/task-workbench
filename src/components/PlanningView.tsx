@@ -17,7 +17,7 @@ import {
   effectiveBucket,
   groupByBucket,
 } from '../lib/planning';
-import { isOverdue, formatRelativeDate } from '../lib/dates';
+import { isOverdue, formatRelativeDate, formatShortPastDate } from '../lib/dates';
 import { getLatestStatusNote } from '../lib/taskRecord';
 
 // ---------------------------------------------------------------------------
@@ -239,7 +239,8 @@ function PlanningTaskRow({ task, selected, onSelect }: PlanningTaskRowProps) {
           </span>
           {latestStatusNote && (
             <span className="planning-task-status-note" title={new Date(latestStatusNote.at).toLocaleString()}>
-              {latestStatusNote.summary}
+              <span className="planning-task-status-note-text">{latestStatusNote.summary}</span>
+              <span className="planning-task-status-note-date">{formatShortPastDate(latestStatusNote.at)}</span>
             </span>
           )}
 

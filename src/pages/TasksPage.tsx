@@ -7,7 +7,7 @@ import TaskRecordDetail from '../components/TaskRecordDetail';
 import TaskRecordPanel from '../components/TaskRecordPanel';
 import TaskForm from '../components/TaskForm';
 import PlanningView, { type PlanningFilter } from '../components/PlanningView';
-import { isOverdue, formatRelativeDate } from '../lib/dates';
+import { isOverdue, formatRelativeDate, formatShortPastDate } from '../lib/dates';
 import { effectiveBucket } from '../lib/planning';
 import { getLatestStatusNote } from '../lib/taskRecord';
 
@@ -367,7 +367,8 @@ export default function TasksPage() {
                         </span>
                         {latestStatusNote && (
                           <span className="task-list-item-status-note" title={new Date(latestStatusNote.at).toLocaleString()}>
-                            {latestStatusNote.summary}
+                            <span className="task-list-item-status-note-text">{latestStatusNote.summary}</span>
+                            <span className="task-list-item-status-note-date">{formatShortPastDate(latestStatusNote.at)}</span>
                           </span>
                         )}
                         {task.responsibleParty && (

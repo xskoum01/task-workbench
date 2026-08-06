@@ -33,9 +33,10 @@ function formatHours(hours: number): string {
 }
 
 export default function TaskRecordPanel({ task, onOpenDetail }: TaskRecordPanelProps) {
-  const { updateTask } = useApp();
+  const { updateTask, deleteTask } = useApp();
   const [notes, setNotes] = useState(task.notes ?? '');
   const [statusNoteInput, setStatusNoteInput] = useState('');
+  const [confirmArchive, setConfirmArchive] = useState(false);
   const overdue = task.dueAt ? isOverdue(task.dueAt, task.status) : false;
   const devopsUrl = task.devopsTaskUrl ?? task.adoContext?.workItemUrl ?? task.adoContext?.prUrl;
   const { mode: taskMode } = inferTaskMode(task);
@@ -45,6 +46,7 @@ export default function TaskRecordPanel({ task, onOpenDetail }: TaskRecordPanelP
 
   useEffect(() => setNotes(task.notes ?? ''), [task.id, task.notes]);
   useEffect(() => setStatusNoteInput(''), [task.id]);
+  useEffect(() => setConfirmArchive(false), [task.id]);
 
   const openEdge = (event: React.MouseEvent<HTMLAnchorElement>, url: string) => {
     event.preventDefault();
@@ -181,10 +183,37 @@ export default function TaskRecordPanel({ task, onOpenDetail }: TaskRecordPanelP
             <div style={{ fontSize: 11, color: 'var(--text-muted)' }}>
               Revision {task.revision ?? 1}
               {task.updatedAt ? ` · updated ${new Date(task.updatedAt).toLocaleString()}` : ''}
+              {task.archivedAt ? ' · archived' : ''}
             </div>
-            <button className="btn btn-secondary" style={{ marginTop: 8 }} onClick={onOpenDetail}>
-              Open full record
-            </button>
+            <div style={{ display: 'flex', gap: 8, marginTop: 8, flexWrap: 'wrap' }}>
+              <button className="btn btn-secondary" onClick={onOpenDetail}>
+                Open full record
+              </button>
+              {task.archivedAt ? (
+                <button
+                  className="btn btn-secondary"
+                  onClick={() => void updateTask(task.id, { archivedAt: undefined })}
+                >
+                  Restore task
+                </button>
+              ) : confirmArchive ? (
+                <>
+                  <button
+                    className="btn btn-danger"
+                    onClick={() => { deleteTask(task.id); setConfirmArchive(false); }}
+                  >
+                    Confirm archive
+                  </button>
+                  <button className="btn btn-ghost" onClick={() => setConfirmArchive(false)}>
+                    Cancel
+                  </button>
+                </>
+              ) : (
+                <button className="btn btn-danger" onClick={() => setConfirmArchive(true)}>
+                  Remove task
+                </button>
+              )}
+            </div>
           </div>
         </div>
 

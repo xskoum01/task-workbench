@@ -788,13 +788,32 @@ body {
 }
 
 .task-list-item-status-note {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  min-width: 0;
+  max-width: 320px;
   font-size: var(--font-size-xs);
-  color: var(--text-muted);
-  font-style: italic;
-  max-width: 240px;
+  font-weight: 500;
+  line-height: 1.5;
+  padding: 1px 6px;
+  border-radius: 3px;
+  color: var(--color-review);
+  background: color-mix(in srgb, var(--color-review) 12%, transparent);
+  border: 1px solid color-mix(in srgb, var(--color-review) 26%, transparent);
+}
+
+.task-list-item-status-note-text {
+  min-width: 0;
   overflow: hidden;
   white-space: nowrap;
   text-overflow: ellipsis;
+}
+
+.task-list-item-status-note-date {
+  flex-shrink: 0;
+  font-weight: 400;
+  color: var(--text-muted);
 }
 
 .task-list-item-label {
@@ -2897,13 +2916,32 @@ body {
 }
 
 .planning-task-status-note {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  min-width: 0;
+  max-width: 320px;
   font-size: var(--font-size-xs);
-  color: var(--text-muted);
-  font-style: italic;
-  max-width: 240px;
+  font-weight: 500;
+  line-height: 1.5;
+  padding: 1px 6px;
+  border-radius: 3px;
+  color: var(--color-review);
+  background: color-mix(in srgb, var(--color-review) 12%, transparent);
+  border: 1px solid color-mix(in srgb, var(--color-review) 26%, transparent);
+}
+
+.planning-task-status-note-text {
+  min-width: 0;
   overflow: hidden;
   white-space: nowrap;
   text-overflow: ellipsis;
+}
+
+.planning-task-status-note-date {
+  flex-shrink: 0;
+  font-weight: 400;
+  color: var(--text-muted);
 }
 
 .planning-task-due {
