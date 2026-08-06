@@ -218,17 +218,6 @@ export default function TaskRecordPanel({ task, onOpenDetail }: TaskRecordPanelP
         </div>
 
         <div className="tip-col-side">
-          <div className="tip-section tip-section--notes">
-            <div className="tip-section-label">Notes</div>
-            <textarea
-              className="tip-notes"
-              value={notes}
-              placeholder="Add decisions, context, or reminders…"
-              onChange={(event) => setNotes(event.target.value)}
-              onBlur={() => void saveNotes()}
-            />
-          </div>
-
           <div className="tip-section">
             <div className="tip-section-label">Status update</div>
             <div style={{ display: 'flex', gap: 6 }}>
@@ -265,6 +254,17 @@ export default function TaskRecordPanel({ task, onOpenDetail }: TaskRecordPanelP
                 ))}
               </div>
             )}
+          </div>
+
+          <div className="tip-section tip-section--notes">
+            <div className="tip-section-label">Notes</div>
+            <textarea
+              className="tip-notes"
+              value={notes}
+              placeholder="Add decisions, context, or reminders…"
+              onChange={(event) => setNotes(event.target.value)}
+              onBlur={() => void saveNotes()}
+            />
           </div>
         </div>
       </div>
