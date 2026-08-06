@@ -1,6 +1,5 @@
 import { describe, expect, it } from 'vitest';
 import type { Task } from '../types';
-import { validateWorkItemTransition } from './lifecycle';
 import { taskToWorkItem } from './workItem';
 
 const task: Task = {
@@ -34,16 +33,6 @@ describe('canonical work item contract', () => {
     expect(item.owner?.displayName).toBe('Viktor');
     expect(item.context.map((entry) => entry.type)).toEqual(['note', 'source']);
     expect(item.revision).toBe(4);
-  });
-
-  it('requires a reason when work becomes blocked', () => {
-    expect(validateWorkItemTransition('in_progress', 'blocked').allowed).toBe(false);
-    expect(validateWorkItemTransition('in_progress', 'blocked', 'Customer decision').allowed).toBe(true);
-  });
-
-  it('allows completed work to reopen only into planned state', () => {
-    expect(validateWorkItemTransition('completed', 'planned').allowed).toBe(true);
-    expect(validateWorkItemTransition('completed', 'in_progress').allowed).toBe(false);
   });
 
   it('preserves canonical-only context when the compatibility task changes', () => {

@@ -206,11 +206,6 @@ function parsePrReviewRequest(
         : `PR comment: review Pull Request`;
 
   const prUrl = extractAdoPrUrl(bodyText);  // used for URL extraction further down
-  if (prUrl) {
-    console.log(`[ado-link] found PR review-request link: ${prUrl}`);
-  } else {
-    console.log('[ado-link] no usable devops link found in PR review-request email');
-  }
 
   // Try to extract an actual review comment from the body.
   // ADO sometimes sends comment notifications with a "PR - ..." subject.
@@ -288,11 +283,6 @@ function parsePrComment(
   const title = normalizeTextTitle(subject);
 
   const prUrl = extractAdoPrUrl(bodyText);
-  if (prUrl) {
-    console.log(`[ado-link] found PR comment link: ${prUrl}`);
-  } else {
-    console.log('[ado-link] no usable devops link found in PR comment email');
-  }
 
   // Extract the review comment text from the body
   const reviewComment = extractReviewComment(bodyText);
@@ -388,7 +378,6 @@ function extractAdoPrUrl(bodyText: string): string | undefined {
     const href  = m[1].trim();
     const label = m[2].trim();
     const score = scoreAdoLink(href, label);
-    console.log(`[ado-link] candidate: score=${score} label="${label}" href=${href.slice(0, 100)}`);
     if (score >= 0) candidates.push({ href, label, score });
   }
 
@@ -407,14 +396,12 @@ function extractAdoPrUrl(bodyText: string): string | undefined {
   }
 
   if (candidates.length === 0) {
-    console.log('[ado-link] no usable devops link found');
     return undefined;
   }
 
   // Sort descending by score; ties broken by insertion order (first occurrence wins)
   candidates.sort((a, b) => b.score - a.score);
   const best = candidates[0];
-  console.log(`[ado-link] selected primary url=${best.href.slice(0, 100)} score=${best.score} label="${best.label}"`);
   return best.href;
 }
 
@@ -657,12 +644,6 @@ export function parseAdoEmail(
   if (/^PR\s*-\s*/i.test(subject)) {
     const nonActionable = detectPrNonActionable(subject, bodyText);
     if (nonActionable) {
-      console.log(
-        `[ado-pr] subject="${subject.slice(0, 70)}"`,
-        `detected subtype=${nonActionable.skipReason.includes('approved') ? 'ado_pr_approved' : 'ado_pr_completed'}`,
-        `final outcome=skip`,
-        `reason=${nonActionable.skipReason}`,
-      );
       return {
         isAdoEmail:          true,
         title:               null,
@@ -680,58 +661,22 @@ export function parseAdoEmail(
   //    unambiguous and covers the most common ADO PR notification format.
   const prReviewResult = parsePrReviewRequest(subject, bodyText, crmProjectCode);
   if (prReviewResult) {
-    console.log(
-      `[ado-pr] subject="${subject.slice(0, 70)}"`,
-      `detected subtype=ado_pr_review_request`,
-      `final outcome=task`,
-      `reason=actionable review request`,
-    );
-    console.log(
-      `[title-route] subject="${subject.slice(0, 70)}"`,
-      `detectedType=ado_pr_review_request`,
-      `source=deterministic_pr`,
-      `finalTitle="${prReviewResult.title}"`,
-    );
     return prReviewResult;
   }
 
   // 2. PR file-comment: "X has commented on <file>"
   const prResult = parsePrComment(subject, bodyText, crmProjectCode);
   if (prResult) {
-    console.log(
-      `[ado-pr] subject="${subject.slice(0, 70)}"`,
-      `detected subtype=ado_pr_comment`,
-      `final outcome=task`,
-      `reason=actionable file comment`,
-    );
-    console.log(
-      `[title-route] subject="${subject.slice(0, 70)}"`,
-      `detectedType=ado_pr_comment`,
-      `source=deterministic_pr`,
-      `finalTitle="${prResult.title}"`,
-    );
     return prResult;
   }
 
   // 3. Work item: "X created Task/Bug/Story <Number>"
   const wiResult = parseWorkItem(subject, bodyText, crmProjectCode);
   if (wiResult) {
-    console.log(
-      `[title-route] subject="${subject.slice(0, 70)}"`,
-      `detectedType=ado_work_item`,
-      `source=deterministic_wi`,
-      `finalTitle="${wiResult.title}"`,
-    );
     return wiResult;
   }
 
   // 4. Recognised ADO sender but no specific type matched — return as generic ADO item
-  console.log(
-    `[title-route] subject="${subject.slice(0, 70)}"`,
-    `detectedType=ado_other`,
-    `source=generic_fallback`,
-    `finalTitle="${subject.trim().slice(0, 70)}"`,
-  );
   return {
     isAdoEmail:          true,
     title:               subject.trim() || null,

@@ -110,39 +110,13 @@ export default function InboxPage() {
   async function handleOutlookImport(msg: OutlookMessage, forceCreate = false): Promise<ImportResult> {
     // Prefer the full body (HTML-stripped) when available; fall back to bodyPreview.
     const bodyText = msg.bodyFull ?? msg.bodyPreview;
-    console.log(
-      `[ado-link] source email subject="${msg.subject?.slice(0, 70)}"`,
-      `body source=${msg.bodyFull ? 'bodyFull' : 'bodyPreview'}`,
-      `bodyLength=${bodyText?.length ?? 0}`,
-    );
-    console.log(
-      `[import-html] InboxPage: msgId=${msg.id.slice(0, 12)}`,
-      `bodyHtml present=${!!msg.bodyHtml}`,
-      `bodyHtml length=${msg.bodyHtml?.length ?? 0}`,
-    );
 
     // Try deterministic Azure DevOps parsing first.
     const adoParsed = parseAdoEmail(msg.subject, msg.fromEmail, bodyText);
 
-    console.log(
-      `[title-route] subject="${msg.subject?.slice(0, 70)}"`,
-      `isAdoEmail=${adoParsed.isAdoEmail}`,
-      `detectedType=${adoParsed.adoContext?.type ?? 'none'}`,
-      `adoTitle="${adoParsed.title?.slice(0, 60) ?? 'null'}"`,
-    );
-    console.log(
-      `[ado-link] extracted prUrl="${adoParsed.adoContext?.prUrl ?? 'none'}"`,
-      `adoContext.type=${adoParsed.adoContext?.type ?? 'none'}`,
-    );
-
     // Non-actionable PR events (approved, completed, merged) — skip deterministically.
     // forceCreate overrides this: if the user manually clicks "Create Task", honour it.
     if (adoParsed.shouldSkip && !forceCreate) {
-      console.log(
-        `[ado-pr] subject="${msg.subject?.slice(0, 70)}"`,
-        `final outcome=skip`,
-        `reason=${adoParsed.skipReason}`,
-      );
       return { outcome: 'rejected', reason: adoParsed.skipReason ?? 'Non-actionable ADO notification' };
     }
 
@@ -163,12 +137,6 @@ export default function InboxPage() {
         `[ADO] "${adoParsed.title?.slice(0, 60)}"`,
         `type=${adoParsed.adoContext?.type ?? 'other'}`,
         `bucket=${adoBucket} priority=${adoPriority}`,
-      );
-
-      const isPrCommentType = adoParsed.adoContext?.type === 'pr-comment';
-      console.log(
-        `[title-route] source=${isPrCommentType ? 'deterministic_pr' : 'deterministic_ado'}`,
-        `titlePassedToImport="${adoParsed.title?.slice(0, 60)}"`,
       );
 
       return importMessage({
@@ -194,11 +162,6 @@ export default function InboxPage() {
 
     // Generic email — run heuristic classifier for a meaningful confidence score.
     const h = heuristicClassify(msg.subject || '', bodyText, 'email');
-    console.log(
-      `[title-route] source=generic_fallback`,
-      `subject="${msg.subject?.slice(0, 70)}"`,
-      `heuristic=${h.confidence}`,
-    );
     return importMessage({
       externalMessageId:  msg.id,
       source:             'email',
@@ -246,14 +209,6 @@ export default function InboxPage() {
     const effectiveSenderEmail = fwd?.senderEmail || msg.senderEmail;
     const effectiveSentAt      = fwd?.sentAt      || msg.sentAt;
     const effectiveBody        = fwd?.content     || msg.content;
-
-    if (fwd) {
-      const source = msg.linkedMessageResolved ? 'linked-message' : rustFwd ? 'rust-fwd' : 'frontend';
-      console.log(
-        `[teams-fwd] resolved (source: ${source})`,
-        `originalSender="${effectiveSenderName}" bodyLen=${effectiveBody.length}`,
-      );
-    }
 
     // Build the full content block first so heuristics can read the message body.
     // For resolved original messages (linked or forwarded) use a clean format that

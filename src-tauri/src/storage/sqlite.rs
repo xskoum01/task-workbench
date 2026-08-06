@@ -330,18 +330,6 @@ impl SqliteWorkItemRepository {
         Ok(items)
     }
 
-    pub fn count(&self) -> Result<usize, ApplicationError> {
-        self.initialize()?;
-        let connection = self.connect()?;
-        connection
-            .query_row(
-                "SELECT (SELECT COUNT(*) FROM work_items) + (SELECT COUNT(*) FROM intake_items)",
-                [],
-                |row| row.get(0),
-            )
-            .map_err(|error| ApplicationError::storage(error.to_string()))
-    }
-
     pub fn list_legacy_compatible(&self) -> Result<Vec<Value>, ApplicationError> {
         self.initialize()?;
         let connection = self.connect()?;

@@ -1,6 +1,6 @@
 [package]
 name = "task-workbench"
-version = "0.1.0"
+version = "0.1.4"
 description = "A Tauri App"
 authors = ["you"]
 edition = "2021"
@@ -35,6 +35,10 @@ rusqlite = { version = "0.32", features = ["bundled"] }
 webbrowser = "0.8"
 # URL percent-encoding for OAuth2 query strings
 urlencoding = "2"
+# OS credential store (Windows Credential Manager / macOS Keychain / Linux
+# Secret Service) for the OpenAI/Anthropic API keys and the Microsoft OAuth
+# token cache — these must not sit in plaintext JSON on disk.
+keyring = "3"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security_Credentials"] }

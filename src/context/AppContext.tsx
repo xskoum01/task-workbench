@@ -9,6 +9,7 @@ import { matchCustomer } from '../lib/customerMatch';
 import { normalizeText, normalizeTitle } from '../lib/textNormalize';
 import { createTaskRecord, normalizeTaskRecord, updateTaskRecord } from '../lib/taskRecord';
 import { taskToWorkItem, type WorkItem } from '../domain/workItem';
+import { isTaskSaveBlocked, buildTaskLoadErrorMessage } from '../lib/taskStorageGuard';
 
 // --- Context value shape ---------------------------------------------------
 
@@ -330,14 +331,8 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
         // tasks.json is corrupted/unreadable. Either way we must NOT call setTasks([])
         // — that would make a failed load indistinguishable from a genuine empty store
         // and any subsequent save would overwrite the real data with an empty array.
-        const msg = err instanceof Error ? err.message : String(err);
         console.warn('Task storage failed to load:', err);
-        setError(
-          'Task storage failed to load. ' +
-          `Detail: ${msg}. ` +
-          'Saving is disabled to prevent data loss. ' +
-          'Restart the app and check the data directory if this persists.',
-        );
+        setError(buildTaskLoadErrorMessage(err));
         setTaskLoadFailed(true);
         taskLoadFailedRef.current = true;
         // tasks state remains [] from initialisation — do not overwrite with setTasks([]).
@@ -371,7 +366,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
   // If the initial load failed, writing would overwrite the real file with an empty array.
   // Returns a Promise<void> in both cases so callers can await uniformly.
   const persistTasksIfSafe = useCallback((tasks: Task[], label: string): Promise<void> => {
-    if (taskLoadFailedRef.current) {
+    if (isTaskSaveBlocked(taskLoadFailedRef.current)) {
       console.warn(`[saveTasks] blocked: initial load failed (${label})`);
       return Promise.resolve();
     }
@@ -447,22 +442,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
 
   const importMessage = useCallback(
     async (input: ImportMessageInput): Promise<ImportResult> => {
-      // Execution probe — appears in browser DevTools console (NOT in the Tauri terminal).
-      // Open DevTools in the Tauri app: right-click inside the app → Inspect.
-      console.log(`[import] ▶ "${input.title?.slice(0, 70)}" source=${input.source} forceCreate=${!!input.forceCreate} customers=${customers.length}`);
-      console.log(`[import-html] emailBodyHtml present=${!!input.emailBodyHtml} length=${input.emailBodyHtml?.length ?? 0}`);
-
       const dedupeKey = input.externalMessageId?.trim();
-
-
-      // --- Per-message trace logs for ADO/PR emails ---
-      if (input.adoContext) {
-        const msgId = input.externalMessageId || '';
-        const subj = input.title || '';
-        const prUrl = input.adoContext.prUrl;
-        console.log(`[ado-link] messageId=${msgId} subject="${subj}"`);
-        if (prUrl) console.log(`[ado-link] selected prUrl=${prUrl}`);
-      }
 
       // --- Force-create path: user explicitly requested task creation ----------
       // Skips prefilter and AI. Upgrades an existing rejected/analyzed record
@@ -473,10 +453,8 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
             (t) => t.source === input.source && t.externalMessageId === dedupeKey,
           );
           if (existing?.classificationState === 'created') {
-            console.log(`[import] force-create: already a task "${input.title}"`);
             // Still backfill emailBodyHtml if the existing task is missing it.
             if (input.source === 'email' && input.emailBodyHtml && !existing.emailBodyHtml) {
-              console.log(`[import-html] force-create duplicate: backfilling emailBodyHtml length=${input.emailBodyHtml.length}`);
               const patched = tasksRef.current.map((t) =>
                 t.id === existing.id
                   ? updateTaskRecord(t, { emailBodyHtml: input.emailBodyHtml }, new Date().toISOString(), 'integration', 'Inbox import')
@@ -490,11 +468,9 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
           }
           if (existing) {
             // Upgrade rejected/analyzed → created; also carry emailBodyHtml forward.
-            console.log(`[import] force-create: upgrading ${existing.classificationState} → created "${input.title}"`);
             const htmlPatch = (input.source === 'email' && input.emailBodyHtml && !existing.emailBodyHtml)
               ? { emailBodyHtml: input.emailBodyHtml }
               : {};
-            if (Object.keys(htmlPatch).length > 0) console.log(`[import-html] force-create upgrade: adding emailBodyHtml length=${input.emailBodyHtml?.length}`);
             const upgraded = tasksRef.current.map((t) =>
               t.id === existing.id
                 ? updateTaskRecord(
@@ -557,7 +533,6 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
           priorityReason:          input.heuristicReason,
           emailBodyHtml:           input.emailBodyHtml,
         };
-        console.log(`[import] force-create: new task "${cleanTitle}"`);
         const withForced = [...tasksRef.current, forcedTask];
         tasksRef.current = withForced;
         setTasks(withForced);
@@ -579,10 +554,6 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
           (t) => t.source === input.source && t.externalMessageId === dedupeKey,
         );
         if (existing) {
-          // --- Per-message trace logs for dedupe path ---
-          console.log(`[ado-link] duplicate existingTaskId=${existing.id}`);
-          console.log(`[import-html] dedupe: existing.emailBodyHtml present=${!!existing.emailBodyHtml} incoming present=${!!input.emailBodyHtml}`);
-
           // Collect all fields that need backfilling into a single update.
           // This avoids multiple setState/saveTasks calls for the same task.
           const backfill: Partial<Task> = {};
@@ -591,7 +562,6 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
           // "already imported before HTML patch" scenario.
           if (input.source === 'email' && input.emailBodyHtml && !existing.emailBodyHtml) {
             backfill.emailBodyHtml = input.emailBodyHtml;
-            console.log(`[import-html] dedupe: backfilling emailBodyHtml (length=${input.emailBodyHtml.length})`);
           }
 
           // Backfill adoContext when new data has URLs that existing record is missing.
@@ -601,11 +571,6 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
               ((newPrUrl && !existingPrUrl) ||
                (input.adoContext.workItemUrl && !existing.adoContext?.workItemUrl))) {
             backfill.adoContext = { ...existing.adoContext, ...input.adoContext };
-            if (!existingPrUrl && newPrUrl) console.log('[ado-link] existing prUrl missing -> backfilling');
-            if (!existing.adoContext?.workItemUrl && input.adoContext?.workItemUrl) console.log('[ado-link] existing workItemUrl missing -> backfilling');
-          } else {
-            if (!existingPrUrl) console.log('[ado-link] existing prUrl missing but no new prUrl found');
-            else console.log('[ado-link] existing prUrl already present -> no update');
           }
 
           if (Object.keys(backfill).length > 0) {
@@ -617,7 +582,6 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
             tasksRef.current = upgraded;
             setTasks(upgraded);
             persistTasksIfSafe(upgraded, 'import:dedupe-backfill');
-            console.log(`[import-html] dedupe: saved backfill for taskId=${existing.id}`);
           }
 
           return { outcome: 'duplicate', reason: 'Already imported', existingState: existing.classificationState, taskId: existing.id };
@@ -643,7 +607,6 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
       });
 
       if (!filterResult.pass) {
-        console.log(`[import] prefilter rejected "${input.title}": ${filterResult.reason}`);
         const rejectedId   = generateId();
         const rejectedAt   = new Date().toISOString();
         const rejectedTask: Task = {
@@ -702,10 +665,6 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
             title:       cleanTitle,
             content:     cleanContent,
           });
-      console.log(
-        `[import] pre-AI customer: ${matchedCustomer?.name ?? 'none'}`,
-        `(${customers.length} customers loaded) title="${cleanTitle.slice(0, 60)}"`,
-      );
 
       // 4. Persist as 'pending' immediately so the item survives app crashes or AI failures.
       // 'pending' is an internal transient state — InboxPage filters it out, so
@@ -752,8 +711,6 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
         emailBodyHtml:           input.emailBodyHtml,
       };
 
-      console.log(`[import] pending "${input.title}" (${input.source})`);
-      console.log(`[import-html] pending: emailBodyHtml stored=${!!pendingTask.emailBodyHtml} length=${pendingTask.emailBodyHtml?.length ?? 0}`);
       const withPending = [...tasksRef.current, pendingTask];
       // *** Critical: update ref synchronously before any awaits ***
       // Concurrent imports (Promise.all) all read tasksRef.current. Without this
@@ -773,9 +730,6 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
       let classification;
       try {
         classification = await api.classifyInboxItem(pendingTask);
-        console.log(
-          `[import] classified "${input.title}": isTask=${classification.isTask} confidence=${classification.confidence}`,
-        );
       } catch (err) {
         const errMsg = err instanceof Error ? err.message : String(err);
         console.warn(`[import] AI classification failed for "${input.title}":`, errMsg);
@@ -845,7 +799,6 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
         const skipReason = !isTask
           ? `AI: isTask=false (conf=${confidence})`
           : `AI: low confidence (conf=${confidence})`;
-        console.log(`[import] skip "${input.title}": ${skipReason}`);
         const withRejected = tasksRef.current.map((t) =>
           t.id === pendingId
             ? updateTaskRecord(
@@ -862,9 +815,6 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
         persistTasksIfSafe(withRejected, 'import:ai-rejected');
         return { outcome: 'rejected', reason: skipReason, taskId: pendingId };
       }
-      if (input.captureMode === 'explicit' && (!isTask || confidence < IMPORT_CONFIG.MIN_CONFIDENCE_ANALYZE)) {
-        console.log(`[import] explicit-capture override "${input.title}": AI weak (isTask=${isTask} conf=${confidence}) → surfaces as analyzed`);
-      }
 
       // Refine customer match using AI-derived name if deterministic match failed.
       // Exclude the Other sentinel from matching — it must only be used as a fallback.
@@ -876,11 +826,6 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
         aiCustomerName: customerName ?? undefined,
       });
       const finalCustomerId = finalCustomer?.id ?? OTHER_CUSTOMER_ID;
-      if (!matchedCustomer && finalCustomer) {
-        console.log(`[import] post-AI customer: ${finalCustomer.name} (via AI name "${customerName}")`);
-      } else if (!finalCustomer) {
-        console.log(`[import] customer UNRESOLVED — AI name was "${customerName ?? 'null'}", ${customers.length} customers loaded`);
-      }
 
       const resolvedTaskType: TaskType = VALID_TASK_TYPES.has(taskType)
         ? (taskType as TaskType)
@@ -909,11 +854,6 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
             // Keep deterministic Czech title when: it has a "Nacenění:" prefix, or AI title looks English
             ? (deterministicIsNaceneni || !aiTitleHasCzech ? input.title : title || input.title)
             : title || input.title;
-      console.log(
-        `[title-route] finalTitle="${resolvedTitle?.slice(0, 70)}"`,
-        `source=${isPrComment ? 'deterministic_pr' : isEmail ? 'email_subject' : 'ai'}`,
-        `customer=${finalCustomer?.name ?? 'Other'}`,
-      );
       const aiFields: Partial<Task> = {
         title:                  resolvedTitle,
         customerId:             finalCustomerId,
@@ -942,9 +882,6 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
       };
 
       if (confidence >= IMPORT_CONFIG.CONFIDENCE_AUTO_CREATE) {
-        console.log(
-          `[import] → created task "${aiFields.title}" (isTask=${isTask} conf=${confidence})`,
-        );
         const withCreated = tasksRef.current.map((t) =>
           t.id === pendingId
             ? updateTaskRecord(
@@ -973,16 +910,12 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
             tasksRef.current = withReply;
             setTasks(withReply);
             persistTasksIfSafe(withReply, 'import:reply-draft');
-            console.log('[import] reply draft generated for', pendingId);
           }).catch((e) => console.warn('[import] reply draft failed (non-blocking):', e));
         }
         return { outcome: 'created', taskId: pendingId };
       }
 
       // Medium confidence — leave in inbox for user review
-      console.log(
-        `[import] analyzed "${aiFields.title}" (confidence: ${confidence}) — needs review`,
-      );
       const withAnalyzed = tasksRef.current.map((t) =>
         t.id === pendingId
           ? updateTaskRecord(
@@ -1011,7 +944,6 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
           tasksRef.current = withReply;
           setTasks(withReply);
           persistTasksIfSafe(withReply, 'import:reply-draft-analyzed');
-          console.log('[import] reply draft generated for', pendingId);
         }).catch((e) => console.warn('[import] reply draft failed (non-blocking):', e));
       }
       return { outcome: 'analyzed', taskId: pendingId };

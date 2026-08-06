@@ -104,7 +104,6 @@ export function matchCustomer(customers: Customer[], opts: MatchInput): Customer
       if (stem.length >= 4) {
         const matchedTok = textTokens.find((tok) => tok.startsWith(stem));
         if (matchedTok) {
-          console.log(`[customer-match] stem match: variant="${v}" stem="${stem}" token="${matchedTok}"`);
           return true;
         }
       }
@@ -131,7 +130,6 @@ export function matchCustomer(customers: Customer[], opts: MatchInput): Customer
     for (const c of customers) {
       for (const v of customerVariants(c)) {
         if (v.includes(normDomain) || normDomain.includes(v)) {
-          console.log(`[customer-match] domain match: "${domainRoot}" → "${c.name}"`);
           return c;
         }
       }
@@ -140,16 +138,10 @@ export function matchCustomer(customers: Customer[], opts: MatchInput): Customer
 
   // Priority 2: customer variant appears in message text (normalised both sides)
   const allVariants = customers.map((c) => ({ c, variants: customerVariants(c) }));
-  console.log(
-    `[customer-match] title="${opts.title?.slice(0, 60) ?? ''}"`,
-    `candidates=[${allVariants.map(({ c, variants }) => `${c.name}:(${variants.join('|')})`).join(', ')}]`,
-  );
-  console.log(`[customer-match] normText tokens=[${textTokens.slice(0, 12).join(', ')}]`);
 
   for (const { c, variants } of allVariants) {
     for (const v of variants) {
       if (textMatchesVariant(v)) {
-        console.log(`[customer-match] text match: variant="${v}" → "${c.name}"`);
         return c;
       }
     }
@@ -162,16 +154,11 @@ export function matchCustomer(customers: Customer[], opts: MatchInput): Customer
       for (const c of customers) {
         const normName = normalizeForMatch(c.name);
         if (normName.includes(aiName) || aiName.includes(normName.split(' ')[0] ?? '')) {
-          console.log(`[customer-match] AI name match: "${opts.aiCustomerName}" → "${c.name}"`);
           return c;
         }
       }
     }
   }
 
-  console.log(
-    `[customer-match] NO MATCH for title="${opts.title?.slice(0, 60)}"`,
-    `(${customers.length} customers checked)`,
-  );
   return null;
 }
