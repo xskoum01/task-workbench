@@ -262,7 +262,7 @@ export default function InboxPage() {
               {inboxItems.length} item{inboxItems.length !== 1 ? 's' : ''} to review
             </div>
           </div>
-          <div style={{ display: 'flex', gap: 8 }}>
+          <div className="page-header-actions">
             {isConnected && (
               <>
                 <button

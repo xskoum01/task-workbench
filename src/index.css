@@ -954,7 +954,19 @@ body {
   display: flex;
   align-items: center;
   justify-content: space-between;
+  flex-wrap: wrap;
+  row-gap: var(--gap-sm);
   margin-bottom: var(--gap-lg);
+}
+
+/* Shared right-hand action cluster in a page header — wraps instead of
+   forcing the page content into horizontal scroll on narrower windows. */
+.page-header-actions {
+  display: flex;
+  align-items: center;
+  gap: var(--gap-sm);
+  flex-wrap: wrap;
+  justify-content: flex-end;
 }
 
 .page-title {
@@ -1204,6 +1216,7 @@ body {
 /* Tab bar */
 .settings-tabs {
   display: flex;
+  flex-wrap: wrap;
   gap: 2px;
   border-bottom: 1px solid var(--border);
   margin-bottom: var(--gap-lg);
@@ -3317,6 +3330,8 @@ body {
   display: flex;
   align-items: center;
   gap: 4px;
+  flex-wrap: wrap;
+  row-gap: 6px;
 }
 
 .planning-filter-chip {
@@ -6694,6 +6709,7 @@ body {
   display: flex;
   align-items: center;
   justify-content: space-between;
+  flex-wrap: wrap;
   gap: 24px;
   padding: 24px;
   border: 1px solid var(--border);
@@ -6749,6 +6765,7 @@ body {
   display: flex;
   align-items: center;
   justify-content: space-between;
+  flex-wrap: wrap;
   gap: 12px;
 }
 .record-section-heading { padding: 14px 16px; border-bottom: 1px solid var(--border); }

@@ -65,7 +65,7 @@ export default function CustomersPage() {
               : `${managedCustomers.length} area${managedCustomers.length === 1 ? '' : 's'}`}
           </div>
         </div>
-        <div style={{ display: 'flex', gap: 8 }}>
+        <div className="page-header-actions">
           {crmBaseDir && (
             <button
               className="btn btn-ghost"

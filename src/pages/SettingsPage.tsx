@@ -831,7 +831,7 @@ export default function SettingsPage() {
                 </ol>
 
                 {/* Tool selector */}
-                <div className="planning-filter-bar" style={{ flexWrap: 'wrap', marginBottom: 8 }}>
+                <div className="planning-filter-bar" style={{ marginBottom: 8 }}>
                   {MCP_TOOL_TABS.map((t) => (
                     <button
                       key={t.id}

@@ -213,7 +213,7 @@ export default function TasksPage() {
             </div>
           </div>
 
-          <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+          <div className="page-header-actions">
             <input
               className="form-input"
               type="search"
