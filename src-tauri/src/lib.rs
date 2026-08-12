@@ -2290,6 +2290,10 @@ struct TokenCache {
 }
 
 const MS_TOKEN_CACHE_ACCOUNT: &str = "ms_tokens";
+const MS_TOKEN_CACHE_CHUNK_COUNT_ACCOUNT: &str = "ms_tokens.chunk_count";
+const MS_TOKEN_CACHE_CHUNK_PREFIX: &str = "ms_tokens.part.";
+const MS_TOKEN_CACHE_CHUNK_CHARS: usize = 1200;
+const MS_TOKEN_CACHE_MAX_CHUNKS: usize = 32;
 
 /// Legacy plaintext location. Only ever read once, to migrate an existing
 /// cache into the credential store; never written to again.
@@ -2299,6 +2303,9 @@ fn legacy_token_cache_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
 
 fn load_token_cache(app: &tauri::AppHandle) -> Option<TokenCache> {
     if let Some(raw) = secrets::load(MS_TOKEN_CACHE_ACCOUNT) {
+        return serde_json::from_str(&raw).ok();
+    }
+    if let Some(raw) = load_chunked_token_cache() {
         return serde_json::from_str(&raw).ok();
     }
     // One-time migration from the legacy plaintext file, mirroring the
@@ -2318,7 +2325,7 @@ fn load_token_cache(app: &tauri::AppHandle) -> Option<TokenCache> {
 fn save_token_cache(app: &tauri::AppHandle, cache: &TokenCache) -> Result<(), String> {
     let _ = app;
     let raw = serde_json::to_string(cache).map_err(|e| e.to_string())?;
-    secrets::store(MS_TOKEN_CACHE_ACCOUNT, &raw)
+    save_chunked_token_cache(&raw)
 }
 
 fn clear_token_cache(app: &tauri::AppHandle) -> Result<(), String> {
@@ -2327,7 +2334,68 @@ fn clear_token_cache(app: &tauri::AppHandle) -> Result<(), String> {
             let _ = fs::remove_file(path);
         }
     }
-    secrets::clear(MS_TOKEN_CACHE_ACCOUNT)
+    clear_stored_token_cache()
+}
+
+fn token_chunk_account(index: usize) -> String {
+    format!("{MS_TOKEN_CACHE_CHUNK_PREFIX}{index}")
+}
+
+fn split_token_cache(raw: &str) -> Vec<String> {
+    let mut chunks = Vec::new();
+    let mut current = String::new();
+    for ch in raw.chars() {
+        if current.chars().count() >= MS_TOKEN_CACHE_CHUNK_CHARS {
+            chunks.push(current);
+            current = String::new();
+        }
+        current.push(ch);
+    }
+    if !current.is_empty() {
+        chunks.push(current);
+    }
+    chunks
+}
+
+fn load_chunked_token_cache() -> Option<String> {
+    let count: usize = secrets::load(MS_TOKEN_CACHE_CHUNK_COUNT_ACCOUNT)?.parse().ok()?;
+    if count == 0 || count > MS_TOKEN_CACHE_MAX_CHUNKS {
+        return None;
+    }
+
+    let mut raw = String::new();
+    for index in 0..count {
+        raw.push_str(&secrets::load(&token_chunk_account(index))?);
+    }
+    Some(raw)
+}
+
+fn save_chunked_token_cache(raw: &str) -> Result<(), String> {
+    let chunks = split_token_cache(raw);
+    if chunks.len() > MS_TOKEN_CACHE_MAX_CHUNKS {
+        return Err(format!(
+            "Microsoft token cache is too large to store securely ({} chunks).",
+            chunks.len(),
+        ));
+    }
+
+    secrets::clear(MS_TOKEN_CACHE_ACCOUNT)?;
+    for index in chunks.len()..MS_TOKEN_CACHE_MAX_CHUNKS {
+        secrets::clear(&token_chunk_account(index))?;
+    }
+    for (index, chunk) in chunks.iter().enumerate() {
+        secrets::store(&token_chunk_account(index), chunk)?;
+    }
+    secrets::store(MS_TOKEN_CACHE_CHUNK_COUNT_ACCOUNT, &chunks.len().to_string())
+}
+
+fn clear_stored_token_cache() -> Result<(), String> {
+    secrets::clear(MS_TOKEN_CACHE_ACCOUNT)?;
+    secrets::clear(MS_TOKEN_CACHE_CHUNK_COUNT_ACCOUNT)?;
+    for index in 0..MS_TOKEN_CACHE_MAX_CHUNKS {
+        secrets::clear(&token_chunk_account(index))?;
+    }
+    Ok(())
 }
 
 fn now_unix() -> u64 {
@@ -4557,6 +4625,11 @@ fn build_planning_today_result(
     })
 }
 
+fn active_planning_items(mut items: Vec<WorkItem>) -> Vec<WorkItem> {
+    items.retain(|item| item.status != WorkItemStatus::Completed);
+    items
+}
+
 /// Canonical Planning Today read model. `planning_bucket` is matched
 /// exactly against the stored/explicit value ("now" / "today") — buckets
 /// are never inferred from `dueAt`, `status`, or the current date. This is
@@ -4570,6 +4643,8 @@ fn get_planning_today(app: tauri::AppHandle, timezone: Option<String>) -> Result
     let service = WorkItemApplicationService { repository: &repo };
     let now_items = service.list(&WorkItemListQuery { include_archived: false, limit: 500, planning_bucket: Some("now".to_string()), ..Default::default() }).map_err(canonical_error)?;
     let today_items = service.list(&WorkItemListQuery { include_archived: false, limit: 500, planning_bucket: Some("today".to_string()), ..Default::default() }).map_err(canonical_error)?;
+    let now_items = active_planning_items(now_items);
+    let today_items = active_planning_items(today_items);
     Ok(build_planning_today_result(&now_items, &today_items, timezone, chrono_now_iso()))
 }
 
@@ -4652,6 +4727,43 @@ mod planning_today_contract_tests {
                 .unwrap()
                 .len(),
             1
+        );
+    }
+
+    #[test]
+    fn planning_today_sections_exclude_completed_items_with_historical_buckets() {
+        let mut done_now = item("done-now", Some("now"));
+        done_now.status = WorkItemStatus::Completed;
+        let mut done_today = item("done-today", Some("today"));
+        done_today.status = WorkItemStatus::Completed;
+        let now_items = active_planning_items(vec![item("active-now", Some("now")), done_now]);
+        let today_items =
+            active_planning_items(vec![item("active-today", Some("today")), done_today]);
+
+        let result = build_planning_today_result(
+            &now_items,
+            &today_items,
+            None,
+            "2026-08-11T12:00:00Z".to_string(),
+        );
+
+        assert_eq!(
+            result["sections"]["now"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|item| item["id"].as_str())
+                .collect::<Vec<_>>(),
+            vec!["active-now"]
+        );
+        assert_eq!(
+            result["sections"]["today"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|item| item["id"].as_str())
+                .collect::<Vec<_>>(),
+            vec!["active-today"]
         );
     }
 

@@ -969,6 +969,20 @@ body {
   justify-content: flex-end;
 }
 
+.m365-inline-status {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 30px;
+  padding: 0 10px;
+  border: 1px solid color-mix(in srgb, var(--color-overdue, #c9883a) 32%, transparent);
+  border-radius: var(--radius-sm);
+  background: color-mix(in srgb, var(--color-overdue, #c9883a) 10%, transparent);
+  color: var(--text-secondary);
+  font-size: 12px;
+  white-space: nowrap;
+}
+
 .page-title {
   font-size: var(--font-size-xl);
   font-weight: 600;

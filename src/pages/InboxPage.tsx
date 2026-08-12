@@ -87,8 +87,10 @@ export default function InboxPage() {
 
   const selectedTask  = tasks.find((t) => t.id === selectedId) ?? null;
 
-  const isConnected = settings?.microsoftConnectionStatus === 'connected';
-  const clientId    = settings?.microsoftClientId ?? '';
+  const isConnected      = settings?.microsoftConnectionStatus === 'connected';
+  const clientId         = settings?.microsoftClientId ?? '';
+  const tenantId         = settings?.microsoftTenant ?? '';
+  const isM365Configured = !!clientId.trim() && !!tenantId.trim();
 
   /**
    * Called when the Outlook/Teams panel detects that the Microsoft refresh token
@@ -282,6 +284,15 @@ export default function InboxPage() {
                   Teams
                 </button>
               </>
+            )}
+            {!isConnected && isM365Configured && (
+              <span
+                className="m365-inline-status"
+                title="Microsoft token cache is disconnected. Open Settings > Microsoft 365 and refresh or reconnect."
+              >
+                <Icon name="log-in" size={13} />
+                Microsoft 365 disconnected
+              </span>
             )}
             <button className="btn btn-secondary" onClick={() => setShowTaskForm(true)}>
               <span className="btn-icon">+</span>
