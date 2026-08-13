@@ -35,6 +35,11 @@ describe('canonical work item contract', () => {
     expect(item.revision).toBe(4);
   });
 
+  it('projects the explicit planning bucket used by overview categories', () => {
+    const item = taskToWorkItem({ ...task, planningBucket: 'now' });
+    expect(item.planningBucket).toBe('now');
+  });
+
   it('preserves canonical-only context when the compatibility task changes', () => {
     const canonical = taskToWorkItem(task);
     canonical.tags = ['renewal'];

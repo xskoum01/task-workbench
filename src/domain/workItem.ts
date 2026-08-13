@@ -1,4 +1,4 @@
-import type { Task, TaskObligationKind, TaskStatus } from '../types';
+import type { PlanningBucket, Task, TaskObligationKind, TaskStatus } from '../types';
 
 export const WORK_ITEM_SCHEMA_VERSION = 1 as const;
 
@@ -82,7 +82,7 @@ export interface WorkItem {
   blockerReason?: string;
   source: string;
   sourceUrl?: string;
-  planningBucket?: string;
+  planningBucket?: PlanningBucket;
   estimateMinutes?: number;
   externalReferences: ExternalReference[];
   tags: string[];
@@ -172,6 +172,7 @@ export function taskToWorkItem(task: Task): WorkItem {
     ...(task.completedAt ? { completedAt: task.completedAt } : {}),
     source: task.source,
     ...(task.sourceUrl ? { sourceUrl: task.sourceUrl } : {}),
+    ...(task.planningBucket ? { planningBucket: task.planningBucket } : {}),
     externalReferences: [
       ...(task.devopsTaskUrl ? [{ type: 'azure_devops_work_item', label: 'Azure DevOps', url: task.devopsTaskUrl }] : []),
       ...(task.ticketUrl ? [{ type: 'ticket', label: 'Helpdesk ticket', url: task.ticketUrl }] : []),

@@ -2,7 +2,7 @@ import { useMemo, useState } from 'react';
 import TaskRecordDetail from '../components/TaskRecordDetail';
 import { useApp } from '../context/AppContext';
 
-type FocusKey = 'overdue' | 'today' | 'blocked' | 'waiting' | 'obligations';
+type FocusKey = 'now' | 'overdue' | 'today' | 'blocked' | 'waiting' | 'obligations';
 
 function localDay(value: Date): string {
   const year = value.getFullYear();
@@ -25,6 +25,7 @@ export default function OverviewPage() {
   );
   const active = records.filter(({ item }) => !['completed', 'cancelled'].includes(item.status));
   const groups: Record<FocusKey, typeof records> = {
+    now: active.filter(({ item }) => item.planningBucket === 'now'),
     overdue: active.filter(({ item }) => !!item.dueAt && item.dueAt.slice(0, 10) < today),
     today: active.filter(({ item }) => item.dueAt?.slice(0, 10) === today),
     blocked: active.filter(({ item }) => item.status === 'blocked'),
@@ -49,6 +50,7 @@ export default function OverviewPage() {
 
       <div className="overview-metrics" role="list" aria-label="Attention categories">
         {([
+          ['now', 'Now'],
           ['overdue', 'Overdue'],
           ['today', 'Due today'],
           ['blocked', 'Blocked'],
