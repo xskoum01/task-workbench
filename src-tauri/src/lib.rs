@@ -4920,6 +4920,48 @@ mod task_record_contract_tests {
         assert!(names.contains(&"get_task_record".to_string()));
     }
 
+    /// The bridge fail-closed gate: task_mcp_execute_tool's ONLY other branch besides
+    /// "is a canonical tool" is an unconditional `return Err(...)` before any of the archived
+    /// developer-workflow (Git/deployment/PR) match arms — task_mcp_is_canonical_tool_name is the
+    /// exact predicate that decides that branch. This can't call task_mcp_execute_tool itself
+    /// (it needs a real tauri::AppHandle this test suite has no way to construct), so this proves
+    /// the gate predicate is correct; the unconditional early return proves nothing past the gate
+    /// is reachable for anything the predicate rejects.
+    #[test]
+    fn bridge_gate_rejects_every_legacy_git_and_deployment_tool_name() {
+        for forbidden in [
+            "commit_task_changes",
+            "push_task_branch",
+            "create_or_checkout_task_branch",
+            "create_branch_for_task",
+            "commit_and_push_task_changes",
+            "record_pull_request_created",
+            "record_manual_deployment",
+            "reconcile_task_git_state",
+            "prepare_pull_request_for_task",
+            "get_task_workbench_mcp_capabilities",
+        ] {
+            assert!(
+                !task_mcp_is_canonical_tool_name(forbidden),
+                "'{forbidden}' must not be treated as a canonical (executable) MCP tool"
+            );
+        }
+    }
+
+    #[test]
+    fn bridge_gate_rejects_a_completely_unknown_tool_name() {
+        assert!(!task_mcp_is_canonical_tool_name("completely_unknown_tool"));
+        assert!(!task_mcp_is_canonical_tool_name(""));
+    }
+
+    #[test]
+    fn bridge_gate_accepts_every_canonical_tool_name() {
+        for tool in canonical_mcp_tool_definitions() {
+            let name = tool["name"].as_str().unwrap();
+            assert!(task_mcp_is_canonical_tool_name(name), "'{name}' should be accepted");
+        }
+    }
+
     #[test]
     fn work_item_patch_updates_whitelisted_fields_and_budget_metadata() {
         let mut canonical = item("task-3");
@@ -10447,14 +10489,38 @@ fn task_mcp_snapshot_proposed_setup(setup: &Value) -> Value {
     })
 }
 
+/// Single authoritative allowlist check backing the fail-closed MCP/bridge gate below. Pure — no
+/// AppHandle/I/O — so it is directly unit-testable, unlike `task_mcp_execute_tool` itself (which
+/// needs a real `tauri::AppHandle` that this codebase's test suite has no way to construct).
+/// `canonical_mcp_tool_definitions()` is the same list `GET /mcp/tools` publishes, so the
+/// published tool list and the executable tool set can never drift apart.
+fn task_mcp_is_canonical_tool_name(tool_name: &str) -> bool {
+    canonical_mcp_tool_definitions()
+        .iter()
+        .any(|tool| tool["name"].as_str() == Some(tool_name))
+}
+
+/// Fail-closed MCP/bridge dispatcher: `POST /mcp/tools/call` (task_mcp_handle_http_connection)
+/// is the ONLY caller of this function, so this is the single authoritative gate for every tool
+/// name reachable through the authenticated localhost bridge. Everything below the early return
+/// is the archived pre-2.0 developer-workflow dispatcher (Git branch/commit/push, PR recording,
+/// deployment recording, etc.). It is kept in source only so the historical task records it once
+/// produced stay readable/greppable; it must never be re-wired to a live entry point. See
+/// docs/legacy-boundary.md.
+#[allow(unreachable_code)]
 fn task_mcp_execute_tool(
     app: &tauri::AppHandle,
     tool_name: &str,
     args: &Value,
 ) -> Result<Value, String> {
-    if canonical_mcp_tool_definitions().iter().any(|tool| tool["name"].as_str() == Some(tool_name)) {
+    if task_mcp_is_canonical_tool_name(tool_name) {
         return task_mcp_execute_canonical_tool(app, tool_name, args);
     }
+    return Err(format!(
+        "unknown_tool: '{tool_name}' is not part of the Task Workbench canonical MCP interface. \
+         Legacy developer-workflow tool names are retained in source for historical reference only \
+         and are never executable through this bridge."
+    ));
     let mut tasks = task_mcp_load_tasks(app)?;
     let customers = task_mcp_load_customers(app).unwrap_or_default();
     let settings = load_settings(app.clone()).unwrap_or_else(|_| serde_json::json!({}));

@@ -63,16 +63,37 @@ const TOOL_DEFINITIONS = [
   {
     name: 'list_work_items',
     description:
-      'List canonical tasks and obligations from Task Workbench. Returns data only and never executes work.',
+      'List canonical tasks and obligations from Task Workbench. Filtering is performed by the ' +
+      'authoritative Task Workbench query layer, not by the caller — always prefer the narrowest ' +
+      'filter that answers the question (e.g. status="in_progress" for "what am I working on", ' +
+      'planningBucket="now" or "today" for the Now/Today view, dueBefore for the nearest deadline, ' +
+      'updatedAfter for "what changed since I last checked") instead of listing every item. ' +
+      'Returns data only and never executes work.',
     inputSchema: {
       type: 'object',
       properties: {
         includeArchived: { type: 'boolean' },
         limit: { type: 'integer', minimum: 1, maximum: 500 },
         cursor: { type: 'string' },
+        status: { type: 'string', enum: WORK_ITEM_STATUS },
+        kind: { type: 'string', enum: ['task', 'obligation'] },
+        owner: {
+          type: 'string',
+          description: 'Matches owner id exactly or owner displayName case-insensitively.',
+        },
+        area: { type: 'string', description: 'Matches areaId exactly.' },
+        source: { type: 'string' },
+        planningBucket: {
+          type: 'string',
+          description: 'Matches the explicitly stored planningBucket exactly; never inferred.',
+        },
+        dueBefore: { type: 'string', description: 'ISO 8601 timestamp; inclusive upper bound on dueAt.' },
+        dueAfter: { type: 'string', description: 'ISO 8601 timestamp; inclusive lower bound on dueAt.' },
+        updatedAfter: { type: 'string', description: 'ISO 8601 timestamp; exclusive lower bound on updatedAt.' },
       },
       additionalProperties: false,
     },
+    annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
     outputSchema: {
       type: 'object',
       required: ['apiVersion', 'generatedAt', 'snapshotRevision', 'items', 'nextCursor'],
@@ -94,6 +115,7 @@ const TOOL_DEFINITIONS = [
       required: ['id'],
       additionalProperties: false,
     },
+    annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
   },
   {
     name: 'get_task_record',
@@ -105,6 +127,7 @@ const TOOL_DEFINITIONS = [
       required: ['id'],
       additionalProperties: false,
     },
+    annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
   },
   {
     name: 'list_work_item_changes',
@@ -117,6 +140,7 @@ const TOOL_DEFINITIONS = [
       },
       additionalProperties: false,
     },
+    annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
   },
   {
     name: 'create_work_item',
@@ -124,10 +148,17 @@ const TOOL_DEFINITIONS = [
       'Create a canonical task or obligation record. This records work; it does not perform it.',
     inputSchema: {
       type: 'object',
-      properties: { item: { type: 'object' } },
+      properties: {
+        item: { type: 'object' },
+        idempotencyKey: {
+          type: 'string',
+          description: 'Optional. Repeating a create with the same key returns the original record instead of creating a duplicate.',
+        },
+      },
       required: ['item'],
       additionalProperties: false,
     },
+    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
   },
   {
     name: 'update_work_item',
@@ -143,6 +174,7 @@ const TOOL_DEFINITIONS = [
       required: ['id', 'item', 'expectedRevision'],
       additionalProperties: false,
     },
+    annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: false },
   },
   {
     name: 'patch_work_item',
@@ -159,6 +191,7 @@ const TOOL_DEFINITIONS = [
       required: ['id', 'patch', 'expectedRevision'],
       additionalProperties: false,
     },
+    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
   },
   {
     name: 'transition_work_item',
@@ -175,6 +208,7 @@ const TOOL_DEFINITIONS = [
       required: ['id', 'status', 'expectedRevision'],
       additionalProperties: false,
     },
+    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
   },
   {
     name: 'append_work_item_note',
@@ -190,6 +224,7 @@ const TOOL_DEFINITIONS = [
       required: ['id', 'text', 'expectedRevision'],
       additionalProperties: false,
     },
+    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
   },
   {
     name: 'get_planning_today',
@@ -203,6 +238,7 @@ const TOOL_DEFINITIONS = [
       properties: { timezone: { type: 'string' } },
       additionalProperties: false,
     },
+    annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
     outputSchema: {
       type: 'object',
       required: ['apiVersion', 'generatedAt', 'sourceRevision', 'timezone', 'sections'],
@@ -414,7 +450,13 @@ async function handleRequest(message) {
       capabilities: { tools: { listChanged: false } },
       serverInfo: { name: SERVER_NAME, version: SERVER_VERSION },
       instructions:
-        'Task Workbench provides authoritative task, obligation, context, status, deadline, and history data. It does not execute tasks or orchestrate agents.',
+        'Task Workbench is the authoritative source of truth for tasks, obligations, status, priority, ' +
+        'deadlines, planning buckets, context, and history. It can read and update these records, but it ' +
+        'never performs the represented work, never orchestrates coding agents or other AI agents, and ' +
+        'never executes Git, repository, or deployment operations — those are outside its product boundary. ' +
+        'Prefer the narrowest read tool for a question instead of listing everything: use list_work_items ' +
+        'with a status/kind/owner/area/source/planningBucket/dueBefore/dueAfter/updatedAfter filter, or ' +
+        'get_planning_today for the live Now/Today view, before falling back to an unfiltered list.',
     });
   }
   if (method === 'notifications/initialized') return null;

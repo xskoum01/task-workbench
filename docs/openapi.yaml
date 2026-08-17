@@ -73,12 +73,23 @@ paths:
                 $ref: "#/components/schemas/WorkItemListEnvelope"
     post:
       operationId: createWorkItem
+      description: >
+        Creates a canonical WorkItem. Accepts either a bare WorkItem body, or
+        `{ item, idempotencyKey }` — a repeated call with the same
+        `idempotencyKey` returns the original record instead of creating a
+        duplicate.
       requestBody:
         required: true
         content:
           application/json:
             schema:
-              $ref: ./work-item.schema.json
+              oneOf:
+                - $ref: ./work-item.schema.json
+                - type: object
+                  required: [item]
+                  properties:
+                    item: { $ref: ./work-item.schema.json }
+                    idempotencyKey: { type: string }
       responses:
         "200": { description: Created work item }
         "400": { $ref: "#/components/responses/Error" }

@@ -8,6 +8,7 @@
     "build": "tsc && vite build",
     "test": "vitest run",
     "test:scanner": "vitest run src/lib/crmReferenceScanner.spec.ts",
+    "mcp": "node mcp/task-workbench-mcp.mjs",
     "mcp:readonly": "node mcp/task-workbench-mcp.mjs",
     "preview": "vite preview",
     "tauri": "tauri"
