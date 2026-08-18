@@ -1,0 +1,377 @@
+//! Daily Queue — the explicit, user-chosen execution order for a calendar day.
+//!
+//! This is a distinct concept from `WorkItem.status` (workflow state) and from
+//! `WorkItem.planning_bucket` (relevance/planning grouping, e.g. "today"). A
+//! work item can be `status=ready`, `planningBucket=today`, and still have no
+//! opinion about *when today* the user intends to work on it — the daily
+//! queue is that explicit ordering, chosen by the user (or set on their
+//! behalf via an explicit MCP mutation), never inferred from status,
+//! priority, or due date. See docs/task-workbench-mcp.md for the full
+//! Today-vs-Daily-Queue contract.
+//!
+//! Everything in this module is pure (no I/O, no SQLite, no AppHandle) so the
+//! ordering rules are unit-testable in isolation. `storage::sqlite` reads the
+//! persisted entries, calls these functions to compute the next state, and
+//! writes the result back atomically under a revision check.
+
+use serde::{Deserialize, Serialize};
+
+/// One entry in a daily queue, in storage/domain shape (`workItemId` + when it
+/// was added). The wire projection returned to REST/MCP callers additionally
+/// carries `position` and the joined `WorkItem` summary — that enrichment
+/// happens in the transport layer (lib.rs), not here.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DailyQueueEntry {
+    pub work_item_id: String,
+    pub added_at: String,
+}
+
+/// The full queue for one calendar day. `revision` follows the same
+/// optimistic-concurrency convention as `WorkItem.revision`, with one
+/// deliberate difference: a date that has never been queued is represented as
+/// `revision: 0` with no entries — a virtual empty queue, not a missing
+/// resource — so `get_daily_queue` never errors for an unknown date, and the
+/// first mutation for that date is simply the one whose `expectedRevision` is
+/// `0`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DailyQueue {
+    pub date: String,
+    pub revision: i64,
+    pub updated_at: String,
+    pub entries: Vec<DailyQueueEntry>,
+}
+
+impl DailyQueue {
+    /// The virtual empty queue for a date that has no stored row yet.
+    pub fn empty(date: &str) -> Self {
+        Self {
+            date: date.to_string(),
+            revision: 0,
+            updated_at: String::new(),
+            entries: vec![],
+        }
+    }
+}
+
+/// Domain-level rejection reasons for the entry-list transforms below. The
+/// storage layer maps these to `ApplicationError` with date/id context.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DailyQueueError {
+    /// `apply_add`: the work item is already in this queue. A work item may
+    /// appear in a given day's queue at most once.
+    AlreadyQueued,
+    /// `apply_move` / `apply_remove`: the work item is not currently in this
+    /// queue (it may exist elsewhere, or not exist at all — the caller
+    /// validates WorkItem existence separately before reaching this point).
+    NotQueued,
+}
+
+/// Inserts `work_item_id` into `entries`. `position` is 1-based; omitted or
+/// out-of-range values append to the end (never an error — a caller asking
+/// for position 999 on a 3-item queue clearly means "put it last").
+pub fn apply_add(
+    entries: &[DailyQueueEntry],
+    work_item_id: &str,
+    position: Option<usize>,
+    at: &str,
+) -> Result<Vec<DailyQueueEntry>, DailyQueueError> {
+    if entries.iter().any(|entry| entry.work_item_id == work_item_id) {
+        return Err(DailyQueueError::AlreadyQueued);
+    }
+    let mut next = entries.to_vec();
+    let insert_at = position
+        .map(|requested| requested.saturating_sub(1).min(next.len()))
+        .unwrap_or(next.len());
+    next.insert(
+        insert_at,
+        DailyQueueEntry {
+            work_item_id: work_item_id.to_string(),
+            added_at: at.to_string(),
+        },
+    );
+    Ok(next)
+}
+
+/// Moves the existing entry for `work_item_id` to 1-based `position`,
+/// clamping out-of-range positions to the nearest valid slot (never an
+/// error), same rationale as `apply_add`.
+pub fn apply_move(
+    entries: &[DailyQueueEntry],
+    work_item_id: &str,
+    position: usize,
+) -> Result<Vec<DailyQueueEntry>, DailyQueueError> {
+    let mut next = entries.to_vec();
+    let current_index = next
+        .iter()
+        .position(|entry| entry.work_item_id == work_item_id)
+        .ok_or(DailyQueueError::NotQueued)?;
+    let entry = next.remove(current_index);
+    let insert_at = position.saturating_sub(1).min(next.len());
+    next.insert(insert_at, entry);
+    Ok(next)
+}
+
+/// Removes the entry for `work_item_id`. Errors (rather than silently
+/// no-op-ing) when it is not present, so a caller's mistaken id is surfaced
+/// instead of masked.
+pub fn apply_remove(
+    entries: &[DailyQueueEntry],
+    work_item_id: &str,
+) -> Result<Vec<DailyQueueEntry>, DailyQueueError> {
+    if !entries.iter().any(|entry| entry.work_item_id == work_item_id) {
+        return Err(DailyQueueError::NotQueued);
+    }
+    Ok(entries
+        .iter()
+        .filter(|entry| entry.work_item_id != work_item_id)
+        .cloned()
+        .collect())
+}
+
+/// Atomically replaces the whole ordered list. Each id that was already
+/// present keeps its original `addedAt` (historical integrity — replacing the
+/// queue is a reorder/edit, not a fresh batch of additions); ids new to the
+/// queue get `at`. Callers must validate `work_item_ids` has no duplicates
+/// before calling this (see `has_duplicates`) — this function trusts its
+/// input list is already deduplicated.
+pub fn apply_replace(
+    entries: &[DailyQueueEntry],
+    work_item_ids: &[String],
+    at: &str,
+) -> Vec<DailyQueueEntry> {
+    work_item_ids
+        .iter()
+        .map(|id| {
+            entries
+                .iter()
+                .find(|entry| &entry.work_item_id == id)
+                .cloned()
+                .unwrap_or_else(|| DailyQueueEntry {
+                    work_item_id: id.clone(),
+                    added_at: at.to_string(),
+                })
+        })
+        .collect()
+}
+
+/// True when `work_item_ids` contains the same id more than once.
+pub fn has_duplicates(work_item_ids: &[String]) -> bool {
+    let mut seen = std::collections::HashSet::new();
+    !work_item_ids.iter().all(|id| seen.insert(id))
+}
+
+/// Strict `YYYY-MM-DD` calendar-date check (rejects `2026-02-30`, not just the
+/// shape) without pulling in a date/time crate. Intentionally a self-contained
+/// copy of the leap-year rule rather than importing lib.rs's own copy: domain
+/// code must not depend on the application/transport layer above it.
+pub fn is_valid_calendar_date(date: &str) -> bool {
+    let bytes = date.as_bytes();
+    if bytes.len() != 10 || bytes[4] != b'-' || bytes[7] != b'-' {
+        return false;
+    }
+    if !date[0..4].bytes().all(|b| b.is_ascii_digit())
+        || !date[5..7].bytes().all(|b| b.is_ascii_digit())
+        || !date[8..10].bytes().all(|b| b.is_ascii_digit())
+    {
+        return false;
+    }
+    let year: i64 = match date[0..4].parse() {
+        Ok(value) => value,
+        Err(_) => return false,
+    };
+    let month: u32 = match date[5..7].parse() {
+        Ok(value) => value,
+        Err(_) => return false,
+    };
+    let day: u32 = match date[8..10].parse() {
+        Ok(value) => value,
+        Err(_) => return false,
+    };
+    if !(1..=12).contains(&month) || day == 0 {
+        return false;
+    }
+    let is_leap = (year % 4 == 0 && year % 100 != 0) || year % 400 == 0;
+    let days_in_month: [u32; 12] = [
+        31,
+        if is_leap { 29 } else { 28 },
+        31,
+        30,
+        31,
+        30,
+        31,
+        31,
+        30,
+        31,
+        30,
+        31,
+    ];
+    day <= days_in_month[(month - 1) as usize]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn entry(id: &str, at: &str) -> DailyQueueEntry {
+        DailyQueueEntry {
+            work_item_id: id.to_string(),
+            added_at: at.to_string(),
+        }
+    }
+
+    // --- is_valid_calendar_date ---
+
+    #[test]
+    fn accepts_well_formed_dates() {
+        assert!(is_valid_calendar_date("2026-08-17"));
+        assert!(is_valid_calendar_date("2024-02-29")); // leap year
+        assert!(is_valid_calendar_date("2026-12-31"));
+    }
+
+    #[test]
+    fn rejects_malformed_or_impossible_dates() {
+        for bad in [
+            "2026-8-17",    // not zero-padded
+            "2026/08/17",   // wrong separators
+            "17-08-2026",   // wrong order
+            "2026-13-01",   // month 13
+            "2026-02-30",   // not a leap year, no Feb 30 anyway
+            "2023-02-29",   // not a leap year
+            "2026-00-10",   // month 0
+            "2026-08-00",   // day 0
+            "",
+            "today",
+        ] {
+            assert!(!is_valid_calendar_date(bad), "expected '{bad}' to be invalid");
+        }
+    }
+
+    // --- apply_add ---
+
+    #[test]
+    fn add_appends_when_no_position_given() {
+        let entries = vec![entry("a", "t1")];
+        let next = apply_add(&entries, "b", None, "t2").unwrap();
+        assert_eq!(
+            next.iter().map(|e| e.work_item_id.as_str()).collect::<Vec<_>>(),
+            vec!["a", "b"]
+        );
+    }
+
+    #[test]
+    fn add_inserts_at_requested_position() {
+        let entries = vec![entry("a", "t1"), entry("b", "t2")];
+        let next = apply_add(&entries, "c", Some(1), "t3").unwrap();
+        assert_eq!(
+            next.iter().map(|e| e.work_item_id.as_str()).collect::<Vec<_>>(),
+            vec!["c", "a", "b"]
+        );
+    }
+
+    #[test]
+    fn add_clamps_an_out_of_range_position_to_the_end() {
+        let entries = vec![entry("a", "t1")];
+        let next = apply_add(&entries, "b", Some(999), "t2").unwrap();
+        assert_eq!(
+            next.iter().map(|e| e.work_item_id.as_str()).collect::<Vec<_>>(),
+            vec!["a", "b"]
+        );
+    }
+
+    #[test]
+    fn add_rejects_a_work_item_already_in_the_queue() {
+        let entries = vec![entry("a", "t1")];
+        assert_eq!(
+            apply_add(&entries, "a", None, "t2"),
+            Err(DailyQueueError::AlreadyQueued)
+        );
+    }
+
+    // --- apply_move ---
+
+    #[test]
+    fn move_reorders_an_existing_entry() {
+        let entries = vec![entry("a", "t1"), entry("b", "t2"), entry("c", "t3")];
+        let next = apply_move(&entries, "c", 1).unwrap();
+        assert_eq!(
+            next.iter().map(|e| e.work_item_id.as_str()).collect::<Vec<_>>(),
+            vec!["c", "a", "b"]
+        );
+    }
+
+    #[test]
+    fn move_preserves_added_at_of_the_moved_entry() {
+        let entries = vec![entry("a", "t1"), entry("b", "t2")];
+        let next = apply_move(&entries, "b", 1).unwrap();
+        assert_eq!(next[0].added_at, "t2");
+    }
+
+    #[test]
+    fn move_clamps_an_out_of_range_position() {
+        let entries = vec![entry("a", "t1"), entry("b", "t2")];
+        let next = apply_move(&entries, "a", 999).unwrap();
+        assert_eq!(
+            next.iter().map(|e| e.work_item_id.as_str()).collect::<Vec<_>>(),
+            vec!["b", "a"]
+        );
+    }
+
+    #[test]
+    fn move_rejects_a_work_item_not_in_the_queue() {
+        let entries = vec![entry("a", "t1")];
+        assert_eq!(apply_move(&entries, "z", 1), Err(DailyQueueError::NotQueued));
+    }
+
+    // --- apply_remove ---
+
+    #[test]
+    fn remove_drops_the_entry() {
+        let entries = vec![entry("a", "t1"), entry("b", "t2")];
+        let next = apply_remove(&entries, "a").unwrap();
+        assert_eq!(
+            next.iter().map(|e| e.work_item_id.as_str()).collect::<Vec<_>>(),
+            vec!["b"]
+        );
+    }
+
+    #[test]
+    fn remove_rejects_a_work_item_not_in_the_queue() {
+        let entries = vec![entry("a", "t1")];
+        assert_eq!(apply_remove(&entries, "z"), Err(DailyQueueError::NotQueued));
+    }
+
+    // --- apply_replace ---
+
+    #[test]
+    fn replace_preserves_added_at_for_surviving_entries_and_stamps_new_ones() {
+        let entries = vec![entry("a", "t1"), entry("b", "t2")];
+        let next = apply_replace(
+            &entries,
+            &["b".to_string(), "c".to_string()],
+            "t-replace",
+        );
+        assert_eq!(next.len(), 2);
+        assert_eq!(next[0].work_item_id, "b");
+        assert_eq!(next[0].added_at, "t2"); // preserved
+        assert_eq!(next[1].work_item_id, "c");
+        assert_eq!(next[1].added_at, "t-replace"); // new
+    }
+
+    #[test]
+    fn replace_with_empty_list_clears_the_queue() {
+        let entries = vec![entry("a", "t1")];
+        let next = apply_replace(&entries, &[], "t2");
+        assert!(next.is_empty());
+    }
+
+    // --- has_duplicates ---
+
+    #[test]
+    fn detects_duplicate_work_item_ids() {
+        assert!(has_duplicates(&["a".to_string(), "b".to_string(), "a".to_string()]));
+        assert!(!has_duplicates(&["a".to_string(), "b".to_string()]));
+        assert!(!has_duplicates(&[]));
+    }
+}

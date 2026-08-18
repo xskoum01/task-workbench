@@ -59,6 +59,38 @@ const WORK_ITEM_SUMMARY_SCHEMA = {
   },
 };
 
+const DAILY_QUEUE_DATE_SCHEMA = {
+  type: 'string',
+  pattern: '^[0-9]{4}-[0-9]{2}-[0-9]{2}$',
+  description: 'Local calendar date, YYYY-MM-DD.',
+};
+
+// Shared response shape for get_daily_queue and every daily-queue mutation
+// (they all return the full updated queue) — kept in one place so all five
+// tools' outputSchema stay identical to each other and to
+// docs/openapi.yaml's DailyQueueResult / lib.rs's mcp_daily_queue_schema().
+const DAILY_QUEUE_SCHEMA = {
+  type: 'object',
+  required: ['apiVersion', 'date', 'revision', 'generatedAt', 'entries'],
+  properties: {
+    apiVersion: { const: '1' },
+    date: { type: 'string' },
+    revision: { type: 'integer' },
+    generatedAt: { type: 'string' },
+    entries: {
+      type: 'array',
+      items: {
+        type: 'object',
+        required: ['position', 'workItem'],
+        properties: {
+          position: { type: 'integer', minimum: 1 },
+          workItem: WORK_ITEM_SUMMARY_SCHEMA,
+        },
+      },
+    },
+  },
+};
+
 const TOOL_DEFINITIONS = [
   {
     name: 'list_work_items',
@@ -258,6 +290,102 @@ const TOOL_DEFINITIONS = [
       },
     },
   },
+  {
+    name: 'get_daily_queue',
+    description:
+      'Read the explicit, user-chosen execution order for one calendar day — distinct from status ' +
+      'and planningBucket. Never AI-ranked or inferred from priority/due date. When `date` is ' +
+      'omitted, defaults to the app\'s local calendar today (the same "today" the desktop UI uses) — ' +
+      'call this first to learn the canonical date/revision before a mutation. If the queue is ' +
+      'explicit and non-empty, treat it as the user-approved order rather than substituting your own ' +
+      'ranking.',
+    inputSchema: {
+      type: 'object',
+      properties: { date: DAILY_QUEUE_DATE_SCHEMA },
+      additionalProperties: false,
+    },
+    annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+    outputSchema: DAILY_QUEUE_SCHEMA,
+  },
+  {
+    name: 'replace_daily_queue',
+    description:
+      'Atomically set the complete ordered daily queue for `date` to exactly `workItemIds`, in that ' +
+      'order — e.g. "set my queue to A, B, C". Rejects a duplicate id, an archived work item, or an ' +
+      'id that does not exist; the whole call fails and nothing is partially applied. Call ' +
+      'get_daily_queue first to resolve `date` and the current `expectedRevision`.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        date: DAILY_QUEUE_DATE_SCHEMA,
+        workItemIds: { type: 'array', items: { type: 'string', minLength: 1 } },
+        expectedRevision: { type: 'integer', minimum: 0 },
+      },
+      required: ['date', 'workItemIds', 'expectedRevision'],
+      additionalProperties: false,
+    },
+    annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: false },
+    outputSchema: DAILY_QUEUE_SCHEMA,
+  },
+  {
+    name: 'add_to_daily_queue',
+    description:
+      'Add one work item to the daily queue for `date`. `position` is 1-based; omitted or ' +
+      'out-of-range values append to the end. Rejects if the work item is already queued for that ' +
+      'date, archived, or does not exist.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        date: DAILY_QUEUE_DATE_SCHEMA,
+        workItemId: { type: 'string', minLength: 1 },
+        position: { type: 'integer', minimum: 1 },
+        expectedRevision: { type: 'integer', minimum: 0 },
+      },
+      required: ['date', 'workItemId', 'expectedRevision'],
+      additionalProperties: false,
+    },
+    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
+    outputSchema: DAILY_QUEUE_SCHEMA,
+  },
+  {
+    name: 'move_daily_queue_item',
+    description:
+      'Move a work item already in the daily queue for `date` to 1-based `position`, clamped to the ' +
+      'valid range — e.g. "put Neopharma before Orbit". Rejects if the work item is not currently in ' +
+      'that day\'s queue. Never changes status or planningBucket.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        date: DAILY_QUEUE_DATE_SCHEMA,
+        workItemId: { type: 'string', minLength: 1 },
+        position: { type: 'integer', minimum: 1 },
+        expectedRevision: { type: 'integer', minimum: 0 },
+      },
+      required: ['date', 'workItemId', 'position', 'expectedRevision'],
+      additionalProperties: false,
+    },
+    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
+    outputSchema: DAILY_QUEUE_SCHEMA,
+  },
+  {
+    name: 'remove_from_daily_queue',
+    description:
+      'Remove one work item from the daily queue for `date`. Does not change the work item\'s ' +
+      'status, planningBucket, or any other field — it only leaves today\'s execution order. Rejects ' +
+      'if the work item is not currently in that day\'s queue.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        date: DAILY_QUEUE_DATE_SCHEMA,
+        workItemId: { type: 'string', minLength: 1 },
+        expectedRevision: { type: 'integer', minimum: 0 },
+      },
+      required: ['date', 'workItemId', 'expectedRevision'],
+      additionalProperties: false,
+    },
+    annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: false },
+    outputSchema: DAILY_QUEUE_SCHEMA,
+  },
 ];
 
 const PUBLIC_TOOL_NAMES = new Set(TOOL_DEFINITIONS.map((tool) => tool.name));
@@ -451,12 +579,20 @@ async function handleRequest(message) {
       serverInfo: { name: SERVER_NAME, version: SERVER_VERSION },
       instructions:
         'Task Workbench is the authoritative source of truth for tasks, obligations, status, priority, ' +
-        'deadlines, planning buckets, context, and history. It can read and update these records, but it ' +
-        'never performs the represented work, never orchestrates coding agents or other AI agents, and ' +
-        'never executes Git, repository, or deployment operations — those are outside its product boundary. ' +
-        'Prefer the narrowest read tool for a question instead of listing everything: use list_work_items ' +
-        'with a status/kind/owner/area/source/planningBucket/dueBefore/dueAfter/updatedAfter filter, or ' +
-        'get_planning_today for the live Now/Today view, before falling back to an unfiltered list.',
+        'deadlines, planning buckets, daily execution order, context, and history. It can read and ' +
+        'update these records, but it never performs the represented work, never orchestrates coding ' +
+        'agents or other AI agents, and never executes Git, repository, or deployment operations — ' +
+        'those are outside its product boundary. Prefer the narrowest read tool for a question instead ' +
+        'of listing everything: use list_work_items with a ' +
+        'status/kind/owner/area/source/planningBucket/dueBefore/dueAfter/updatedAfter filter, or ' +
+        'get_planning_today for the live Now/Today view, before falling back to an unfiltered list. ' +
+        'For "what should I work on / in what order today", use get_daily_queue — it is a distinct ' +
+        'concept from status and planningBucket: the user\'s own explicit, chosen execution order for ' +
+        'a calendar day, never AI-ranked or inferred from priority/due date. If it is explicit and ' +
+        'non-empty, treat it as the user-approved plan rather than substituting your own ranking; only ' +
+        'change it via replace_daily_queue/add_to_daily_queue/move_daily_queue_item/' +
+        'remove_from_daily_queue, each of which requires the current expectedRevision from ' +
+        'get_daily_queue.',
     });
   }
   if (method === 'notifications/initialized') return null;

@@ -244,6 +244,136 @@ paths:
                 $ref: "#/components/schemas/PlanningTodayEnvelope"
         "401": { $ref: "#/components/responses/Error" }
         "503": { $ref: "#/components/responses/Error" }
+  /planning/daily-queue:
+    get:
+      operationId: getDailyQueue
+      description: >
+        The Daily Queue is a distinct concept from both `status` and
+        `planningBucket`: it is the explicit, user-chosen order to work
+        through items on one calendar date, never AI-ranked or inferred from
+        priority/due date/status. A date with no queue yet is not an error —
+        it returns `revision: 0` with an empty `entries` array (a virtual
+        empty queue); the first mutation for that date is the one whose
+        `expectedRevision` is `0`. When `date` is omitted, it defaults to the
+        app's local calendar today — the same "today" `src/lib/dates.ts`'s
+        `localTodayStr()` computes for the UI, so REST/MCP and the UI can
+        never disagree about what day "today" means.
+      parameters:
+        - in: query
+          name: date
+          schema: { type: string, pattern: "^[0-9]{4}-[0-9]{2}-[0-9]{2}$" }
+          description: Local calendar date, YYYY-MM-DD. Defaults to local today.
+      responses:
+        "200":
+          description: The daily queue for the resolved date
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DailyQueueEnvelope"
+        "400": { $ref: "#/components/responses/Error" }
+    patch:
+      operationId: replaceDailyQueue
+      description: >
+        Atomically sets the complete ordered queue for `date` to exactly
+        `workItemIds`, in that order. Rejects a duplicate id, an archived
+        work item, or an id that does not exist — the whole call fails and
+        nothing is partially applied. An id that was already queued for that
+        date keeps its original `addedAt`; a newly-added id is stamped with
+        the request time.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [date, workItemIds, expectedRevision]
+              properties:
+                date: { type: string, pattern: "^[0-9]{4}-[0-9]{2}-[0-9]{2}$" }
+                workItemIds:
+                  type: array
+                  items: { type: string, minLength: 1 }
+                expectedRevision:
+                  type: integer
+                  minimum: 0
+                  description: Use 0 for a date that has no queue yet.
+      responses:
+        "200": { description: The updated daily queue }
+        "400": { $ref: "#/components/responses/Error" }
+        "409": { $ref: "#/components/responses/Error" }
+  /planning/daily-queue/items:
+    post:
+      operationId: addToDailyQueue
+      description: >
+        Adds one work item to the queue for `date`. `position` is 1-based;
+        omitted or out-of-range values append to the end. Rejects if the
+        work item is already queued for that date, archived, or does not
+        exist.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [date, workItemId, expectedRevision]
+              properties:
+                date: { type: string, pattern: "^[0-9]{4}-[0-9]{2}-[0-9]{2}$" }
+                workItemId: { type: string, minLength: 1 }
+                position: { type: integer, minimum: 1 }
+                expectedRevision: { type: integer, minimum: 0 }
+      responses:
+        "200": { description: The updated daily queue }
+        "400": { $ref: "#/components/responses/Error" }
+        "404": { $ref: "#/components/responses/Error" }
+        "409": { $ref: "#/components/responses/Error" }
+  /planning/daily-queue/items/{workItemId}/move:
+    parameters:
+      - $ref: "#/components/parameters/WorkItemId"
+    post:
+      operationId: moveDailyQueueItem
+      description: >
+        Moves a work item already in the queue for `date` to 1-based
+        `position`, clamped to the valid range. Rejects if the work item is
+        not currently in that day's queue. Never changes `status` or
+        `planningBucket`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [date, position, expectedRevision]
+              properties:
+                date: { type: string, pattern: "^[0-9]{4}-[0-9]{2}-[0-9]{2}$" }
+                position: { type: integer, minimum: 1 }
+                expectedRevision: { type: integer, minimum: 0 }
+      responses:
+        "200": { description: The updated daily queue }
+        "400": { $ref: "#/components/responses/Error" }
+        "409": { $ref: "#/components/responses/Error" }
+  /planning/daily-queue/items/{workItemId}/remove:
+    parameters:
+      - $ref: "#/components/parameters/WorkItemId"
+    post:
+      operationId: removeFromDailyQueue
+      description: >
+        Removes a work item from the queue for `date`. Does not change the
+        work item's `status`, `planningBucket`, or any other field — it only
+        leaves today's execution order. Rejects if the work item is not
+        currently in that day's queue.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [date, expectedRevision]
+              properties:
+                date: { type: string, pattern: "^[0-9]{4}-[0-9]{2}-[0-9]{2}$" }
+                expectedRevision: { type: integer, minimum: 0 }
+      responses:
+        "200": { description: The updated daily queue }
+        "400": { $ref: "#/components/responses/Error" }
+        "409": { $ref: "#/components/responses/Error" }
 components:
   securitySchemes:
     bridgeToken:
@@ -450,3 +580,36 @@ components:
         - type: object
           properties:
             result: { $ref: "#/components/schemas/PlanningTodayResult" }
+    DailyQueueEntryProjection:
+      type: object
+      description: >
+        One queued work item, enriched with its position and current
+        WorkItem summary. A work item that has been entirely deleted (never
+        merely archived, completed, or cancelled — those still resolve
+        normally) is dropped from this projection; the underlying persisted
+        queue and its revision are unaffected.
+      required: [position, workItem]
+      properties:
+        position: { type: integer, minimum: 1 }
+        workItem: { $ref: "#/components/schemas/WorkItemSummary" }
+    DailyQueueResult:
+      type: object
+      required: [apiVersion, date, revision, generatedAt, entries]
+      properties:
+        apiVersion: { const: "1" }
+        date: { type: string, description: "YYYY-MM-DD, the resolved date this queue is for." }
+        revision:
+          type: integer
+          description: >
+            0 means this date has no queue yet (a virtual empty queue) — the
+            first mutation for that date must pass expectedRevision=0.
+        generatedAt: { type: string, format: date-time }
+        entries:
+          type: array
+          items: { $ref: "#/components/schemas/DailyQueueEntryProjection" }
+    DailyQueueEnvelope:
+      allOf:
+        - $ref: "#/components/schemas/CanonicalEnvelope"
+        - type: object
+          properties:
+            result: { $ref: "#/components/schemas/DailyQueueResult" }

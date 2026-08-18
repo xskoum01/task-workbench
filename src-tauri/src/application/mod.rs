@@ -1,3 +1,5 @@
+pub mod daily_queue;
+
 use crate::domain::lifecycle::validate_transition;
 use crate::domain::work_item::{
     ActorType, WorkItem, WorkItemContextEntry, WorkItemEvent, WorkItemStatus,

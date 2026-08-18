@@ -6842,3 +6842,128 @@ body {
   .overview-metrics { grid-template-columns: repeat(3, 1fr); }
   .obligation-grid { grid-template-columns: 1fr; }
 }
+
+/* --- Daily Queue --------------------------------------------------------- */
+
+.daily-queue {
+  margin-bottom: 24px;
+  padding: 16px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--bg-secondary);
+}
+.daily-queue-header { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 12px; }
+.daily-queue-header h3 { margin: 0; font-size: 14px; }
+.daily-queue-add-btn {
+  padding: 6px 11px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  color: var(--text-secondary);
+  background: transparent;
+  font: inherit;
+  cursor: pointer;
+}
+.daily-queue-add-btn:hover { color: var(--text-primary); border-color: var(--accent); background: var(--bg-hover); }
+
+.daily-queue-error {
+  margin-bottom: 12px;
+  padding: 8px 12px;
+  border: 1px solid var(--color-blocked, #f85149);
+  border-radius: 6px;
+  color: var(--text-primary);
+  background: rgba(248, 81, 73, 0.12);
+  font-size: 12px;
+}
+
+.daily-queue-loading,
+.daily-queue-empty {
+  padding: 24px 12px;
+  color: var(--text-muted);
+  text-align: center;
+  border: 1px dashed var(--border);
+  border-radius: 8px;
+  font-size: 13px;
+}
+
+.daily-queue-group { margin-bottom: 10px; }
+.daily-queue-group:last-child { margin-bottom: 0; }
+.daily-queue-group-label {
+  margin-bottom: 6px;
+  color: var(--text-muted);
+  font-size: 10px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: .08em;
+}
+.daily-queue-group--now .daily-queue-group-label { color: var(--accent); }
+
+.daily-queue-list { display: grid; gap: 6px; margin: 0; padding: 0; list-style: none; }
+
+.daily-queue-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--bg-overlay);
+  cursor: grab;
+}
+.daily-queue-row:active { cursor: grabbing; }
+.daily-queue-row--active { border-color: var(--accent); }
+.daily-queue-row--done { opacity: .6; }
+.daily-queue-row--done .daily-queue-title { text-decoration: line-through; }
+
+.daily-queue-position {
+  display: grid;
+  place-items: center;
+  width: 20px;
+  height: 20px;
+  border-radius: 50%;
+  color: var(--text-secondary);
+  background: var(--bg-hover);
+  font-size: 11px;
+  font-weight: 600;
+  flex: none;
+}
+
+.daily-queue-main { display: grid; min-width: 0; gap: 3px; flex: 1; }
+.daily-queue-title { overflow: hidden; font-size: 13px; text-overflow: ellipsis; white-space: nowrap; }
+.daily-queue-meta { display: flex; align-items: center; gap: 6px; color: var(--text-muted); font-size: 11px; }
+.daily-queue-sep { opacity: .6; }
+
+.daily-queue-actions { display: flex; align-items: center; gap: 4px; flex: none; }
+.daily-queue-action-btn {
+  display: grid;
+  place-items: center;
+  width: 24px;
+  height: 24px;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  color: var(--text-secondary);
+  background: transparent;
+  font-size: 10px;
+  cursor: pointer;
+}
+.daily-queue-action-btn:hover:not(:disabled) { color: var(--text-primary); border-color: var(--border); background: var(--bg-hover); }
+.daily-queue-action-btn:disabled { color: var(--text-muted); opacity: .4; cursor: default; }
+.daily-queue-action-btn--remove:hover:not(:disabled) { color: var(--color-blocked, #f85149); }
+
+.daily-queue-picker-empty { padding: 20px 8px; color: var(--text-muted); text-align: center; font-size: 13px; }
+.daily-queue-picker-list { display: grid; gap: 6px; margin: 0; padding: 0; list-style: none; }
+.daily-queue-picker-item {
+  display: grid;
+  width: 100%;
+  gap: 3px;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  color: inherit;
+  background: transparent;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+.daily-queue-picker-item:hover { border-color: var(--accent); background: var(--bg-hover); }
+.daily-queue-picker-title { font-size: 13px; }
+.daily-queue-picker-meta { display: flex; flex-wrap: wrap; gap: 8px; color: var(--text-muted); font-size: 11px; }

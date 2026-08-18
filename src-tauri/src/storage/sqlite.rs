@@ -1,4 +1,6 @@
+use crate::application::daily_queue::DailyQueueRepository;
 use crate::application::{ApplicationError, MutationContext, WorkItemRepository};
+use crate::domain::daily_queue::{DailyQueue, DailyQueueEntry};
 use crate::domain::work_item::{
     ActorType, ObligationMode, PartyReference, WorkItem, WorkItemContextEntry, WorkItemEvent,
     WorkItemKind, WorkItemPriority, WorkItemStatus, WORK_ITEM_SCHEMA_VERSION,
@@ -154,6 +156,12 @@ impl SqliteWorkItemRepository {
                     revision INTEGER NOT NULL,
                     changed_at TEXT NOT NULL,
                     action TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS daily_queues (
+                    date TEXT PRIMARY KEY,
+                    revision INTEGER NOT NULL CHECK(revision >= 1),
+                    updated_at TEXT NOT NULL,
+                    entries_json TEXT NOT NULL
                 );
                 "#,
             )
@@ -759,6 +767,209 @@ impl WorkItemRepository for SqliteWorkItemRepository {
             .commit()
             .map_err(|error| ApplicationError::storage(error.to_string()))?;
         Ok(updated)
+    }
+}
+
+// --- Daily Queue ------------------------------------------------------------
+//
+// One row per local calendar date. Unlike `work_items`, a date with no row is
+// a valid, meaningful state (nothing queued yet) rather than "not found" —
+// `read_daily_queue` represents that as revision 0 with no entries, matching
+// `DailyQueue::empty`. Every mutation reads the current row and writes the
+// next one inside a single transaction, with the revision check embedded in
+// the write statement's own WHERE clause (`AND revision = ?`) rather than
+// only checked in Rust beforehand — see `write_daily_queue` for why: it closes
+// a race that `WorkItemRepository::update`'s revision check (checked in Rust,
+// but not repeated in the UPDATE's WHERE clause) does not.
+
+fn read_daily_queue(
+    transaction: &Transaction,
+    date: &str,
+) -> Result<DailyQueue, ApplicationError> {
+    let row: Option<(i64, String, String)> = transaction
+        .query_row(
+            "SELECT revision, updated_at, entries_json FROM daily_queues WHERE date = ?1",
+            [date],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()
+        .map_err(|error| ApplicationError::storage(error.to_string()))?;
+    match row {
+        Some((revision, updated_at, entries_json)) => {
+            let entries: Vec<DailyQueueEntry> = serde_json::from_str(&entries_json)
+                .map_err(|error| ApplicationError::storage(error.to_string()))?;
+            Ok(DailyQueue { date: date.to_string(), revision, updated_at, entries })
+        }
+        None => Ok(DailyQueue::empty(date)),
+    }
+}
+
+/// Writes `next_entries` as the new state for `date`, requiring the row to
+/// still be at `expected_revision` at write time. `expected_revision == 0`
+/// means "this date has no row yet" and takes the INSERT path; any other
+/// value takes the UPDATE path with `AND revision = ?` in the WHERE clause,
+/// so a concurrent writer that already advanced the revision between this
+/// call's read and write causes `affected == 0` here — detected below and
+/// reported as `revision_conflict` with the actual current revision, instead
+/// of silently overwriting the concurrent write.
+fn write_daily_queue(
+    transaction: &Transaction,
+    date: &str,
+    expected_revision: i64,
+    next_entries: &[DailyQueueEntry],
+    at: &str,
+) -> Result<DailyQueue, ApplicationError> {
+    let new_revision = expected_revision + 1;
+    let entries_json = serde_json::to_string(next_entries)
+        .map_err(|error| ApplicationError::storage(error.to_string()))?;
+    let affected = if expected_revision == 0 {
+        transaction
+            .execute(
+                "INSERT INTO daily_queues(date, revision, updated_at, entries_json)
+                 VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT(date) DO NOTHING",
+                params![date, new_revision, at, entries_json],
+            )
+            .map_err(|error| ApplicationError::storage(error.to_string()))?
+    } else {
+        transaction
+            .execute(
+                "UPDATE daily_queues SET revision = ?2, updated_at = ?3, entries_json = ?4
+                 WHERE date = ?1 AND revision = ?5",
+                params![date, new_revision, at, entries_json, expected_revision],
+            )
+            .map_err(|error| ApplicationError::storage(error.to_string()))?
+    };
+    if affected == 0 {
+        let current = read_daily_queue(transaction, date)?;
+        return Err(ApplicationError::revision_conflict(expected_revision, current.revision));
+    }
+    Ok(DailyQueue {
+        date: date.to_string(),
+        revision: new_revision,
+        updated_at: at.to_string(),
+        entries: next_entries.to_vec(),
+    })
+}
+
+/// Maps a pure `domain::daily_queue` rejection into a contextual application error.
+fn daily_queue_domain_error(
+    error: crate::domain::daily_queue::DailyQueueError,
+    work_item_id: &str,
+    date: &str,
+) -> ApplicationError {
+    use crate::domain::daily_queue::DailyQueueError;
+    match error {
+        DailyQueueError::AlreadyQueued => ApplicationError::validation(format!(
+            "Work item {work_item_id} is already in the daily queue for {date}."
+        )),
+        DailyQueueError::NotQueued => ApplicationError::validation(format!(
+            "Work item {work_item_id} is not in the daily queue for {date}."
+        )),
+    }
+}
+
+impl DailyQueueRepository for SqliteWorkItemRepository {
+    fn get_queue(&self, date: &str) -> Result<DailyQueue, ApplicationError> {
+        self.initialize()?;
+        let mut connection = self.connect()?;
+        let transaction = connection
+            .transaction()
+            .map_err(|error| ApplicationError::storage(error.to_string()))?;
+        let queue = read_daily_queue(&transaction, date)?;
+        transaction
+            .commit()
+            .map_err(|error| ApplicationError::storage(error.to_string()))?;
+        Ok(queue)
+    }
+
+    fn replace(
+        &self,
+        date: &str,
+        work_item_ids: &[String],
+        expected_revision: i64,
+        at: &str,
+    ) -> Result<DailyQueue, ApplicationError> {
+        self.initialize()?;
+        let mut connection = self.connect()?;
+        let transaction = connection
+            .transaction()
+            .map_err(|error| ApplicationError::storage(error.to_string()))?;
+        let current = read_daily_queue(&transaction, date)?;
+        let next = crate::domain::daily_queue::apply_replace(&current.entries, work_item_ids, at);
+        let result = write_daily_queue(&transaction, date, expected_revision, &next, at)?;
+        transaction
+            .commit()
+            .map_err(|error| ApplicationError::storage(error.to_string()))?;
+        Ok(result)
+    }
+
+    fn add(
+        &self,
+        date: &str,
+        work_item_id: &str,
+        position: Option<usize>,
+        expected_revision: i64,
+        at: &str,
+    ) -> Result<DailyQueue, ApplicationError> {
+        self.initialize()?;
+        let mut connection = self.connect()?;
+        let transaction = connection
+            .transaction()
+            .map_err(|error| ApplicationError::storage(error.to_string()))?;
+        let current = read_daily_queue(&transaction, date)?;
+        let next = crate::domain::daily_queue::apply_add(&current.entries, work_item_id, position, at)
+            .map_err(|error| daily_queue_domain_error(error, work_item_id, date))?;
+        let result = write_daily_queue(&transaction, date, expected_revision, &next, at)?;
+        transaction
+            .commit()
+            .map_err(|error| ApplicationError::storage(error.to_string()))?;
+        Ok(result)
+    }
+
+    fn move_item(
+        &self,
+        date: &str,
+        work_item_id: &str,
+        position: usize,
+        expected_revision: i64,
+        at: &str,
+    ) -> Result<DailyQueue, ApplicationError> {
+        self.initialize()?;
+        let mut connection = self.connect()?;
+        let transaction = connection
+            .transaction()
+            .map_err(|error| ApplicationError::storage(error.to_string()))?;
+        let current = read_daily_queue(&transaction, date)?;
+        let next = crate::domain::daily_queue::apply_move(&current.entries, work_item_id, position)
+            .map_err(|error| daily_queue_domain_error(error, work_item_id, date))?;
+        let result = write_daily_queue(&transaction, date, expected_revision, &next, at)?;
+        transaction
+            .commit()
+            .map_err(|error| ApplicationError::storage(error.to_string()))?;
+        Ok(result)
+    }
+
+    fn remove(
+        &self,
+        date: &str,
+        work_item_id: &str,
+        expected_revision: i64,
+        at: &str,
+    ) -> Result<DailyQueue, ApplicationError> {
+        self.initialize()?;
+        let mut connection = self.connect()?;
+        let transaction = connection
+            .transaction()
+            .map_err(|error| ApplicationError::storage(error.to_string()))?;
+        let current = read_daily_queue(&transaction, date)?;
+        let next = crate::domain::daily_queue::apply_remove(&current.entries, work_item_id)
+            .map_err(|error| daily_queue_domain_error(error, work_item_id, date))?;
+        let result = write_daily_queue(&transaction, date, expected_revision, &next, at)?;
+        transaction
+            .commit()
+            .map_err(|error| ApplicationError::storage(error.to_string()))?;
+        Ok(result)
     }
 }
 
@@ -1892,5 +2103,124 @@ mod tests {
         let with_archived = repository.list(true, 50).unwrap();
         assert_eq!(with_archived.len(), 2);
         assert!(with_archived.iter().any(|item| item.id == "task-archived"));
+    }
+
+    // --- Daily Queue (SQLite adapter) ---------------------------------------
+    //
+    // Ordering/validation rules are covered exhaustively against fakes in
+    // application::daily_queue's tests. These tests exercise only what a real
+    // SQLite connection can actually prove: the revision compare-and-swap,
+    // that a losing writer is rejected rather than silently overwriting, and
+    // that data survives a fresh connection (simulating an app restart).
+
+    #[test]
+    fn daily_queue_get_on_an_unseen_date_is_a_virtual_empty_queue_at_revision_zero() {
+        let directory = tempdir().unwrap();
+        let repository = SqliteWorkItemRepository::at(directory.path().join("test.sqlite3"));
+        let queue = repository.get_queue("2026-08-17").unwrap();
+        assert_eq!(queue.revision, 0);
+        assert!(queue.entries.is_empty());
+    }
+
+    #[test]
+    fn daily_queue_add_persists_and_increments_revision() {
+        let directory = tempdir().unwrap();
+        let repository = SqliteWorkItemRepository::at(directory.path().join("test.sqlite3"));
+        let queue = repository
+            .add("2026-08-17", "task-a", None, 0, "2026-08-17T08:00:00Z")
+            .unwrap();
+        assert_eq!(queue.revision, 1);
+        let queue = repository
+            .add("2026-08-17", "task-b", None, 1, "2026-08-17T08:05:00Z")
+            .unwrap();
+        assert_eq!(queue.revision, 2);
+        assert_eq!(
+            queue.entries.iter().map(|e| e.work_item_id.as_str()).collect::<Vec<_>>(),
+            vec!["task-a", "task-b"]
+        );
+    }
+
+    #[test]
+    fn daily_queue_stale_expected_revision_is_rejected_at_the_sql_layer() {
+        let directory = tempdir().unwrap();
+        let repository = SqliteWorkItemRepository::at(directory.path().join("test.sqlite3"));
+        repository.add("2026-08-17", "task-a", None, 0, "t1").unwrap();
+        // Still claiming revision 0 (as if unaware task-a was already added).
+        let error = repository
+            .add("2026-08-17", "task-b", None, 0, "t2")
+            .unwrap_err();
+        assert_eq!(error.code, "revision_conflict");
+        assert_eq!(error.current_revision, Some(1));
+        // Nothing changed — task-b must not have been inserted.
+        let queue = repository.get_queue("2026-08-17").unwrap();
+        assert_eq!(queue.revision, 1);
+        assert_eq!(queue.entries.len(), 1);
+        assert_eq!(queue.entries[0].work_item_id, "task-a");
+    }
+
+    /// Simulates two callers that both read revision 1 and then race to move
+    /// item. A true OS-thread race and this sequential replay are
+    /// observationally identical here: both callers computed their mutation
+    /// against the same revision they saw, and SQLite's transaction (plus the
+    /// `AND revision = ?` compare-and-swap in `write_daily_queue`) serializes
+    /// whichever write actually reaches the database first. Exactly one may
+    /// succeed at revision 1 — the other must see `revision_conflict`, never
+    /// a silently-lost update.
+    #[test]
+    fn only_one_of_two_concurrent_reorder_attempts_at_the_same_revision_succeeds() {
+        let directory = tempdir().unwrap();
+        let repository = SqliteWorkItemRepository::at(directory.path().join("test.sqlite3"));
+        repository.add("2026-08-17", "task-a", None, 0, "t1").unwrap();
+        repository.add("2026-08-17", "task-b", None, 1, "t2").unwrap();
+        // Both "concurrent" callers observed revision 2 before attempting to move.
+        let first = repository.move_item("2026-08-17", "task-b", 1, 2, "t3");
+        let second = repository.move_item("2026-08-17", "task-a", 1, 2, "t4");
+        let outcomes = [first.is_ok(), second.is_ok()];
+        assert_eq!(outcomes.iter().filter(|ok| **ok).count(), 1, "exactly one of the two racing writers should succeed");
+        let loser = if first.is_ok() { second } else { first };
+        assert_eq!(loser.unwrap_err().code, "revision_conflict");
+        // Final state reflects exactly one applied move, at revision 3.
+        let queue = repository.get_queue("2026-08-17").unwrap();
+        assert_eq!(queue.revision, 3);
+    }
+
+    #[test]
+    fn daily_queue_survives_reopening_the_database() {
+        let directory = tempdir().unwrap();
+        let db_path = directory.path().join("test.sqlite3");
+        {
+            let repository = SqliteWorkItemRepository::at(db_path.clone());
+            repository.add("2026-08-17", "task-a", None, 0, "t1").unwrap();
+            repository.add("2026-08-17", "task-b", None, 1, "t2").unwrap();
+        }
+        // A fresh repository instance over the same file simulates an app restart.
+        let reopened = SqliteWorkItemRepository::at(db_path);
+        let queue = reopened.get_queue("2026-08-17").unwrap();
+        assert_eq!(queue.revision, 2);
+        assert_eq!(
+            queue.entries.iter().map(|e| e.work_item_id.as_str()).collect::<Vec<_>>(),
+            vec!["task-a", "task-b"]
+        );
+    }
+
+    #[test]
+    fn daily_queue_for_one_date_is_independent_of_another_date_in_sqlite() {
+        let directory = tempdir().unwrap();
+        let repository = SqliteWorkItemRepository::at(directory.path().join("test.sqlite3"));
+        repository.add("2026-08-17", "task-a", None, 0, "t1").unwrap();
+        repository.add("2026-08-18", "task-b", None, 0, "t2").unwrap();
+        let day17 = repository.get_queue("2026-08-17").unwrap();
+        let day18 = repository.get_queue("2026-08-18").unwrap();
+        assert_eq!(day17.entries[0].work_item_id, "task-a");
+        assert_eq!(day18.entries[0].work_item_id, "task-b");
+    }
+
+    #[test]
+    fn daily_queue_remove_of_unknown_work_item_is_rejected() {
+        let directory = tempdir().unwrap();
+        let repository = SqliteWorkItemRepository::at(directory.path().join("test.sqlite3"));
+        repository.add("2026-08-17", "task-a", None, 0, "t1").unwrap();
+        let error = repository.remove("2026-08-17", "ghost", 1, "t2").unwrap_err();
+        assert_eq!(error.code, "validation_error");
     }
 }

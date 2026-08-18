@@ -1,4 +1,5 @@
 import http from 'node:http';
+import { readFileSync } from 'node:fs';
 import { afterEach, describe, expect, it } from 'vitest';
 import {
   PUBLIC_TOOL_NAMES,
@@ -13,7 +14,19 @@ const MUTATION_TOOLS = new Set([
   'patch_work_item',
   'transition_work_item',
   'append_work_item_note',
+  'replace_daily_queue',
+  'add_to_daily_queue',
+  'move_daily_queue_item',
+  'remove_from_daily_queue',
 ]);
+
+const DAILY_QUEUE_TOOLS = [
+  'get_daily_queue',
+  'replace_daily_queue',
+  'add_to_daily_queue',
+  'move_daily_queue_item',
+  'remove_from_daily_queue',
+];
 
 function findTool(name) {
   const tool = TOOL_DEFINITIONS.find((candidate) => candidate.name === name);
@@ -47,14 +60,19 @@ function withMockBridge(respond) {
 describe('Task Workbench MCP 2.x boundary', () => {
   it('exposes only canonical task-data tools', () => {
     expect([...PUBLIC_TOOL_NAMES].sort()).toEqual([
+      'add_to_daily_queue',
       'append_work_item_note',
       'create_work_item',
+      'get_daily_queue',
       'get_planning_today',
       'get_task_record',
       'get_work_item',
       'list_work_item_changes',
       'list_work_items',
+      'move_daily_queue_item',
       'patch_work_item',
+      'remove_from_daily_queue',
+      'replace_daily_queue',
       'transition_work_item',
       'update_work_item',
     ]);
@@ -73,6 +91,10 @@ describe('Task Workbench MCP 2.x boundary', () => {
       'patch_work_item',
       'transition_work_item',
       'append_work_item_note',
+      'replace_daily_queue',
+      'add_to_daily_queue',
+      'move_daily_queue_item',
+      'remove_from_daily_queue',
     ]) {
       const tool = TOOL_DEFINITIONS.find((candidate) => candidate.name === name);
       expect(tool.inputSchema.required).toContain('expectedRevision');
@@ -207,6 +229,94 @@ describe('Task Workbench MCP 2.x boundary', () => {
           expect.arrayContaining(['apiVersion', 'generatedAt']),
         );
       }
+    });
+
+    it('every daily queue tool declares the same machine-readable outputSchema', () => {
+      const schemas = DAILY_QUEUE_TOOLS.map((name) => findTool(name).outputSchema);
+      for (const schema of schemas) {
+        expect(schema).toBeDefined();
+        expect(schema.required).toEqual(
+          expect.arrayContaining(['apiVersion', 'date', 'revision', 'generatedAt', 'entries']),
+        );
+      }
+      // All five must be the exact same schema object — one source of truth, not five hand-copies.
+      expect(schemas.every((schema) => schema === schemas[0])).toBe(true);
+    });
+  });
+
+  describe('daily queue tools', () => {
+    it('are all listed and are not the same as Today/planningBucket', () => {
+      for (const name of DAILY_QUEUE_TOOLS) {
+        expect(PUBLIC_TOOL_NAMES.has(name)).toBe(true);
+      }
+      const description = findTool('get_daily_queue').description;
+      expect(description).toContain('distinct from status and planningBucket');
+    });
+
+    it('get_daily_queue takes an optional date and is read-only/idempotent', () => {
+      const tool = findTool('get_daily_queue');
+      expect(tool.inputSchema.required ?? []).not.toContain('date');
+      expect(tool.inputSchema.properties.date.pattern).toBe('^[0-9]{4}-[0-9]{2}-[0-9]{2}$');
+      expect(tool.annotations).toEqual({
+        readOnlyHint: true,
+        destructiveHint: false,
+        idempotentHint: true,
+        openWorldHint: false,
+      });
+    });
+
+    it('every mutation requires date and expectedRevision, and allows expectedRevision=0 for a new queue', () => {
+      for (const name of ['replace_daily_queue', 'add_to_daily_queue', 'move_daily_queue_item', 'remove_from_daily_queue']) {
+        const tool = findTool(name);
+        expect(tool.inputSchema.required).toEqual(expect.arrayContaining(['date', 'expectedRevision']));
+        expect(tool.inputSchema.properties.expectedRevision.minimum).toBe(0);
+        expect(tool.annotations.readOnlyHint).toBe(false);
+        expect(tool.annotations.openWorldHint).toBe(false);
+      }
+    });
+
+    it('move_daily_queue_item additionally requires a 1-based position', () => {
+      const tool = findTool('move_daily_queue_item');
+      expect(tool.inputSchema.required).toContain('position');
+      expect(tool.inputSchema.properties.position.minimum).toBe(1);
+    });
+
+    it('replace_daily_queue takes an ordered array of work item ids, not a free-form object', () => {
+      const tool = findTool('replace_daily_queue');
+      expect(tool.inputSchema.properties.workItemIds.type).toBe('array');
+      expect(tool.inputSchema.properties.workItemIds.items.type).toBe('string');
+    });
+
+    it('sets destructiveHint truthfully: replace/remove can discard entries, add/move cannot', () => {
+      expect(findTool('replace_daily_queue').annotations.destructiveHint).toBe(true);
+      expect(findTool('remove_from_daily_queue').annotations.destructiveHint).toBe(true);
+      expect(findTool('add_to_daily_queue').annotations.destructiveHint).toBe(false);
+      expect(findTool('move_daily_queue_item').annotations.destructiveHint).toBe(false);
+    });
+
+    it('fails closed on an unrecognized field for every daily queue tool', () => {
+      for (const name of DAILY_QUEUE_TOOLS) {
+        expect(findTool(name).inputSchema.additionalProperties).toBe(false);
+      }
+    });
+
+    it('accepts no repository, file-system, or execution-shaped field on any daily queue tool', () => {
+      const forbiddenFieldNames = ['repoRoot', 'repoPath', 'path', 'cwd', 'command', 'script', 'branch'];
+      for (const name of DAILY_QUEUE_TOOLS) {
+        const properties = Object.keys(findTool(name).inputSchema.properties ?? {});
+        for (const forbidden of forbiddenFieldNames) {
+          expect(properties).not.toContain(forbidden);
+        }
+      }
+    });
+
+    it('the JS MCP server never computes its own "today" — date defaulting is left to the bridge', () => {
+      // callTool()/handleRequest() forward args verbatim (see requestJson). A missing `date` must
+      // reach the bridge as-is so Rust's local_date_ymd() resolves it — never a JS-computed
+      // new Date() here, which would use a different (and possibly UTC) notion of "today" than the
+      // desktop app / src/lib/dates.ts's localTodayStr().
+      const source = readFileSync(new URL('./task-workbench-mcp.mjs', import.meta.url), 'utf8');
+      expect(source).not.toMatch(/new Date\s*\(/);
     });
   });
 

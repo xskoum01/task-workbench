@@ -169,6 +169,76 @@ export function getPlanningToday(timezone?: string): Promise<unknown> {
   return invoke('get_planning_today', { timezone });
 }
 
+// --- Daily Queue -------------------------------------------------------
+//
+// The explicit, user-chosen execution order for one calendar day — distinct
+// from WorkItem.status (workflow state) and WorkItem.planningBucket
+// (relevance grouping, e.g. "today"). See docs/task-workbench-mcp.md for the
+// full contract. Never generated automatically from priority/due date/status.
+
+export interface DailyQueueEntry {
+  position: number;
+  workItem: WorkItem;
+}
+
+export interface DailyQueueResult {
+  apiVersion: string;
+  date: string;
+  revision: number;
+  generatedAt: string;
+  entries: DailyQueueEntry[];
+}
+
+/**
+ * Reads the daily queue for `date` (defaults to the app's local calendar
+ * today when omitted — the same "today" `localTodayStr()` in `./dates`
+ * computes for the UI).
+ */
+export function getDailyQueue(date?: string): Promise<DailyQueueResult> {
+  return invoke<DailyQueueResult>('get_daily_queue', { date });
+}
+
+/** Atomically sets the complete ordered queue for `date` to `workItemIds`, in that order. */
+export function replaceDailyQueue(
+  date: string,
+  workItemIds: string[],
+  expectedRevision: number,
+): Promise<DailyQueueResult> {
+  return invoke<DailyQueueResult>('replace_daily_queue', { date, workItemIds, expectedRevision });
+}
+
+/**
+ * Adds one work item to the queue for `date`. `position` is 1-based;
+ * omitted or out-of-range values append to the end.
+ */
+export function addToDailyQueue(
+  date: string,
+  workItemId: string,
+  expectedRevision: number,
+  position?: number,
+): Promise<DailyQueueResult> {
+  return invoke<DailyQueueResult>('add_to_daily_queue', { date, workItemId, position, expectedRevision });
+}
+
+/** Moves a work item already in the queue for `date` to 1-based `position`. */
+export function moveDailyQueueItem(
+  date: string,
+  workItemId: string,
+  position: number,
+  expectedRevision: number,
+): Promise<DailyQueueResult> {
+  return invoke<DailyQueueResult>('move_daily_queue_item', { date, workItemId, position, expectedRevision });
+}
+
+/** Removes a work item from the queue for `date`. Never changes the work item itself. */
+export function removeFromDailyQueue(
+  date: string,
+  workItemId: string,
+  expectedRevision: number,
+): Promise<DailyQueueResult> {
+  return invoke<DailyQueueResult>('remove_from_daily_queue', { date, workItemId, expectedRevision });
+}
+
 /** Explicitly clears all tasks. Bypasses the empty-overwrite guard. */
 export function clearAllTasks(): Promise<void> {
   return invoke('clear_all_tasks');
