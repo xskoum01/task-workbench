@@ -8,7 +8,7 @@ interface ActivityPageProps {
 
 export default function ActivityPage({ weekLog }: ActivityPageProps) {
   const { tasks } = useApp();
-  const [mode, setMode] = useState<'history' | 'week'>('history');
+  const [mode, setMode] = useState<'history' | 'week'>('week');
   const [detailId, setDetailId] = useState<string | null>(null);
   const events = useMemo(
     () => tasks.flatMap((task) =>

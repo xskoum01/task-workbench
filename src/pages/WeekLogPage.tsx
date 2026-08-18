@@ -109,6 +109,7 @@ function DayNote({ dateKey, initialNote, onSave, rows = 3 }: DayNoteProps) {
   return (
     <div className="wl-note-wrap">
       <textarea
+        autoFocus
         className="wl-note-textarea"
         value={value}
         placeholder="What did you work on today?"
