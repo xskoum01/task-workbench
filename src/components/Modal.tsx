@@ -13,6 +13,14 @@ interface ModalProps {
 export default function Modal({ title, onClose, children, size = 'md', footer }: ModalProps) {
   const titleId = useId();
   const dialogRef = useRef<HTMLDivElement>(null);
+  const onCloseRef = useRef(onClose);
+
+  // Keep the latest callback without re-running the focus-management effect.
+  // Parent renders often pass an inline onClose function; using it as an effect
+  // dependency would tear down and recreate the focus trap on every parent update.
+  useEffect(() => {
+    onCloseRef.current = onClose;
+  }, [onClose]);
 
   useEffect(() => {
     const dialog = dialogRef.current;
@@ -42,7 +50,7 @@ export default function Modal({ title, onClose, children, size = 'md', footer }:
       if (!dialog || !isTopmostDialog()) return;
       if (e.key === 'Escape') {
         e.preventDefault();
-        onClose();
+        onCloseRef.current();
         return;
       }
       if (e.key !== 'Tab') return;
@@ -69,7 +77,7 @@ export default function Modal({ title, onClose, children, size = 'md', footer }:
       document.removeEventListener('keydown', handleKey, true);
       if (previouslyFocused?.isConnected) previouslyFocused.focus();
     };
-  }, [onClose]);
+  }, []);
 
   // Render at document.body so the overlay is never hidden by a collapsed
   // <details> element or any display:none ancestor in the component tree.
