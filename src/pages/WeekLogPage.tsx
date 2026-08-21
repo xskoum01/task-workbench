@@ -5,6 +5,8 @@ import Icon from '../components/Icon';
 import Modal from '../components/Modal';
 import TaskRecordDetail from '../components/TaskRecordDetail';
 import { TypeBadge, SourceBadge } from '../components/StatusBadge';
+import { getDailyQueue, type DailyQueueNoteEntry } from '../lib/tauriCommands';
+import { completedQueueNotes } from '../lib/dailyQueue';
 
 // ---------------------------------------------------------------------------
 // Date helpers
@@ -172,6 +174,17 @@ function CompletedTaskRow({ task, customerName, onClick }: CompletedTaskRowProps
   );
 }
 
+function CompletedQueueNoteRow({ note }: { note: DailyQueueNoteEntry }) {
+  return (
+    <div className="wl-task-row wl-task-row--note" title="Completed queue note">
+      <span className="wl-task-title">{note.text}</span>
+      <div className="wl-task-meta">
+        <span className="wl-queue-note-badge">Queue note</span>
+      </div>
+    </div>
+  );
+}
+
 // ---------------------------------------------------------------------------
 // Main page
 // ---------------------------------------------------------------------------
@@ -182,6 +195,7 @@ export default function WeekLogPage() {
   const [weekStart, setWeekStart] = useState<Date>(() => getMondayOf(new Date()));
   const [selectedTaskId, setSelectedTaskId] = useState<string | null>(null);
   const [noteModalDateKey, setNoteModalDateKey] = useState<string | null>(null);
+  const [completedNotes, setCompletedNotes] = useState<DailyQueueNoteEntry[]>([]);
   const detailRef = useRef<HTMLDivElement>(null);
 
   // Clear selection when the task is deleted or no longer in the list.
@@ -215,6 +229,28 @@ export default function WeekLogPage() {
   }, [tasks]);
 
   const tasksByDay = completedByDay();
+
+  useEffect(() => {
+    let cancelled = false;
+    const dates = Array.from({ length: 7 }, (_, index) => {
+      const date = new Date(weekStart);
+      date.setDate(weekStart.getDate() + index);
+      return toYmd(date);
+    });
+    void Promise.all(dates.map((date) => getDailyQueue(date).catch(() => null))).then((queues) => {
+      if (cancelled) return;
+      const notes = queues.flatMap((queue) => queue ? completedQueueNotes(queue.entries) : []);
+      setCompletedNotes([...new Map(notes.map((note) => [note.id, note])).values()]);
+    });
+    return () => { cancelled = true; };
+  }, [weekStart]);
+
+  const completedNotesByDay = new Map<string, DailyQueueNoteEntry[]>();
+  for (const note of completedNotes) {
+    if (!note.completedAt) continue;
+    const key = toYmd(new Date(note.completedAt));
+    completedNotesByDay.set(key, [...(completedNotesByDay.get(key) ?? []), note]);
+  }
 
   // Resolve the day entry for the currently open note modal (may be null when
   // the modal is closed or when the note date is outside the visible week).
@@ -280,8 +316,9 @@ export default function WeekLogPage() {
           {days.map(({ date, key, name }) => {
             const isToday = key === today;
             const dayTasks = tasksByDay.get(key) ?? [];
+            const dayQueueNotes = completedNotesByDay.get(key) ?? [];
             const note = settings.weeklyNotes?.[key] ?? '';
-            const isEmpty = !note.trim() && dayTasks.length === 0;
+            const isEmpty = !note.trim() && dayTasks.length === 0 && dayQueueNotes.length === 0;
 
             return (
               <div key={key} className={`wl-day-card${isToday ? ' wl-day-card--today wl-day-card--featured' : ''}`}>
@@ -299,7 +336,7 @@ export default function WeekLogPage() {
                 />
 
                 {/* Completed tasks */}
-                {dayTasks.length > 0 && (
+                {(dayTasks.length > 0 || dayQueueNotes.length > 0) && (
                   <div className="wl-tasks">
                     <div className="wl-tasks-label">Completed</div>
                     {dayTasks.map((t) => (
@@ -309,6 +346,9 @@ export default function WeekLogPage() {
                         customerName={getCustomerById(t.customerId)?.name}
                         onClick={() => setSelectedTaskId(t.id === selectedTaskId ? null : t.id)}
                       />
+                    ))}
+                    {dayQueueNotes.map((queueNote) => (
+                      <CompletedQueueNoteRow key={queueNote.id} note={queueNote} />
                     ))}
                   </div>
                 )}

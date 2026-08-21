@@ -4741,6 +4741,7 @@ fn daily_queue_projection(work_items: &dyn WorkItemRepository, queue: crate::dom
                     "position": position,
                     "text": text,
                     "addedAt": entry.added_at,
+                    "completedAt": entry.completed_at,
                 }));
             }
             let item = work_items.get(&entry.work_item_id).ok().flatten()?;
@@ -4799,6 +4800,16 @@ fn add_note_to_daily_queue(app: tauri::AppHandle, date: String, text: String, po
     let entry_id = format!("queue-note:{}", task_mcp_generate_id());
     let queue = service
         .add_note(&date, &entry_id, &text, position, expected_revision, &chrono_now_iso())
+        .map_err(canonical_error)?;
+    Ok(daily_queue_projection(&repo, queue))
+}
+
+#[tauri::command]
+fn complete_daily_queue_entry(app: tauri::AppHandle, date: String, entry_id: String, expected_revision: i64) -> Result<Value, String> {
+    let repo = canonical_repo(&app)?;
+    let service = crate::application::daily_queue::DailyQueueApplicationService { queues: &repo, work_items: &repo };
+    let queue = service
+        .complete_entry(&date, &entry_id, expected_revision, &chrono_now_iso())
         .map_err(canonical_error)?;
     Ok(daily_queue_projection(&repo, queue))
 }
@@ -5956,6 +5967,7 @@ fn mcp_daily_queue_schema() -> Value {
                         "workItem": mcp_work_item_summary_schema(),
                         "text": {"type": "string"},
                         "addedAt": {"type": "string"},
+                        "completedAt": {"type": ["string","null"]},
                     }
                 }
             }
@@ -24391,6 +24403,7 @@ pub fn run() {
             replace_daily_queue,
             add_to_daily_queue,
             add_note_to_daily_queue,
+            complete_daily_queue_entry,
             move_daily_queue_item,
             remove_from_daily_queue,
             clear_all_tasks,

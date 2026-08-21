@@ -23,6 +23,11 @@ export function isTerminal(workItem: WorkItem): boolean {
   return TERMINAL_STATUSES.has(workItem.status);
 }
 
+/** Completion is stored on notes and remains authoritative on WorkItems. */
+export function isQueueEntryDone(entry: DailyQueueEntry): boolean {
+  return entry.kind === 'note' ? !!entry.completedAt : isTerminal(entry.workItem);
+}
+
 /**
  * The first non-terminal entry — shown as "Právě teď" (Right now) in the UI.
  * This is purely a display convention: it never implies `status=in_progress`
@@ -30,7 +35,15 @@ export function isTerminal(workItem: WorkItem): boolean {
  * explicit status transition.
  */
 export function activeEntry(entries: DailyQueueEntry[]): DailyQueueEntry | undefined {
-  return entries.find((entry) => entry.kind === 'note' || !isTerminal(entry.workItem));
+  return entries.find((entry) => !isQueueEntryDone(entry));
+}
+
+/** Completed text notes rendered by Week Log; full tasks come from Task storage. */
+export function completedQueueNotes(entries: DailyQueueEntry[]) {
+  return entries.filter(
+    (entry): entry is Extract<DailyQueueEntry, { kind: 'note' }> =>
+      entry.kind === 'note' && !!entry.completedAt,
+  );
 }
 
 /** Entries after (and including, if none is active) the "Právě teď" entry — shown as "Dále". */

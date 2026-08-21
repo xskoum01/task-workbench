@@ -15,13 +15,14 @@ import type { WorkItem } from '../domain/workItem';
 import {
   addNoteToDailyQueue,
   addToDailyQueue,
+  completeDailyQueueEntry,
   getDailyQueue,
   moveDailyQueueItem,
   removeFromDailyQueue,
   type DailyQueueEntry,
   type DailyQueueResult,
 } from '../lib/tauriCommands';
-import { activeEntry, positionAbove, positionBelow, queueableCandidates, upcomingEntries, WORK_ITEM_DRAG_TYPE } from '../lib/dailyQueue';
+import { activeEntry, isQueueEntryDone, positionAbove, positionBelow, queueableCandidates, upcomingEntries, WORK_ITEM_DRAG_TYPE } from '../lib/dailyQueue';
 import { localTodayStr } from '../lib/dates';
 import Modal from './Modal';
 import Icon from './Icon';
@@ -54,16 +55,17 @@ interface DailyQueueRowProps {
   queueLength: number;
   onMove: (workItemId: string, position: number) => void;
   onRemove: (workItemId: string) => void;
+  onComplete: (entry: DailyQueueEntry) => void;
   onDragStart: (entryId: string) => void;
   onDragOver: (event: React.DragEvent) => void;
   onDrop: (event: React.DragEvent, entry: DailyQueueEntry) => void;
 }
 
-function DailyQueueRow({ entry, isActive, queueLength, onMove, onRemove, onDragStart, onDragOver, onDrop }: DailyQueueRowProps) {
+function DailyQueueRow({ entry, isActive, queueLength, onMove, onRemove, onComplete, onDragStart, onDragOver, onDrop }: DailyQueueRowProps) {
   const { position } = entry;
   const workItem = entry.kind === 'work_item' ? entry.workItem : null;
   const title = entry.kind === 'work_item' ? entry.workItem.title : entry.text;
-  const isDone = workItem ? workItem.status === 'completed' || workItem.status === 'cancelled' : false;
+  const isDone = isQueueEntryDone(entry);
 
   return (
     <li
@@ -91,6 +93,17 @@ function DailyQueueRow({ entry, isActive, queueLength, onMove, onRemove, onDragS
         </span>
       </span>
       <span className="daily-queue-actions">
+        {!isDone && (
+          <button
+            type="button"
+            className="daily-queue-action-btn daily-queue-action-btn--done"
+            aria-label={`Mark ${title} as done`}
+            title="Mark as done"
+            onClick={() => onComplete(entry)}
+          >
+            <Icon name="check" size={13} />
+          </button>
+        )}
         <button
           type="button"
           className="daily-queue-action-btn"
@@ -160,9 +173,11 @@ function AddTaskPicker({ candidates, onPick, onClose }: AddTaskPickerProps) {
 export interface DailyQueueProps {
   /** Active (non-archived) canonical work items, used to populate the "+ Add task" picker. */
   workItems: WorkItem[];
+  /** Uses the existing canonical task completion flow so Week Log remains authoritative. */
+  onCompleteWorkItem?: (workItemId: string) => Promise<void>;
 }
 
-export default function DailyQueue({ workItems }: DailyQueueProps) {
+export default function DailyQueue({ workItems, onCompleteWorkItem }: DailyQueueProps) {
   const [queue, setQueue] = useState<DailyQueueResult | null>(null);
   const [isLoading, setIsLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -215,6 +230,21 @@ export default function DailyQueue({ workItems }: DailyQueueProps) {
 
   function handleRemove(entryId: string) {
     applyMutation((current) => removeFromDailyQueue(current.date, entryId, current.revision));
+  }
+
+  async function handleComplete(entry: DailyQueueEntry) {
+    if (entry.kind === 'note') {
+      await applyMutation((current) => completeDailyQueueEntry(current.date, entry.id, current.revision));
+      return;
+    }
+    if (!onCompleteWorkItem) return;
+    try {
+      await onCompleteWorkItem(entry.workItem.id);
+      await reload();
+      setError(null);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    }
   }
 
   function handleAdd(workItemId: string, position?: number) {
@@ -298,6 +328,7 @@ export default function DailyQueue({ workItems }: DailyQueueProps) {
                   queueLength={entries.length}
                   onMove={handleMove}
                   onRemove={handleRemove}
+                  onComplete={(entry) => { void handleComplete(entry); }}
                   onDragStart={(entryId) => { dragIdRef.current = entryId; }}
                   onDragOver={(event) => event.preventDefault()}
                   onDrop={handleDrop}
@@ -317,6 +348,7 @@ export default function DailyQueue({ workItems }: DailyQueueProps) {
                     queueLength={entries.length}
                     onMove={handleMove}
                     onRemove={handleRemove}
+                    onComplete={(entry) => { void handleComplete(entry); }}
                     onDragStart={(entryId) => { dragIdRef.current = entryId; }}
                     onDragOver={(event) => event.preventDefault()}
                     onDrop={handleDrop}

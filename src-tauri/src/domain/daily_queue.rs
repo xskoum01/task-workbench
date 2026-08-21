@@ -28,6 +28,10 @@ pub struct DailyQueueEntry {
     /// promoted to canonical WorkItems. Older persisted entries omit it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
+    /// Completion timestamp for queue-local notes. Work-item completion stays
+    /// authoritative on the WorkItem itself.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completed_at: Option<String>,
     pub added_at: String,
 }
 
@@ -93,6 +97,7 @@ pub fn apply_add(
         DailyQueueEntry {
             work_item_id: work_item_id.to_string(),
             note: None,
+            completed_at: None,
             added_at: at.to_string(),
         },
     );
@@ -121,9 +126,25 @@ pub fn apply_add_note(
         DailyQueueEntry {
             work_item_id: entry_id.to_string(),
             note: Some(text.to_string()),
+            completed_at: None,
             added_at: at.to_string(),
         },
     );
+    Ok(next)
+}
+
+/// Marks an existing queue entry complete without removing or reordering it.
+pub fn apply_complete(
+    entries: &[DailyQueueEntry],
+    entry_id: &str,
+    at: &str,
+) -> Result<Vec<DailyQueueEntry>, DailyQueueError> {
+    let mut next = entries.to_vec();
+    let entry = next
+        .iter_mut()
+        .find(|entry| entry.work_item_id == entry_id)
+        .ok_or(DailyQueueError::NotQueued)?;
+    entry.completed_at = Some(at.to_string());
     Ok(next)
 }
 
@@ -184,6 +205,7 @@ pub fn apply_replace(
                 .unwrap_or_else(|| DailyQueueEntry {
                     work_item_id: id.clone(),
                     note: None,
+                    completed_at: None,
                     added_at: at.to_string(),
                 })
         })
@@ -252,6 +274,7 @@ mod tests {
         DailyQueueEntry {
             work_item_id: id.to_string(),
             note: None,
+            completed_at: None,
             added_at: at.to_string(),
         }
     }
@@ -329,6 +352,14 @@ mod tests {
         let next = apply_add_note(&[], "note-1", "Send email", None, "t1").unwrap();
         assert_eq!(next[0].work_item_id, "note-1");
         assert_eq!(next[0].note.as_deref(), Some("Send email"));
+    }
+
+    #[test]
+    fn completes_a_note_without_removing_or_reordering_it() {
+        let entries = apply_add_note(&[], "note-1", "Send email", None, "t1").unwrap();
+        let completed = apply_complete(&entries, "note-1", "t2").unwrap();
+        assert_eq!(completed[0].work_item_id, "note-1");
+        assert_eq!(completed[0].completed_at.as_deref(), Some("t2"));
     }
 
     // --- apply_move ---

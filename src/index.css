@@ -6865,6 +6865,13 @@ body {
   background: var(--bg-primary);
   font: inherit;
 }
+
+.wl-task-row--note { cursor: default; }
+.wl-task-row--note:hover { background: var(--bg-overlay); border-color: var(--border-subtle); }
+.wl-queue-note-badge {
+  color: var(--color-done);
+  font-size: 10px;
+}
 .daily-queue-note-form input:focus { border-color: var(--accent); outline: none; }
 .daily-queue-add-btn {
   padding: 6px 11px;
@@ -6968,6 +6975,7 @@ body {
 }
 .daily-queue-action-btn:hover:not(:disabled) { color: var(--text-primary); border-color: var(--border); background: var(--bg-hover); }
 .daily-queue-action-btn:disabled { color: var(--text-muted); opacity: .4; cursor: default; }
+.daily-queue-action-btn--done:hover:not(:disabled) { color: var(--color-done); }
 .daily-queue-action-btn--remove:hover:not(:disabled) { color: var(--color-blocked, #f85149); }
 
 .daily-queue-picker-empty { padding: 20px 8px; color: var(--text-muted); text-align: center; font-size: 13px; }

@@ -956,6 +956,28 @@ impl DailyQueueRepository for SqliteWorkItemRepository {
         Ok(result)
     }
 
+    fn complete_entry(
+        &self,
+        date: &str,
+        entry_id: &str,
+        expected_revision: i64,
+        at: &str,
+    ) -> Result<DailyQueue, ApplicationError> {
+        self.initialize()?;
+        let mut connection = self.connect()?;
+        let transaction = connection
+            .transaction()
+            .map_err(|error| ApplicationError::storage(error.to_string()))?;
+        let current = read_daily_queue(&transaction, date)?;
+        let next = crate::domain::daily_queue::apply_complete(&current.entries, entry_id, at)
+            .map_err(|error| daily_queue_domain_error(error, entry_id, date))?;
+        let result = write_daily_queue(&transaction, date, expected_revision, &next, at)?;
+        transaction
+            .commit()
+            .map_err(|error| ApplicationError::storage(error.to_string()))?;
+        Ok(result)
+    }
+
     fn move_item(
         &self,
         date: &str,
@@ -2224,16 +2246,20 @@ mod tests {
             repository
                 .add_note("2026-08-17", "queue-note-1", "Send email", None, 2, "t3")
                 .unwrap();
+            repository
+                .complete_entry("2026-08-17", "queue-note-1", 3, "t4")
+                .unwrap();
         }
         // A fresh repository instance over the same file simulates an app restart.
         let reopened = SqliteWorkItemRepository::at(db_path);
         let queue = reopened.get_queue("2026-08-17").unwrap();
-        assert_eq!(queue.revision, 3);
+        assert_eq!(queue.revision, 4);
         assert_eq!(
             queue.entries.iter().map(|e| e.work_item_id.as_str()).collect::<Vec<_>>(),
             vec!["task-a", "task-b", "queue-note-1"]
         );
         assert_eq!(queue.entries[2].note.as_deref(), Some("Send email"));
+        assert_eq!(queue.entries[2].completed_at.as_deref(), Some("t4"));
     }
 
     #[test]

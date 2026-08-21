@@ -148,9 +148,10 @@ since a WorkItem always exists with revision 1 by the time it can be
 mutated).
 
 Queue entries are a tagged union. `kind: "work_item"` entries include the
-current `workItem` summary; `kind: "note"` entries contain only `text`. Both
-carry a stable queue-entry `id`, `position`, and `addedAt`, so Jarvis can read
-and order lightweight reminders such as “send email” alongside full records.
+current `workItem` summary; `kind: "note"` entries contain `text` and an
+optional `completedAt` timestamp. Both carry a stable queue-entry `id`,
+`position`, and `addedAt`, so Jarvis can read and order lightweight reminders
+such as “send email” alongside full records and recognize completed notes.
 Pass that `id` as `workItemId` to the existing move/remove tools; for work-item
 entries it is the canonical work-item ID.
 
@@ -171,12 +172,12 @@ entries it is the canonical work-item ID.
   text. Do not create a canonical WorkItem for this lightweight note.
 
 **Completed/cancelled entries.** An entry stays in the persisted queue after
-its work item transitions to `completed`/`cancelled` — the queue record is
-historical and is not silently rewritten — but the projected `workItem` in
-the response reflects the current status, so a client can (and the desktop
-UI does) style it as done and skip it when picking "what's next", without
-the backend needing special-case deletion logic. Removing it from the queue
-view entirely is an explicit `remove_from_daily_queue` call.
+its work item transitions to `completed`/`cancelled`, or after a queue note is
+marked done — the queue record is historical and is not silently rewritten.
+The projected `workItem` status or note `completedAt` tells clients (including
+Jarvis and the desktop UI) that the entry is done and should be skipped when
+choosing "what's next". Removing it from the queue entirely remains an explicit
+`remove_from_daily_queue` call.
 
 The lifecycle states are:
 

@@ -613,6 +613,7 @@ components:
         workItem: { $ref: "#/components/schemas/WorkItemSummary" }
         text: { type: string }
         addedAt: { type: string, format: date-time }
+        completedAt: { type: [string, "null"], format: date-time }
     DailyQueueResult:
       type: object
       required: [apiVersion, date, revision, generatedAt, entries]

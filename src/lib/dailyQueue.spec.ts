@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import {
   activeEntry,
+  completedQueueNotes,
   isAlreadyQueued,
   isTerminal,
   positionAbove,
@@ -54,6 +55,18 @@ describe('activeEntry / upcomingEntries', () => {
       id: 'note-1', kind: 'note', position: 1, text: 'Send email', addedAt: '2026-08-17T08:00:00Z',
     };
     expect(activeEntry([note])).toBe(note);
+  });
+
+  it('skips completed notes and exposes them to Week Log', () => {
+    const completedNote: DailyQueueEntry = {
+      id: 'note-1', kind: 'note', position: 1, text: 'Send email',
+      addedAt: '2026-08-17T08:00:00Z', completedAt: '2026-08-17T09:00:00Z',
+    };
+    const activeNote: DailyQueueEntry = {
+      id: 'note-2', kind: 'note', position: 2, text: 'Call client', addedAt: '2026-08-17T08:05:00Z',
+    };
+    expect(activeEntry([completedNote, activeNote])).toBe(activeNote);
+    expect(completedQueueNotes([completedNote, activeNote])).toEqual([completedNote]);
   });
 
   it('picks the first non-terminal entry as active', () => {

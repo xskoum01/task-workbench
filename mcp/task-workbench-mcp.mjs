@@ -89,6 +89,7 @@ const DAILY_QUEUE_SCHEMA = {
           workItem: WORK_ITEM_SUMMARY_SCHEMA,
           text: { type: 'string' },
           addedAt: { type: 'string' },
+          completedAt: { type: ['string', 'null'] },
         },
       },
     },

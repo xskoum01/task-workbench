@@ -47,6 +47,14 @@ pub trait DailyQueueRepository {
         at: &str,
     ) -> Result<DailyQueue, ApplicationError>;
 
+    fn complete_entry(
+        &self,
+        date: &str,
+        entry_id: &str,
+        expected_revision: i64,
+        at: &str,
+    ) -> Result<DailyQueue, ApplicationError>;
+
     fn move_item(
         &self,
         date: &str,
@@ -129,6 +137,17 @@ impl<'a> DailyQueueApplicationService<'a> {
             return Err(ApplicationError::validation("Queue note text cannot exceed 500 characters."));
         }
         self.queues.add_note(date, entry_id, text, position, expected_revision, at)
+    }
+
+    pub fn complete_entry(
+        &self,
+        date: &str,
+        entry_id: &str,
+        expected_revision: i64,
+        at: &str,
+    ) -> Result<DailyQueue, ApplicationError> {
+        validate_date(date)?;
+        self.queues.complete_entry(date, entry_id, expected_revision, at)
     }
 
     pub fn move_item(
@@ -303,6 +322,12 @@ mod tests {
             let current = self.current(date);
             let next = crate::domain::daily_queue::apply_add_note(&current.entries, entry_id, text, position, at)
                 .map_err(|_| ApplicationError::validation(format!("Entry {entry_id} is already in the daily queue for {date}.")))?;
+            self.check_and_write(date, expected_revision, next, at)
+        }
+        fn complete_entry(&self, date: &str, entry_id: &str, expected_revision: i64, at: &str) -> Result<DailyQueue, ApplicationError> {
+            let current = self.current(date);
+            let next = crate::domain::daily_queue::apply_complete(&current.entries, entry_id, at)
+                .map_err(|_| ApplicationError::validation(format!("Entry {entry_id} is not in the daily queue for {date}.")))?;
             self.check_and_write(date, expected_revision, next, at)
         }
         fn move_item(&self, date: &str, work_item_id: &str, position: usize, expected_revision: i64, at: &str) -> Result<DailyQueue, ApplicationError> {

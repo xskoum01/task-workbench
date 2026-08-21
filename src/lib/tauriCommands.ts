@@ -190,6 +190,7 @@ export interface DailyQueueWorkItemEntry extends DailyQueueEntryBase {
 export interface DailyQueueNoteEntry extends DailyQueueEntryBase {
   kind: 'note';
   text: string;
+  completedAt?: string | null;
 }
 
 export type DailyQueueEntry = DailyQueueWorkItemEntry | DailyQueueNoteEntry;
@@ -241,6 +242,15 @@ export function addNoteToDailyQueue(
   position?: number,
 ): Promise<DailyQueueResult> {
   return invoke<DailyQueueResult>('add_note_to_daily_queue', { date, text, position, expectedRevision });
+}
+
+/** Marks a queue-local entry complete without removing or reordering it. */
+export function completeDailyQueueEntry(
+  date: string,
+  entryId: string,
+  expectedRevision: number,
+): Promise<DailyQueueResult> {
+  return invoke<DailyQueueResult>('complete_daily_queue_entry', { date, entryId, expectedRevision });
 }
 
 /** Moves a work item already in the queue for `date` to 1-based `position`. */

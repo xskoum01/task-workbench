@@ -205,7 +205,14 @@ export default function TasksPage() {
         </div>
       )}
       <div className="page-content">
-        <DailyQueue workItems={workItems.filter((item) => !item.archivedAt)} />
+        <DailyQueue
+          workItems={workItems.filter((item) => !item.archivedAt)}
+          onCompleteWorkItem={(id) => updateTask(id, {
+            status: 'done',
+            waitingState: null,
+            attentionState: null,
+          })}
+        />
 
         <div className="page-header">
           <div>

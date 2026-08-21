@@ -138,6 +138,40 @@ describe('DailyQueue', () => {
     expect(screen.getByText('Text note')).toBeInTheDocument();
   });
 
+  it('marks a text note done in the persistent queue', async () => {
+    const initial: DailyQueueResult = {
+      ...queueResult([], 1),
+      entries: [{
+        id: 'queue-note-1', kind: 'note', position: 1, text: 'Send email',
+        addedAt: '2026-08-17T08:00:00Z',
+      }],
+    };
+    const completed: DailyQueueResult = {
+      ...initial,
+      revision: 2,
+      entries: [{ ...initial.entries[0], completedAt: '2026-08-17T09:00:00Z' } as api.DailyQueueNoteEntry],
+    };
+    vi.spyOn(api, 'getDailyQueue').mockResolvedValue(initial);
+    const completeSpy = vi.spyOn(api, 'completeDailyQueueEntry').mockResolvedValue(completed);
+
+    render(<DailyQueue workItems={[]} />);
+    fireEvent.click(await screen.findByRole('button', { name: /mark send email as done/i }));
+
+    await waitFor(() => expect(completeSpy).toHaveBeenCalledWith('2026-08-17', 'queue-note-1', 1));
+    expect(screen.queryByRole('button', { name: /mark send email as done/i })).not.toBeInTheDocument();
+  });
+
+  it('uses the existing work-item completion flow for a queued task', async () => {
+    const task = workItem('task-1', { title: 'Finish report' });
+    vi.spyOn(api, 'getDailyQueue').mockResolvedValue(queueResult([{ item: task, position: 1 }]));
+    const completeWorkItem = vi.fn().mockResolvedValue(undefined);
+
+    render(<DailyQueue workItems={[task]} onCompleteWorkItem={completeWorkItem} />);
+    fireEvent.click(await screen.findByRole('button', { name: /mark finish report as done/i }));
+
+    await waitFor(() => expect(completeWorkItem).toHaveBeenCalledWith('task-1'));
+  });
+
   it('accepts a work item dropped from the Work records list', async () => {
     const dropped = workItem('drop-me', { title: 'Dragged work' });
     vi.spyOn(api, 'getDailyQueue').mockResolvedValue(queueResult([], 0));
