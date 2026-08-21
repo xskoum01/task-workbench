@@ -10,9 +10,10 @@
  * the MCP tools.
  */
 
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import type { WorkItem } from '../domain/workItem';
 import {
+  addNoteToDailyQueue,
   addToDailyQueue,
   getDailyQueue,
   moveDailyQueueItem,
@@ -20,7 +21,7 @@ import {
   type DailyQueueEntry,
   type DailyQueueResult,
 } from '../lib/tauriCommands';
-import { activeEntry, positionAbove, positionBelow, queueableCandidates, upcomingEntries } from '../lib/dailyQueue';
+import { activeEntry, positionAbove, positionBelow, queueableCandidates, upcomingEntries, WORK_ITEM_DRAG_TYPE } from '../lib/dailyQueue';
 import { localTodayStr } from '../lib/dates';
 import Modal from './Modal';
 import Icon from './Icon';
@@ -53,32 +54,40 @@ interface DailyQueueRowProps {
   queueLength: number;
   onMove: (workItemId: string, position: number) => void;
   onRemove: (workItemId: string) => void;
-  onDragStart: (workItemId: string) => void;
+  onDragStart: (entryId: string) => void;
   onDragOver: (event: React.DragEvent) => void;
-  onDrop: (entry: DailyQueueEntry) => void;
+  onDrop: (event: React.DragEvent, entry: DailyQueueEntry) => void;
 }
 
 function DailyQueueRow({ entry, isActive, queueLength, onMove, onRemove, onDragStart, onDragOver, onDrop }: DailyQueueRowProps) {
-  const { workItem, position } = entry;
-  const isDone = workItem.status === 'completed' || workItem.status === 'cancelled';
+  const { position } = entry;
+  const workItem = entry.kind === 'work_item' ? entry.workItem : null;
+  const title = entry.kind === 'work_item' ? entry.workItem.title : entry.text;
+  const isDone = workItem ? workItem.status === 'completed' || workItem.status === 'cancelled' : false;
 
   return (
     <li
       className={`daily-queue-row${isActive ? ' daily-queue-row--active' : ''}${isDone ? ' daily-queue-row--done' : ''}`}
       draggable
-      onDragStart={() => onDragStart(workItem.id)}
+      onDragStart={() => onDragStart(entry.id)}
       onDragOver={onDragOver}
-      onDrop={() => onDrop(entry)}
+      onDrop={(event) => onDrop(event, entry)}
       data-testid="daily-queue-row"
     >
       <span className="daily-queue-position" aria-hidden="true">{position}</span>
       <span className="daily-queue-main">
-        <span className="daily-queue-title">{workItem.title}</span>
+        <span className="daily-queue-title">{title}</span>
         <span className="daily-queue-meta">
-          {workItem.areaId && <span className="daily-queue-area">{workItem.areaId}</span>}
-          <span className="daily-queue-status">{STATUS_LABELS[workItem.status]}</span>
-          <span className="daily-queue-sep">·</span>
-          <span className="daily-queue-priority">{PRIORITY_LABELS[workItem.priority]}</span>
+          {workItem ? (
+            <>
+              {workItem.areaId && <span className="daily-queue-area">{workItem.areaId}</span>}
+              <span className="daily-queue-status">{STATUS_LABELS[workItem.status]}</span>
+              <span className="daily-queue-sep">·</span>
+              <span className="daily-queue-priority">{PRIORITY_LABELS[workItem.priority]}</span>
+            </>
+          ) : (
+            <span className="daily-queue-note-label">Text note</span>
+          )}
         </span>
       </span>
       <span className="daily-queue-actions">
@@ -88,7 +97,7 @@ function DailyQueueRow({ entry, isActive, queueLength, onMove, onRemove, onDragS
           aria-label="Move up"
           title="Move up"
           disabled={position <= 1}
-          onClick={() => onMove(workItem.id, positionAbove(position))}
+          onClick={() => onMove(entry.id, positionAbove(position))}
         >
           ▲
         </button>
@@ -98,16 +107,16 @@ function DailyQueueRow({ entry, isActive, queueLength, onMove, onRemove, onDragS
           aria-label="Move down"
           title="Move down"
           disabled={position >= queueLength}
-          onClick={() => onMove(workItem.id, positionBelow(position, queueLength))}
+          onClick={() => onMove(entry.id, positionBelow(position, queueLength))}
         >
           ▼
         </button>
         <button
           type="button"
           className="daily-queue-action-btn daily-queue-action-btn--remove"
-          aria-label={`Remove ${workItem.title} from today's queue`}
+          aria-label={`Remove ${title} from today's queue`}
           title="Remove from queue"
-          onClick={() => onRemove(workItem.id)}
+          onClick={() => onRemove(entry.id)}
         >
           <Icon name="trash-2" size={13} />
         </button>
@@ -158,7 +167,8 @@ export default function DailyQueue({ workItems }: DailyQueueProps) {
   const [isLoading, setIsLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [showPicker, setShowPicker] = useState(false);
-  const [dragId, setDragId] = useState<string | null>(null);
+  const dragIdRef = useRef<string | null>(null);
+  const [noteText, setNoteText] = useState('');
   const date = localTodayStr();
 
   const reload = useCallback(async () => {
@@ -199,23 +209,40 @@ export default function DailyQueue({ workItems }: DailyQueueProps) {
     [queue, reload],
   );
 
-  function handleMove(workItemId: string, position: number) {
-    applyMutation((current) => moveDailyQueueItem(current.date, workItemId, position, current.revision));
+  function handleMove(entryId: string, position: number) {
+    applyMutation((current) => moveDailyQueueItem(current.date, entryId, position, current.revision));
   }
 
-  function handleRemove(workItemId: string) {
-    applyMutation((current) => removeFromDailyQueue(current.date, workItemId, current.revision));
+  function handleRemove(entryId: string) {
+    applyMutation((current) => removeFromDailyQueue(current.date, entryId, current.revision));
   }
 
-  function handleAdd(workItemId: string) {
+  function handleAdd(workItemId: string, position?: number) {
     setShowPicker(false);
-    applyMutation((current) => addToDailyQueue(current.date, workItemId, current.revision));
+    applyMutation((current) => position === undefined
+      ? addToDailyQueue(current.date, workItemId, current.revision)
+      : addToDailyQueue(current.date, workItemId, current.revision, position));
   }
 
-  function handleDrop(target: DailyQueueEntry) {
-    const draggedId = dragId;
-    setDragId(null);
-    if (!draggedId || draggedId === target.workItem.id) return;
+  function handleAddNote(event: React.FormEvent) {
+    event.preventDefault();
+    const text = noteText.trim();
+    if (!text) return;
+    setNoteText('');
+    applyMutation((current) => addNoteToDailyQueue(current.date, text, current.revision));
+  }
+
+  function handleDrop(event: React.DragEvent, target?: DailyQueueEntry) {
+    event.preventDefault();
+    event.stopPropagation();
+    const droppedWorkItemId = event.dataTransfer?.getData(WORK_ITEM_DRAG_TYPE) ?? '';
+    if (droppedWorkItemId) {
+      handleAdd(droppedWorkItemId, target?.position);
+      return;
+    }
+    const draggedId = dragIdRef.current;
+    dragIdRef.current = null;
+    if (!draggedId || !target || draggedId === target.id) return;
     handleMove(draggedId, target.position);
   }
 
@@ -224,12 +251,29 @@ export default function DailyQueue({ workItems }: DailyQueueProps) {
   const upcoming = upcomingEntries(entries);
 
   return (
-    <section className="daily-queue" aria-label="Today's queue">
+    <section
+      className="daily-queue"
+      aria-label="Today's queue"
+      onDragOver={(event) => event.preventDefault()}
+      onDrop={(event) => handleDrop(event)}
+    >
       <div className="daily-queue-header">
         <h3>Today's queue</h3>
-        <button type="button" className="daily-queue-add-btn" onClick={() => setShowPicker(true)}>
-          + Add task
-        </button>
+        <div className="daily-queue-header-actions">
+          <form className="daily-queue-note-form" onSubmit={handleAddNote}>
+            <input
+              value={noteText}
+              onChange={(event) => setNoteText(event.target.value)}
+              placeholder="Add a quick note…"
+              aria-label="Quick queue note"
+              maxLength={500}
+            />
+            <button type="submit" className="daily-queue-add-btn" disabled={!noteText.trim()}>+ Add note</button>
+          </form>
+          <button type="button" className="daily-queue-add-btn" onClick={() => setShowPicker(true)}>
+            + Add work item
+          </button>
+        </div>
       </div>
 
       {error && (
@@ -254,7 +298,7 @@ export default function DailyQueue({ workItems }: DailyQueueProps) {
                   queueLength={entries.length}
                   onMove={handleMove}
                   onRemove={handleRemove}
-                  onDragStart={setDragId}
+                  onDragStart={(entryId) => { dragIdRef.current = entryId; }}
                   onDragOver={(event) => event.preventDefault()}
                   onDrop={handleDrop}
                 />
@@ -267,13 +311,13 @@ export default function DailyQueue({ workItems }: DailyQueueProps) {
               <ol className="daily-queue-list">
                 {upcoming.map((entry) => (
                   <DailyQueueRow
-                    key={entry.workItem.id}
+                    key={entry.id}
                     entry={entry}
                     isActive={false}
                     queueLength={entries.length}
                     onMove={handleMove}
                     onRemove={handleRemove}
-                    onDragStart={setDragId}
+                    onDragStart={(entryId) => { dragIdRef.current = entryId; }}
                     onDragOver={(event) => event.preventDefault()}
                     onDrop={handleDrop}
                   />

@@ -37,6 +37,16 @@ pub trait DailyQueueRepository {
         at: &str,
     ) -> Result<DailyQueue, ApplicationError>;
 
+    fn add_note(
+        &self,
+        date: &str,
+        entry_id: &str,
+        text: &str,
+        position: Option<usize>,
+        expected_revision: i64,
+        at: &str,
+    ) -> Result<DailyQueue, ApplicationError>;
+
     fn move_item(
         &self,
         date: &str,
@@ -99,6 +109,26 @@ impl<'a> DailyQueueApplicationService<'a> {
         validate_date(date)?;
         self.require_active_work_item(work_item_id)?;
         self.queues.add(date, work_item_id, position, expected_revision, at)
+    }
+
+    pub fn add_note(
+        &self,
+        date: &str,
+        entry_id: &str,
+        text: &str,
+        position: Option<usize>,
+        expected_revision: i64,
+        at: &str,
+    ) -> Result<DailyQueue, ApplicationError> {
+        validate_date(date)?;
+        let text = text.trim();
+        if text.is_empty() {
+            return Err(ApplicationError::validation("Queue note text cannot be empty."));
+        }
+        if text.chars().count() > 500 {
+            return Err(ApplicationError::validation("Queue note text cannot exceed 500 characters."));
+        }
+        self.queues.add_note(date, entry_id, text, position, expected_revision, at)
     }
 
     pub fn move_item(
@@ -267,6 +297,12 @@ mod tests {
             let current = self.current(date);
             let next = crate::domain::daily_queue::apply_add(&current.entries, work_item_id, position, at)
                 .map_err(|_| ApplicationError::validation(format!("Work item {work_item_id} is already in the daily queue for {date}.")))?;
+            self.check_and_write(date, expected_revision, next, at)
+        }
+        fn add_note(&self, date: &str, entry_id: &str, text: &str, position: Option<usize>, expected_revision: i64, at: &str) -> Result<DailyQueue, ApplicationError> {
+            let current = self.current(date);
+            let next = crate::domain::daily_queue::apply_add_note(&current.entries, entry_id, text, position, at)
+                .map_err(|_| ApplicationError::validation(format!("Entry {entry_id} is already in the daily queue for {date}.")))?;
             self.check_and_write(date, expected_revision, next, at)
         }
         fn move_item(&self, date: &str, work_item_id: &str, position: usize, expected_revision: i64, at: &str) -> Result<DailyQueue, ApplicationError> {

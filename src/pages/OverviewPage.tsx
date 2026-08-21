@@ -1,6 +1,5 @@
 import { useMemo, useState } from 'react';
 import TaskRecordDetail from '../components/TaskRecordDetail';
-import DailyQueue from '../components/DailyQueue';
 import { useApp } from '../context/AppContext';
 
 type FocusKey = 'now' | 'overdue' | 'today' | 'blocked' | 'waiting' | 'obligations';
@@ -48,8 +47,6 @@ export default function OverviewPage() {
           <span>active records</span>
         </div>
       </section>
-
-      <DailyQueue workItems={workItems.filter((item) => !item.archivedAt)} />
 
       <div className="overview-metrics" role="list" aria-label="Attention categories">
         {([

@@ -325,6 +325,26 @@ paths:
         "400": { $ref: "#/components/responses/Error" }
         "404": { $ref: "#/components/responses/Error" }
         "409": { $ref: "#/components/responses/Error" }
+  /planning/daily-queue/notes:
+    post:
+      operationId: addNoteToDailyQueue
+      description: Adds a lightweight queue-local text reminder without creating a WorkItem.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [date, text, expectedRevision]
+              properties:
+                date: { type: string, pattern: "^[0-9]{4}-[0-9]{2}-[0-9]{2}$" }
+                text: { type: string, minLength: 1, maxLength: 500 }
+                position: { type: integer, minimum: 1 }
+                expectedRevision: { type: integer, minimum: 0 }
+      responses:
+        "200": { description: The updated daily queue }
+        "400": { $ref: "#/components/responses/Error" }
+        "409": { $ref: "#/components/responses/Error" }
   /planning/daily-queue/items/{workItemId}/move:
     parameters:
       - $ref: "#/components/parameters/WorkItemId"
@@ -583,15 +603,16 @@ components:
     DailyQueueEntryProjection:
       type: object
       description: >
-        One queued work item, enriched with its position and current
-        WorkItem summary. A work item that has been entirely deleted (never
-        merely archived, completed, or cancelled — those still resolve
-        normally) is dropped from this projection; the underlying persisted
-        queue and its revision are unaffected.
-      required: [position, workItem]
+        One ordered queue entry. Work-item entries include the current WorkItem
+        summary; note entries are queue-local text and do not create WorkItems.
+      required: [id, kind, position, addedAt]
       properties:
+        id: { type: string }
+        kind: { type: string, enum: [work_item, note] }
         position: { type: integer, minimum: 1 }
         workItem: { $ref: "#/components/schemas/WorkItemSummary" }
+        text: { type: string }
+        addedAt: { type: string, format: date-time }
     DailyQueueResult:
       type: object
       required: [apiVersion, date, revision, generatedAt, entries]

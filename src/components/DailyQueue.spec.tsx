@@ -33,7 +33,13 @@ function queueResult(entries: Array<{ item: WorkItem; position: number }>, revis
     date: '2026-08-17',
     revision,
     generatedAt: '2026-08-17T08:00:00Z',
-    entries: entries.map(({ item, position }) => ({ position, workItem: item })),
+    entries: entries.map(({ item, position }) => ({
+      id: item.id,
+      kind: 'work_item' as const,
+      position,
+      workItem: item,
+      addedAt: '2026-08-17T08:00:00Z',
+    })),
   };
 }
 
@@ -98,12 +104,54 @@ describe('DailyQueue', () => {
     render(<DailyQueue workItems={[queued, addable]} />);
     await screen.findByText('Already queued');
 
-    fireEvent.click(screen.getByRole('button', { name: /add task/i }));
+    fireEvent.click(screen.getByRole('button', { name: /add work item/i }));
     expect(screen.getByText('Addable task')).toBeInTheDocument();
     expect(screen.queryByText('Already queued', { selector: '.daily-queue-picker-title' })).not.toBeInTheDocument();
 
     fireEvent.click(screen.getByText('Addable task'));
     await waitFor(() => expect(addSpy).toHaveBeenCalledWith('2026-08-17', 'addable', 1));
+  });
+
+  it('creates a lightweight text note without creating a work item', async () => {
+    vi.spyOn(api, 'getDailyQueue').mockResolvedValue(queueResult([], 0));
+    const updated: DailyQueueResult = {
+      ...queueResult([], 1),
+      entries: [{
+        id: 'queue-note-1',
+        kind: 'note',
+        position: 1,
+        text: 'Send email',
+        addedAt: '2026-08-17T08:00:00Z',
+      }],
+    };
+    const addNoteSpy = vi.spyOn(api, 'addNoteToDailyQueue').mockResolvedValue(updated);
+
+    render(<DailyQueue workItems={[]} />);
+    await screen.findByText(/nothing queued/i);
+    fireEvent.change(screen.getByRole('textbox', { name: /quick queue note/i }), {
+      target: { value: '  Send email  ' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: /add note/i }));
+
+    await waitFor(() => expect(addNoteSpy).toHaveBeenCalledWith('2026-08-17', 'Send email', 0));
+    expect(await screen.findByText('Send email')).toBeInTheDocument();
+    expect(screen.getByText('Text note')).toBeInTheDocument();
+  });
+
+  it('accepts a work item dropped from the Work records list', async () => {
+    const dropped = workItem('drop-me', { title: 'Dragged work' });
+    vi.spyOn(api, 'getDailyQueue').mockResolvedValue(queueResult([], 0));
+    const addSpy = vi.spyOn(api, 'addToDailyQueue').mockResolvedValue(
+      queueResult([{ item: dropped, position: 1 }], 1),
+    );
+    render(<DailyQueue workItems={[dropped]} />);
+    const queue = await screen.findByRole('region', { name: /today's queue/i });
+
+    fireEvent.drop(queue, {
+      dataTransfer: { getData: (type: string) => type === 'application/x-task-workbench-work-item' ? dropped.id : '' },
+    });
+
+    await waitFor(() => expect(addSpy).toHaveBeenCalledWith('2026-08-17', dropped.id, 0));
   });
 
   it('removes a task', async () => {

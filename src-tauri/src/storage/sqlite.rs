@@ -83,7 +83,12 @@ impl SqliteWorkItemRepository {
         // (default) uses plain file locking with no shared-memory reader
         // path, which removes that entire failure class.
         connection
-            .execute_batch("PRAGMA foreign_keys = ON; PRAGMA journal_mode = DELETE;")
+            // FULL makes a successful queue mutation durable before control
+            // returns to the UI, including when the desktop app is closed
+            // immediately afterwards. The queue must never be session-only.
+            .execute_batch(
+                "PRAGMA foreign_keys = ON; PRAGMA journal_mode = DELETE; PRAGMA synchronous = FULL;",
+            )
             .map_err(|error| ApplicationError::storage(error.to_string()))?;
         Ok(connection)
     }
@@ -920,6 +925,30 @@ impl DailyQueueRepository for SqliteWorkItemRepository {
         let current = read_daily_queue(&transaction, date)?;
         let next = crate::domain::daily_queue::apply_add(&current.entries, work_item_id, position, at)
             .map_err(|error| daily_queue_domain_error(error, work_item_id, date))?;
+        let result = write_daily_queue(&transaction, date, expected_revision, &next, at)?;
+        transaction
+            .commit()
+            .map_err(|error| ApplicationError::storage(error.to_string()))?;
+        Ok(result)
+    }
+
+    fn add_note(
+        &self,
+        date: &str,
+        entry_id: &str,
+        text: &str,
+        position: Option<usize>,
+        expected_revision: i64,
+        at: &str,
+    ) -> Result<DailyQueue, ApplicationError> {
+        self.initialize()?;
+        let mut connection = self.connect()?;
+        let transaction = connection
+            .transaction()
+            .map_err(|error| ApplicationError::storage(error.to_string()))?;
+        let current = read_daily_queue(&transaction, date)?;
+        let next = crate::domain::daily_queue::apply_add_note(&current.entries, entry_id, text, position, at)
+            .map_err(|error| daily_queue_domain_error(error, entry_id, date))?;
         let result = write_daily_queue(&transaction, date, expected_revision, &next, at)?;
         transaction
             .commit()
@@ -2192,15 +2221,19 @@ mod tests {
             let repository = SqliteWorkItemRepository::at(db_path.clone());
             repository.add("2026-08-17", "task-a", None, 0, "t1").unwrap();
             repository.add("2026-08-17", "task-b", None, 1, "t2").unwrap();
+            repository
+                .add_note("2026-08-17", "queue-note-1", "Send email", None, 2, "t3")
+                .unwrap();
         }
         // A fresh repository instance over the same file simulates an app restart.
         let reopened = SqliteWorkItemRepository::at(db_path);
         let queue = reopened.get_queue("2026-08-17").unwrap();
-        assert_eq!(queue.revision, 2);
+        assert_eq!(queue.revision, 3);
         assert_eq!(
             queue.entries.iter().map(|e| e.work_item_id.as_str()).collect::<Vec<_>>(),
-            vec!["task-a", "task-b"]
+            vec!["task-a", "task-b", "queue-note-1"]
         );
+        assert_eq!(queue.entries[2].note.as_deref(), Some("Send email"));
     }
 
     #[test]

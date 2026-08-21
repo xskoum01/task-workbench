@@ -7,9 +7,11 @@ import TaskRecordDetail from '../components/TaskRecordDetail';
 import TaskRecordPanel from '../components/TaskRecordPanel';
 import TaskForm from '../components/TaskForm';
 import PlanningView, { type PlanningFilter } from '../components/PlanningView';
+import DailyQueue from '../components/DailyQueue';
 import { isOverdue, formatRelativeDate, formatShortPastDate } from '../lib/dates';
 import { effectiveBucket } from '../lib/planning';
 import { getLatestStatusNote } from '../lib/taskRecord';
+import { WORK_ITEM_DRAG_TYPE } from '../lib/dailyQueue';
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -44,7 +46,7 @@ const STATUS_FILTERS: { value: TaskStatus | 'all'; label: string }[] = [
 
 export default function TasksPage() {
   const {
-    tasks, getCustomerById, updateTask, deleteTask, reloadTasks,
+    tasks, workItems, getCustomerById, updateTask, deleteTask, reloadTasks,
     taskLoadFailed, error, taskStorageStatus, restoreTasksFromLatestBackup,
   } = useApp();
 
@@ -203,6 +205,8 @@ export default function TasksPage() {
         </div>
       )}
       <div className="page-content">
+        <DailyQueue workItems={workItems.filter((item) => !item.archivedAt)} />
+
         <div className="page-header">
           <div>
             <div className="page-title">Work records</div>
@@ -350,7 +354,12 @@ export default function TasksPage() {
                     key={task.id}
                     role="button"
                     tabIndex={0}
+                    draggable={!task.archivedAt}
                     className={`task-list-item${selectedId === task.id ? ' selected' : ''}${task.dueAt && isOverdue(task.dueAt, task.status) ? ' overdue' : ''}`}
+                    onDragStart={(event) => {
+                      event.dataTransfer.effectAllowed = 'copy';
+                      event.dataTransfer.setData(WORK_ITEM_DRAG_TYPE, task.id);
+                    }}
                     onClick={() => handleSelect(task.id)}
                     onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') handleSelect(task.id); }}
                   >

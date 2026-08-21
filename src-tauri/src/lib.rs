@@ -4733,9 +4733,25 @@ fn daily_queue_projection(work_items: &dyn WorkItemRepository, queue: crate::dom
         .entries
         .iter()
         .filter_map(|entry| {
+            if let Some(text) = &entry.note {
+                position += 1;
+                return Some(serde_json::json!({
+                    "id": entry.work_item_id,
+                    "kind": "note",
+                    "position": position,
+                    "text": text,
+                    "addedAt": entry.added_at,
+                }));
+            }
             let item = work_items.get(&entry.work_item_id).ok().flatten()?;
             position += 1;
-            Some(serde_json::json!({"position": position, "workItem": canonical_summary(&item)}))
+            Some(serde_json::json!({
+                "id": entry.work_item_id,
+                "kind": "work_item",
+                "position": position,
+                "workItem": canonical_summary(&item),
+                "addedAt": entry.added_at,
+            }))
         })
         .collect();
     serde_json::json!({
@@ -4772,6 +4788,17 @@ fn add_to_daily_queue(app: tauri::AppHandle, date: String, work_item_id: String,
     let service = crate::application::daily_queue::DailyQueueApplicationService { queues: &repo, work_items: &repo };
     let queue = service
         .add(&date, &work_item_id, position, expected_revision, &chrono_now_iso())
+        .map_err(canonical_error)?;
+    Ok(daily_queue_projection(&repo, queue))
+}
+
+#[tauri::command]
+fn add_note_to_daily_queue(app: tauri::AppHandle, date: String, text: String, position: Option<usize>, expected_revision: i64) -> Result<Value, String> {
+    let repo = canonical_repo(&app)?;
+    let service = crate::application::daily_queue::DailyQueueApplicationService { queues: &repo, work_items: &repo };
+    let entry_id = format!("queue-note:{}", task_mcp_generate_id());
+    let queue = service
+        .add_note(&date, &entry_id, &text, position, expected_revision, &chrono_now_iso())
         .map_err(canonical_error)?;
     Ok(daily_queue_projection(&repo, queue))
 }
@@ -5069,7 +5096,7 @@ mod task_record_contract_tests {
     }
 
     #[test]
-    fn canonical_mcp_toolset_includes_all_five_daily_queue_tools() {
+    fn canonical_mcp_toolset_includes_all_daily_queue_tools() {
         let names: Vec<String> = canonical_mcp_tool_definitions()
             .iter()
             .filter_map(|tool| tool["name"].as_str().map(str::to_string))
@@ -5078,6 +5105,7 @@ mod task_record_contract_tests {
             "get_daily_queue",
             "replace_daily_queue",
             "add_to_daily_queue",
+            "add_note_to_daily_queue",
             "move_daily_queue_item",
             "remove_from_daily_queue",
         ] {
@@ -5087,7 +5115,7 @@ mod task_record_contract_tests {
 
     #[test]
     fn daily_queue_mutation_tools_require_expected_revision_and_fail_closed_on_unknown_fields() {
-        for name in ["replace_daily_queue", "add_to_daily_queue", "move_daily_queue_item", "remove_from_daily_queue"] {
+        for name in ["replace_daily_queue", "add_to_daily_queue", "add_note_to_daily_queue", "move_daily_queue_item", "remove_from_daily_queue"] {
             let tool = canonical_mcp_tool_definitions().into_iter().find(|t| t["name"] == name).unwrap();
             let required = tool["inputSchema"]["required"].as_array().cloned().unwrap_or_default();
             assert!(required.contains(&Value::String("expectedRevision".to_string())), "{name} must require expectedRevision");
@@ -5104,7 +5132,7 @@ mod task_record_contract_tests {
         let tools = canonical_mcp_tool_definitions();
         let get_tool = tools.iter().find(|t| t["name"] == "get_daily_queue").unwrap();
         assert_eq!(get_tool["annotations"]["readOnlyHint"], Value::Bool(true));
-        for name in ["replace_daily_queue", "add_to_daily_queue", "move_daily_queue_item", "remove_from_daily_queue"] {
+        for name in ["replace_daily_queue", "add_to_daily_queue", "add_note_to_daily_queue", "move_daily_queue_item", "remove_from_daily_queue"] {
             let tool = tools.iter().find(|t| t["name"] == name).unwrap();
             assert_eq!(tool["annotations"]["readOnlyHint"], Value::Bool(false), "{name} is a mutation");
             assert_eq!(tool["annotations"]["openWorldHint"], Value::Bool(false), "{name} only touches local state");
@@ -5606,7 +5634,7 @@ fn task_mcp_bridge_state() -> &'static Mutex<Value> {
             "port": TASK_MCP_BRIDGE_PORT,
             "canonicalTools": canonical_mcp_tool_definitions(),
             "readOnlyTools": canonical_mcp_tool_definitions().into_iter().filter(|tool| matches!(tool["name"].as_str(), Some("list_work_items"|"get_work_item"|"get_task_record"|"list_work_item_changes"|"get_planning_today"|"get_daily_queue"))).collect::<Vec<_>>(),
-            "localWriteTools": canonical_mcp_tool_definitions().into_iter().filter(|tool| matches!(tool["name"].as_str(), Some("create_work_item"|"update_work_item"|"patch_work_item"|"transition_work_item"|"append_work_item_note"|"replace_daily_queue"|"add_to_daily_queue"|"move_daily_queue_item"|"remove_from_daily_queue"))).collect::<Vec<_>>(),
+            "localWriteTools": canonical_mcp_tool_definitions().into_iter().filter(|tool| matches!(tool["name"].as_str(), Some("create_work_item"|"update_work_item"|"patch_work_item"|"transition_work_item"|"append_work_item_note"|"replace_daily_queue"|"add_to_daily_queue"|"add_note_to_daily_queue"|"move_daily_queue_item"|"remove_from_daily_queue"))).collect::<Vec<_>>(),
             "readOnlyMode": false,
             "localWriteMode": true,
             "lastError": Value::Null,
@@ -5633,7 +5661,7 @@ fn task_mcp_current_bridge_state() -> Value {
                 "port": TASK_MCP_BRIDGE_PORT,
                 "canonicalTools": canonical_mcp_tool_definitions(),
                 "readOnlyTools": canonical_mcp_tool_definitions().into_iter().filter(|tool| matches!(tool["name"].as_str(), Some("list_work_items"|"get_work_item"|"get_task_record"|"list_work_item_changes"|"get_planning_today"|"get_daily_queue"))).collect::<Vec<_>>(),
-                "localWriteTools": canonical_mcp_tool_definitions().into_iter().filter(|tool| matches!(tool["name"].as_str(), Some("create_work_item"|"update_work_item"|"patch_work_item"|"transition_work_item"|"append_work_item_note"|"replace_daily_queue"|"add_to_daily_queue"|"move_daily_queue_item"|"remove_from_daily_queue"))).collect::<Vec<_>>(),
+                "localWriteTools": canonical_mcp_tool_definitions().into_iter().filter(|tool| matches!(tool["name"].as_str(), Some("create_work_item"|"update_work_item"|"patch_work_item"|"transition_work_item"|"append_work_item_note"|"replace_daily_queue"|"add_to_daily_queue"|"add_note_to_daily_queue"|"move_daily_queue_item"|"remove_from_daily_queue"))).collect::<Vec<_>>(),
                 "readOnlyMode": false,
                 "localWriteMode": true,
                 "lastError": "Bridge state lock poisoned.",
@@ -5903,7 +5931,7 @@ fn mcp_work_item_summary_schema() -> Value {
 }
 
 /// Shared response shape for get_daily_queue and every daily-queue mutation
-/// (they all return the full updated queue) — kept in one place so all five
+/// (they all return the full updated queue) — kept in one place so every
 /// tools' outputSchema stay identical to each other and to
 /// docs/openapi.yaml's DailyQueueResult / mcp/task-workbench-mcp.mjs's
 /// DAILY_QUEUE_SCHEMA.
@@ -5920,10 +5948,14 @@ fn mcp_daily_queue_schema() -> Value {
                 "type": "array",
                 "items": {
                     "type": "object",
-                    "required": ["position","workItem"],
+                    "required": ["id","kind","position","addedAt"],
                     "properties": {
+                        "id": {"type": "string"},
+                        "kind": {"enum": ["work_item","note"]},
                         "position": {"type": "integer", "minimum": 1},
                         "workItem": mcp_work_item_summary_schema(),
+                        "text": {"type": "string"},
+                        "addedAt": {"type": "string"},
                     }
                 }
             }
@@ -5948,8 +5980,9 @@ fn canonical_mcp_tool_definitions() -> Vec<Value> {
         serde_json::json!({"name":"get_daily_queue","description":"Read the explicit, user-chosen execution order for one calendar day — distinct from status and planningBucket. Never AI-ranked or inferred from priority/due date. When `date` is omitted, defaults to the app's local calendar today (the same 'today' the desktop UI uses) — call this first to learn the canonical date/revision before a mutation.","inputSchema":{"type":"object","additionalProperties":false,"properties":{"date":queue_date_property}},"outputSchema":mcp_daily_queue_schema(),"annotations":read_only}),
         serde_json::json!({"name":"replace_daily_queue","description":"Atomically set the complete ordered daily queue for `date` to exactly `workItemIds`, in that order. Use for \"set my queue to A, B, C\". Rejects a duplicate id, an archived work item, or an id that does not exist — the whole call fails, nothing is partially applied.","inputSchema":{"type":"object","required":["date","workItemIds","expectedRevision"],"additionalProperties":false,"properties":{"date":queue_date_property,"workItemIds":{"type":"array","items":{"type":"string","minLength":1}},"expectedRevision":{"type":"integer","minimum":0}}},"outputSchema":mcp_daily_queue_schema(),"annotations":{"readOnlyHint":false,"destructiveHint":true,"idempotentHint":false,"openWorldHint":false}}),
         serde_json::json!({"name":"add_to_daily_queue","description":"Add one work item to the daily queue for `date`. `position` is 1-based; omitted or out-of-range values append to the end. Rejects if the work item is already queued for that date, archived, or does not exist.","inputSchema":{"type":"object","required":["date","workItemId","expectedRevision"],"additionalProperties":false,"properties":{"date":queue_date_property,"workItemId":{"type":"string","minLength":1},"position":{"type":"integer","minimum":1},"expectedRevision":{"type":"integer","minimum":0}}},"outputSchema":mcp_daily_queue_schema(),"annotations":{"readOnlyHint":false,"destructiveHint":false,"idempotentHint":false,"openWorldHint":false}}),
-        serde_json::json!({"name":"move_daily_queue_item","description":"Move a work item already in the daily queue for `date` to 1-based `position`, clamped to the valid range. Rejects if the work item is not currently in that day's queue. Never changes status or planningBucket.","inputSchema":{"type":"object","required":["date","workItemId","position","expectedRevision"],"additionalProperties":false,"properties":{"date":queue_date_property,"workItemId":{"type":"string","minLength":1},"position":{"type":"integer","minimum":1},"expectedRevision":{"type":"integer","minimum":0}}},"outputSchema":mcp_daily_queue_schema(),"annotations":{"readOnlyHint":false,"destructiveHint":false,"idempotentHint":false,"openWorldHint":false}}),
-        serde_json::json!({"name":"remove_from_daily_queue","description":"Remove one work item from the daily queue for `date`. Does not change the work item's status, planningBucket, or any other field — it only leaves today's execution order. Rejects if the work item is not currently in that day's queue.","inputSchema":{"type":"object","required":["date","workItemId","expectedRevision"],"additionalProperties":false,"properties":{"date":queue_date_property,"workItemId":{"type":"string","minLength":1},"expectedRevision":{"type":"integer","minimum":0}}},"outputSchema":mcp_daily_queue_schema(),"annotations":{"readOnlyHint":false,"destructiveHint":true,"idempotentHint":false,"openWorldHint":false}}),
+        serde_json::json!({"name":"add_note_to_daily_queue","description":"Add a lightweight text-only reminder to the daily queue without creating a WorkItem. Text is trimmed, required, and limited to 500 characters.","inputSchema":{"type":"object","required":["date","text","expectedRevision"],"additionalProperties":false,"properties":{"date":queue_date_property,"text":{"type":"string","minLength":1,"maxLength":500},"position":{"type":"integer","minimum":1},"expectedRevision":{"type":"integer","minimum":0}}},"outputSchema":mcp_daily_queue_schema(),"annotations":{"readOnlyHint":false,"destructiveHint":false,"idempotentHint":false,"openWorldHint":false}}),
+        serde_json::json!({"name":"move_daily_queue_item","description":"Move an entry already in the daily queue to a 1-based position. Pass the entry's `id` as `workItemId`; for work entries this is the work item id, while notes have a generated queue-local id. Never changes a WorkItem's status or planningBucket.","inputSchema":{"type":"object","required":["date","workItemId","position","expectedRevision"],"additionalProperties":false,"properties":{"date":queue_date_property,"workItemId":{"type":"string","minLength":1},"position":{"type":"integer","minimum":1},"expectedRevision":{"type":"integer","minimum":0}}},"outputSchema":mcp_daily_queue_schema(),"annotations":{"readOnlyHint":false,"destructiveHint":false,"idempotentHint":false,"openWorldHint":false}}),
+        serde_json::json!({"name":"remove_from_daily_queue","description":"Remove an entry from the daily queue by passing its `id` as `workItemId`. This never changes or deletes an underlying WorkItem.","inputSchema":{"type":"object","required":["date","workItemId","expectedRevision"],"additionalProperties":false,"properties":{"date":queue_date_property,"workItemId":{"type":"string","minLength":1},"expectedRevision":{"type":"integer","minimum":0}}},"outputSchema":mcp_daily_queue_schema(),"annotations":{"readOnlyHint":false,"destructiveHint":true,"idempotentHint":false,"openWorldHint":false}}),
     ]
 }
 
@@ -5968,6 +6001,7 @@ fn task_mcp_execute_canonical_tool(app: &tauri::AppHandle, name: &str, args: &Va
         "get_daily_queue" => get_daily_queue(app.clone(), args["date"].as_str().map(str::to_string)),
         "replace_daily_queue" => replace_daily_queue(app.clone(), args["date"].as_str().unwrap_or_default().to_string(), args["workItemIds"].as_array().map(|values| values.iter().filter_map(|v| v.as_str().map(str::to_string)).collect()).unwrap_or_default(), args["expectedRevision"].as_i64().unwrap_or(0)),
         "add_to_daily_queue" => add_to_daily_queue(app.clone(), args["date"].as_str().unwrap_or_default().to_string(), args["workItemId"].as_str().unwrap_or_default().to_string(), args["position"].as_u64().map(|v| v as usize), args["expectedRevision"].as_i64().unwrap_or(0)),
+        "add_note_to_daily_queue" => add_note_to_daily_queue(app.clone(), args["date"].as_str().unwrap_or_default().to_string(), args["text"].as_str().unwrap_or_default().to_string(), args["position"].as_u64().map(|v| v as usize), args["expectedRevision"].as_i64().unwrap_or(0)),
         "move_daily_queue_item" => move_daily_queue_item(app.clone(), args["date"].as_str().unwrap_or_default().to_string(), args["workItemId"].as_str().unwrap_or_default().to_string(), args["position"].as_u64().unwrap_or(0) as usize, args["expectedRevision"].as_i64().unwrap_or(0)),
         "remove_from_daily_queue" => remove_from_daily_queue(app.clone(), args["date"].as_str().unwrap_or_default().to_string(), args["workItemId"].as_str().unwrap_or_default().to_string(), args["expectedRevision"].as_i64().unwrap_or(0)),
         _ => Err(format!("Unknown canonical tool: {name}")),
@@ -14509,6 +14543,8 @@ fn handle_canonical_http(app: &tauri::AppHandle, method: &str, raw_path: &str, b
         replace_daily_queue(app.clone(), json["date"].as_str().unwrap_or_default().to_string(), work_item_ids, json["expectedRevision"].as_i64().unwrap_or(0))
     } else if method == "POST" && path == "/api/v1/planning/daily-queue/items" {
         add_to_daily_queue(app.clone(), json["date"].as_str().unwrap_or_default().to_string(), json["workItemId"].as_str().unwrap_or_default().to_string(), json["position"].as_u64().map(|v| v as usize), json["expectedRevision"].as_i64().unwrap_or(0))
+    } else if method == "POST" && path == "/api/v1/planning/daily-queue/notes" {
+        add_note_to_daily_queue(app.clone(), json["date"].as_str().unwrap_or_default().to_string(), json["text"].as_str().unwrap_or_default().to_string(), json["position"].as_u64().map(|v| v as usize), json["expectedRevision"].as_i64().unwrap_or(0))
     } else if let Some(id) = path.strip_prefix("/api/v1/planning/daily-queue/items/") {
         if method == "POST" && id.ends_with("/move") { let work_item_id = id.trim_end_matches("/move"); move_daily_queue_item(app.clone(), json["date"].as_str().unwrap_or_default().to_string(), work_item_id.to_string(), json["position"].as_u64().unwrap_or(0) as usize, json["expectedRevision"].as_i64().unwrap_or(0)) }
         else if method == "POST" && id.ends_with("/remove") { let work_item_id = id.trim_end_matches("/remove"); remove_from_daily_queue(app.clone(), json["date"].as_str().unwrap_or_default().to_string(), work_item_id.to_string(), json["expectedRevision"].as_i64().unwrap_or(0)) }
@@ -24354,6 +24390,7 @@ pub fn run() {
             get_daily_queue,
             replace_daily_queue,
             add_to_daily_queue,
+            add_note_to_daily_queue,
             move_daily_queue_item,
             remove_from_daily_queue,
             clear_all_tasks,

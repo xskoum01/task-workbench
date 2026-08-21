@@ -176,10 +176,23 @@ export function getPlanningToday(timezone?: string): Promise<unknown> {
 // (relevance grouping, e.g. "today"). See docs/task-workbench-mcp.md for the
 // full contract. Never generated automatically from priority/due date/status.
 
-export interface DailyQueueEntry {
+interface DailyQueueEntryBase {
+  id: string;
   position: number;
+  addedAt: string;
+}
+
+export interface DailyQueueWorkItemEntry extends DailyQueueEntryBase {
+  kind: 'work_item';
   workItem: WorkItem;
 }
+
+export interface DailyQueueNoteEntry extends DailyQueueEntryBase {
+  kind: 'note';
+  text: string;
+}
+
+export type DailyQueueEntry = DailyQueueWorkItemEntry | DailyQueueNoteEntry;
 
 export interface DailyQueueResult {
   apiVersion: string;
@@ -218,6 +231,16 @@ export function addToDailyQueue(
   position?: number,
 ): Promise<DailyQueueResult> {
   return invoke<DailyQueueResult>('add_to_daily_queue', { date, workItemId, position, expectedRevision });
+}
+
+/** Adds a queue-local text reminder without creating a canonical WorkItem. */
+export function addNoteToDailyQueue(
+  date: string,
+  text: string,
+  expectedRevision: number,
+  position?: number,
+): Promise<DailyQueueResult> {
+  return invoke<DailyQueueResult>('add_note_to_daily_queue', { date, text, position, expectedRevision });
 }
 
 /** Moves a work item already in the queue for `date` to 1-based `position`. */

@@ -66,7 +66,7 @@ const DAILY_QUEUE_DATE_SCHEMA = {
 };
 
 // Shared response shape for get_daily_queue and every daily-queue mutation
-// (they all return the full updated queue) — kept in one place so all five
+// (they all return the full updated queue) — kept in one place so every
 // tools' outputSchema stay identical to each other and to
 // docs/openapi.yaml's DailyQueueResult / lib.rs's mcp_daily_queue_schema().
 const DAILY_QUEUE_SCHEMA = {
@@ -81,10 +81,14 @@ const DAILY_QUEUE_SCHEMA = {
       type: 'array',
       items: {
         type: 'object',
-        required: ['position', 'workItem'],
+        required: ['id', 'kind', 'position', 'addedAt'],
         properties: {
+          id: { type: 'string' },
+          kind: { enum: ['work_item', 'note'] },
           position: { type: 'integer', minimum: 1 },
           workItem: WORK_ITEM_SUMMARY_SCHEMA,
+          text: { type: 'string' },
+          addedAt: { type: 'string' },
         },
       },
     },
@@ -350,9 +354,9 @@ const TOOL_DEFINITIONS = [
   {
     name: 'move_daily_queue_item',
     description:
-      'Move a work item already in the daily queue for `date` to 1-based `position`, clamped to the ' +
-      'valid range — e.g. "put Neopharma before Orbit". Rejects if the work item is not currently in ' +
-      'that day\'s queue. Never changes status or planningBucket.',
+      'Move an entry already in the daily queue to a 1-based position. Pass the entry\'s `id` as ' +
+      '`workItemId`; for work entries this is the work item id, while notes have a generated ' +
+      'queue-local id. Never changes a WorkItem\'s status or planningBucket.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -368,11 +372,29 @@ const TOOL_DEFINITIONS = [
     outputSchema: DAILY_QUEUE_SCHEMA,
   },
   {
+    name: 'add_note_to_daily_queue',
+    description:
+      'Add a lightweight text-only reminder to the daily queue without creating a WorkItem. ' +
+      'Text is trimmed, required, and limited to 500 characters.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        date: DAILY_QUEUE_DATE_SCHEMA,
+        text: { type: 'string', minLength: 1, maxLength: 500 },
+        position: { type: 'integer', minimum: 1 },
+        expectedRevision: { type: 'integer', minimum: 0 },
+      },
+      required: ['date', 'text', 'expectedRevision'],
+      additionalProperties: false,
+    },
+    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
+    outputSchema: DAILY_QUEUE_SCHEMA,
+  },
+  {
     name: 'remove_from_daily_queue',
     description:
-      'Remove one work item from the daily queue for `date`. Does not change the work item\'s ' +
-      'status, planningBucket, or any other field — it only leaves today\'s execution order. Rejects ' +
-      'if the work item is not currently in that day\'s queue.',
+      'Remove an entry from the daily queue by passing its `id` as `workItemId`. This never changes ' +
+      'or deletes an underlying WorkItem.',
     inputSchema: {
       type: 'object',
       properties: {

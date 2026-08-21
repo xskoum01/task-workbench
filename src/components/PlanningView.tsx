@@ -19,6 +19,7 @@ import {
 } from '../lib/planning';
 import { isOverdue, formatRelativeDate, formatShortPastDate } from '../lib/dates';
 import { getLatestStatusNote } from '../lib/taskRecord';
+import { WORK_ITEM_DRAG_TYPE } from '../lib/dailyQueue';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -223,7 +224,15 @@ function PlanningTaskRow({ task, selected, onSelect }: PlanningTaskRowProps) {
   if (blocked)  rowClass += ' blocked';
 
   return (
-    <button className={rowClass} onClick={() => onSelect(task.id)}>
+    <button
+      className={rowClass}
+      onClick={() => onSelect(task.id)}
+      draggable
+      onDragStart={(event) => {
+        event.dataTransfer.effectAllowed = 'copy';
+        event.dataTransfer.setData(WORK_ITEM_DRAG_TYPE, task.id);
+      }}
+    >
       {/* Main content — same structure as task-list-item-main */}
       <div className="planning-task-main">
         <div className="planning-task-title-row">

@@ -32,7 +32,7 @@ function workItem(id: string, status: WorkItem['status'] = 'ready', archived = f
 }
 
 function entry(position: number, item: WorkItem): DailyQueueEntry {
-  return { position, workItem: item };
+  return { id: item.id, kind: 'work_item', position, workItem: item, addedAt: '2026-08-17T08:00:00Z' };
 }
 
 describe('isTerminal', () => {
@@ -49,10 +49,17 @@ describe('isTerminal', () => {
 });
 
 describe('activeEntry / upcomingEntries', () => {
+  it('allows a text note to be the active entry', () => {
+    const note: DailyQueueEntry = {
+      id: 'note-1', kind: 'note', position: 1, text: 'Send email', addedAt: '2026-08-17T08:00:00Z',
+    };
+    expect(activeEntry([note])).toBe(note);
+  });
+
   it('picks the first non-terminal entry as active', () => {
     const entries = [entry(1, workItem('a', 'completed')), entry(2, workItem('b', 'ready')), entry(3, workItem('c', 'ready'))];
-    expect(activeEntry(entries)?.workItem.id).toBe('b');
-    expect(upcomingEntries(entries).map((e) => e.workItem.id)).toEqual(['a', 'c']);
+    expect(activeEntry(entries)?.id).toBe('b');
+    expect(upcomingEntries(entries).map((e) => e.id)).toEqual(['a', 'c']);
   });
 
   it('returns undefined active entry when every entry is terminal', () => {

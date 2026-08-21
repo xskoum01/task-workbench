@@ -15,6 +15,9 @@ import type { WorkItem } from '../domain/workItem';
 
 const TERMINAL_STATUSES = new Set<WorkItem['status']>(['completed', 'cancelled']);
 
+/** MIME-like key shared by draggable Work rows and the queue drop target. */
+export const WORK_ITEM_DRAG_TYPE = 'application/x-task-workbench-work-item';
+
 /** True once a work item's status means there is no more work left to do on it. */
 export function isTerminal(workItem: WorkItem): boolean {
   return TERMINAL_STATUSES.has(workItem.status);
@@ -27,7 +30,7 @@ export function isTerminal(workItem: WorkItem): boolean {
  * explicit status transition.
  */
 export function activeEntry(entries: DailyQueueEntry[]): DailyQueueEntry | undefined {
-  return entries.find((entry) => !isTerminal(entry.workItem));
+  return entries.find((entry) => entry.kind === 'note' || !isTerminal(entry.workItem));
 }
 
 /** Entries after (and including, if none is active) the "Právě teď" entry — shown as "Dále". */
@@ -39,7 +42,7 @@ export function upcomingEntries(entries: DailyQueueEntry[]): DailyQueueEntry[] {
 
 /** True when `workItemId` is already present in the queue (add must reject re-adding it). */
 export function isAlreadyQueued(entries: DailyQueueEntry[], workItemId: string): boolean {
-  return entries.some((entry) => entry.workItem.id === workItemId);
+  return entries.some((entry) => entry.kind === 'work_item' && entry.workItem.id === workItemId);
 }
 
 /**

@@ -16,6 +16,7 @@ const MUTATION_TOOLS = new Set([
   'append_work_item_note',
   'replace_daily_queue',
   'add_to_daily_queue',
+  'add_note_to_daily_queue',
   'move_daily_queue_item',
   'remove_from_daily_queue',
 ]);
@@ -24,6 +25,7 @@ const DAILY_QUEUE_TOOLS = [
   'get_daily_queue',
   'replace_daily_queue',
   'add_to_daily_queue',
+  'add_note_to_daily_queue',
   'move_daily_queue_item',
   'remove_from_daily_queue',
 ];
@@ -60,6 +62,7 @@ function withMockBridge(respond) {
 describe('Task Workbench MCP 2.x boundary', () => {
   it('exposes only canonical task-data tools', () => {
     expect([...PUBLIC_TOOL_NAMES].sort()).toEqual([
+      'add_note_to_daily_queue',
       'add_to_daily_queue',
       'append_work_item_note',
       'create_work_item',
@@ -93,6 +96,7 @@ describe('Task Workbench MCP 2.x boundary', () => {
       'append_work_item_note',
       'replace_daily_queue',
       'add_to_daily_queue',
+      'add_note_to_daily_queue',
       'move_daily_queue_item',
       'remove_from_daily_queue',
     ]) {
@@ -239,7 +243,7 @@ describe('Task Workbench MCP 2.x boundary', () => {
           expect.arrayContaining(['apiVersion', 'date', 'revision', 'generatedAt', 'entries']),
         );
       }
-      // All five must be the exact same schema object — one source of truth, not five hand-copies.
+      // Every queue tool uses the exact same schema object — one source of truth.
       expect(schemas.every((schema) => schema === schemas[0])).toBe(true);
     });
   });
@@ -266,7 +270,7 @@ describe('Task Workbench MCP 2.x boundary', () => {
     });
 
     it('every mutation requires date and expectedRevision, and allows expectedRevision=0 for a new queue', () => {
-      for (const name of ['replace_daily_queue', 'add_to_daily_queue', 'move_daily_queue_item', 'remove_from_daily_queue']) {
+      for (const name of ['replace_daily_queue', 'add_to_daily_queue', 'add_note_to_daily_queue', 'move_daily_queue_item', 'remove_from_daily_queue']) {
         const tool = findTool(name);
         expect(tool.inputSchema.required).toEqual(expect.arrayContaining(['date', 'expectedRevision']));
         expect(tool.inputSchema.properties.expectedRevision.minimum).toBe(0);
@@ -291,6 +295,7 @@ describe('Task Workbench MCP 2.x boundary', () => {
       expect(findTool('replace_daily_queue').annotations.destructiveHint).toBe(true);
       expect(findTool('remove_from_daily_queue').annotations.destructiveHint).toBe(true);
       expect(findTool('add_to_daily_queue').annotations.destructiveHint).toBe(false);
+      expect(findTool('add_note_to_daily_queue').annotations.destructiveHint).toBe(false);
       expect(findTool('move_daily_queue_item').annotations.destructiveHint).toBe(false);
     });
 

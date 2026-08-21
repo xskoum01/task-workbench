@@ -55,6 +55,7 @@ created by the bridge, and are not returned by status responses.
 | `get_daily_queue` | No | Read the explicit execution order for one calendar day |
 | `replace_daily_queue` | Yes | Atomically set the whole ordered queue for a day |
 | `add_to_daily_queue` | Yes | Add one work item to a day's queue |
+| `add_note_to_daily_queue` | Yes | Add a queue-local text reminder without creating a work item |
 | `move_daily_queue_item` | Yes | Reorder one work item within a day's queue |
 | `remove_from_daily_queue` | Yes | Remove one work item from a day's queue |
 
@@ -122,6 +123,10 @@ entry never changes the work item's `status` or `planningBucket` — those
 remain independent fields, changed only through their own tools
 (`transition_work_item`, `patch_work_item`).
 
+The queue is persisted in the application's SQLite store. Closing or restarting
+Task Workbench never clears it; entries remain in the same order until an
+explicit queue mutation removes or replaces them.
+
 **Date/timezone model.** The Daily Queue's "date" is the local calendar date
 of the machine running the desktop app (this is a single-user, Windows-only
 desktop application — there is no server/multi-timezone concern to resolve).
@@ -142,7 +147,14 @@ that date is simply the one whose `expectedRevision` is `0`. This is why
 since a WorkItem always exists with revision 1 by the time it can be
 mutated).
 
-**Typical Claude flows:**
+Queue entries are a tagged union. `kind: "work_item"` entries include the
+current `workItem` summary; `kind: "note"` entries contain only `text`. Both
+carry a stable queue-entry `id`, `position`, and `addedAt`, so Jarvis can read
+and order lightweight reminders such as “send email” alongside full records.
+Pass that `id` as `workItemId` to the existing move/remove tools; for work-item
+entries it is the canonical work-item ID.
+
+**Typical Claude/Jarvis flows:**
 
 - *"What's my queue today?"* → `get_daily_queue()` with no `date`.
 - *"Put Neopharma before Orbit."* → `get_daily_queue()` to get the current
@@ -154,6 +166,9 @@ mutated).
 - *"What should I do now?"* → if `get_daily_queue()` returns a non-empty
   queue, treat it as the user's own approved plan — do not substitute a
   priority/due-date-based ranking instead.
+- *"Remember to send an email today."* → `get_daily_queue()`, then
+  `add_note_to_daily_queue` with the returned date/revision and the reminder
+  text. Do not create a canonical WorkItem for this lightweight note.
 
 **Completed/cancelled entries.** An entry stays in the persisted queue after
 its work item transitions to `completed`/`cancelled` — the queue record is
