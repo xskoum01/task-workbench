@@ -4215,13 +4215,32 @@ fn canonical_external_references(item: &WorkItem) -> Vec<Value> {
     refs
 }
 
-fn canonical_summary(item: &WorkItem) -> Value {
+fn canonical_area_names(customers: &[Value]) -> HashMap<String, String> {
+    customers
+        .iter()
+        .filter_map(|customer| {
+            let id = customer.get("id")?.as_str()?.trim();
+            let name = customer.get("name")?.as_str()?.trim();
+            (!id.is_empty() && !name.is_empty()).then(|| (id.to_string(), name.to_string()))
+        })
+        .collect()
+}
+
+fn load_canonical_area_names(app: &tauri::AppHandle) -> HashMap<String, String> {
+    canonical_area_names(&task_mcp_load_customers(app).unwrap_or_default())
+}
+
+fn canonical_summary(item: &WorkItem, area_names: &HashMap<String, String>) -> Value {
     let planning_bucket = item.planning_bucket.clone().map(Value::String).or_else(|| item.metadata.get("planningBucket").cloned()).unwrap_or(Value::Null);
     let estimate_minutes = item.estimate_minutes.map(Value::from).or_else(|| item.metadata.get("estimateMinutes").cloned()).or_else(|| item.metadata.get("estimatedEffort").and_then(|v| v.as_f64()).map(|h| Value::from((h * 60.0).round() as i64)));
+    let area = item.area_id.as_ref().map(|id| {
+        let name = area_names.get(id).map(String::as_str).unwrap_or(id);
+        serde_json::json!({"id": id, "name": name})
+    });
     serde_json::json!({
         "id": item.id, "kind": item.kind, "title": item.title, "status": item.status,
         "priority": item.priority, "planningBucket": planning_bucket,
-        "owner": item.owner, "area": item.area_id.as_ref().map(|id| serde_json::json!({"id":id,"name":id})),
+        "owner": item.owner, "area": area,
         "dueAt": item.due_at, "estimateMinutes": estimate_minutes, "source": item.source,
         "updatedAt": item.updated_at, "revision": item.revision, "archived": item.archived_at.is_some()
     })
@@ -4389,7 +4408,8 @@ fn list_work_items(app: tauri::AppHandle, include_archived: Option<bool>, limit:
     let requested_limit = limit.unwrap_or(50).clamp(1, 500);
     let mut items = service.list(&WorkItemListQuery { include_archived: include_archived.unwrap_or(false), limit: requested_limit.saturating_add(1), status, kind, owner, area, source, planning_bucket, due_before, due_after, updated_after, cursor }).map_err(canonical_error)?;
     let next_cursor = if items.len() > requested_limit { items.pop().map(|item| format!("{}|{}", item.updated_at, item.id)) } else { None };
-    Ok(serde_json::json!({"apiVersion":"1", "generatedAt": chrono_now_iso(), "snapshotRevision": items.iter().map(|i| i.revision).max().unwrap_or(0), "items": items.iter().map(canonical_summary).collect::<Vec<_>>(), "nextCursor": next_cursor}))
+    let area_names = load_canonical_area_names(&app);
+    Ok(serde_json::json!({"apiVersion":"1", "generatedAt": chrono_now_iso(), "snapshotRevision": items.iter().map(|i| i.revision).max().unwrap_or(0), "items": items.iter().map(|item| canonical_summary(item, &area_names)).collect::<Vec<_>>(), "nextCursor": next_cursor}))
 }
 
 #[tauri::command]
@@ -4667,6 +4687,7 @@ fn append_work_item_note(app: tauri::AppHandle, id: String, text: String, expect
 fn build_planning_today_result(
     now_items: &[WorkItem],
     today_items: &[WorkItem],
+    area_names: &HashMap<String, String>,
     timezone: Option<String>,
     generated_at: String,
 ) -> Value {
@@ -4682,8 +4703,8 @@ fn build_planning_today_result(
         "sourceRevision": source_revision,
         "timezone": timezone.unwrap_or_else(|| "UTC".to_string()),
         "sections": {
-            "now": now_items.iter().map(canonical_summary).collect::<Vec<_>>(),
-            "today": today_items.iter().map(canonical_summary).collect::<Vec<_>>(),
+            "now": now_items.iter().map(|item| canonical_summary(item, area_names)).collect::<Vec<_>>(),
+            "today": today_items.iter().map(|item| canonical_summary(item, area_names)).collect::<Vec<_>>(),
         }
     })
 }
@@ -4708,7 +4729,8 @@ fn get_planning_today(app: tauri::AppHandle, timezone: Option<String>) -> Result
     let today_items = service.list(&WorkItemListQuery { include_archived: false, limit: 500, planning_bucket: Some("today".to_string()), ..Default::default() }).map_err(canonical_error)?;
     let now_items = active_planning_items(now_items);
     let today_items = active_planning_items(today_items);
-    Ok(build_planning_today_result(&now_items, &today_items, timezone, chrono_now_iso()))
+    let area_names = load_canonical_area_names(&app);
+    Ok(build_planning_today_result(&now_items, &today_items, &area_names, timezone, chrono_now_iso()))
 }
 
 // --- Daily Queue -------------------------------------------------------
@@ -4727,7 +4749,7 @@ fn get_planning_today(app: tauri::AppHandle, timezone: Option<String>) -> Result
 /// archived, completed, or cancelled — those still resolve normally) is
 /// dropped from the projection; the underlying persisted queue is untouched,
 /// so this can never itself change the queue's revision.
-fn daily_queue_projection(work_items: &dyn WorkItemRepository, queue: crate::domain::daily_queue::DailyQueue) -> Value {
+fn daily_queue_projection(work_items: &dyn WorkItemRepository, queue: crate::domain::daily_queue::DailyQueue, area_names: &HashMap<String, String>) -> Value {
     let mut position = 0i64;
     let entries: Vec<Value> = queue
         .entries
@@ -4750,7 +4772,7 @@ fn daily_queue_projection(work_items: &dyn WorkItemRepository, queue: crate::dom
                 "id": entry.work_item_id,
                 "kind": "work_item",
                 "position": position,
-                "workItem": canonical_summary(&item),
+                "workItem": canonical_summary(&item, area_names),
                 "addedAt": entry.added_at,
             }))
         })
@@ -4770,7 +4792,8 @@ fn get_daily_queue(app: tauri::AppHandle, date: Option<String>) -> Result<Value,
     let resolved_date = date.unwrap_or_else(local_date_ymd);
     let service = crate::application::daily_queue::DailyQueueApplicationService { queues: &repo, work_items: &repo };
     let queue = service.get(&resolved_date).map_err(canonical_error)?;
-    Ok(daily_queue_projection(&repo, queue))
+    let area_names = load_canonical_area_names(&app);
+    Ok(daily_queue_projection(&repo, queue, &area_names))
 }
 
 #[tauri::command]
@@ -4780,7 +4803,8 @@ fn replace_daily_queue(app: tauri::AppHandle, date: String, work_item_ids: Vec<S
     let queue = service
         .replace(&date, &work_item_ids, expected_revision, &chrono_now_iso())
         .map_err(canonical_error)?;
-    Ok(daily_queue_projection(&repo, queue))
+    let area_names = load_canonical_area_names(&app);
+    Ok(daily_queue_projection(&repo, queue, &area_names))
 }
 
 #[tauri::command]
@@ -4790,7 +4814,8 @@ fn add_to_daily_queue(app: tauri::AppHandle, date: String, work_item_id: String,
     let queue = service
         .add(&date, &work_item_id, position, expected_revision, &chrono_now_iso())
         .map_err(canonical_error)?;
-    Ok(daily_queue_projection(&repo, queue))
+    let area_names = load_canonical_area_names(&app);
+    Ok(daily_queue_projection(&repo, queue, &area_names))
 }
 
 #[tauri::command]
@@ -4801,7 +4826,8 @@ fn add_note_to_daily_queue(app: tauri::AppHandle, date: String, text: String, po
     let queue = service
         .add_note(&date, &entry_id, &text, position, expected_revision, &chrono_now_iso())
         .map_err(canonical_error)?;
-    Ok(daily_queue_projection(&repo, queue))
+    let area_names = load_canonical_area_names(&app);
+    Ok(daily_queue_projection(&repo, queue, &area_names))
 }
 
 #[tauri::command]
@@ -4811,7 +4837,8 @@ fn complete_daily_queue_entry(app: tauri::AppHandle, date: String, entry_id: Str
     let queue = service
         .complete_entry(&date, &entry_id, expected_revision, &chrono_now_iso())
         .map_err(canonical_error)?;
-    Ok(daily_queue_projection(&repo, queue))
+    let area_names = load_canonical_area_names(&app);
+    Ok(daily_queue_projection(&repo, queue, &area_names))
 }
 
 #[tauri::command]
@@ -4821,7 +4848,8 @@ fn move_daily_queue_item(app: tauri::AppHandle, date: String, work_item_id: Stri
     let queue = service
         .move_item(&date, &work_item_id, position, expected_revision, &chrono_now_iso())
         .map_err(canonical_error)?;
-    Ok(daily_queue_projection(&repo, queue))
+    let area_names = load_canonical_area_names(&app);
+    Ok(daily_queue_projection(&repo, queue, &area_names))
 }
 
 #[tauri::command]
@@ -4831,7 +4859,8 @@ fn remove_from_daily_queue(app: tauri::AppHandle, date: String, work_item_id: St
     let queue = service
         .remove(&date, &work_item_id, expected_revision, &chrono_now_iso())
         .map_err(canonical_error)?;
-    Ok(daily_queue_projection(&repo, queue))
+    let area_names = load_canonical_area_names(&app);
+    Ok(daily_queue_projection(&repo, queue, &area_names))
 }
 
 #[cfg(test)]
@@ -4890,6 +4919,7 @@ mod planning_today_contract_tests {
         let result = build_planning_today_result(
             &now_items,
             &today_items,
+            &HashMap::new(),
             None,
             "2026-08-02T16:46:20Z".to_string(),
         );
@@ -4929,6 +4959,7 @@ mod planning_today_contract_tests {
         let result = build_planning_today_result(
             &now_items,
             &today_items,
+            &HashMap::new(),
             None,
             "2026-08-11T12:00:00Z".to_string(),
         );
@@ -4956,7 +4987,7 @@ mod planning_today_contract_tests {
     #[test]
     fn summary_items_use_the_documented_camel_case_field_set() {
         let now_items = vec![item("1", Some("now"))];
-        let result = build_planning_today_result(&now_items, &[], None, "2026-08-02T00:00:00Z".to_string());
+        let result = build_planning_today_result(&now_items, &[], &HashMap::new(), None, "2026-08-02T00:00:00Z".to_string());
         let summary = &result["sections"]["now"][0];
         for field in [
             "id", "kind", "title", "status", "priority", "planningBucket",
@@ -4968,6 +4999,27 @@ mod planning_today_contract_tests {
                 "WorkItemSummary is missing expected field `{field}`"
             );
         }
+    }
+
+    #[test]
+    fn summary_exposes_stable_area_id_and_resolved_display_name() {
+        let mut work_item = item("task-11264", Some("now"));
+        work_item.area_id = Some("customer-ptacek".to_string());
+        let area_names = HashMap::from([(
+            "customer-ptacek".to_string(),
+            "Ptáček".to_string(),
+        )]);
+
+        let result = build_planning_today_result(
+            &[work_item],
+            &[],
+            &area_names,
+            None,
+            "2026-08-22T00:00:00Z".to_string(),
+        );
+
+        assert_eq!(result["sections"]["now"][0]["area"]["id"], "customer-ptacek");
+        assert_eq!(result["sections"]["now"][0]["area"]["name"], "Ptáček");
     }
 
     /// build_planning_today_result is a pure formatter: it renders exactly
@@ -4984,6 +5036,7 @@ mod planning_today_contract_tests {
         let result = build_planning_today_result(
             &passed_in_without_a_bucket,
             &[],
+            &HashMap::new(),
             None,
             "2026-08-02T00:00:00Z".to_string(),
         );

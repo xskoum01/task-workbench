@@ -227,4 +227,27 @@ mod tests {
         assert_eq!(value["status"], "in_progress");
         assert!(value.get("obligationMode").is_none());
     }
+
+    #[test]
+    fn reads_an_older_work_item_without_area_identity() {
+        let value = serde_json::json!({
+            "schemaVersion": 1,
+            "id": "old-work-1",
+            "kind": "task",
+            "title": "Older persisted item",
+            "status": "planned",
+            "priority": "normal",
+            "source": "manual",
+            "externalReferences": [],
+            "tags": [],
+            "context": [],
+            "createdAt": "2026-07-29T10:00:00Z",
+            "updatedAt": "2026-07-29T10:00:00Z",
+            "revision": 1,
+            "history": []
+        });
+
+        let item: WorkItem = serde_json::from_value(value).unwrap();
+        assert_eq!(item.area_id, None);
+    }
 }

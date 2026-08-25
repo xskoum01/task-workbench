@@ -31,6 +31,7 @@ describe('canonical work item contract', () => {
     expect(item.obligationMode).toBe('ongoing');
     expect(item.status).toBe('waiting');
     expect(item.owner?.displayName).toBe('Viktor');
+    expect(item.areaId).toBe('customer-1');
     expect(item.context.map((entry) => entry.type)).toEqual(['note', 'source']);
     expect(item.revision).toBe(4);
   });
@@ -62,5 +63,10 @@ describe('canonical work item contract', () => {
     expect(projected.tags).toEqual(['renewal']);
     expect(projected.nextReviewAt).toBe('2026-08-01T08:00:00.000Z');
     expect(projected.context.some((entry) => entry.id === 'decision-1')).toBe(true);
+  });
+
+  it('keeps a task without customer context valid', () => {
+    const item = taskToWorkItem({ ...task, customerId: '' });
+    expect(item.areaId).toBeUndefined();
   });
 });

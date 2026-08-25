@@ -168,6 +168,7 @@ export function taskToWorkItem(task: Task): WorkItem {
     ...(task.accountableTo
       ? { accountableTo: { displayName: task.accountableTo } }
       : {}),
+    ...(task.customerId ? { areaId: task.customerId } : {}),
     ...(task.dueAt ? { dueAt: task.dueAt } : {}),
     ...(task.completedAt ? { completedAt: task.completedAt } : {}),
     source: task.source,

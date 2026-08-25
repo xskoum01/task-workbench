@@ -473,8 +473,8 @@ components:
         area:
           type: [object, "null"]
           description: >
-            `name` currently duplicates `id` — it is not a resolved
-            human-readable area name yet.
+            Provider-neutral project/area identity. `id` is the stable area
+            identifier and `name` is its current human-readable display label.
           properties:
             id: { type: string }
             name: { type: string }
