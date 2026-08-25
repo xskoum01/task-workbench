@@ -6,6 +6,7 @@ import {
   isTerminal,
   positionAbove,
   positionBelow,
+  positionForDrop,
   queueableCandidates,
   upcomingEntries,
 } from './dailyQueue';
@@ -124,5 +125,17 @@ describe('positionAbove / positionBelow', () => {
   it('moves down by one, clamped at the queue length', () => {
     expect(positionBelow(1, 3)).toBe(2);
     expect(positionBelow(3, 3)).toBe(3);
+  });
+});
+
+describe('positionForDrop', () => {
+  it('accounts for the source being removed when moving down', () => {
+    expect(positionForDrop(1, 3, 'before')).toBe(2);
+    expect(positionForDrop(1, 3, 'after')).toBe(3);
+  });
+
+  it('keeps the target position stable when moving up', () => {
+    expect(positionForDrop(3, 1, 'before')).toBe(1);
+    expect(positionForDrop(3, 1, 'after')).toBe(2);
   });
 });

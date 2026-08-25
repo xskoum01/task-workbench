@@ -6920,6 +6920,7 @@ body {
 .daily-queue-list { display: grid; gap: 6px; margin: 0; padding: 0; list-style: none; }
 
 .daily-queue-row {
+  position: relative;
   display: flex;
   align-items: center;
   gap: 12px;
@@ -6930,9 +6931,33 @@ body {
   cursor: grab;
 }
 .daily-queue-row:active { cursor: grabbing; }
+.daily-queue-row--dragging { opacity: .45; }
+.daily-queue-row--drop-before::before,
+.daily-queue-row--drop-after::after {
+  position: absolute;
+  right: 4px;
+  left: 4px;
+  height: 2px;
+  border-radius: 2px;
+  background: var(--accent);
+  content: '';
+  pointer-events: none;
+}
+.daily-queue-row--drop-before::before { top: -5px; }
+.daily-queue-row--drop-after::after { bottom: -5px; }
 .daily-queue-row--active { border-color: var(--accent); }
 .daily-queue-row--done { opacity: .6; }
 .daily-queue-row--done .daily-queue-title { text-decoration: line-through; }
+
+.daily-queue-drag-handle {
+  color: var(--text-muted);
+  font-size: 16px;
+  line-height: 1;
+  cursor: grab;
+  user-select: none;
+  flex: none;
+}
+.daily-queue-row:hover .daily-queue-drag-handle { color: var(--text-secondary); }
 
 .daily-queue-position {
   display: grid;

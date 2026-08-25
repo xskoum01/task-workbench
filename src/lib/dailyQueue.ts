@@ -18,6 +18,27 @@ const TERMINAL_STATUSES = new Set<WorkItem['status']>(['completed', 'cancelled']
 /** MIME-like key shared by draggable Work rows and the queue drop target. */
 export const WORK_ITEM_DRAG_TYPE = 'application/x-task-workbench-work-item';
 
+/** Internal drag type used when reordering entries already in Today's queue. */
+export const DAILY_QUEUE_ENTRY_DRAG_TYPE = 'application/x-task-workbench-daily-queue-entry';
+
+export type QueueDropPlacement = 'before' | 'after';
+
+/**
+ * Convert a visual before/after drop target into the final 1-based position
+ * expected by move_daily_queue_item. Removing the source first shifts the
+ * target by one when the source was above it.
+ */
+export function positionForDrop(
+  sourcePosition: number,
+  targetPosition: number,
+  placement: QueueDropPlacement,
+): number {
+  if (placement === 'before') {
+    return sourcePosition < targetPosition ? targetPosition - 1 : targetPosition;
+  }
+  return sourcePosition < targetPosition ? targetPosition : targetPosition + 1;
+}
+
 /** True once a work item's status means there is no more work left to do on it. */
 export function isTerminal(workItem: WorkItem): boolean {
   return TERMINAL_STATUSES.has(workItem.status);

@@ -22,7 +22,18 @@ import {
   type DailyQueueEntry,
   type DailyQueueResult,
 } from '../lib/tauriCommands';
-import { activeEntry, isQueueEntryDone, positionAbove, positionBelow, queueableCandidates, upcomingEntries, WORK_ITEM_DRAG_TYPE } from '../lib/dailyQueue';
+import {
+  activeEntry,
+  DAILY_QUEUE_ENTRY_DRAG_TYPE,
+  isQueueEntryDone,
+  positionAbove,
+  positionBelow,
+  positionForDrop,
+  queueableCandidates,
+  type QueueDropPlacement,
+  upcomingEntries,
+  WORK_ITEM_DRAG_TYPE,
+} from '../lib/dailyQueue';
 import { localTodayStr } from '../lib/dates';
 import Modal from './Modal';
 import Icon from './Icon';
@@ -56,12 +67,15 @@ interface DailyQueueRowProps {
   onMove: (workItemId: string, position: number) => void;
   onRemove: (workItemId: string) => void;
   onComplete: (entry: DailyQueueEntry) => void;
-  onDragStart: (entryId: string) => void;
-  onDragOver: (event: React.DragEvent) => void;
+  isDragging: boolean;
+  dropPlacement: QueueDropPlacement | null;
+  onDragStart: (event: React.DragEvent, entry: DailyQueueEntry) => void;
+  onDragEnd: () => void;
+  onDragOver: (event: React.DragEvent, entry: DailyQueueEntry) => void;
   onDrop: (event: React.DragEvent, entry: DailyQueueEntry) => void;
 }
 
-function DailyQueueRow({ entry, isActive, queueLength, onMove, onRemove, onComplete, onDragStart, onDragOver, onDrop }: DailyQueueRowProps) {
+function DailyQueueRow({ entry, isActive, queueLength, onMove, onRemove, onComplete, isDragging, dropPlacement, onDragStart, onDragEnd, onDragOver, onDrop }: DailyQueueRowProps) {
   const { position } = entry;
   const workItem = entry.kind === 'work_item' ? entry.workItem : null;
   const title = entry.kind === 'work_item' ? entry.workItem.title : entry.text;
@@ -69,13 +83,16 @@ function DailyQueueRow({ entry, isActive, queueLength, onMove, onRemove, onCompl
 
   return (
     <li
-      className={`daily-queue-row${isActive ? ' daily-queue-row--active' : ''}${isDone ? ' daily-queue-row--done' : ''}`}
+      className={`daily-queue-row${isActive ? ' daily-queue-row--active' : ''}${isDone ? ' daily-queue-row--done' : ''}${isDragging ? ' daily-queue-row--dragging' : ''}${dropPlacement ? ` daily-queue-row--drop-${dropPlacement}` : ''}`}
       draggable
-      onDragStart={() => onDragStart(entry.id)}
-      onDragOver={onDragOver}
+      onDragStart={(event) => onDragStart(event, entry)}
+      onDragEnd={onDragEnd}
+      onDragOver={(event) => onDragOver(event, entry)}
       onDrop={(event) => onDrop(event, entry)}
       data-testid="daily-queue-row"
+      title="Drag to reorder"
     >
+      <span className="daily-queue-drag-handle" aria-hidden="true">⠿</span>
       <span className="daily-queue-position" aria-hidden="true">{position}</span>
       <span className="daily-queue-main">
         <span className="daily-queue-title">{title}</span>
@@ -183,6 +200,8 @@ export default function DailyQueue({ workItems, onCompleteWorkItem }: DailyQueue
   const [error, setError] = useState<string | null>(null);
   const [showPicker, setShowPicker] = useState(false);
   const dragIdRef = useRef<string | null>(null);
+  const [draggedEntryId, setDraggedEntryId] = useState<string | null>(null);
+  const [dropIndicator, setDropIndicator] = useState<{ entryId: string; placement: QueueDropPlacement } | null>(null);
   const [noteText, setNoteText] = useState('');
   const date = localTodayStr();
 
@@ -262,6 +281,43 @@ export default function DailyQueue({ workItems, onCompleteWorkItem }: DailyQueue
     applyMutation((current) => addNoteToDailyQueue(current.date, text, current.revision));
   }
 
+  function clearQueueDrag() {
+    dragIdRef.current = null;
+    setDraggedEntryId(null);
+    setDropIndicator(null);
+  }
+
+  function handleQueueDragStart(event: React.DragEvent, entry: DailyQueueEntry) {
+    dragIdRef.current = entry.id;
+    setDraggedEntryId(entry.id);
+    event.dataTransfer.effectAllowed = 'move';
+    // WebView2 needs actual drag data for a reliable native drag operation.
+    event.dataTransfer.setData(DAILY_QUEUE_ENTRY_DRAG_TYPE, entry.id);
+  }
+
+  function dropPlacementFor(event: React.DragEvent, target: DailyQueueEntry): QueueDropPlacement {
+    const bounds = event.currentTarget.getBoundingClientRect();
+    if (bounds.height > 0) {
+      return event.clientY < bounds.top + bounds.height / 2 ? 'before' : 'after';
+    }
+
+    // jsdom and some synthetic drag events have no element geometry. Preserve
+    // the intuitive direction: moving up inserts before, moving down after.
+    const source = entries.find((entry) => entry.id === dragIdRef.current);
+    return source && source.position < target.position ? 'after' : 'before';
+  }
+
+  function handleQueueDragOver(event: React.DragEvent, target: DailyQueueEntry) {
+    event.preventDefault();
+    event.stopPropagation();
+    if (!dragIdRef.current || dragIdRef.current === target.id) {
+      setDropIndicator(null);
+      return;
+    }
+    event.dataTransfer.dropEffect = 'move';
+    setDropIndicator({ entryId: target.id, placement: dropPlacementFor(event, target) });
+  }
+
   function handleDrop(event: React.DragEvent, target?: DailyQueueEntry) {
     event.preventDefault();
     event.stopPropagation();
@@ -270,10 +326,18 @@ export default function DailyQueue({ workItems, onCompleteWorkItem }: DailyQueue
       handleAdd(droppedWorkItemId, target?.position);
       return;
     }
-    const draggedId = dragIdRef.current;
-    dragIdRef.current = null;
-    if (!draggedId || !target || draggedId === target.id) return;
-    handleMove(draggedId, target.position);
+    const draggedId = dragIdRef.current
+      ?? event.dataTransfer?.getData(DAILY_QUEUE_ENTRY_DRAG_TYPE)
+      ?? '';
+    const source = entries.find((entry) => entry.id === draggedId);
+    if (!source || !target || draggedId === target.id) {
+      clearQueueDrag();
+      return;
+    }
+    const placement = dropPlacementFor(event, target);
+    const position = positionForDrop(source.position, target.position, placement);
+    clearQueueDrag();
+    if (position !== source.position) handleMove(draggedId, position);
   }
 
   const entries = queue?.entries ?? [];
@@ -329,8 +393,11 @@ export default function DailyQueue({ workItems, onCompleteWorkItem }: DailyQueue
                   onMove={handleMove}
                   onRemove={handleRemove}
                   onComplete={(entry) => { void handleComplete(entry); }}
-                  onDragStart={(entryId) => { dragIdRef.current = entryId; }}
-                  onDragOver={(event) => event.preventDefault()}
+                  isDragging={draggedEntryId === active.id}
+                  dropPlacement={dropIndicator?.entryId === active.id ? dropIndicator.placement : null}
+                  onDragStart={handleQueueDragStart}
+                  onDragEnd={clearQueueDrag}
+                  onDragOver={handleQueueDragOver}
                   onDrop={handleDrop}
                 />
               </ol>
@@ -349,8 +416,11 @@ export default function DailyQueue({ workItems, onCompleteWorkItem }: DailyQueue
                     onMove={handleMove}
                     onRemove={handleRemove}
                     onComplete={(entry) => { void handleComplete(entry); }}
-                    onDragStart={(entryId) => { dragIdRef.current = entryId; }}
-                    onDragOver={(event) => event.preventDefault()}
+                    isDragging={draggedEntryId === entry.id}
+                    dropPlacement={dropIndicator?.entryId === entry.id ? dropIndicator.placement : null}
+                    onDragStart={handleQueueDragStart}
+                    onDragEnd={clearQueueDrag}
+                    onDragOver={handleQueueDragOver}
                     onDrop={handleDrop}
                   />
                 ))}

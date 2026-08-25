@@ -43,6 +43,16 @@ function queueResult(entries: Array<{ item: WorkItem; position: number }>, revis
   };
 }
 
+function dragDataTransfer() {
+  const data = new Map<string, string>();
+  return {
+    effectAllowed: 'uninitialized',
+    dropEffect: 'none',
+    setData: (type: string, value: string) => data.set(type, value),
+    getData: (type: string) => data.get(type) ?? '',
+  };
+}
+
 describe('DailyQueue', () => {
   beforeEach(() => {
     vi.restoreAllMocks();
@@ -236,11 +246,41 @@ describe('DailyQueue', () => {
 
     const sourceRow = screen.getByText('C').closest('.daily-queue-row')!;
     const targetRow = screen.getByText('A').closest('.daily-queue-row')!;
-    fireEvent.dragStart(sourceRow);
-    fireEvent.dragOver(targetRow);
-    fireEvent.drop(targetRow);
+    const dataTransfer = dragDataTransfer();
+    fireEvent.dragStart(sourceRow, { dataTransfer });
+    expect(dataTransfer.effectAllowed).toBe('move');
+    expect(sourceRow).toHaveClass('daily-queue-row--dragging');
+
+    fireEvent.dragOver(targetRow, { dataTransfer });
+    expect(targetRow).toHaveClass('daily-queue-row--drop-before');
+    fireEvent.drop(targetRow, { dataTransfer });
 
     await waitFor(() => expect(moveSpy).toHaveBeenCalledWith('2026-08-17', 'c', 1, 1));
+  });
+
+  it('moves an entry downward to the position after the hovered row', async () => {
+    const a = workItem('a', { title: 'A' });
+    const b = workItem('b', { title: 'B' });
+    const c = workItem('c', { title: 'C' });
+    vi.spyOn(api, 'getDailyQueue').mockResolvedValue(
+      queueResult([{ item: a, position: 1 }, { item: b, position: 2 }, { item: c, position: 3 }]),
+    );
+    const moveSpy = vi.spyOn(api, 'moveDailyQueueItem').mockResolvedValue(
+      queueResult([{ item: b, position: 1 }, { item: c, position: 2 }, { item: a, position: 3 }], 2),
+    );
+
+    render(<DailyQueue workItems={[]} />);
+    await screen.findByText('C');
+
+    const sourceRow = screen.getByText('A').closest('.daily-queue-row')!;
+    const targetRow = screen.getByText('C').closest('.daily-queue-row')!;
+    const dataTransfer = dragDataTransfer();
+    fireEvent.dragStart(sourceRow, { dataTransfer });
+    fireEvent.dragOver(targetRow, { dataTransfer });
+    expect(targetRow).toHaveClass('daily-queue-row--drop-after');
+    fireEvent.drop(targetRow, { dataTransfer });
+
+    await waitFor(() => expect(moveSpy).toHaveBeenCalledWith('2026-08-17', 'a', 3, 1));
   });
 
   it('on a revision conflict, shows a message and refreshes from the authoritative queue', async () => {
