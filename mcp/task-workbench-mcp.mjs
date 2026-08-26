@@ -301,7 +301,9 @@ const TOOL_DEFINITIONS = [
       'Read the explicit, user-chosen execution order for one calendar day — distinct from status ' +
       'and planningBucket. Never AI-ranked or inferred from priority/due date. When `date` is ' +
       'omitted, defaults to the app\'s local calendar today (the same "today" the desktop UI uses) — ' +
-      'call this first to learn the canonical date/revision before a mutation. If the queue is ' +
+      'reading local today initializes it once by carrying forward unfinished entries from the latest ' +
+      'earlier queue; completed/cancelled work items and completed notes stay historical. Call this ' +
+      'first to learn the canonical date/revision before a mutation. If the queue is ' +
       'explicit and non-empty, treat it as the user-approved order rather than substituting your own ' +
       'ranking.',
     inputSchema: {
@@ -309,7 +311,7 @@ const TOOL_DEFINITIONS = [
       properties: { date: DAILY_QUEUE_DATE_SCHEMA },
       additionalProperties: false,
     },
-    annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
     outputSchema: DAILY_QUEUE_SCHEMA,
   },
   {

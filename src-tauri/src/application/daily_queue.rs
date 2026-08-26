@@ -4,6 +4,7 @@
 
 use super::{ApplicationError, WorkItemRepository};
 use crate::domain::daily_queue::{is_valid_calendar_date, DailyQueue};
+use crate::domain::work_item::WorkItemStatus;
 
 /// Port implemented by the SQLite adapter. Every mutation here is expected to
 /// perform its own atomic read-check-write (matching `WorkItemRepository`'s
@@ -19,6 +20,20 @@ pub trait DailyQueueRepository {
     /// concrete value ambiguous (`error[E0034]`) for any caller with both
     /// traits in scope, which the storage-layer test module already is.
     fn get_queue(&self, date: &str) -> Result<DailyQueue, ApplicationError>;
+
+    /// Latest persisted queue before `date`, used only to seed a new local
+    /// day. Historical queues themselves are never rewritten.
+    fn latest_queue_before(&self, date: &str) -> Result<Option<DailyQueue>, ApplicationError>;
+
+    /// Creates the first persisted revision for `date` from carried entries.
+    /// Implementations must fail with `revision_conflict` if another caller
+    /// created the date first.
+    fn initialize_from_carryover(
+        &self,
+        date: &str,
+        entries: &[crate::domain::daily_queue::DailyQueueEntry],
+        at: &str,
+    ) -> Result<DailyQueue, ApplicationError>;
 
     fn replace(
         &self,
@@ -82,6 +97,43 @@ impl<'a> DailyQueueApplicationService<'a> {
     pub fn get(&self, date: &str) -> Result<DailyQueue, ApplicationError> {
         validate_date(date)?;
         self.queues.get_queue(date)
+    }
+
+    /// Opens today's queue, carrying forward unfinished entries from the
+    /// latest earlier queue when this date has not been initialized yet.
+    /// Completed/cancelled work items and completed queue notes stay only in
+    /// the historical source day.
+    pub fn get_or_rollover(&self, date: &str, at: &str) -> Result<DailyQueue, ApplicationError> {
+        validate_date(date)?;
+        let current = self.queues.get_queue(date)?;
+        if current.revision != 0 {
+            return Ok(current);
+        }
+
+        let Some(previous) = self.queues.latest_queue_before(date)? else {
+            return Ok(current);
+        };
+        let mut entries = Vec::new();
+        for entry in previous.entries {
+            if entry.note.is_some() {
+                if entry.completed_at.is_none() {
+                    entries.push(entry);
+                }
+                continue;
+            }
+            let Some(item) = self.work_items.get(&entry.work_item_id)? else {
+                continue;
+            };
+            if !matches!(item.status, WorkItemStatus::Completed | WorkItemStatus::Cancelled) {
+                entries.push(entry);
+            }
+        }
+
+        match self.queues.initialize_from_carryover(date, &entries, at) {
+            Ok(queue) => Ok(queue),
+            Err(error) if error.code == "revision_conflict" => self.queues.get_queue(date),
+            Err(error) => Err(error),
+        }
     }
 
     /// Atomically replaces the whole ordered list. Rejects duplicate ids and
@@ -307,6 +359,15 @@ mod tests {
         fn get_queue(&self, date: &str) -> Result<DailyQueue, ApplicationError> {
             Ok(self.current(date))
         }
+        fn latest_queue_before(&self, date: &str) -> Result<Option<DailyQueue>, ApplicationError> {
+            Ok(self.rows.borrow().iter()
+                .filter(|(candidate, _)| candidate.as_str() < date)
+                .max_by_key(|(candidate, _)| candidate.as_str())
+                .map(|(_, queue)| queue.clone()))
+        }
+        fn initialize_from_carryover(&self, date: &str, entries: &[DailyQueueEntry], at: &str) -> Result<DailyQueue, ApplicationError> {
+            self.check_and_write(date, 0, entries.to_vec(), at)
+        }
         fn replace(&self, date: &str, work_item_ids: &[String], expected_revision: i64, at: &str) -> Result<DailyQueue, ApplicationError> {
             let current = self.current(date);
             let next = crate::domain::daily_queue::apply_replace(&current.entries, work_item_ids, at);
@@ -355,6 +416,48 @@ mod tests {
         let queue = service(&work_items, &queues).get("2026-08-17").unwrap();
         assert_eq!(queue.revision, 0);
         assert!(queue.entries.is_empty());
+    }
+
+    #[test]
+    fn rollover_carries_only_unfinished_entries_in_their_existing_order() {
+        let active = work_item("active", false);
+        let mut completed = work_item("completed", false);
+        completed.status = WorkItemStatus::Completed;
+        let work_items = FakeWorkItems { items: vec![active, completed] };
+        let queues = FakeQueues::new();
+        let svc = service(&work_items, &queues);
+
+        svc.add("2026-08-17", "active", None, 0, "t1").unwrap();
+        svc.add("2026-08-17", "completed", None, 1, "t2").unwrap();
+        svc.add_note("2026-08-17", "note-open", "Call client", None, 2, "t3").unwrap();
+        svc.add_note("2026-08-17", "note-done", "Send email", None, 3, "t4").unwrap();
+        svc.complete_entry("2026-08-17", "note-done", 4, "t5").unwrap();
+
+        let today = svc.get_or_rollover("2026-08-19", "t6").unwrap();
+        assert_eq!(today.revision, 1);
+        assert_eq!(
+            today.entries.iter().map(|entry| entry.work_item_id.as_str()).collect::<Vec<_>>(),
+            vec!["active", "note-open"]
+        );
+        assert_eq!(today.entries[0].added_at, "t1");
+        assert_eq!(today.entries[1].added_at, "t3");
+
+        let historical = svc.get("2026-08-17").unwrap();
+        assert_eq!(historical.revision, 5);
+        assert_eq!(historical.entries.len(), 4);
+    }
+
+    #[test]
+    fn rollover_never_repopulates_a_date_that_was_already_initialized() {
+        let work_items = FakeWorkItems { items: vec![work_item("active", false)] };
+        let queues = FakeQueues::new();
+        let svc = service(&work_items, &queues);
+        svc.add("2026-08-17", "active", None, 0, "t1").unwrap();
+        svc.replace("2026-08-18", &[], 0, "t2").unwrap();
+
+        let today = svc.get_or_rollover("2026-08-18", "t3").unwrap();
+        assert_eq!(today.revision, 1);
+        assert!(today.entries.is_empty());
     }
 
     #[test]

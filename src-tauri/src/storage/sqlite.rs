@@ -809,6 +809,30 @@ fn read_daily_queue(
     }
 }
 
+fn read_latest_daily_queue_before(
+    transaction: &Transaction,
+    date: &str,
+) -> Result<Option<DailyQueue>, ApplicationError> {
+    let row: Option<(String, i64, String, String)> = transaction
+        .query_row(
+            "SELECT date, revision, updated_at, entries_json
+             FROM daily_queues
+             WHERE date < ?1
+             ORDER BY date DESC
+             LIMIT 1",
+            [date],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .optional()
+        .map_err(|error| ApplicationError::storage(error.to_string()))?;
+    row.map(|(date, revision, updated_at, entries_json)| {
+        let entries: Vec<DailyQueueEntry> = serde_json::from_str(&entries_json)
+            .map_err(|error| ApplicationError::storage(error.to_string()))?;
+        Ok(DailyQueue { date, revision, updated_at, entries })
+    })
+    .transpose()
+}
+
 /// Writes `next_entries` as the new state for `date`, requiring the row to
 /// still be at `expected_revision` at write time. `expected_revision == 0`
 /// means "this date has no row yet" and takes the INSERT path; any other
@@ -886,6 +910,37 @@ impl DailyQueueRepository for SqliteWorkItemRepository {
             .commit()
             .map_err(|error| ApplicationError::storage(error.to_string()))?;
         Ok(queue)
+    }
+
+    fn latest_queue_before(&self, date: &str) -> Result<Option<DailyQueue>, ApplicationError> {
+        self.initialize()?;
+        let mut connection = self.connect()?;
+        let transaction = connection
+            .transaction()
+            .map_err(|error| ApplicationError::storage(error.to_string()))?;
+        let queue = read_latest_daily_queue_before(&transaction, date)?;
+        transaction
+            .commit()
+            .map_err(|error| ApplicationError::storage(error.to_string()))?;
+        Ok(queue)
+    }
+
+    fn initialize_from_carryover(
+        &self,
+        date: &str,
+        entries: &[DailyQueueEntry],
+        at: &str,
+    ) -> Result<DailyQueue, ApplicationError> {
+        self.initialize()?;
+        let mut connection = self.connect()?;
+        let transaction = connection
+            .transaction()
+            .map_err(|error| ApplicationError::storage(error.to_string()))?;
+        let result = write_daily_queue(&transaction, date, 0, entries, at)?;
+        transaction
+            .commit()
+            .map_err(|error| ApplicationError::storage(error.to_string()))?;
+        Ok(result)
     }
 
     fn replace(
@@ -2272,6 +2327,28 @@ mod tests {
         let day18 = repository.get_queue("2026-08-18").unwrap();
         assert_eq!(day17.entries[0].work_item_id, "task-a");
         assert_eq!(day18.entries[0].work_item_id, "task-b");
+    }
+
+    #[test]
+    fn daily_queue_carryover_uses_the_latest_earlier_date_and_is_persisted() {
+        let directory = tempdir().unwrap();
+        let repository = SqliteWorkItemRepository::at(directory.path().join("test.sqlite3"));
+        repository.add("2026-08-15", "old", None, 0, "t1").unwrap();
+        repository.add("2026-08-17", "latest", None, 0, "t2").unwrap();
+
+        let source = repository.latest_queue_before("2026-08-20").unwrap().unwrap();
+        assert_eq!(source.date, "2026-08-17");
+        let carried = repository
+            .initialize_from_carryover("2026-08-20", &source.entries, "t3")
+            .unwrap();
+        assert_eq!(carried.revision, 1);
+        assert_eq!(carried.entries[0].work_item_id, "latest");
+        assert_eq!(repository.get_queue("2026-08-20").unwrap(), carried);
+
+        let error = repository
+            .initialize_from_carryover("2026-08-20", &[], "t4")
+            .unwrap_err();
+        assert_eq!(error.code, "revision_conflict");
     }
 
     #[test]

@@ -257,7 +257,10 @@ paths:
         `expectedRevision` is `0`. When `date` is omitted, it defaults to the
         app's local calendar today — the same "today" `src/lib/dates.ts`'s
         `localTodayStr()` computes for the UI, so REST/MCP and the UI can
-        never disagree about what day "today" means.
+        never disagree about what day "today" means. Reading local today
+        initializes that date once from the latest earlier queue, preserving
+        unfinished entries in order while leaving completed/cancelled work and
+        completed notes in the historical day.
       parameters:
         - in: query
           name: date

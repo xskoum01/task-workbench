@@ -14,6 +14,7 @@ const MUTATION_TOOLS = new Set([
   'patch_work_item',
   'transition_work_item',
   'append_work_item_note',
+  'get_daily_queue',
   'replace_daily_queue',
   'add_to_daily_queue',
   'add_note_to_daily_queue',
@@ -257,12 +258,12 @@ describe('Task Workbench MCP 2.x boundary', () => {
       expect(description).toContain('distinct from status and planningBucket');
     });
 
-    it('get_daily_queue takes an optional date and is read-only/idempotent', () => {
+    it('get_daily_queue takes an optional date and truthfully reports today initialization', () => {
       const tool = findTool('get_daily_queue');
       expect(tool.inputSchema.required ?? []).not.toContain('date');
       expect(tool.inputSchema.properties.date.pattern).toBe('^[0-9]{4}-[0-9]{2}-[0-9]{2}$');
       expect(tool.annotations).toEqual({
-        readOnlyHint: true,
+        readOnlyHint: false,
         destructiveHint: false,
         idempotentHint: true,
         openWorldHint: false,

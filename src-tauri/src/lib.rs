@@ -4791,7 +4791,12 @@ fn get_daily_queue(app: tauri::AppHandle, date: Option<String>) -> Result<Value,
     let repo = canonical_repo(&app)?;
     let resolved_date = date.unwrap_or_else(local_date_ymd);
     let service = crate::application::daily_queue::DailyQueueApplicationService { queues: &repo, work_items: &repo };
-    let queue = service.get(&resolved_date).map_err(canonical_error)?;
+    let queue = if resolved_date == local_date_ymd() {
+        service.get_or_rollover(&resolved_date, &chrono_now_iso())
+    } else {
+        service.get(&resolved_date)
+    }
+    .map_err(canonical_error)?;
     let area_names = load_canonical_area_names(&app);
     Ok(daily_queue_projection(&repo, queue, &area_names))
 }
@@ -5195,7 +5200,7 @@ mod task_record_contract_tests {
     fn daily_queue_tool_annotations_are_truthful() {
         let tools = canonical_mcp_tool_definitions();
         let get_tool = tools.iter().find(|t| t["name"] == "get_daily_queue").unwrap();
-        assert_eq!(get_tool["annotations"]["readOnlyHint"], Value::Bool(true));
+        assert_eq!(get_tool["annotations"]["readOnlyHint"], Value::Bool(false));
         for name in ["replace_daily_queue", "add_to_daily_queue", "add_note_to_daily_queue", "move_daily_queue_item", "remove_from_daily_queue"] {
             let tool = tools.iter().find(|t| t["name"] == name).unwrap();
             assert_eq!(tool["annotations"]["readOnlyHint"], Value::Bool(false), "{name} is a mutation");
@@ -5697,8 +5702,8 @@ fn task_mcp_bridge_state() -> &'static Mutex<Value> {
             "host": TASK_MCP_BRIDGE_HOST,
             "port": TASK_MCP_BRIDGE_PORT,
             "canonicalTools": canonical_mcp_tool_definitions(),
-            "readOnlyTools": canonical_mcp_tool_definitions().into_iter().filter(|tool| matches!(tool["name"].as_str(), Some("list_work_items"|"get_work_item"|"get_task_record"|"list_work_item_changes"|"get_planning_today"|"get_daily_queue"))).collect::<Vec<_>>(),
-            "localWriteTools": canonical_mcp_tool_definitions().into_iter().filter(|tool| matches!(tool["name"].as_str(), Some("create_work_item"|"update_work_item"|"patch_work_item"|"transition_work_item"|"append_work_item_note"|"replace_daily_queue"|"add_to_daily_queue"|"add_note_to_daily_queue"|"move_daily_queue_item"|"remove_from_daily_queue"))).collect::<Vec<_>>(),
+            "readOnlyTools": canonical_mcp_tool_definitions().into_iter().filter(|tool| matches!(tool["name"].as_str(), Some("list_work_items"|"get_work_item"|"get_task_record"|"list_work_item_changes"|"get_planning_today"))).collect::<Vec<_>>(),
+            "localWriteTools": canonical_mcp_tool_definitions().into_iter().filter(|tool| matches!(tool["name"].as_str(), Some("create_work_item"|"update_work_item"|"patch_work_item"|"transition_work_item"|"append_work_item_note"|"get_daily_queue"|"replace_daily_queue"|"add_to_daily_queue"|"add_note_to_daily_queue"|"move_daily_queue_item"|"remove_from_daily_queue"))).collect::<Vec<_>>(),
             "readOnlyMode": false,
             "localWriteMode": true,
             "lastError": Value::Null,
@@ -5724,8 +5729,8 @@ fn task_mcp_current_bridge_state() -> Value {
                 "host": TASK_MCP_BRIDGE_HOST,
                 "port": TASK_MCP_BRIDGE_PORT,
                 "canonicalTools": canonical_mcp_tool_definitions(),
-                "readOnlyTools": canonical_mcp_tool_definitions().into_iter().filter(|tool| matches!(tool["name"].as_str(), Some("list_work_items"|"get_work_item"|"get_task_record"|"list_work_item_changes"|"get_planning_today"|"get_daily_queue"))).collect::<Vec<_>>(),
-                "localWriteTools": canonical_mcp_tool_definitions().into_iter().filter(|tool| matches!(tool["name"].as_str(), Some("create_work_item"|"update_work_item"|"patch_work_item"|"transition_work_item"|"append_work_item_note"|"replace_daily_queue"|"add_to_daily_queue"|"add_note_to_daily_queue"|"move_daily_queue_item"|"remove_from_daily_queue"))).collect::<Vec<_>>(),
+                "readOnlyTools": canonical_mcp_tool_definitions().into_iter().filter(|tool| matches!(tool["name"].as_str(), Some("list_work_items"|"get_work_item"|"get_task_record"|"list_work_item_changes"|"get_planning_today"))).collect::<Vec<_>>(),
+                "localWriteTools": canonical_mcp_tool_definitions().into_iter().filter(|tool| matches!(tool["name"].as_str(), Some("create_work_item"|"update_work_item"|"patch_work_item"|"transition_work_item"|"append_work_item_note"|"get_daily_queue"|"replace_daily_queue"|"add_to_daily_queue"|"add_note_to_daily_queue"|"move_daily_queue_item"|"remove_from_daily_queue"))).collect::<Vec<_>>(),
                 "readOnlyMode": false,
                 "localWriteMode": true,
                 "lastError": "Bridge state lock poisoned.",
@@ -6042,7 +6047,7 @@ fn canonical_mcp_tool_definitions() -> Vec<Value> {
         serde_json::json!({"name":"transition_work_item","description":"Apply a validated lifecycle transition.","inputSchema":{"type":"object","required":["id","status","expectedRevision"],"additionalProperties":false,"properties":{"id":{"type":"string"},"status":{"type":"string"},"reason":{"type":"string"},"expectedRevision":{"type":"integer","minimum":1},"actorName":{"type":"string"}}},"annotations":{"readOnlyHint":false,"destructiveHint":false,"idempotentHint":false,"openWorldHint":false}}),
         serde_json::json!({"name":"append_work_item_note","description":"Append contextual information to a work item.","inputSchema":{"type":"object","required":["id","text","expectedRevision"],"additionalProperties":false,"properties":{"id":{"type":"string"},"text":{"type":"string","minLength":1},"expectedRevision":{"type":"integer","minimum":1},"actorName":{"type":"string"}}},"annotations":{"readOnlyHint":false,"destructiveHint":false,"idempotentHint":false,"openWorldHint":false}}),
         serde_json::json!({"name":"get_planning_today","description":"Return the live deterministic Now and Today planning sections. Membership is an exact match against each item's stored planningBucket — never inferred from dueAt/status/date. timezone is echoed back only.","inputSchema":{"type":"object","additionalProperties":false,"properties":{"timezone":{"type":"string"}}},"outputSchema":{"type":"object","required":["apiVersion","generatedAt","sourceRevision","timezone","sections"],"properties":{"apiVersion":{"const":"1"},"generatedAt":{"type":"string"},"sourceRevision":{"type":"integer"},"timezone":{"type":"string"},"sections":{"type":"object","required":["now","today"],"properties":{"now":{"type":"array","items":mcp_work_item_summary_schema()},"today":{"type":"array","items":mcp_work_item_summary_schema()}}}}},"annotations":read_only}),
-        serde_json::json!({"name":"get_daily_queue","description":"Read the explicit, user-chosen execution order for one calendar day — distinct from status and planningBucket. Never AI-ranked or inferred from priority/due date. When `date` is omitted, defaults to the app's local calendar today (the same 'today' the desktop UI uses) — call this first to learn the canonical date/revision before a mutation.","inputSchema":{"type":"object","additionalProperties":false,"properties":{"date":queue_date_property}},"outputSchema":mcp_daily_queue_schema(),"annotations":read_only}),
+        serde_json::json!({"name":"get_daily_queue","description":"Read the explicit, user-chosen execution order for one calendar day — distinct from status and planningBucket. Never AI-ranked or inferred from priority/due date. Reading the app's local today initializes that date once by carrying forward unfinished entries from the latest earlier queue; completed/cancelled work items and completed notes remain historical. Call this first to learn the canonical date/revision before a mutation.","inputSchema":{"type":"object","additionalProperties":false,"properties":{"date":queue_date_property}},"outputSchema":mcp_daily_queue_schema(),"annotations":{"readOnlyHint":false,"destructiveHint":false,"idempotentHint":true,"openWorldHint":false}}),
         serde_json::json!({"name":"replace_daily_queue","description":"Atomically set the complete ordered daily queue for `date` to exactly `workItemIds`, in that order. Use for \"set my queue to A, B, C\". Rejects a duplicate id, an archived work item, or an id that does not exist — the whole call fails, nothing is partially applied.","inputSchema":{"type":"object","required":["date","workItemIds","expectedRevision"],"additionalProperties":false,"properties":{"date":queue_date_property,"workItemIds":{"type":"array","items":{"type":"string","minLength":1}},"expectedRevision":{"type":"integer","minimum":0}}},"outputSchema":mcp_daily_queue_schema(),"annotations":{"readOnlyHint":false,"destructiveHint":true,"idempotentHint":false,"openWorldHint":false}}),
         serde_json::json!({"name":"add_to_daily_queue","description":"Add one work item to the daily queue for `date`. `position` is 1-based; omitted or out-of-range values append to the end. Rejects if the work item is already queued for that date, archived, or does not exist.","inputSchema":{"type":"object","required":["date","workItemId","expectedRevision"],"additionalProperties":false,"properties":{"date":queue_date_property,"workItemId":{"type":"string","minLength":1},"position":{"type":"integer","minimum":1},"expectedRevision":{"type":"integer","minimum":0}}},"outputSchema":mcp_daily_queue_schema(),"annotations":{"readOnlyHint":false,"destructiveHint":false,"idempotentHint":false,"openWorldHint":false}}),
         serde_json::json!({"name":"add_note_to_daily_queue","description":"Add a lightweight text-only reminder to the daily queue without creating a WorkItem. Text is trimmed, required, and limited to 500 characters.","inputSchema":{"type":"object","required":["date","text","expectedRevision"],"additionalProperties":false,"properties":{"date":queue_date_property,"text":{"type":"string","minLength":1,"maxLength":500},"position":{"type":"integer","minimum":1},"expectedRevision":{"type":"integer","minimum":0}}},"outputSchema":mcp_daily_queue_schema(),"annotations":{"readOnlyHint":false,"destructiveHint":false,"idempotentHint":false,"openWorldHint":false}}),

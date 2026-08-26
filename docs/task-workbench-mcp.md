@@ -124,8 +124,11 @@ remain independent fields, changed only through their own tools
 (`transition_work_item`, `patch_work_item`).
 
 The queue is persisted in the application's SQLite store. Closing or restarting
-Task Workbench never clears it; entries remain in the same order until an
-explicit queue mutation removes or replaces them.
+Task Workbench never clears it. When local today has no queue row yet, it is
+initialized from the latest earlier queue in the same order: unfinished tasks
+and notes carry forward, while completed/cancelled tasks and completed notes
+remain only in the historical day. Explicitly clearing an initialized day stays
+cleared.
 
 **Date/timezone model.** The Daily Queue's "date" is the local calendar date
 of the machine running the desktop app (this is a single-user, Windows-only
@@ -171,13 +174,13 @@ entries it is the canonical work-item ID.
   `add_note_to_daily_queue` with the returned date/revision and the reminder
   text. Do not create a canonical WorkItem for this lightweight note.
 
-**Completed/cancelled entries.** An entry stays in the persisted queue after
+**Completed/cancelled entries.** An entry stays in that day's persisted queue after
 its work item transitions to `completed`/`cancelled`, or after a queue note is
 marked done — the queue record is historical and is not silently rewritten.
 The projected `workItem` status or note `completedAt` tells clients (including
 Jarvis and the desktop UI) that the entry is done and should be skipped when
-choosing "what's next". Removing it from the queue entirely remains an explicit
-`remove_from_daily_queue` call.
+choosing "what's next". It is omitted when the next local day is first opened;
+unfinished entries carry forward until explicitly removed or completed.
 
 The lifecycle states are:
 
