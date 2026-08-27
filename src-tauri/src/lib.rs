@@ -1,5 +1,6 @@
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use rand::Rng;
+use regex::Regex;
 use crate::application::{MutationContext, WorkItemApplicationService, WorkItemListQuery, WorkItemRepository};
 use crate::domain::work_item::{
     ActorType, ExternalReference, PartyReference, WorkItem, WorkItemPriority, WorkItemStatus,
@@ -4332,16 +4333,94 @@ fn task_record_phase_options(workflow_type: &str) -> Value {
     Value::Array(options.iter().map(|(value, label)| serde_json::json!({"value": value, "label": label})).collect())
 }
 
-fn task_record_workflow_type(legacy_task: &Value) -> &'static str {
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct TaskModeContract {
+    developer_ado_context_types: HashSet<String>,
+    developer_target_kinds: HashSet<String>,
+    developer_keyword_patterns: Vec<String>,
+}
+
+struct CompiledTaskModeContract {
+    developer_ado_context_types: HashSet<String>,
+    developer_target_kinds: HashSet<String>,
+    developer_keyword_patterns: Vec<Regex>,
+}
+
+static TASK_MODE_CONTRACT: OnceLock<CompiledTaskModeContract> = OnceLock::new();
+
+fn task_mode_contract() -> &'static CompiledTaskModeContract {
+    TASK_MODE_CONTRACT.get_or_init(|| {
+        let source: TaskModeContract = serde_json::from_str(include_str!(
+            "../../src/lib/taskModeContract.json"
+        ))
+        .expect("taskModeContract.json must be valid");
+        CompiledTaskModeContract {
+            developer_ado_context_types: source.developer_ado_context_types,
+            developer_target_kinds: source.developer_target_kinds,
+            developer_keyword_patterns: source
+                .developer_keyword_patterns
+                .into_iter()
+                .map(|pattern| {
+                    Regex::new(&format!("(?i:{pattern})"))
+                        .unwrap_or_else(|error| panic!("invalid task-mode regex {pattern:?}: {error}"))
+                })
+                .collect(),
+        }
+    })
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct ResolvedTaskWorkflowType {
+    workflow_type: &'static str,
+    is_auto: bool,
+}
+
+/// Authoritative workflow-type resolver for Task Workbench read projections.
+/// `taskMode` is only an explicit user override; automatic classification is
+/// derived at read time from the shared contract also used by the React UI.
+fn resolve_task_workflow_type(legacy_task: &Value) -> ResolvedTaskWorkflowType {
     match legacy_task["taskMode"].as_str() {
-        Some("developer") => "developer",
-        Some("general") => "general",
+        Some("developer") => ResolvedTaskWorkflowType {
+            workflow_type: "developer",
+            is_auto: false,
+        },
+        Some("general") => ResolvedTaskWorkflowType {
+            workflow_type: "general",
+            is_auto: false,
+        },
         _ => {
-            let has_dev_context = legacy_task.get("workflowSetup").is_some()
-                || legacy_task.get("crmDeveloperWorkflow").is_some()
-                || legacy_task.get("devopsTaskUrl").and_then(Value::as_str).is_some_and(|v| !v.trim().is_empty())
-                || legacy_task.get("adoContext").is_some();
-            if has_dev_context { "developer" } else { "general" }
+            let contract = task_mode_contract();
+            let ado_context_type = legacy_task["adoContext"]["type"].as_str();
+            let dev_target_kind = legacy_task["workflowSetup"]["devTargetKind"].as_str();
+            let has_devops_url = legacy_task["devopsTaskUrl"]
+                .as_str()
+                .is_some_and(|value| !value.is_empty());
+            let text_to_scan = format!(
+                "{} {} {}",
+                legacy_task["title"].as_str().unwrap_or_default(),
+                legacy_task["originalMessage"].as_str().unwrap_or_default(),
+                legacy_task["analysisResult"]["summary"]
+                    .as_str()
+                    .unwrap_or_default(),
+            );
+            let has_developer_evidence = ado_context_type
+                .is_some_and(|value| contract.developer_ado_context_types.contains(value))
+                || has_devops_url
+                || dev_target_kind
+                    .is_some_and(|value| contract.developer_target_kinds.contains(value))
+                || contract
+                    .developer_keyword_patterns
+                    .iter()
+                    .any(|pattern| pattern.is_match(&text_to_scan));
+            ResolvedTaskWorkflowType {
+                workflow_type: if has_developer_evidence {
+                    "developer"
+                } else {
+                    "general"
+                },
+                is_auto: true,
+            }
         }
     }
 }
@@ -4361,7 +4440,7 @@ fn task_record_notes_text(canonical: &WorkItem, legacy_task: &Value) -> String {
 }
 
 fn task_record_detail(canonical: &WorkItem, legacy_task: Value) -> Value {
-    let workflow_type = task_record_workflow_type(&legacy_task);
+    let workflow_type = resolve_task_workflow_type(&legacy_task).workflow_type;
     let phase = task_record_phase_from_legacy(&legacy_task, canonical);
     let canonical_detail_value = canonical_detail(canonical);
     let external_links = canonical_detail_value
@@ -4422,9 +4501,16 @@ fn get_work_item(app: tauri::AppHandle, id: String) -> Result<Value, String> {
 #[tauri::command]
 fn get_task_record(app: tauri::AppHandle, id: String) -> Result<Value, String> {
     let repo = canonical_repo(&app)?;
-    let service = WorkItemApplicationService { repository: &repo };
-    let canonical = service.get(&id).map_err(canonical_error)?;
-    let legacy_snapshot = repo.get_legacy_snapshot(&id).map_err(canonical_error)?;
+    task_record_from_repository(&repo, &id)
+}
+
+fn task_record_from_repository(
+    repo: &SqliteWorkItemRepository,
+    id: &str,
+) -> Result<Value, String> {
+    let service = WorkItemApplicationService { repository: repo };
+    let canonical = service.get(id).map_err(canonical_error)?;
+    let legacy_snapshot = repo.get_legacy_snapshot(id).map_err(canonical_error)?;
     let legacy_task = crate::storage::sqlite::legacy_compatible_value(&canonical, legacy_snapshot);
     Ok(task_record_detail(&canonical, legacy_task))
 }
@@ -5058,6 +5144,7 @@ mod task_record_contract_tests {
         WorkItemStatus, WORK_ITEM_SCHEMA_VERSION,
     };
     use std::collections::HashMap;
+    use tempfile::tempdir;
 
     fn item(id: &str) -> WorkItem {
         WorkItem {
@@ -5153,6 +5240,77 @@ mod task_record_contract_tests {
         assert_eq!(detail["derived"]["recordStatus"], "analyzed");
         assert_eq!(detail["derived"]["recordStatusLabel"], "Analyzed");
         assert_eq!(detail["derived"]["recordStatusOptions"].as_array().unwrap().len(), 4);
+    }
+
+    #[test]
+    fn frontend_and_backend_share_the_effective_workflow_type_contract_cases() {
+        let cases: Value = serde_json::from_str(include_str!(
+            "../../src/lib/taskMode.contract-cases.json"
+        ))
+        .unwrap();
+
+        for contract_case in cases.as_array().unwrap() {
+            let resolved = resolve_task_workflow_type(&contract_case["task"]);
+            assert_eq!(
+                resolved.workflow_type,
+                contract_case["expected"]["mode"].as_str().unwrap(),
+                "workflow type mismatch for {}",
+                contract_case["name"].as_str().unwrap(),
+            );
+            assert_eq!(
+                resolved.is_auto,
+                contract_case["expected"]["isAuto"].as_bool().unwrap(),
+                "automatic/explicit mismatch for {}",
+                contract_case["name"].as_str().unwrap(),
+            );
+        }
+    }
+
+    #[test]
+    fn public_task_record_projection_resolves_auto_mode_after_reload_without_persisting_override() {
+        let directory = tempdir().unwrap();
+        let database_path = directory.path().join("task-workbench.sqlite3");
+        let repository = SqliteWorkItemRepository::at(database_path.clone());
+        let auto_developer = serde_json::json!({
+            "id": "auto-developer",
+            "title": "Programátorské zadání č. 2 — OnLoad + OnChange validace délky schůzky",
+            "source": "manual",
+            "customerId": "",
+            "taskType": "other",
+            "obligationKind": "task",
+            "status": "new",
+            "confidence": 100,
+            "originalMessage": "",
+            "receivedAt": "2026-08-26T08:00:00Z",
+            "createdAt": "2026-08-26T08:00:00Z",
+            "updatedAt": "2026-08-26T08:00:00Z",
+            "revision": 1,
+            "suggestedActions": [],
+            "history": []
+        });
+        repository.sync_legacy_snapshot(&[auto_developer]).unwrap();
+        drop(repository);
+
+        let reopened = SqliteWorkItemRepository::at(database_path);
+        let automatic = task_record_from_repository(&reopened, "auto-developer").unwrap();
+        assert_eq!(automatic["derived"]["workflowType"], "developer");
+        assert!(automatic["legacyTask"].get("taskMode").is_none());
+
+        let mut records = reopened.list_legacy_compatible().unwrap();
+        records[0]["taskMode"] = Value::String("general".to_string());
+        records[0]["revision"] = Value::from(2);
+        records[0]["updatedAt"] = Value::String("2026-08-26T09:00:00Z".to_string());
+        reopened.sync_legacy_snapshot(&records).unwrap();
+        let explicit_general = task_record_from_repository(&reopened, "auto-developer").unwrap();
+        assert_eq!(explicit_general["derived"]["workflowType"], "general");
+
+        let mut records = reopened.list_legacy_compatible().unwrap();
+        records[0]["taskMode"] = Value::String("developer".to_string());
+        records[0]["revision"] = Value::from(3);
+        records[0]["updatedAt"] = Value::String("2026-08-26T10:00:00Z".to_string());
+        reopened.sync_legacy_snapshot(&records).unwrap();
+        let explicit_developer = task_record_from_repository(&reopened, "auto-developer").unwrap();
+        assert_eq!(explicit_developer["derived"]["workflowType"], "developer");
     }
 
     #[test]

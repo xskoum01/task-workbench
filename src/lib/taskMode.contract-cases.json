@@ -1,0 +1,67 @@
+[
+  {
+    "name": "explicit developer override",
+    "task": { "taskMode": "developer" },
+    "expected": { "mode": "developer", "isAuto": false }
+  },
+  {
+    "name": "explicit general overrides developer text",
+    "task": { "taskMode": "general", "title": "OnLoad validation" },
+    "expected": { "mode": "general", "isAuto": false }
+  },
+  {
+    "name": "ADO work item",
+    "task": { "adoContext": { "type": "work-item" } },
+    "expected": { "mode": "developer", "isAuto": true }
+  },
+  {
+    "name": "ADO PR comment",
+    "task": { "adoContext": { "type": "pr-comment" } },
+    "expected": { "mode": "developer", "isAuto": true }
+  },
+  {
+    "name": "unrelated ADO context is not developer evidence",
+    "task": { "adoContext": { "type": "build" } },
+    "expected": { "mode": "general", "isAuto": true }
+  },
+  {
+    "name": "DevOps task URL",
+    "task": { "devopsTaskUrl": "https://dev.azure.com/example/_workitems/edit/42" },
+    "expected": { "mode": "developer", "isAuto": true }
+  },
+  {
+    "name": "plugin target",
+    "task": { "workflowSetup": { "devTargetKind": "plugin" } },
+    "expected": { "mode": "developer", "isAuto": true }
+  },
+  {
+    "name": "script target",
+    "task": { "workflowSetup": { "devTargetKind": "script" } },
+    "expected": { "mode": "developer", "isAuto": true }
+  },
+  {
+    "name": "repository target",
+    "task": { "workflowSetup": { "devTargetKind": "repo" } },
+    "expected": { "mode": "developer", "isAuto": true }
+  },
+  {
+    "name": "CRM OnLoad keyword",
+    "task": { "title": "Programátorské zadání č. 2 — OnLoad + OnChange validace délky schůzky" },
+    "expected": { "mode": "developer", "isAuto": true }
+  },
+  {
+    "name": "Dataverse keyword in original message",
+    "task": { "originalMessage": "Upravit Dataverse formulář" },
+    "expected": { "mode": "developer", "isAuto": true }
+  },
+  {
+    "name": "PCF keyword in analysis summary",
+    "task": { "analysisResult": { "summary": "Implement a PCF control" } },
+    "expected": { "mode": "developer", "isAuto": true }
+  },
+  {
+    "name": "automatic general",
+    "task": { "title": "Confirm the renewal date" },
+    "expected": { "mode": "general", "isAuto": true }
+  }
+]

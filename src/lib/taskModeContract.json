@@ -1,0 +1,30 @@
+{
+  "developerAdoContextTypes": ["work-item", "pr-comment"],
+  "developerTargetKinds": ["plugin", "script", "repo"],
+  "developerKeywordPatterns": [
+    "\\bplugin\\b",
+    "\\biplugin\\b",
+    "dataverse",
+    "\\bcrm plugin\\b",
+    "preoperation|postoperation",
+    "\\.csproj\\b|\\.cs\\b",
+    "\\bstatecode\\b|\\bstatuscode\\b",
+    "\\bIOrganizationService\\b|\\bIPlugin\\b|\\bITracingService\\b",
+    "\\bentita\\b",
+    "entit[eě]",
+    "\\bformulář|\\bformuláři\\b",
+    "sekc[ei]",
+    "\\bzáložka\\b|\\bzáložce\\b",
+    "skrývání|skrýt|skryj|zobrazení|zobrazit",
+    "\\bnvr_|\\bcr[a-z0-9]{1,4}_",
+    "\\bpole\\b",
+    "\\bpcf\\b",
+    "power apps|dynamics 365|\\bd365\\b",
+    "\\bscript\\b.*\\b(crm|d365|dynamics|dataverse|xrm)\\b|\\b(xrm|formcontext)\\b",
+    "\\bwebresource\\b|\\bonchange\\b|\\bonload\\b|\\bonsave\\b",
+    "\\bribbon\\b",
+    "\\bformcontext\\b|\\bxrm\\.page\\b",
+    "\\.js\\b.*crm|crm.*\\.js\\b|\\.ts\\b.*crm|crm.*\\.ts\\b",
+    "\\bpole\\b.*entit|entit.*\\bpole\\b"
+  ]
+}
