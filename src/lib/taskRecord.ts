@@ -108,11 +108,11 @@ export function buildStatusNoteHistory(
   return [...(task.history ?? []), entry].slice(-MAX_HISTORY_ENTRIES);
 }
 
-export function getStatusNotes(task: Task): TaskHistoryEntry[] {
+export function getStatusNotes<TEntry extends { action: string }>(task: { history?: TEntry[] }): TEntry[] {
   return (task.history ?? []).filter((entry) => entry.action === STATUS_NOTE_ACTION);
 }
 
-export function getLatestStatusNote(task: Task): TaskHistoryEntry | undefined {
+export function getLatestStatusNote<TEntry extends { action: string }>(task: { history?: TEntry[] }): TEntry | undefined {
   const notes = getStatusNotes(task);
   return notes[notes.length - 1];
 }

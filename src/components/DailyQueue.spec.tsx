@@ -89,6 +89,30 @@ describe('DailyQueue', () => {
     expect(nowGroup).toContainElement(screen.getByText('Ptáček'));
   });
 
+  it('shows the latest status update from the current work record', async () => {
+    const queued = workItem('status-task', { title: 'Status task' });
+    const current = workItem('status-task', {
+      title: 'Status task',
+      history: [{
+        id: 'status-1',
+        at: new Date().toISOString(),
+        actorType: 'user',
+        action: 'status-note',
+        summary: 'Waiting for customer confirmation',
+      }],
+    });
+    vi.spyOn(api, 'getDailyQueue').mockResolvedValue(
+      queueResult([{ item: queued, position: 1 }]),
+    );
+
+    render(<DailyQueue workItems={[current]} />);
+
+    const row = (await screen.findByText('Status task')).closest<HTMLElement>('.daily-queue-row')!;
+    const statusUpdate = within(row).getByText('Waiting for customer confirmation');
+    expect(statusUpdate).toHaveClass('task-list-item-status-note-text');
+    expect(within(row).getByText('dnes')).toHaveClass('task-list-item-status-note-date');
+  });
+
   it('a completed item is never shown as "Right now" even if it is first in the queue', async () => {
     const done = workItem('done', { title: 'Finished thing', status: 'completed' });
     const active = workItem('todo', { title: 'Still to do', status: 'ready' });

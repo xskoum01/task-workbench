@@ -34,7 +34,8 @@ import {
   upcomingEntries,
   WORK_ITEM_DRAG_TYPE,
 } from '../lib/dailyQueue';
-import { localTodayStr } from '../lib/dates';
+import { formatShortPastDate, localTodayStr } from '../lib/dates';
+import { getLatestStatusNote } from '../lib/taskRecord';
 import Modal from './Modal';
 import Icon from './Icon';
 
@@ -62,6 +63,7 @@ function isRevisionConflict(message: string): boolean {
 
 interface DailyQueueRowProps {
   entry: DailyQueueEntry;
+  currentWorkItem?: WorkItem;
   isActive: boolean;
   queueLength: number;
   onMove: (workItemId: string, position: number) => void;
@@ -75,11 +77,12 @@ interface DailyQueueRowProps {
   onDrop: (event: React.DragEvent, entry: DailyQueueEntry) => void;
 }
 
-function DailyQueueRow({ entry, isActive, queueLength, onMove, onRemove, onComplete, isDragging, dropPlacement, onDragStart, onDragEnd, onDragOver, onDrop }: DailyQueueRowProps) {
+function DailyQueueRow({ entry, currentWorkItem, isActive, queueLength, onMove, onRemove, onComplete, isDragging, dropPlacement, onDragStart, onDragEnd, onDragOver, onDrop }: DailyQueueRowProps) {
   const { position } = entry;
-  const workItem = entry.kind === 'work_item' ? entry.workItem : null;
+  const workItem = entry.kind === 'work_item' ? currentWorkItem ?? entry.workItem : null;
   const title = entry.kind === 'work_item' ? entry.workItem.title : entry.text;
   const isDone = isQueueEntryDone(entry);
+  const latestStatusNote = workItem ? getLatestStatusNote(workItem) : undefined;
 
   return (
     <li
@@ -103,6 +106,12 @@ function DailyQueueRow({ entry, isActive, queueLength, onMove, onRemove, onCompl
               <span className="daily-queue-status">{STATUS_LABELS[workItem.status]}</span>
               <span className="daily-queue-sep">·</span>
               <span className="daily-queue-priority">{PRIORITY_LABELS[workItem.priority]}</span>
+              {latestStatusNote && (
+                <span className="task-list-item-status-note" title={new Date(latestStatusNote.at).toLocaleString()}>
+                  <span className="task-list-item-status-note-text">{latestStatusNote.summary}</span>
+                  <span className="task-list-item-status-note-date">{formatShortPastDate(latestStatusNote.at)}</span>
+                </span>
+              )}
             </>
           ) : (
             <span className="daily-queue-note-label">Text note</span>
@@ -341,6 +350,7 @@ export default function DailyQueue({ workItems, onCompleteWorkItem }: DailyQueue
   }
 
   const entries = queue?.entries ?? [];
+  const currentWorkItems = new Map(workItems.map((item) => [item.id, item]));
   const active = activeEntry(entries);
   const upcoming = upcomingEntries(entries);
 
@@ -388,6 +398,7 @@ export default function DailyQueue({ workItems, onCompleteWorkItem }: DailyQueue
               <ol className="daily-queue-list">
                 <DailyQueueRow
                   entry={active}
+                  currentWorkItem={active.kind === 'work_item' ? currentWorkItems.get(active.id) : undefined}
                   isActive
                   queueLength={entries.length}
                   onMove={handleMove}
@@ -411,6 +422,7 @@ export default function DailyQueue({ workItems, onCompleteWorkItem }: DailyQueue
                   <DailyQueueRow
                     key={entry.id}
                     entry={entry}
+                    currentWorkItem={entry.kind === 'work_item' ? currentWorkItems.get(entry.id) : undefined}
                     isActive={false}
                     queueLength={entries.length}
                     onMove={handleMove}
